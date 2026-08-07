@@ -119,6 +119,12 @@ Upstream PR #47 addresses them. Use `cargo test --lib` (530 tests) as the workin
 - **Changing `[embedding_prefix]` needs `engraph index --reindex`.** Incremental indexing compares
   content hashes, so a config change alone leaves every existing vector as it was and silently mixes
   two embedding schemes in one vector space.
+- **The FTS index holds each chunk's first 200 characters, not the chunk** (issue #11). All four
+  `insert_fts_chunk` sites pass `snippet`, and the full text is never stored — `chunks` has no
+  `text` column. 79.7% of chunks on the eval vault are truncated and ~70% of the corpus cannot be
+  reached by keyword search at all; `Saltmere`, a place name in two notes, returns zero FTS hits.
+  This degrades the FTS lane *and* `best_matching_chunk_seq`, so graph-lane section anchoring is
+  affected too. Assume any lexical result predates the fix until #11 lands.
 - **RRF scores tie constantly**, since every lane hands out the same `weight/(k + rank)` values.
   Sorting them without a tiebreak means `HashMap` order decides the ranking, and results vary
   run-to-run — they did, from about rank 7 down, until #6 added tiebreaks in `fusion.rs` and
@@ -135,6 +141,9 @@ See issues on this repo:
   conceptual probe, −4 (out of the window) on the exact-name non-regression probe. Both of its
   retrieval acceptance criteria turned out to have been met already by #1 + #6. Needs #3 to decide
   whether a length-scaled or conditional prefix is worth having.
+- **#11** FTS indexes the 200-char snippet, not the chunk — **70% of the corpus is unreachable by
+  keyword search.** Straight defect, four-line fix, but it moves every probe rank, so it should land
+  before #3 freezes a battery against the current numbers.
 - **#3** retrieval eval battery — now adjudicates #2, and calibrates #4
 - **#4** relevance floor — configurable per-lane min scores so nonsense queries return nothing
 - **#5** embedding model config — expose output dim, tie max chunk tokens to the model's context window
@@ -148,7 +157,11 @@ See issues on this repo:
 - ~~**#7** exclude derived `*-index.md` / `templates/` from ingest, and make `exclude` glob for
   real~~ — **done**, 14.2% of chunks and 18.3% of edges removed from the eval corpus
 
-Suggested order: **#3 next**, and now with a concrete debt to pay off. Five hand-picked probes were
+Suggested order: **#11 then #3.** #11 first because it is a bug rather than a design question, and
+because it invalidates the lexical half of every measurement below — including #6's, since
+`best_matching_chunk_seq` resolves graph-lane sections through `chunks_fts`. Freezing a battery
+before fixing it would bake the defect into the baseline. Then #3, and now with a concrete debt to
+pay off. Five hand-picked probes were
 enough to show that #2 trades one probe for another, and not enough to say which trade is right —
 the same five gave contradictory verdicts on three configurations of the same feature. #3 supplies
 the measurements everything else is judged by. Then **#5** (makes chunk size and dim configurable,
