@@ -18,6 +18,7 @@ git fetch upstream && git diff --stat upstream/main main
 | commit | what | origin |
 |---|---|---|
 | `a19f27a` | chunker overlap-stride crawl | cherry-pick of upstream PR #41 (`ec7b06b`, @jdubdevs) |
+| `structure_chunk` | structure-first chunking | this fork, issue #1 |
 
 Cherry-picked rather than merged: PR #41 branched before upstream's #40 graph fix, so merging the
 branch wholesale would have silently reverted `src/graph.rs`.
@@ -84,19 +85,27 @@ Use `cargo test --lib` (469 tests) as the working suite.
   `embeddinggemma-300M` at `target_dim=256`. Upstream PR #48 fixes it.
 - **Intelligence is not a quality dial.** Enabling it (query expansion + Qwen3 reranker, 1.6GB)
   *regressed* exact-name lookup in testing. Treat on/off as distinct configurations.
+- **Retrieval is file-level, not chunk-level.** Every lane collapses to one result per `file_path`
+  before fusion (`search.rs:131`, `fusion.rs:45`). However good the chunking, a document can only
+  occupy one slot in the results, and the chunk that wins it may not be the relevant one. This is
+  issue #6, and it caps what #1 and #2 can deliver.
 
 ## Open work
 
 See issues on this repo:
 
-- **#1** structure-first chunking (section → sub-section → paragraph → size)
+- ~~**#1** structure-first chunking (section → sub-section → paragraph → size)~~ — **done**, 93.1%
+  heading attribution (best measured). Retrieval barely moved; see #6 for why.
 - **#2** contextual embedding prefix (filename / heading path / tags into every chunk)
-- **#3** retrieval eval battery — gates #1 and #2, and calibrates #4
+- **#3** retrieval eval battery — gates #2, and calibrates #4
 - **#4** relevance floor — configurable per-lane min scores so nonsense queries return nothing
 - **#5** embedding model config — expose output dim, tie max chunk tokens to the model's context window
+- **#6** section-level retrieval granularity — dedup on `(file_path, heading)` so a document can
+  contribute more than one section to the results
 
-Suggested order: **#3 first** (it supplies the measurements the others are judged by), then **#5**
-(makes chunk size and dim configurable, which #1/#2/#3 all need in order to compare configurations),
-then #1 and #2 (independent of each other), then #4 (needs #3's negative controls to calibrate).
+Suggested order: **#6 next** — measurement showed it is the binding constraint, and it raises the
+ceiling for #2. Then **#3** (supplies the measurements the rest are judged by), then **#5** (makes
+chunk size and dim configurable, which #2/#3 need to compare configurations), then #2, then #4
+(needs #3's negative controls to calibrate).
 
 `eval/` holds the seed material for #3.

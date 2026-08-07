@@ -2,10 +2,50 @@
 pub struct Chunk {
     /// The heading line (any `#` level), if any.
     pub heading: Option<String>,
+    /// Heading *text* of every ancestor section, outermost first, including this
+    /// chunk's own heading as the last element. Empty for pre-heading content.
+    ///
+    /// `## Abilities` / `### Combat` yields `["Abilities", "Combat"]`. Not
+    /// persisted or embedded yet — this is the input issue #2 needs to build a
+    /// contextual embedding prefix.
+    pub heading_path: Vec<String>,
     /// Full chunk text (without frontmatter).
     pub text: String,
     /// First 200 chars of `text`, truncated with `"..."` if needed.
     pub snippet: String,
+}
+
+impl Chunk {
+    /// Build a chunk from a heading line and a body, deriving `text` and `snippet`.
+    ///
+    /// The heading line is prepended to the body so every chunk *begins* with the
+    /// heading it is labelled with. `continuation` appends ` (cont.)` to the label
+    /// for the second and later pieces of a split section.
+    fn from_section(
+        heading_line: Option<&str>,
+        heading_path: &[String],
+        body: &str,
+        continuation: bool,
+    ) -> Chunk {
+        let heading = heading_line.map(|h| {
+            if continuation {
+                format!("{h} (cont.)")
+            } else {
+                h.to_string()
+            }
+        });
+        let text = match &heading {
+            Some(h) => format!("{h}\n{}", body.trim()),
+            None => body.trim().to_string(),
+        };
+        let snippet = make_snippet(&text);
+        Chunk {
+            heading,
+            heading_path: heading_path.to_vec(),
+            text,
+            snippet,
+        }
+    }
 }
 
 /// Result of parsing a markdown file.
@@ -206,6 +246,7 @@ pub fn smart_chunk(content: &str, target_tokens: usize, overlap_pct: usize) -> V
         let snippet = make_snippet(content.trim());
         return vec![Chunk {
             heading,
+            heading_path: Vec::new(),
             text: content.trim().to_string(),
             snippet,
         }];
@@ -232,6 +273,7 @@ pub fn smart_chunk(content: &str, target_tokens: usize, overlap_pct: usize) -> V
                 let snippet = make_snippet(&text);
                 chunks.push(Chunk {
                     heading,
+                    heading_path: Vec::new(),
                     text,
                     snippet,
                 });
@@ -291,6 +333,7 @@ pub fn smart_chunk(content: &str, target_tokens: usize, overlap_pct: usize) -> V
             let snippet = make_snippet(&chunk_text);
             chunks.push(Chunk {
                 heading,
+                heading_path: Vec::new(),
                 text: chunk_text,
                 snippet,
             });
@@ -328,15 +371,188 @@ fn weighted_score(bp: &BreakPoint, ideal_offset: usize) -> f64 {
     bp.score as f64 * distance_factor
 }
 
-/// Parse markdown content into frontmatter tags and smart-chunked pieces.
+/// Byte offset at which each line of `content` begins.
+///
+/// Uses `split_inclusive` so multi-byte characters and `\r\n` terminators are
+/// accounted for exactly. Index positions line up with `str::lines()`, which is
+/// what `markdown::parse_headings` reports against.
+fn line_offsets(content: &str) -> Vec<usize> {
+    let mut offsets = Vec::new();
+    let mut pos = 0usize;
+    for line in content.split_inclusive('\n') {
+        offsets.push(pos);
+        pos += line.len();
+    }
+    offsets
+}
+
+/// Structure-first chunking: a chunk boundary is placed at every ATX heading,
+/// and size only decides how an *oversized* section is subdivided.
+///
+/// The hierarchy is walked to build each chunk's ancestor `heading_path`, but
+/// chunks are emitted **flat**: a section owns the content between its heading
+/// and the next heading of *any* level, so a parent never swallows its
+/// subsections. That keeps one topic per vector, which is what makes the
+/// heading path worth embedding (issue #2).
+///
+/// Splitting order, per section:
+/// 1. whole section, if it fits in `target_tokens`
+/// 2. otherwise pack whole paragraphs (blank-line separated) up to the budget
+/// 3. a single paragraph still too large falls back to `smart_chunk`
+///
+/// The heading line is re-emitted at the head of every piece, so no chunk is
+/// ever labelled with a heading that begins partway through it. Sizes here use
+/// the `chars/4` approximation; `split_oversized_chunks` enforces the real
+/// tokenizer limit downstream.
+pub fn structure_chunk(content: &str, target_tokens: usize, overlap_pct: usize) -> Vec<Chunk> {
+    if content.trim().is_empty() {
+        return Vec::new();
+    }
+
+    let offsets = line_offsets(content);
+    let headings = crate::markdown::parse_headings(content);
+    let line_start = |line: usize| offsets.get(line).copied().unwrap_or(content.len());
+
+    let mut chunks = Vec::new();
+
+    // Content before the first heading (frontmatter is already stripped).
+    let first_heading = headings
+        .first()
+        .map(|h| line_start(h.line))
+        .unwrap_or(content.len());
+    emit_section(
+        &content[..first_heading],
+        None,
+        &[],
+        target_tokens,
+        overlap_pct,
+        &mut chunks,
+    );
+
+    // Ancestor stack of (level, heading text) for the heading path.
+    let mut ancestors: Vec<(u8, String)> = Vec::new();
+
+    for (i, heading) in headings.iter().enumerate() {
+        while ancestors
+            .last()
+            .is_some_and(|(level, _)| *level >= heading.level)
+        {
+            ancestors.pop();
+        }
+        ancestors.push((heading.level, heading.text.clone()));
+        let path: Vec<String> = ancestors.iter().map(|(_, text)| text.clone()).collect();
+
+        let heading_start = line_start(heading.line);
+        let body_start = line_start(heading.line + 1);
+        // Next heading of ANY level ends this section: subsections are siblings,
+        // not children, for the purpose of chunk content.
+        let body_end = headings
+            .get(i + 1)
+            .map(|next| line_start(next.line))
+            .unwrap_or(content.len());
+
+        let heading_line = content[heading_start..body_start].trim_end();
+        let body = &content[body_start..body_end.max(body_start)];
+
+        // A heading with no body of its own (immediately followed by a
+        // subheading) would produce a chunk that is nothing but its own title.
+        // Skip it — the text survives in its descendants' heading_path.
+        if body.trim().is_empty() {
+            continue;
+        }
+
+        emit_section(
+            body,
+            Some(heading_line),
+            &path,
+            target_tokens,
+            overlap_pct,
+            &mut chunks,
+        );
+    }
+
+    chunks
+}
+
+/// Emit one or more chunks for a single section body, splitting on paragraph
+/// boundaries and then on size only when a paragraph alone busts the budget.
+fn emit_section(
+    body: &str,
+    heading_line: Option<&str>,
+    heading_path: &[String],
+    target_tokens: usize,
+    overlap_pct: usize,
+    out: &mut Vec<Chunk>,
+) {
+    let body = body.trim();
+    if body.is_empty() {
+        return;
+    }
+
+    // The heading is re-emitted on every piece, so it spends budget every time.
+    let heading_tokens = heading_line.map(approx_tokens).unwrap_or(0);
+    let budget = target_tokens.saturating_sub(heading_tokens).max(1);
+
+    if approx_tokens(body) <= budget {
+        out.push(Chunk::from_section(heading_line, heading_path, body, false));
+        return;
+    }
+
+    let mut pieces: Vec<String> = Vec::new();
+    let mut current = String::new();
+
+    for paragraph in body.split("\n\n") {
+        let paragraph = paragraph.trim();
+        if paragraph.is_empty() {
+            continue;
+        }
+
+        // A single paragraph over budget: flush what we have, then fall back to
+        // size-based splitting with overlap for this paragraph alone.
+        if approx_tokens(paragraph) > budget {
+            if !current.is_empty() {
+                pieces.push(std::mem::take(&mut current));
+            }
+            for chunk in smart_chunk(paragraph, budget, overlap_pct) {
+                pieces.push(chunk.text);
+            }
+            continue;
+        }
+
+        let candidate = if current.is_empty() {
+            paragraph.to_string()
+        } else {
+            format!("{current}\n\n{paragraph}")
+        };
+        if !current.is_empty() && approx_tokens(&candidate) > budget {
+            pieces.push(std::mem::replace(&mut current, paragraph.to_string()));
+        } else {
+            current = candidate;
+        }
+    }
+    if !current.is_empty() {
+        pieces.push(current);
+    }
+
+    for (i, piece) in pieces.into_iter().enumerate() {
+        out.push(Chunk::from_section(
+            heading_line,
+            heading_path,
+            &piece,
+            i > 0,
+        ));
+    }
+}
+
+/// Parse markdown content into frontmatter tags and structure-first chunks.
 ///
 /// 1. Strip YAML frontmatter (between `---` at start), parse `tags` if present.
-/// 2. Run `smart_chunk` on the body with target 512 tokens, 15% overlap.
+/// 2. Run `structure_chunk` on the body with target 512 tokens, 15% overlap.
 /// 3. Return `ParsedMarkdown { tags, chunks }`.
 pub fn chunk_markdown(content: &str) -> ParsedMarkdown {
     let (tags, body) = parse_frontmatter(content);
 
-    let chunks = smart_chunk(body, 512, 15);
+    let chunks = structure_chunk(body, 512, 15);
 
     ParsedMarkdown { tags, chunks }
 }
@@ -393,13 +609,17 @@ pub fn split_oversized_chunks(
             } else {
                 chunk.heading.as_ref().map(|h| format!("{h} (cont.)"))
             };
+            let sub_text = sub_text.trim();
             let full_text = match &heading {
-                Some(h) => format!("{h}\n{}", sub_text.trim()),
-                None => sub_text.trim().to_string(),
+                // Structure-first chunks already lead with their heading; only
+                // prepend when it isn't there, or the first piece gets it twice.
+                Some(h) if !sub_text.starts_with(h.as_str()) => format!("{h}\n{sub_text}"),
+                _ => sub_text.to_string(),
             };
             let snippet = make_snippet(&full_text);
             result.push(Chunk {
                 heading,
+                heading_path: chunk.heading_path.clone(),
                 text: full_text,
                 snippet,
             });
@@ -782,24 +1002,211 @@ mod tests {
         }
     }
 
-    // ── Existing tests (updated for smart chunking) ──────────────────────
+    // ── Structure-first chunking tests ───────────────────────────────────
+
+    #[test]
+    fn test_structure_chunk_one_chunk_per_section() {
+        let md = "## Alpha\nA body.\n\n## Beta\nB body.\n\n## Gamma\nG body.\n";
+        let chunks = structure_chunk(md, 512, 15);
+        assert_eq!(chunks.len(), 3);
+        for (chunk, expected) in chunks.iter().zip(["Alpha", "Beta", "Gamma"]) {
+            assert_eq!(chunk.heading.as_deref(), Some(&*format!("## {expected}")));
+            assert_eq!(chunk.heading_path, vec![expected.to_string()]);
+        }
+    }
+
+    #[test]
+    fn test_structure_chunk_no_chunk_spans_two_sections() {
+        // Six tiny sections: size-driven chunking merged all of these into one.
+        let md: String = (0..6)
+            .map(|i| format!("## Section {i}\nBody of section {i}.\n\n"))
+            .collect();
+        let chunks = structure_chunk(&md, 512, 15);
+
+        assert_eq!(chunks.len(), 6);
+        for chunk in &chunks {
+            let headings = chunk
+                .text
+                .lines()
+                .filter(|l| l.trim_start().starts_with("## "))
+                .count();
+            assert_eq!(headings, 1, "chunk spans sections:\n{}", chunk.text);
+        }
+    }
+
+    #[test]
+    fn test_structure_chunk_heading_always_starts_chunk() {
+        // Long enough to force a split inside a section.
+        let filler = "Sentence of prose padding this section out. ".repeat(60);
+        let md = format!("## First\n{filler}\n\n{filler}\n\n## Second\nShort.\n");
+        let chunks = structure_chunk(&md, 128, 15);
+
+        assert!(chunks.len() > 2, "expected the first section to split");
+        for chunk in &chunks {
+            let heading = chunk.heading.as_deref().expect("every chunk is labelled");
+            // The label is the chunk's first line, never a heading discovered
+            // partway through the text.
+            let base = heading.trim_end_matches(" (cont.)");
+            assert!(
+                chunk.text.starts_with(base),
+                "chunk labelled {heading:?} does not begin with it:\n{}",
+                chunk.text
+            );
+        }
+        // Continuations are marked, and the section that fits is not.
+        assert_eq!(chunks[0].heading.as_deref(), Some("## First"));
+        assert_eq!(chunks[1].heading.as_deref(), Some("## First (cont.)"));
+        assert_eq!(chunks.last().unwrap().heading.as_deref(), Some("## Second"));
+    }
+
+    #[test]
+    fn test_structure_chunk_packs_whole_paragraphs() {
+        // Three paragraphs, each ~40 approx-tokens; a 60-token budget must pack
+        // them one per chunk rather than cutting a paragraph in half.
+        let para = |n: usize| format!("Paragraph {n} {}", "word ".repeat(30));
+        let md = format!("## Body\n{}\n\n{}\n\n{}\n", para(1), para(2), para(3));
+        let chunks = structure_chunk(&md, 64, 15);
+
+        assert_eq!(chunks.len(), 3);
+        for (i, chunk) in chunks.iter().enumerate() {
+            assert!(
+                chunk.text.contains(&format!("Paragraph {}", i + 1)),
+                "chunk {i} lost its paragraph:\n{}",
+                chunk.text
+            );
+        }
+    }
+
+    #[test]
+    fn test_structure_chunk_oversized_paragraph_falls_back_to_size_split() {
+        // A single paragraph — no blank lines to split on — well over budget.
+        let giant = "This is one very long unbroken paragraph. ".repeat(80);
+        let md = format!("## Wall\n{giant}");
+        let chunks = structure_chunk(&md, 64, 15);
+
+        assert!(
+            chunks.len() > 3,
+            "expected the oversized paragraph to be size-split, got {}",
+            chunks.len()
+        );
+        for chunk in &chunks {
+            assert!(chunk.heading.as_deref().unwrap().starts_with("## Wall"));
+            assert_eq!(chunk.heading_path, vec!["Wall".to_string()]);
+        }
+        // No content is lost.
+        let recovered: String = chunks
+            .iter()
+            .map(|c| {
+                c.text
+                    .replace("## Wall (cont.)\n", "")
+                    .replace("## Wall\n", "")
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(recovered.contains("one very long unbroken paragraph"));
+    }
+
+    #[test]
+    fn test_structure_chunk_subsections_are_siblings_with_ancestor_path() {
+        let md = "## Abilities\nOverview text.\n\n### Combat\nSword work.\n\n### Magic\nSpell work.\n\n## Gear\nA sword.\n";
+        let chunks = structure_chunk(md, 512, 15);
+
+        assert_eq!(chunks.len(), 4);
+        // A parent does not swallow its subsections...
+        assert_eq!(chunks[0].text, "## Abilities\nOverview text.");
+        // ...but each subsection knows its ancestry.
+        assert_eq!(
+            chunks[1].heading_path,
+            vec!["Abilities".to_string(), "Combat".to_string()]
+        );
+        assert_eq!(
+            chunks[2].heading_path,
+            vec!["Abilities".to_string(), "Magic".to_string()]
+        );
+        // Popping back to a shallower level resets the path.
+        assert_eq!(chunks[3].heading_path, vec!["Gear".to_string()]);
+    }
+
+    #[test]
+    fn test_structure_chunk_skips_bodyless_heading() {
+        let md = "## Parent\n### Child\nOnly real content.\n";
+        let chunks = structure_chunk(md, 512, 15);
+
+        // `## Parent` has no body of its own, so it produces no title-only chunk.
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].heading.as_deref(), Some("### Child"));
+        assert_eq!(
+            chunks[0].heading_path,
+            vec!["Parent".to_string(), "Child".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_structure_chunk_preamble_before_first_heading() {
+        let md = "Intro prose with no heading.\n\n## Section\nBody.\n";
+        let chunks = structure_chunk(md, 512, 15);
+
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks[0].heading.is_none());
+        assert!(chunks[0].heading_path.is_empty());
+        assert_eq!(chunks[0].text, "Intro prose with no heading.");
+        assert_eq!(chunks[1].heading.as_deref(), Some("## Section"));
+    }
+
+    #[test]
+    fn test_structure_chunk_ignores_headings_in_code_fences() {
+        let md = "## Real\nSee below:\n\n```md\n## Not A Heading\n```\n\n## Also Real\nBody.\n";
+        let chunks = structure_chunk(md, 512, 15);
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].heading.as_deref(), Some("## Real"));
+        assert!(chunks[0].text.contains("## Not A Heading"));
+        assert_eq!(chunks[1].heading.as_deref(), Some("## Also Real"));
+    }
+
+    #[test]
+    fn test_structure_chunk_handles_multibyte_headings() {
+        // Byte offsets, not char counts: a mis-slice here would panic.
+        let md = "## Ríoghán's Résumé\nBody — with an em dash.\n\n## 日本語\n本文です。\n";
+        let chunks = structure_chunk(md, 512, 15);
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].heading.as_deref(), Some("## Ríoghán's Résumé"));
+        assert_eq!(chunks[1].heading.as_deref(), Some("## 日本語"));
+        assert!(chunks[1].text.contains("本文です。"));
+    }
+
+    #[test]
+    fn test_split_oversized_chunks_does_not_duplicate_heading() {
+        // Structure-first chunks already lead with their heading; the token-aware
+        // pass must not prepend it a second time.
+        let chunk = Chunk {
+            heading: Some("## Section".to_string()),
+            heading_path: vec!["Section".to_string()],
+            text: "## Section\nShort body.".to_string(),
+            snippet: "## Section\nShort body.".to_string(),
+        };
+        let token_fn = |s: &str| s.split_whitespace().count();
+        let result = split_oversized_chunks(vec![chunk], &token_fn, 512, 50);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].text.matches("## Section").count(), 1);
+        assert_eq!(result[0].heading_path, vec!["Section".to_string()]);
+    }
+
+    // ── Existing tests ───────────────────────────────────────────────────
 
     #[test]
     fn test_chunk_by_headings() {
         let md = "## A\nContent A\n\n## B\nContent B\n";
         let parsed = chunk_markdown(md);
-        // Smart chunking with small content should keep it as one chunk
-        // since total tokens < 512
-        assert!(parsed.chunks.len() >= 1);
-        // The content should all be present
-        let all_text: String = parsed
-            .chunks
-            .iter()
-            .map(|c| c.text.clone())
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert!(all_text.contains("Content A"));
-        assert!(all_text.contains("Content B"));
+        // One chunk per section, regardless of how far under the size target
+        // they are. Merging them would put two topics in one vector.
+        assert_eq!(parsed.chunks.len(), 2);
+        assert_eq!(parsed.chunks[0].heading.as_deref(), Some("## A"));
+        assert_eq!(parsed.chunks[0].text, "## A\nContent A");
+        assert_eq!(parsed.chunks[1].heading.as_deref(), Some("## B"));
+        assert_eq!(parsed.chunks[1].text, "## B\nContent B");
     }
 
     #[test]
@@ -874,6 +1281,7 @@ mod tests {
 
         let chunk = Chunk {
             heading: Some("## Long Section".to_string()),
+            heading_path: vec!["Long Section".to_string()],
             text: format!("## Long Section\n{long_text}"),
             snippet: make_snippet(&format!("## Long Section\n{long_text}")),
         };
@@ -908,6 +1316,7 @@ mod tests {
     fn test_short_chunk_no_split() {
         let chunk = Chunk {
             heading: Some("## Short".to_string()),
+            heading_path: vec!["Short".to_string()],
             text: "## Short\nJust a few words here.".to_string(),
             snippet: "## Short\nJust a few words here.".to_string(),
         };
