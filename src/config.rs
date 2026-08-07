@@ -111,6 +111,27 @@ pub struct ApiKeyConfig {
     pub permissions: String, // "read" | "write"
 }
 
+/// Granularity of search results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum GroupBy {
+    /// One result per matching section — a document may appear more than once,
+    /// bounded by `max_chunks_per_file`.
+    #[default]
+    Chunk,
+    /// One result per document, represented by its best-scoring section. This is
+    /// what engraph returned before sections were addressable.
+    File,
+}
+
+/// Default ceiling on how many sections of one document a result set may hold.
+///
+/// Three is enough for a rules page to answer with the spell, its prerequisite,
+/// and its counter, and few enough that a 33-section document cannot fill a page.
+pub fn default_max_chunks_per_file() -> usize {
+    3
+}
+
 /// Application configuration, loaded from `~/.engraph/config.toml` with CLI overrides.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -119,6 +140,11 @@ pub struct Config {
     pub vault_path: Option<PathBuf>,
     /// Number of results to return from search.
     pub top_n: usize,
+    /// Maximum number of sections one document may contribute to a result set.
+    /// 0 means unlimited.
+    pub max_chunks_per_file: usize,
+    /// Whether search results address sections or whole documents.
+    pub group_by: GroupBy,
     /// Glob patterns to exclude from indexing.
     pub exclude: Vec<String>,
     /// Number of files to process per embedding batch.
@@ -150,6 +176,8 @@ impl Default for Config {
         Self {
             vault_path: None,
             top_n: 5,
+            max_chunks_per_file: default_max_chunks_per_file(),
+            group_by: GroupBy::default(),
             exclude: vec![".obsidian/".to_string()],
             batch_size: 64,
             respect_gitignore: true,
@@ -303,6 +331,18 @@ batch_size = 128
 
         let cfg = Config::load_from(&path).unwrap();
         assert_eq!(cfg.exclude, vec!["*-index.md", "templates/"]);
+    }
+
+    #[test]
+    fn retrieval_granularity_round_trips() {
+        let cfg: Config = toml::from_str("max_chunks_per_file = 5\ngroup_by = \"file\"\n").unwrap();
+        assert_eq!(cfg.max_chunks_per_file, 5);
+        assert_eq!(cfg.group_by, GroupBy::File);
+
+        // Chunk-level results with a cap of 3 are what a config without them means.
+        let bare: Config = toml::from_str("").unwrap();
+        assert_eq!(bare.max_chunks_per_file, 3);
+        assert_eq!(bare.group_by, GroupBy::Chunk);
     }
 
     #[test]

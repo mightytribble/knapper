@@ -251,6 +251,10 @@ pub struct EngraphServer {
     recent_writes: RecentWrites,
     /// When true, write/edit/delete MCP tools return an error instead of executing.
     read_only: bool,
+    /// Retrieval granularity settings from `config.toml`, so MCP callers get the
+    /// same result shape the CLI does.
+    max_chunks_per_file: usize,
+    group_by: crate::config::GroupBy,
 }
 
 fn read_only_err() -> McpError {
@@ -399,6 +403,8 @@ impl EngraphServer {
                 .map(|g| g.as_mut() as &mut dyn RerankModel),
             store: &store,
             rerank_candidates: 30,
+            max_chunks_per_file: self.max_chunks_per_file,
+            group_by: self.group_by,
         };
 
         let output =
@@ -1076,6 +1082,10 @@ pub async fn run_serve(
             exclude.push(pattern);
         }
     }
+    // Capture retrieval settings before the watcher takes ownership of `config`.
+    let max_chunks_per_file = config.max_chunks_per_file;
+    let group_by = config.group_by;
+
     let (watcher_handle, watcher_shutdown) = crate::watcher::start_watcher(
         store_arc.clone(),
         embedder_arc.clone(),
@@ -1100,6 +1110,8 @@ pub async fn run_serve(
         reranker,
         recent_writes,
         read_only,
+        max_chunks_per_file,
+        group_by,
     };
 
     // Cancellation token for coordinated shutdown of HTTP + MCP
@@ -1120,6 +1132,8 @@ pub async fn run_serve(
             recent_writes: http_recent_writes,
             rate_limiter: Arc::new(crate::http::RateLimiter::new(config.http.rate_limit)),
             read_only,
+            max_chunks_per_file,
+            group_by,
         };
         let router = crate::http::build_router(api_state);
         let addr = format!("{}:{}", opts.host, opts.port);

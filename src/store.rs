@@ -22,10 +22,30 @@ pub struct FileRecord {
 pub struct ChunkRecord {
     pub id: i64,
     pub file_id: i64,
+    /// Ordinal position within the file, 0-based. `(file_id, seq)` is the chunk's
+    /// retrieval identity: it is the only key the semantic and FTS lanes can both
+    /// produce, so it is what search dedups and fuses on.
+    pub seq: i64,
     pub heading: String,
     pub snippet: String,
     pub vector_id: u64,
     pub token_count: i64,
+}
+
+/// Columns selected for every [`ChunkRecord`], in the order [`chunk_from_row`] expects.
+const CHUNK_COLUMNS: &str = "id, file_id, seq, heading, snippet, vector_id, token_count";
+
+/// Build a [`ChunkRecord`] from a row selecting [`CHUNK_COLUMNS`].
+fn chunk_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChunkRecord> {
+    Ok(ChunkRecord {
+        id: row.get(0)?,
+        file_id: row.get(1)?,
+        seq: row.get(2)?,
+        heading: row.get(3)?,
+        snippet: row.get(4)?,
+        vector_id: row.get::<_, i64>(5)? as u64,
+        token_count: row.get(6)?,
+    })
 }
 
 /// A single result from an FTS5 full-text search.
@@ -124,12 +144,16 @@ CREATE TABLE IF NOT EXISTS files (
 CREATE TABLE IF NOT EXISTS chunks (
     id          INTEGER PRIMARY KEY,
     file_id     INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    seq         INTEGER NOT NULL DEFAULT 0,
     heading     TEXT NOT NULL,
     snippet     TEXT NOT NULL,
     vector_id   INTEGER UNIQUE NOT NULL,
     token_count INTEGER NOT NULL,
     vector      BLOB
 );
+-- idx_chunks_file_seq is created in `migrate`, not here: on a database written
+-- before `seq` existed the CREATE TABLE above is a no-op, and indexing a column
+-- the table does not have yet fails the whole schema batch.
 
 CREATE TABLE IF NOT EXISTS tombstones (
     id         INTEGER PRIMARY KEY,
@@ -264,6 +288,35 @@ impl Store {
         let _ = self
             .conn
             .execute_batch("ALTER TABLE files ADD COLUMN note_date INTEGER;");
+
+        // Add chunks.seq, and backfill it for databases indexed before chunk
+        // identity existed. Chunks were always inserted in document order, so the
+        // ordinal of a chunk's rowid within its file is the seq the FTS index was
+        // built with — that is what makes the two lanes joinable.
+        let has_chunk_seq: bool = {
+            let mut stmt = self.conn.prepare("PRAGMA table_info(chunks)")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            let mut found = false;
+            for row in rows {
+                if row.as_deref() == Ok("seq") {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        if !has_chunk_seq {
+            self.conn.execute_batch(
+                "ALTER TABLE chunks ADD COLUMN seq INTEGER NOT NULL DEFAULT 0;
+                 UPDATE chunks SET seq = (
+                     SELECT COUNT(*) FROM chunks older
+                     WHERE older.file_id = chunks.file_id AND older.id < chunks.id
+                 );",
+            )?;
+        }
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_chunks_file_seq ON chunks(file_id, seq);",
+        )?;
 
         // Check if edges table exists.
         let has_edges: bool = {
@@ -518,26 +571,39 @@ impl Store {
 
     // ── Chunks ──────────────────────────────────────────────────
 
+    /// Insert a chunk. `seq` is its 0-based position in the file and must match
+    /// the `chunk_seq` given to [`insert_fts_chunk`](Self::insert_fts_chunk) for
+    /// the same chunk, or the two lanes will disagree about what they retrieved.
     pub fn insert_chunk(
         &self,
         file_id: i64,
+        seq: i64,
         heading: &str,
         snippet: &str,
         vector_id: u64,
         token_count: i64,
     ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO chunks (file_id, heading, snippet, vector_id, token_count)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![file_id, heading, snippet, vector_id as i64, token_count],
+            "INSERT INTO chunks (file_id, seq, heading, snippet, vector_id, token_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                file_id,
+                seq,
+                heading,
+                snippet,
+                vector_id as i64,
+                token_count
+            ],
         )?;
         Ok(())
     }
 
     /// Insert a chunk with its embedding vector stored as a BLOB.
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_chunk_with_vector(
         &self,
         file_id: i64,
+        seq: i64,
         heading: &str,
         snippet: &str,
         vector_id: u64,
@@ -546,10 +612,11 @@ impl Store {
     ) -> Result<()> {
         let vector_bytes: Vec<u8> = vector.iter().flat_map(|f| f.to_le_bytes()).collect();
         self.conn.execute(
-            "INSERT INTO chunks (file_id, heading, snippet, vector_id, token_count, vector)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO chunks (file_id, seq, heading, snippet, vector_id, token_count, vector)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 file_id,
+                seq,
                 heading,
                 snippet,
                 vector_id as i64,
@@ -583,20 +650,10 @@ impl Store {
     }
 
     pub fn get_chunks_by_file(&self, file_id: i64) -> Result<Vec<ChunkRecord>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, file_id, heading, snippet, vector_id, token_count
-             FROM chunks WHERE file_id = ?1",
-        )?;
-        let rows = stmt.query_map(params![file_id], |row| {
-            Ok(ChunkRecord {
-                id: row.get(0)?,
-                file_id: row.get(1)?,
-                heading: row.get(2)?,
-                snippet: row.get(3)?,
-                vector_id: row.get::<_, i64>(4)? as u64,
-                token_count: row.get(5)?,
-            })
-        })?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {CHUNK_COLUMNS} FROM chunks WHERE file_id = ?1 ORDER BY seq"
+        ))?;
+        let rows = stmt.query_map(params![file_id], chunk_from_row)?;
         let mut chunks = Vec::new();
         for row in rows {
             chunks.push(row?);
@@ -605,20 +662,25 @@ impl Store {
     }
 
     pub fn get_chunk_by_vector_id(&self, vector_id: u64) -> Result<Option<ChunkRecord>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, file_id, heading, snippet, vector_id, token_count
-             FROM chunks WHERE vector_id = ?1",
-        )?;
-        let mut rows = stmt.query_map(params![vector_id as i64], |row| {
-            Ok(ChunkRecord {
-                id: row.get(0)?,
-                file_id: row.get(1)?,
-                heading: row.get(2)?,
-                snippet: row.get(3)?,
-                vector_id: row.get::<_, i64>(4)? as u64,
-                token_count: row.get(5)?,
-            })
-        })?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {CHUNK_COLUMNS} FROM chunks WHERE vector_id = ?1"
+        ))?;
+        let mut rows = stmt.query_map(params![vector_id as i64], chunk_from_row)?;
+        match rows.next() {
+            Some(rec) => Ok(Some(rec?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Look up a chunk by its retrieval identity.
+    ///
+    /// The FTS lane returns `(file_id, chunk_seq)` and nothing else; this is how
+    /// it recovers the heading and full snippet the semantic lane gets for free.
+    pub fn get_chunk_by_seq(&self, file_id: i64, seq: i64) -> Result<Option<ChunkRecord>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {CHUNK_COLUMNS} FROM chunks WHERE file_id = ?1 AND seq = ?2"
+        ))?;
+        let mut rows = stmt.query_map(params![file_id, seq], chunk_from_row)?;
         match rows.next() {
             Some(rec) => Ok(Some(rec?)),
             None => Ok(None),
@@ -998,14 +1060,43 @@ impl Store {
         Ok(result.is_ok())
     }
 
+    /// Which chunk of `file_id` best matches any of `terms`, by BM25.
+    ///
+    /// The graph lane ranks whole files but has to name a section; this is how it
+    /// names the one that actually contains the query, rather than the longest.
+    /// Returns `None` when no chunk of the file matches — which is also the
+    /// relevance signal `file_contains_term` used to give.
+    pub fn best_matching_chunk_seq(&self, file_id: i64, terms: &[String]) -> Result<Option<i64>> {
+        if terms.is_empty() {
+            return Ok(None);
+        }
+        let disjunction = terms
+            .iter()
+            .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+
+        let result: rusqlite::Result<i64> = self.conn.query_row(
+            "SELECT chunk_seq FROM chunks_fts
+             WHERE chunks_fts MATCH ?1 AND file_id = ?2
+             ORDER BY bm25(chunks_fts) LIMIT 1",
+            params![disjunction, file_id],
+            |row| row.get(0),
+        );
+        match result {
+            Ok(seq) => Ok(Some(seq)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            // A malformed FTS expression means no match, not a failed search.
+            Err(_) => Ok(None),
+        }
+    }
+
     /// Get the best (highest token_count) chunk for a file.
-    pub fn get_best_chunk_for_file(&self, file_id: i64) -> Result<Option<(String, String)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT heading, snippet FROM chunks WHERE file_id = ?1 ORDER BY token_count DESC LIMIT 1",
-        )?;
-        let mut rows = stmt.query_map(params![file_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
+    pub fn get_best_chunk_for_file(&self, file_id: i64) -> Result<Option<ChunkRecord>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {CHUNK_COLUMNS} FROM chunks WHERE file_id = ?1 ORDER BY token_count DESC LIMIT 1"
+        ))?;
+        let mut rows = stmt.query_map(params![file_id], chunk_from_row)?;
         match rows.next() {
             Some(r) => Ok(Some(r?)),
             None => Ok(None),
@@ -2056,10 +2147,10 @@ mod tests {
             .unwrap();
 
         store
-            .insert_chunk(file_id, "Heading 1", "Some text here", 1, 42)
+            .insert_chunk(file_id, 0, "Heading 1", "Some text here", 1, 42)
             .unwrap();
         store
-            .insert_chunk(file_id, "Heading 2", "More text", 2, 30)
+            .insert_chunk(file_id, 1, "Heading 2", "More text", 2, 30)
             .unwrap();
 
         let chunks = store.get_chunks_by_file(file_id).unwrap();
@@ -2087,9 +2178,11 @@ mod tests {
                 None,
             )
             .unwrap();
-        store.insert_chunk(file_id, "H", "snippet", 10, 5).unwrap();
         store
-            .insert_chunk(file_id, "H2", "snippet2", 11, 6)
+            .insert_chunk(file_id, 0, "H", "snippet", 10, 5)
+            .unwrap();
+        store
+            .insert_chunk(file_id, 1, "H2", "snippet2", 11, 6)
             .unwrap();
 
         assert_eq!(store.get_chunks_by_file(file_id).unwrap().len(), 2);
@@ -2138,8 +2231,10 @@ mod tests {
                 None,
             )
             .unwrap();
-        store.insert_chunk(file_id, "H", "text", 50, 10).unwrap();
-        store.insert_chunk(file_id, "H2", "text2", 51, 12).unwrap();
+        store.insert_chunk(file_id, 0, "H", "text", 50, 10).unwrap();
+        store
+            .insert_chunk(file_id, 1, "H2", "text2", 51, 12)
+            .unwrap();
 
         // Simulate detecting hash change: collect old vector_ids for tombstoning.
         let old_vector_ids = store.get_vector_ids_for_file(file_id).unwrap();
@@ -2163,7 +2258,7 @@ mod tests {
             )
             .unwrap();
         store
-            .insert_chunk(new_file_id, "H", "new text", 60, 15)
+            .insert_chunk(new_file_id, 0, "H", "new text", 60, 15)
             .unwrap();
 
         let rec = store.get_file("notes/change.md").unwrap().unwrap();
@@ -2614,15 +2709,184 @@ mod tests {
             .unwrap();
 
         store
-            .insert_chunk(f1, "Small heading", "small snippet", 1, 10)
+            .insert_chunk(f1, 0, "Small heading", "small snippet", 1, 10)
             .unwrap();
         store
-            .insert_chunk(f1, "Big heading", "big snippet", 2, 100)
+            .insert_chunk(f1, 1, "Big heading", "big snippet", 2, 100)
             .unwrap();
 
         let best = store.get_best_chunk_for_file(f1).unwrap().unwrap();
-        assert_eq!(best.0, "Big heading");
-        assert_eq!(best.1, "big snippet");
+        assert_eq!(best.heading, "Big heading");
+        assert_eq!(best.snippet, "big snippet");
+        assert_eq!(best.seq, 1, "identity travels with the chunk");
+    }
+
+    /// Insert a file with one chunk per (heading, text) pair, numbered in order.
+    fn seed_sections(store: &Store, path: &str, sections: &[(&str, &str)]) -> i64 {
+        let docid = generate_docid(path);
+        store
+            .insert_file(path, "hash", 100, &[], &docid, None, None)
+            .unwrap();
+        let file_id = store.get_file(path).unwrap().unwrap().id;
+        for (seq, (heading, text)) in sections.iter().enumerate() {
+            store
+                .insert_chunk(
+                    file_id,
+                    seq as i64,
+                    heading,
+                    text,
+                    (file_id * 100 + seq as i64) as u64,
+                    10,
+                )
+                .unwrap();
+            store.insert_fts_chunk(file_id, seq as i64, text).unwrap();
+        }
+        file_id
+    }
+
+    #[test]
+    fn test_get_chunk_by_seq() {
+        let store = Store::open_memory().unwrap();
+        let file_id = seed_sections(
+            &store,
+            "rules/abjuration.md",
+            &[
+                ("## Level 3 Counterspell", "stops a spell being cast"),
+                ("## Level 9 Dimensional Anchor", "pins a creature in place"),
+            ],
+        );
+
+        let chunk = store.get_chunk_by_seq(file_id, 1).unwrap().unwrap();
+        assert_eq!(chunk.heading, "## Level 9 Dimensional Anchor");
+        assert_eq!(chunk.seq, 1);
+
+        assert!(store.get_chunk_by_seq(file_id, 9).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_best_matching_chunk_seq_picks_the_matching_section() {
+        let store = Store::open_memory().unwrap();
+        // Snippets carry their heading line, as the chunker emits them.
+        let file_id = seed_sections(
+            &store,
+            "rules/abjuration.md",
+            &[
+                ("## Overview", "## Overview\nan introduction to wards"),
+                (
+                    "## Counterspell",
+                    "## Counterspell\nstops a spell being cast",
+                ),
+                (
+                    "## Dimensional Anchor",
+                    "## Dimensional Anchor\npins a creature in place",
+                ),
+            ],
+        );
+
+        let seq = store
+            .best_matching_chunk_seq(file_id, &["counterspell".to_string()])
+            .unwrap();
+        assert_eq!(seq, Some(1), "must name the section that matched");
+
+        // No match is the relevance signal the graph lane filters on.
+        let none = store
+            .best_matching_chunk_seq(file_id, &["quantum".to_string()])
+            .unwrap();
+        assert!(none.is_none());
+
+        // No terms cannot mean "everything matches".
+        assert!(
+            store
+                .best_matching_chunk_seq(file_id, &[])
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_best_matching_chunk_seq_scores_across_all_terms() {
+        let store = Store::open_memory().unwrap();
+        let file_id = seed_sections(
+            &store,
+            "notes/temple.md",
+            &[
+                ("## Description", "the temple stands at the crossroads"),
+                ("## Noises", "the archivist investigates strange noises"),
+            ],
+        );
+
+        // "temple" matches section 0 and "noises" matches section 1; the section
+        // matching more of the query has to win, or a stopword picks the answer.
+        let terms = vec![
+            "investigates".to_string(),
+            "strange".to_string(),
+            "noises".to_string(),
+            "temple".to_string(),
+        ];
+        assert_eq!(
+            store.best_matching_chunk_seq(file_id, &terms).unwrap(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn test_migration_backfills_chunk_seq_from_insertion_order() {
+        // Databases indexed before chunk identity existed have no seq column, but
+        // their FTS rows were written with 0,1,2… — the backfill has to land on
+        // the same numbers or the two lanes silently retrieve different chunks.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("legacy.db");
+
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE files (
+                     id INTEGER PRIMARY KEY, path TEXT UNIQUE NOT NULL,
+                     content_hash TEXT NOT NULL, mtime INTEGER NOT NULL,
+                     tags TEXT NOT NULL DEFAULT '[]', indexed_at TEXT NOT NULL, docid TEXT);
+                 CREATE TABLE chunks (
+                     id INTEGER PRIMARY KEY,
+                     file_id INTEGER NOT NULL,
+                     heading TEXT NOT NULL, snippet TEXT NOT NULL,
+                     vector_id INTEGER UNIQUE NOT NULL, token_count INTEGER NOT NULL,
+                     vector BLOB);
+                 INSERT INTO files (id, path, content_hash, mtime, indexed_at)
+                     VALUES (1, 'a.md', 'h', 1, 'now'), (2, 'b.md', 'h', 1, 'now');
+                 INSERT INTO chunks (file_id, heading, snippet, vector_id, token_count)
+                     VALUES (1, 'A0', 's', 10, 1), (1, 'A1', 's', 11, 1),
+                            (2, 'B0', 's', 12, 1), (1, 'A2', 's', 13, 1);",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&db_path).unwrap();
+
+        let seq_of = |heading: &str| -> i64 {
+            store
+                .conn
+                .query_row(
+                    "SELECT seq FROM chunks WHERE heading = ?1",
+                    [heading],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(seq_of("A0"), 0);
+        assert_eq!(seq_of("A1"), 1);
+        assert_eq!(seq_of("A2"), 2, "numbering is per file, by insertion order");
+        assert_eq!(seq_of("B0"), 0, "a second file restarts at zero");
+
+        // Re-opening must not renumber anything.
+        drop(store);
+        let store = Store::open(&db_path).unwrap();
+        assert_eq!(
+            store
+                .conn
+                .query_row("SELECT seq FROM chunks WHERE heading = 'A2'", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
     }
 
     #[test]
@@ -2974,7 +3238,7 @@ mod tests {
             .unwrap();
         let vector: Vec<f32> = (0..256).map(|i| (i as f32) / 256.0).collect();
         store
-            .insert_chunk_with_vector(file_id, "heading", "snippet", 0, 100, &vector)
+            .insert_chunk_with_vector(file_id, 0, "heading", "snippet", 0, 100, &vector)
             .unwrap();
 
         // Clear vec0 to simulate a pre-migration state, then re-run the migration.
@@ -3219,10 +3483,10 @@ mod tests {
         let v1: Vec<f32> = vec![1.0, 2.0, 3.0];
         let v2: Vec<f32> = vec![4.0, 5.0, 6.0];
         store
-            .insert_chunk_with_vector(file_id, "H1", "text1", 100, 10, &v1)
+            .insert_chunk_with_vector(file_id, 0, "H1", "text1", 100, 10, &v1)
             .unwrap();
         store
-            .insert_chunk_with_vector(file_id, "H2", "text2", 101, 10, &v2)
+            .insert_chunk_with_vector(file_id, 0, "H2", "text2", 101, 10, &v2)
             .unwrap();
 
         let vectors = store.get_chunk_vectors_for_file(file_id).unwrap();
@@ -3431,7 +3695,7 @@ mod tests {
         // Insert a chunk + FTS entry + vec entry for the file
         let vid = store.next_vector_id().unwrap();
         store
-            .insert_chunk(file_id, "## Heading", "chunk text", vid, 10)
+            .insert_chunk(file_id, 0, "## Heading", "chunk text", vid, 10)
             .unwrap();
         store.insert_fts_chunk(file_id, 0, "chunk text").unwrap();
 

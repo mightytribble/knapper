@@ -20,6 +20,7 @@ git fetch upstream && git diff --stat upstream/main main
 | `a19f27a` | chunker overlap-stride crawl | cherry-pick of upstream PR #41 (`ec7b06b`, @jdubdevs) |
 | `structure_chunk` | structure-first chunking | this fork, issue #1 |
 | `src/exclude.rs` | glob `exclude` patterns, shared by indexer + watcher | this fork, issue #7 |
+| `chunks.seq` | chunk identity — section-level retrieval | this fork, issue #6 |
 
 Cherry-picked rather than merged: PR #41 branched before upstream's #40 graph fix, so merging the
 branch wholesale would have silently reverted `src/graph.rs`.
@@ -53,7 +54,7 @@ export LIBCLANG_PATH="$HOME/.engraph-buildenv/lib/python3.12/site-packages/clang
 export BINDGEN_EXTRA_CLANG_ARGS="-I/usr/lib/gcc/x86_64-linux-gnu/13/include -I/usr/include -I/usr/include/x86_64-linux-gnu"
 
 cargo build --release        # ~10 min cold, ~20s incremental
-cargo test --lib             # 499 pass
+cargo test --lib             # 517 pass
 ```
 
 Each env var exists for a specific failure. Omit one and you get:
@@ -96,10 +97,21 @@ Upstream PR #47 addresses them. Use `cargo test --lib` (499 tests) as the workin
   everything and are linked to by nothing, making them the largest out-hubs in the vault. Any two
   notes they list become 2-hop neighbours, so graph expansion returns siblings-of-a-category rather
   than answers. Exclude them.
-- **Retrieval is file-level, not chunk-level.** Every lane collapses to one result per `file_path`
-  before fusion (`search.rs:131`, `fusion.rs:45`). However good the chunking, a document can only
-  occupy one slot in the results, and the chunk that wins it may not be the relevant one. This is
-  issue #6, and it caps what #1 and #2 can deliver.
+- **Retrieval is section-level** (this fork, issue #6). Lanes dedup and fuse on `(file_id, seq)`,
+  so a document contributes as many sections as it has good ones, up to `max_chunks_per_file`
+  (default 3). `group_by = "file"` / `--group-by file` restores upstream's one-result-per-document
+  behaviour — it is the same code path with a cap of 1. Upstream collapses every lane to one result
+  per `file_path` before fusion, so however good the chunking, the chunk that won a document's only
+  slot was often not the relevant one.
+- **`chunks.seq` is load-bearing and implicit.** It must equal the `chunk_seq` written to
+  `chunks_fts` for the same chunk, because that pair is the only key the semantic and FTS lanes can
+  both produce. Nothing enforces it at the type level — all four insert sites pass the loop index to
+  both calls. Databases predating the column are backfilled by rowid order within each file, which
+  reproduces the original numbering exactly (verified against a from-scratch index).
+- **RRF scores tie constantly**, since every lane hands out the same `weight/(k + rank)` values.
+  Sorting them without a tiebreak means `HashMap` order decides the ranking, and results vary
+  run-to-run — they did, from about rank 7 down, until #6 added tiebreaks in `fusion.rs` and
+  `graph.rs`. Worth remembering before trusting any A/B measurement taken before that.
 
 ## Open work
 
@@ -111,14 +123,23 @@ See issues on this repo:
 - **#3** retrieval eval battery — gates #2, and calibrates #4
 - **#4** relevance floor — configurable per-lane min scores so nonsense queries return nothing
 - **#5** embedding model config — expose output dim, tie max chunk tokens to the model's context window
-- **#6** section-level retrieval granularity — dedup on `(file_path, heading)` so a document can
-  contribute more than one section to the results
+- ~~**#6** section-level retrieval granularity — fuse on `(file_id, seq)` so a document can
+  contribute more than one section~~ — **done**, probe 3 now returns the correct section and every
+  result names its heading. Did **not** fix probe 1, so `eval/section-split.py` cannot be retired
+  and the Path A / Path B question stays open.
 - ~~**#7** exclude derived `*-index.md` / `templates/` from ingest, and make `exclude` glob for
   real~~ — **done**, 14.2% of chunks and 18.3% of edges removed from the eval corpus
 
-Suggested order: **#6 first** — measurement showed it is the binding constraint, and it raises the
-ceiling for #2. Then **#3** (supplies the measurements the rest are judged by), then **#5** (makes
-chunk size and dim configurable, which #2/#3 need to compare configurations), then #2, then #4
-(needs #3's negative controls to calibrate).
+Suggested order: **#3 next** — it supplies the measurements everything else is judged by, and the
+five seed probes have given up what they have to give: #6 moved three of them, and the one it was
+expected to fix outright turned out not to be a granularity problem. Then **#5** (makes chunk size
+and dim configurable, which #2/#3 need to compare configurations), then #2, then #4 (needs #3's
+negative controls to calibrate).
+
+**Probe 1 is the open question #6 was expected to close.** The section-per-file transform puts
+`temple-of-the-architect` at ranks 1–4; indexing in place leaves it at 21, before and after #6. The
+ranking unit was not the difference, so something else about writing sections as files — their own
+embeddings as whole documents, their own docids, their own graph nodes — is. Worth a ticket once #3
+can measure it.
 
 `eval/` holds the seed material for #3.

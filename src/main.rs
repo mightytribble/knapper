@@ -57,6 +57,10 @@ enum Command {
         /// Show per-lane RRF score breakdown for each result.
         #[arg(long, conflicts_with = "json")]
         explain: bool,
+
+        /// Return one result per matching section, or one per document.
+        #[arg(long, value_enum)]
+        group_by: Option<engraph::config::GroupBy>,
     },
 
     /// Show index status and statistics.
@@ -520,15 +524,19 @@ async fn main() -> Result<()> {
             query,
             top_n,
             explain,
+            group_by,
         } => {
             cfg.merge_top_n(top_n);
+            let group_by = group_by.unwrap_or(cfg.group_by);
 
             if !index_exists(&data_dir) {
                 eprintln!("No index found. Run 'engraph index <path>' first.");
                 std::process::exit(1);
             }
 
-            search::run_search(&query, cfg.top_n, cli.json, explain, &data_dir, &cfg)?;
+            search::run_search(
+                &query, cfg.top_n, cli.json, explain, group_by, &data_dir, &cfg,
+            )?;
         }
 
         Command::Status => {

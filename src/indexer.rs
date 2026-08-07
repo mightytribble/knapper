@@ -411,6 +411,7 @@ pub fn index_file(
 
         store.insert_chunk_with_vector(
             file_id,
+            chunk_seq as i64,
             &heading,
             snippet,
             vector_id,

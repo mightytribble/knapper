@@ -640,7 +640,15 @@ pub fn create_note(
         let start_vid = store.next_vector_id()?;
         for (chunk_seq, (heading, snippet, vector, token_count)) in chunk_data.iter().enumerate() {
             let vid = start_vid + chunk_seq as u64;
-            store.insert_chunk_with_vector(file_id, heading, snippet, vid, *token_count, vector)?;
+            store.insert_chunk_with_vector(
+                file_id,
+                chunk_seq as i64,
+                heading,
+                snippet,
+                vid,
+                *token_count,
+                vector,
+            )?;
             store.insert_vec(vid, vector)?;
             store.insert_fts_chunk(file_id, chunk_seq as i64, snippet)?;
         }
@@ -787,7 +795,15 @@ pub fn append_to_note(
         let start_vid = store.next_vector_id()?;
         for (chunk_seq, (heading, snippet, vector, token_count)) in chunk_data.iter().enumerate() {
             let vid = start_vid + chunk_seq as u64;
-            store.insert_chunk_with_vector(file_id, heading, snippet, vid, *token_count, vector)?;
+            store.insert_chunk_with_vector(
+                file_id,
+                chunk_seq as i64,
+                heading,
+                snippet,
+                vid,
+                *token_count,
+                vector,
+            )?;
             store.insert_vec(vid, vector)?;
             store.insert_fts_chunk(file_id, chunk_seq as i64, snippet)?;
         }
@@ -1562,7 +1578,15 @@ pub fn unarchive_note(
         let start_vid = store.next_vector_id()?;
         for (seq, (heading, snippet, vector, token_count)) in chunk_data.iter().enumerate() {
             let vid = start_vid + seq as u64;
-            store.insert_chunk_with_vector(file_id, heading, snippet, vid, *token_count, vector)?;
+            store.insert_chunk_with_vector(
+                file_id,
+                seq as i64,
+                heading,
+                snippet,
+                vid,
+                *token_count,
+                vector,
+            )?;
             store.insert_vec(vid, vector)?;
             store.insert_fts_chunk(file_id, seq as i64, snippet)?;
         }

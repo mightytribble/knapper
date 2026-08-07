@@ -600,6 +600,12 @@ vault_path = "~/Documents/MyVault"
 top_n = 10
 exclude = [".obsidian/", "node_modules/", ".git/", "*-index.md", "templates/"]
 
+# Results address sections, not whole documents. "file" restores one result
+# per document; max_chunks_per_file bounds how much of one document can fill
+# a page of results (0 = unlimited).
+group_by = "chunk"
+max_chunks_per_file = 3
+
 # Enable LLM-powered intelligence (query expansion + reranking)
 intelligence = true
 
@@ -617,6 +623,8 @@ intelligence = true
 [agents]
 # names = ["claude-code", "cursor"]
 ```
+
+Search returns **sections**. A note whose "Counterspell" and "Dispel Magic" sections both answer a query contributes both, up to `max_chunks_per_file`, and each result names the heading it came from. Pass `--group-by file` (or set `group_by = "file"`) for one result per document, representing it by its best-matching section.
 
 `exclude` takes `.gitignore`-style globs, matched against paths relative to the vault root. A pattern with no `/` matches at any depth (`*-index.md` catches `lore/lore-index.md`); a trailing `/` means a directory and everything under it; an embedded `/` anchors the pattern to the vault root (`drafts/**`). Excluding a path that is already indexed removes it from the store — chunks, vectors, FTS entries and graph edges — on the next index run.
 

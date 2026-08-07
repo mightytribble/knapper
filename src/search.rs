@@ -4,6 +4,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde_json::json;
 
+use crate::config::GroupBy;
 use crate::fusion::{self, RankedResult};
 use crate::graph;
 use crate::llm::{self, EmbedModel, OrchestratorModel, RerankModel};
@@ -21,6 +22,8 @@ pub struct SearchResult {
     pub score: f32,
     pub confidence: f64,
     pub file_path: String,
+    /// Which section of the file this result is, 0-based.
+    pub chunk_seq: i64,
     pub heading: Option<String>,
     pub snippet: String,
     pub docid: Option<String>,
@@ -31,6 +34,8 @@ pub struct SearchResult {
 pub struct InternalSearchResult {
     pub file_path: String,
     pub file_id: i64,
+    /// Which section of the file this result is, 0-based.
+    pub chunk_seq: i64,
     pub score: f64,
     pub confidence: f64,
     pub heading: Option<String>,
@@ -51,6 +56,24 @@ pub struct SearchConfig<'a> {
     pub reranker: Option<&'a mut dyn RerankModel>,
     pub store: &'a Store,
     pub rerank_candidates: usize,
+    /// Ceiling on how many sections of one document may appear in the results.
+    pub max_chunks_per_file: usize,
+    /// Whether results address sections or whole documents.
+    pub group_by: GroupBy,
+}
+
+impl<'a> SearchConfig<'a> {
+    /// A model-free config carrying the caller's retrieval settings.
+    pub fn new(store: &'a Store, config: &crate::config::Config) -> Self {
+        Self {
+            orchestrator: None,
+            reranker: None,
+            store,
+            rerank_candidates: 30,
+            max_chunks_per_file: config.max_chunks_per_file,
+            group_by: config.group_by,
+        }
+    }
 }
 
 /// Run hybrid search and return structured results (no I/O).
@@ -63,12 +86,15 @@ pub fn search_internal(
     top_n: usize,
     store: &Store,
     embedder: &mut impl EmbedModel,
+    group_by: GroupBy,
 ) -> Result<SearchOutput> {
     let mut config = SearchConfig {
         orchestrator: None,
         reranker: None,
         store,
         rerank_candidates: 30,
+        max_chunks_per_file: crate::config::default_max_chunks_per_file(),
+        group_by,
     };
     search_with_intelligence(query, top_n, embedder, &mut config)
 }
@@ -128,41 +154,29 @@ pub fn search_with_intelligence(
             .store
             .search_vec(&query_vec, top_n * 3, &tombstones)?;
 
-        // Group semantic results by file_path, keeping best per file.
-        let mut sem_by_file: HashMap<String, RankedResult> = HashMap::new();
         for (vector_id, distance) in raw_results {
             if let Some(chunk) = config.store.get_chunk_by_vector_id(vector_id)? {
                 let (file_path, docid) = match config.store.get_file_by_id(chunk.file_id)? {
                     Some(f) => (f.path, f.docid),
                     None => ("<unknown>".to_string(), None),
                 };
-                let score = (1.0 - distance) as f64;
                 let heading = if chunk.heading.is_empty() {
                     None
                 } else {
                     Some(chunk.heading)
                 };
 
-                let better = match sem_by_file.get(&file_path) {
-                    Some(existing) => score > existing.score,
-                    None => true,
-                };
-                if better {
-                    sem_by_file.insert(
-                        file_path.clone(),
-                        RankedResult {
-                            file_path,
-                            file_id: chunk.file_id,
-                            score,
-                            heading,
-                            snippet: chunk.snippet,
-                            docid,
-                        },
-                    );
-                }
+                all_semantic.push(RankedResult {
+                    file_path,
+                    file_id: chunk.file_id,
+                    chunk_seq: chunk.seq,
+                    score: (1.0 - distance) as f64,
+                    heading,
+                    snippet: chunk.snippet,
+                    docid,
+                });
             }
         }
-        all_semantic.extend(sem_by_file.into_values());
 
         // FTS lane
         let fts_raw = config
@@ -170,42 +184,44 @@ pub fn search_with_intelligence(
             .fts_search(expanded_query, top_n * 3)
             .unwrap_or_default();
 
-        let mut fts_by_file: HashMap<String, RankedResult> = HashMap::new();
         for fr in fts_raw {
             let (file_path, docid) = match config.store.get_file_by_id(fr.file_id)? {
                 Some(f) => (f.path, f.docid),
                 None => continue,
             };
+            // The FTS index holds text only; the heading lives on the chunk row,
+            // which `(file_id, chunk_seq)` now reaches.
+            let heading = config
+                .store
+                .get_chunk_by_seq(fr.file_id, fr.chunk_seq)?
+                .map(|c| c.heading)
+                .filter(|h| !h.is_empty());
 
-            let better = match fts_by_file.get(&file_path) {
-                Some(existing) => fr.score > existing.score,
-                None => true,
-            };
-            if better {
-                fts_by_file.insert(
-                    file_path.clone(),
-                    RankedResult {
-                        file_path,
-                        file_id: fr.file_id,
-                        score: fr.score,
-                        heading: None, // FTS doesn't return headings
-                        snippet: fr.snippet,
-                        docid,
-                    },
-                );
-            }
+            all_fts.push(RankedResult {
+                file_path,
+                file_id: fr.file_id,
+                chunk_seq: fr.chunk_seq,
+                score: fr.score,
+                heading,
+                snippet: fr.snippet,
+                docid,
+            });
         }
-        all_fts.extend(fts_by_file.into_values());
     }
 
-    // Deduplicate across expanded queries (keep best score per file)
-    let semantic_results = dedup_by_file(all_semantic);
-    let fts_results = dedup_by_file(all_fts);
+    // Deduplicate across expanded queries, then bound each file's share of the
+    // lane. Without the bound a 33-chunk document would take 33 of the ranks
+    // this lane hands to RRF, pushing every other document down.
+    let cap = config.max_chunks_per_file;
+    let semantic_results = collapse_lane(all_semantic, cap);
+    let fts_results = collapse_lane(all_fts, cap);
 
     // --- Graph lane from combined seeds ---
     let mut combined_seeds = merge_seeds(&semantic_results, &fts_results);
 
-    // Inject temporal candidates as graph seeds when date_range is present
+    // Inject temporal candidates as graph seeds when date_range is present.
+    // Seeds are consumed by `graph_expand`, which reads only the file, so these
+    // never reach fusion and their chunk identity is not used.
     let temporal_seeds: Vec<RankedResult> = if let Some(range) = &orchestration.date_range {
         config
             .store
@@ -215,6 +231,7 @@ pub fn search_with_intelligence(
             .map(|f| RankedResult {
                 file_path: f.path.clone(),
                 file_id: f.id,
+                chunk_seq: 0,
                 score: 1.0,
                 heading: None,
                 snippet: String::new(),
@@ -258,6 +275,7 @@ pub fn search_with_intelligence(
             rerank_results.push(RankedResult {
                 file_path: candidate.file_path.clone(),
                 file_id: candidate.file_id,
+                chunk_seq: candidate.chunk_seq,
                 score,
                 heading: candidate.heading.clone(),
                 snippet: candidate.snippet.clone(),
@@ -300,6 +318,7 @@ pub fn search_with_intelligence(
                 Some(RankedResult {
                     file_path: c.file_path.clone(),
                     file_id: c.file_id,
+                    chunk_seq: c.chunk_seq,
                     score,
                     heading: c.heading.clone(),
                     snippet: c.snippet.clone(),
@@ -340,6 +359,17 @@ pub fn search_with_intelligence(
         fused_pass1
     };
 
+    // Bound each document's share of the result set. `GroupBy::File` is the same
+    // operation with a cap of one, which is what engraph did before chunks were
+    // addressable at all.
+    let final_fused = fusion::cap_per_file(
+        final_fused,
+        match config.group_by {
+            GroupBy::File => 1,
+            GroupBy::Chunk => cap,
+        },
+    );
+
     // Convert fused results to InternalSearchResult, taking top_n.
     let results: Vec<InternalSearchResult> = final_fused
         .iter()
@@ -347,6 +377,7 @@ pub fn search_with_intelligence(
         .map(|f| InternalSearchResult {
             file_path: f.file_path.clone(),
             file_id: f.file_id,
+            chunk_seq: f.chunk_seq,
             score: f.rrf_score,
             confidence: f.confidence,
             heading: f.heading.clone(),
@@ -362,22 +393,38 @@ pub fn search_with_intelligence(
     })
 }
 
-/// Deduplicate ranked results by file path, keeping the highest score per file.
-fn dedup_by_file(results: Vec<RankedResult>) -> Vec<RankedResult> {
-    let mut by_file: HashMap<String, RankedResult> = HashMap::new();
+/// Prepare one lane's raw hits for fusion: one entry per chunk, best score wins,
+/// sorted best-first, and at most `cap` chunks from any single file.
+///
+/// The same chunk can arrive several times — once per query expansion — and the
+/// cap is what keeps a long document from owning the lane's top ranks.
+fn collapse_lane(results: Vec<RankedResult>, cap: usize) -> Vec<RankedResult> {
+    let mut by_chunk: HashMap<(i64, i64), RankedResult> = HashMap::new();
     for r in results {
-        let dominated = by_file
-            .get(&r.file_path)
+        let dominated = by_chunk
+            .get(&r.chunk_key())
             .is_some_and(|existing| existing.score >= r.score);
         if !dominated {
-            by_file.insert(r.file_path.clone(), r);
+            by_chunk.insert(r.chunk_key(), r);
         }
     }
-    let mut deduped: Vec<RankedResult> = by_file.into_values().collect();
+    let mut deduped: Vec<RankedResult> = by_chunk.into_values().collect();
     deduped.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            // Ties are common in FTS; order by chunk so results are stable.
+            .then_with(|| a.chunk_key().cmp(&b.chunk_key()))
+    });
+
+    if cap == 0 {
+        return deduped;
+    }
+    let mut per_file: HashMap<i64, usize> = HashMap::new();
+    deduped.retain(|r| {
+        let count = per_file.entry(r.file_id).or_insert(0);
+        *count += 1;
+        *count <= cap
     });
     deduped
 }
@@ -393,7 +440,15 @@ fn merge_seeds(semantic: &[RankedResult], fts: &[RankedResult]) -> Vec<RankedRes
             by_file.insert(r.file_path.clone(), r.clone());
         }
     }
-    by_file.into_values().collect()
+    // Seeds drive graph expansion; a stable order keeps that reproducible.
+    let mut seeds: Vec<RankedResult> = by_file.into_values().collect();
+    seeds.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.chunk_key().cmp(&b.chunk_key()))
+    });
+    seeds
 }
 
 /// Run a search query and print results.
@@ -406,6 +461,7 @@ pub fn run_search(
     top_n: usize,
     json: bool,
     explain: bool,
+    group_by: GroupBy,
     data_dir: &Path,
     config: &crate::config::Config,
 ) -> Result<()> {
@@ -449,8 +505,8 @@ pub fn run_search(
             reranker: reranker_model
                 .as_mut()
                 .map(|r| r.as_mut() as &mut dyn llm::RerankModel),
-            store: &store,
-            rerank_candidates: 30,
+            group_by,
+            ..SearchConfig::new(&store, config)
         };
         search_with_intelligence(query, top_n, &mut embedder, &mut search_config)?
     };
@@ -462,6 +518,7 @@ pub fn run_search(
             score: r.score as f32,
             confidence: r.confidence,
             file_path: r.file_path.clone(),
+            chunk_seq: r.chunk_seq,
             heading: r.heading.clone(),
             snippet: r.snippet.clone(),
             docid: r.docid.clone(),
@@ -540,6 +597,7 @@ pub fn format_results(results: &[SearchResult], json: bool) -> String {
                     "score": score_rounded,
                     "confidence": r.confidence,
                     "file": r.file_path,
+                    "section": r.chunk_seq,
                     "heading": r.heading,
                     "snippet": r.snippet,
                     "docid": r.docid,
@@ -680,6 +738,7 @@ mod tests {
             score: 0.87,
             confidence: 100.0,
             file_path: "foo.md".to_string(),
+            chunk_seq: 0,
             heading: Some("## Bar".to_string()),
             snippet: "Some text...".to_string(),
             docid: Some("ab12cd".to_string()),
@@ -697,6 +756,7 @@ mod tests {
             score: 0.87,
             confidence: 100.0,
             file_path: "foo.md".to_string(),
+            chunk_seq: 0,
             heading: Some("## Bar".to_string()),
             snippet: "Some text...".to_string(),
             docid: None,
@@ -711,6 +771,7 @@ mod tests {
             score: 0.87,
             confidence: 100.0,
             file_path: "foo.md".to_string(),
+            chunk_seq: 0,
             heading: Some("## Bar".to_string()),
             snippet: "Some text...".to_string(),
             docid: Some("ab12cd".to_string()),
@@ -722,6 +783,10 @@ mod tests {
         assert_eq!(parsed[0]["score"], 0.87);
         assert_eq!(parsed[0]["confidence"], 100.0);
         assert_eq!(parsed[0]["file"], "foo.md");
+        assert_eq!(
+            parsed[0]["section"], 0,
+            "results address a section, not a file"
+        );
         assert_eq!(parsed[0]["heading"], "## Bar");
         assert_eq!(parsed[0]["snippet"], "Some text...");
         assert_eq!(parsed[0]["docid"], "ab12cd");
@@ -837,47 +902,198 @@ mod tests {
         assert!(output.intent.is_none());
     }
 
-    #[test]
-    fn test_dedup_by_file_keeps_best() {
-        let results = vec![
-            RankedResult {
-                file_path: "a.md".to_string(),
-                file_id: 1,
-                score: 0.5,
-                heading: None,
-                snippet: "low".to_string(),
-                docid: None,
-            },
-            RankedResult {
-                file_path: "a.md".to_string(),
-                file_id: 1,
-                score: 0.9,
-                heading: None,
-                snippet: "high".to_string(),
-                docid: None,
-            },
-            RankedResult {
-                file_path: "b.md".to_string(),
-                file_id: 2,
-                score: 0.7,
-                heading: None,
-                snippet: "only".to_string(),
-                docid: None,
-            },
-        ];
-        let deduped = dedup_by_file(results);
-        assert_eq!(deduped.len(), 2);
-        // Sorted by score descending
-        assert_eq!(deduped[0].file_path, "a.md");
-        assert!((deduped[0].score - 0.9).abs() < 1e-10);
-        assert_eq!(deduped[0].snippet, "high");
-        assert_eq!(deduped[1].file_path, "b.md");
+    fn ranked(file_path: &str, file_id: i64, chunk_seq: i64, score: f64) -> RankedResult {
+        RankedResult {
+            file_path: file_path.to_string(),
+            file_id,
+            chunk_seq,
+            score,
+            heading: None,
+            snippet: format!("{file_path}#{chunk_seq}@{score}"),
+            docid: None,
+        }
     }
 
     #[test]
-    fn test_dedup_by_file_empty() {
-        let deduped = dedup_by_file(vec![]);
-        assert!(deduped.is_empty());
+    fn collapse_lane_keeps_best_score_per_chunk() {
+        // The same chunk arrives twice — once per query expansion.
+        let results = vec![
+            ranked("a.md", 1, 0, 0.5),
+            ranked("a.md", 1, 0, 0.9),
+            ranked("b.md", 2, 0, 0.7),
+        ];
+        let collapsed = collapse_lane(results, 3);
+        assert_eq!(collapsed.len(), 2);
+        // Sorted by score descending
+        assert_eq!(collapsed[0].file_path, "a.md");
+        assert!((collapsed[0].score - 0.9).abs() < 1e-10);
+        assert_eq!(collapsed[0].snippet, "a.md#0@0.9");
+        assert_eq!(collapsed[1].file_path, "b.md");
+    }
+
+    #[test]
+    fn collapse_lane_keeps_distinct_chunks_of_one_file() {
+        // This is the whole point of #6: two sections of one document are two
+        // results, not one. Before, the second was discarded.
+        let results = vec![
+            ranked("a.md", 1, 0, 0.5),
+            ranked("a.md", 1, 4, 0.9),
+            ranked("a.md", 1, 7, 0.7),
+        ];
+        let collapsed = collapse_lane(results, 3);
+        assert_eq!(collapsed.len(), 3);
+        let seqs: Vec<i64> = collapsed.iter().map(|r| r.chunk_seq).collect();
+        assert_eq!(seqs, vec![4, 7, 0], "ordered by score, not by position");
+    }
+
+    #[test]
+    fn collapse_lane_caps_one_files_share_of_the_lane() {
+        // A 6-section document must not own the lane's top six ranks.
+        let mut results: Vec<RankedResult> = (0..6)
+            .map(|seq| ranked("long.md", 1, seq, 0.9 - seq as f64 * 0.01))
+            .collect();
+        results.push(ranked("other.md", 2, 0, 0.5));
+
+        let collapsed = collapse_lane(results, 2);
+        assert_eq!(collapsed.len(), 3);
+        assert_eq!(
+            collapsed
+                .iter()
+                .filter(|r| r.file_path == "long.md")
+                .count(),
+            2
+        );
+        assert!(
+            collapsed.iter().any(|r| r.file_path == "other.md"),
+            "the capped file must not crowd out other documents"
+        );
+        // The two survivors are its best-scoring sections.
+        assert_eq!(collapsed[0].chunk_seq, 0);
+        assert_eq!(collapsed[1].chunk_seq, 1);
+    }
+
+    #[test]
+    fn collapse_lane_cap_of_zero_is_unlimited() {
+        let results: Vec<RankedResult> = (0..5).map(|seq| ranked("long.md", 1, seq, 0.5)).collect();
+        assert_eq!(collapse_lane(results, 0).len(), 5);
+    }
+
+    #[test]
+    fn collapse_lane_empty() {
+        assert!(collapse_lane(vec![], 3).is_empty());
+    }
+
+    /// Index a small vault in memory. Embeddings are hash-based, so only the FTS
+    /// lane carries meaning here — which is enough to pin retrieval granularity.
+    fn indexed_vault() -> (tempfile::TempDir, Store, crate::llm::MockLlm) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("rules")).unwrap();
+        std::fs::write(
+            root.join("rules/abjuration-spells.md"),
+            "# Abjuration\n\n\
+             ## Level 3 Counterspell\n\nA warding effect that stops a spell mid-cast.\n\n\
+             ## Level 5 Dispel Magic\n\nA warding effect that ends an ongoing spell.\n\n\
+             ## Level 9 Dimensional Anchor\n\nA warding effect that pins a creature.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("rules/evocation-spells.md"),
+            "# Evocation\n\n## Level 1 Firebolt\n\nA bolt of flame.\n",
+        )
+        .unwrap();
+
+        let store = Store::open_memory().unwrap();
+        let mut embedder = crate::llm::MockLlm::new(256);
+        let config = crate::config::Config::default();
+        crate::indexer::run_index_shared(root, &config, &store, &mut embedder, false, None)
+            .unwrap();
+        (tmp, store, embedder)
+    }
+
+    #[test]
+    fn one_document_can_contribute_several_sections() {
+        // #6's acceptance criterion. Three sections of one file match "warding";
+        // before chunk-level fusion only one of them could ever be returned.
+        let (_tmp, store, mut embedder) = indexed_vault();
+
+        let output = search_internal("warding", 10, &store, &mut embedder, GroupBy::Chunk).unwrap();
+
+        let hits: Vec<&InternalSearchResult> = output
+            .results
+            .iter()
+            .filter(|r| r.file_path == "rules/abjuration-spells.md")
+            .collect();
+        assert!(
+            hits.len() > 1,
+            "expected several sections of one document, got {}: {:#?}",
+            hits.len(),
+            output.results
+        );
+
+        let seqs: std::collections::HashSet<i64> = hits.iter().map(|r| r.chunk_seq).collect();
+        assert_eq!(seqs.len(), hits.len(), "each result is a distinct section");
+
+        // Every result names the section it came from.
+        assert!(hits.iter().all(|r| r.heading.is_some()));
+    }
+
+    #[test]
+    fn results_respect_the_per_file_cap() {
+        let (_tmp, store, mut embedder) = indexed_vault();
+
+        for cap in [1, 2] {
+            let mut config = SearchConfig {
+                orchestrator: None,
+                reranker: None,
+                store: &store,
+                rerank_candidates: 30,
+                max_chunks_per_file: cap,
+                group_by: GroupBy::Chunk,
+            };
+            let output =
+                search_with_intelligence("warding", 10, &mut embedder, &mut config).unwrap();
+
+            let count = output
+                .results
+                .iter()
+                .filter(|r| r.file_path == "rules/abjuration-spells.md")
+                .count();
+            assert!(count <= cap, "cap {cap} exceeded: {count} results");
+        }
+    }
+
+    #[test]
+    fn group_by_file_returns_one_result_per_document() {
+        let (_tmp, store, mut embedder) = indexed_vault();
+
+        let output = search_internal("warding", 10, &store, &mut embedder, GroupBy::File).unwrap();
+
+        let mut seen = std::collections::HashSet::new();
+        for r in &output.results {
+            assert!(
+                seen.insert(r.file_path.clone()),
+                "{} appeared twice under file grouping",
+                r.file_path
+            );
+        }
+        assert!(!output.results.is_empty());
+    }
+
+    #[test]
+    fn fts_results_carry_their_heading() {
+        // The FTS lane used to return `heading: None` because the FTS index holds
+        // no headings; `(file_id, chunk_seq)` is what recovers them.
+        let (_tmp, store, mut embedder) = indexed_vault();
+
+        let output =
+            search_internal("mid-cast", 10, &store, &mut embedder, GroupBy::Chunk).unwrap();
+        let hit = output
+            .results
+            .iter()
+            .find(|r| r.file_path == "rules/abjuration-spells.md")
+            .expect("the phrase appears in exactly one section");
+        assert_eq!(hit.heading.as_deref(), Some("## Level 3 Counterspell"));
     }
 
     #[test]
@@ -885,6 +1101,7 @@ mod tests {
         let semantic = vec![RankedResult {
             file_path: "shared.md".to_string(),
             file_id: 1,
+            chunk_seq: 0,
             score: 0.8,
             heading: None,
             snippet: "sem".to_string(),
@@ -894,6 +1111,7 @@ mod tests {
             RankedResult {
                 file_path: "shared.md".to_string(),
                 file_id: 1,
+                chunk_seq: 0,
                 score: 0.9,
                 heading: None,
                 snippet: "fts".to_string(),
@@ -902,6 +1120,7 @@ mod tests {
             RankedResult {
                 file_path: "fts_only.md".to_string(),
                 file_id: 2,
+                chunk_seq: 0,
                 score: 0.6,
                 heading: None,
                 snippet: "fts only".to_string(),

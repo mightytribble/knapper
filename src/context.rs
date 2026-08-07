@@ -728,7 +728,15 @@ pub fn context_topic_with_search(
     max_chars: usize,
     embedder: &mut impl crate::llm::EmbedModel,
 ) -> Result<ContextBundle> {
-    let search_output = crate::search::search_internal(topic, 5, params.store, embedder)?;
+    // A context bundle is assembled from whole notes, so it wants one result per
+    // note — several sections of the same file would read the file in twice.
+    let search_output = crate::search::search_internal(
+        topic,
+        5,
+        params.store,
+        embedder,
+        crate::config::GroupBy::File,
+    )?;
     context_topic_from_results(params, topic, &search_output.results, max_chars)
 }
 
@@ -914,7 +922,7 @@ mod tests {
             .unwrap();
         store.insert_edge(f2, f1, "mention").unwrap();
         store
-            .insert_chunk(f2, "# Daily", "Talked to John about Rust.", 10, 20)
+            .insert_chunk(f2, 0, "# Daily", "Talked to John about Rust.", 10, 20)
             .unwrap();
         store
             .insert_fts_chunk(f2, 0, "Talked to John about Rust.")
@@ -1040,6 +1048,7 @@ mod tests {
         let search_results = vec![crate::search::InternalSearchResult {
             file_path: "result.md".into(),
             file_id: 1,
+            chunk_seq: 0,
             score: 0.85,
             confidence: 100.0,
             heading: Some("# Result".into()),
@@ -1074,6 +1083,7 @@ mod tests {
         let search_results = vec![crate::search::InternalSearchResult {
             file_path: "long.md".into(),
             file_id: 1,
+            chunk_seq: 0,
             score: 0.9,
             confidence: 100.0,
             heading: None,
@@ -1112,6 +1122,7 @@ mod tests {
         let search_results = vec![crate::search::InternalSearchResult {
             file_path: "main.md".into(),
             file_id: f1,
+            chunk_seq: 0,
             score: 0.8,
             confidence: 100.0,
             heading: None,

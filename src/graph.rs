@@ -68,8 +68,8 @@ pub fn graph_expand(
     let seed_ids: HashSet<i64> = seeds.iter().map(|s| s.file_id).collect();
 
     // Track best score per expanded file (multi-parent merge: take highest)
-    // (file_id) → (best_score, hop_depth, seed_file_path)
-    let mut expansions: HashMap<i64, (f64, usize, String)> = HashMap::new();
+    // (file_id) → (best_score, hop_depth, seed_file_path, matched chunk seq)
+    let mut expansions: HashMap<i64, (f64, usize, String, Option<i64>)> = HashMap::new();
 
     for seed in seeds {
         let neighbors = store.get_neighbors(seed.file_id, max_hops)?;
@@ -86,12 +86,14 @@ pub fn graph_expand(
             };
             let mut expansion_score = seed.score * decay;
 
-            // Relevance filter: must match a query term via FTS or share tags
-            let term_match = query_terms
-                .iter()
-                .any(|t| store.file_contains_term(neighbor_id, t).unwrap_or(false));
+            // Relevance filter: must match a query term via FTS or share tags.
+            // The matching chunk doubles as this result's section — a file-level
+            // lane still has to say which part of the file it means.
+            let matched_seq = store
+                .best_matching_chunk_seq(neighbor_id, &query_terms)
+                .unwrap_or(None);
 
-            if !term_match {
+            if matched_seq.is_none() {
                 let shared = store
                     .get_shared_tags_files(neighbor_id, 100)
                     .unwrap_or_default();
@@ -106,35 +108,49 @@ pub fn graph_expand(
             match expansions.entry(neighbor_id) {
                 Entry::Occupied(mut e) => {
                     if expansion_score > e.get().0 {
-                        e.insert((expansion_score, hop, seed.file_path.clone()));
+                        e.insert((expansion_score, hop, seed.file_path.clone(), matched_seq));
                     }
                 }
                 Entry::Vacant(e) => {
-                    e.insert((expansion_score, hop, seed.file_path.clone()));
+                    e.insert((expansion_score, hop, seed.file_path.clone(), matched_seq));
                 }
             }
         }
     }
 
     // Sort by score descending, cap at max_expansions
-    let mut results: Vec<(i64, f64, usize, String)> = expansions
+    let mut results: Vec<(i64, f64, usize, String, Option<i64>)> = expansions
         .into_iter()
-        .map(|(fid, (score, hop, seed))| (fid, score, hop, seed))
+        .map(|(fid, (score, hop, seed, seq))| (fid, score, hop, seed, seq))
         .collect();
-    results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    // Hop decay quantises scores hard (seed × 0.8, × 0.5), so ties are the norm
+    // here and the truncation below decides which files reach fusion at all.
+    // Break them on file id rather than on hash order.
+    results.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
     results.truncate(max_expansions);
 
     // Convert to RankedResult
     let mut ranked = Vec::new();
-    for (file_id, score, _hop, _seed) in results {
+    for (file_id, score, _hop, _seed, matched_seq) in results {
         let file = store.get_file_by_id(file_id)?;
         let (file_path, docid) = match file {
             Some(f) => (f.path, f.docid),
             None => continue,
         };
-        let (heading, snippet) = store
-            .get_best_chunk_for_file(file_id)?
-            .unwrap_or_else(|| (String::new(), String::new()));
+        // Prefer the chunk that matched the query. Files admitted on shared tags
+        // alone matched nothing, so they fall back to the file's largest chunk.
+        let chunk = match matched_seq {
+            Some(seq) => store.get_chunk_by_seq(file_id, seq)?,
+            None => store.get_best_chunk_for_file(file_id)?,
+        };
+        let (chunk_seq, heading, snippet) = match chunk {
+            Some(c) => (c.seq, c.heading, c.snippet),
+            None => (0, String::new(), String::new()),
+        };
         let heading = if heading.is_empty() {
             None
         } else {
@@ -144,6 +160,7 @@ pub fn graph_expand(
         ranked.push(RankedResult {
             file_path,
             file_id,
+            chunk_seq,
             score,
             heading,
             snippet,
@@ -258,7 +275,7 @@ mod tests {
 
         store.insert_edge(f1, f2, "wikilink").unwrap();
         store
-            .insert_chunk(f2, "## Linked", "Linked content about delivery", 10, 20)
+            .insert_chunk(f2, 0, "## Linked", "Linked content about delivery", 10, 20)
             .unwrap();
         store
             .insert_fts_chunk(f2, 0, "Linked content about delivery")
@@ -267,6 +284,7 @@ mod tests {
         let seeds = vec![RankedResult {
             file_path: "seed.md".into(),
             file_id: f1,
+            chunk_seq: 0,
             score: 0.85,
             heading: None,
             snippet: "Seed".into(),
@@ -280,6 +298,84 @@ mod tests {
     }
 
     #[test]
+    fn test_graph_expand_names_the_matching_section() {
+        // The graph lane ranks whole files, but fusion keys on chunks, so it has
+        // to say which section it means. The one containing the query beats the
+        // file's longest section.
+        let store = Store::open_memory().unwrap();
+        let seed = store
+            .insert_file(
+                "seed.md",
+                "h1",
+                100,
+                &[],
+                &generate_docid("seed.md"),
+                None,
+                None,
+            )
+            .unwrap();
+        let neighbor = store
+            .insert_file(
+                "linked.md",
+                "h2",
+                100,
+                &[],
+                &generate_docid("linked.md"),
+                None,
+                None,
+            )
+            .unwrap();
+        store.insert_edge(seed, neighbor, "wikilink").unwrap();
+
+        // Section 0 is much longer, so it wins `get_best_chunk_for_file`.
+        store
+            .insert_chunk(
+                neighbor,
+                0,
+                "## Overview",
+                "## Overview\nA long introduction with plenty of words in it.",
+                10,
+                200,
+            )
+            .unwrap();
+        store
+            .insert_fts_chunk(
+                neighbor,
+                0,
+                "## Overview\nA long introduction with plenty of words in it.",
+            )
+            .unwrap();
+        store
+            .insert_chunk(
+                neighbor,
+                1,
+                "## Delivery",
+                "## Delivery\nThe delivery date slipped.",
+                11,
+                20,
+            )
+            .unwrap();
+        store
+            .insert_fts_chunk(neighbor, 1, "## Delivery\nThe delivery date slipped.")
+            .unwrap();
+
+        let seeds = vec![RankedResult {
+            file_path: "seed.md".into(),
+            file_id: seed,
+            chunk_seq: 0,
+            score: 0.85,
+            heading: None,
+            snippet: "Seed".into(),
+            docid: None,
+        }];
+
+        let expanded = graph_expand(&store, &seeds, "delivery", 2, 20).unwrap();
+        assert_eq!(expanded.len(), 1);
+        assert_eq!(expanded[0].chunk_seq, 1);
+        assert_eq!(expanded[0].heading.as_deref(), Some("## Delivery"));
+    }
+
+    #[test]
     fn test_graph_expand_skips_seeds() {
         let store = Store::open_memory().unwrap();
         let f1 = store
@@ -290,13 +386,16 @@ mod tests {
             .unwrap();
 
         store.insert_edge(f1, f2, "wikilink").unwrap();
-        store.insert_chunk(f2, "## B", "Content B", 10, 20).unwrap();
+        store
+            .insert_chunk(f2, 0, "## B", "Content B", 10, 20)
+            .unwrap();
         store.insert_fts_chunk(f2, 0, "Content B").unwrap();
 
         let seeds = vec![
             RankedResult {
                 file_path: "a.md".into(),
                 file_id: f1,
+                chunk_seq: 0,
                 score: 0.9,
                 heading: None,
                 snippet: "A".into(),
@@ -305,6 +404,7 @@ mod tests {
             RankedResult {
                 file_path: "b.md".into(),
                 file_id: f2,
+                chunk_seq: 0,
                 score: 0.8,
                 heading: None,
                 snippet: "B".into(),
@@ -340,7 +440,7 @@ mod tests {
         store.insert_edge(f1, f3, "wikilink").unwrap();
         store.insert_edge(f2, f3, "wikilink").unwrap();
         store
-            .insert_chunk(f3, "## Shared", "Shared topic content", 10, 20)
+            .insert_chunk(f3, 0, "## Shared", "Shared topic content", 10, 20)
             .unwrap();
         store
             .insert_fts_chunk(f3, 0, "Shared topic content")
@@ -350,6 +450,7 @@ mod tests {
             RankedResult {
                 file_path: "a.md".into(),
                 file_id: f1,
+                chunk_seq: 0,
                 score: 0.9,
                 heading: None,
                 snippet: "A".into(),
@@ -358,6 +459,7 @@ mod tests {
             RankedResult {
                 file_path: "b.md".into(),
                 file_id: f2,
+                chunk_seq: 0,
                 score: 0.5,
                 heading: None,
                 snippet: "B".into(),
@@ -382,6 +484,7 @@ mod tests {
         let seeds = vec![RankedResult {
             file_path: "a.md".into(),
             file_id: f1,
+            chunk_seq: 0,
             score: 0.9,
             heading: None,
             snippet: "A".into(),
@@ -420,7 +523,7 @@ mod tests {
 
         store.insert_edge(f1, f2, "wikilink").unwrap();
         store
-            .insert_chunk(f2, "## Linked", "Unrelated content", 10, 20)
+            .insert_chunk(f2, 0, "## Linked", "Unrelated content", 10, 20)
             .unwrap();
         store
             .insert_fts_chunk(f2, 0, "Unrelated content here")
@@ -429,6 +532,7 @@ mod tests {
         let seeds = vec![RankedResult {
             file_path: "seed.md".into(),
             file_id: f1,
+            chunk_seq: 0,
             score: 0.85,
             heading: None,
             snippet: "Seed".into(),
@@ -473,6 +577,7 @@ mod tests {
         store
             .insert_chunk(
                 backlinker,
+                0,
                 "## Backlink",
                 "Backlink content about delivery",
                 10,
@@ -486,6 +591,7 @@ mod tests {
         let seeds = vec![RankedResult {
             file_path: "seed.md".into(),
             file_id: seed,
+            chunk_seq: 0,
             score: 0.85,
             heading: None,
             snippet: "Seed".into(),

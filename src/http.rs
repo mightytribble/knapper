@@ -44,6 +44,9 @@ pub struct ApiState {
     pub recent_writes: RecentWrites,
     pub rate_limiter: Arc<RateLimiter>,
     pub read_only: bool,
+    /// Retrieval granularity settings from `config.toml`.
+    pub max_chunks_per_file: usize,
+    pub group_by: crate::config::GroupBy,
 }
 
 // ---------------------------------------------------------------------------
@@ -476,6 +479,8 @@ async fn handle_search(
             .map(|g| g.as_mut() as &mut dyn RerankModel),
         store: &store,
         rerank_candidates: 30,
+        max_chunks_per_file: state.max_chunks_per_file,
+        group_by: state.group_by,
     };
 
     let output = search::search_with_intelligence(&body.query, top_n, &mut *embedder, &mut config)
@@ -1174,6 +1179,8 @@ mod tests {
             recent_writes: Arc::new(Mutex::new(HashMap::<PathBuf, SystemTime>::new())),
             rate_limiter,
             read_only: false,
+            max_chunks_per_file: crate::config::default_max_chunks_per_file(),
+            group_by: crate::config::GroupBy::default(),
         }
     }
 
