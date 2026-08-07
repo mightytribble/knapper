@@ -90,6 +90,16 @@ Upstream PR #47 addresses them. Use `cargo test --lib` (533 tests) as the workin
   `embeddinggemma-300M` at `target_dim=256`. Upstream PR #48 fixes it.
 - **Intelligence is not a quality dial.** Enabling it (query expansion + Qwen3 reranker, 1.6GB)
   *regressed* exact-name lookup in testing. Treat on/off as distinct configurations.
+- **Every embedding is computed with the wrong model's prompt prefix** (issue #10).
+  `PromptFormat::EmbeddingGemma` emits `<bos>search_query:` / `<bos>search_document: {title} {text}`,
+  which is *nomic-embed-text*'s convention; EmbeddingGemma documents
+  `task: search result | query: …` and `title: {title | "none"} | text: …`. Affects queries and
+  documents alike, so it is a floor under every retrieval measurement in `eval/`.
+  Two traps when fixing it: the documented strings contain **no `<bos>`**, and `str_to_token` is
+  called with `AddBos::Never` because the current string supplies one literally
+  (`parse_special = true` in llama-cpp-2, so it does become the real BOS token) — swap the strings
+  without addressing that and every embedding loses its BOS. Changing the *document* side needs
+  `--reindex`; changing the *query* side needs nothing.
 - **`exclude` is `.gitignore`-style globs** (`src/exclude.rs`, this fork). No separator means the
   pattern matches at any depth; a trailing `/` means a directory and its contents; an embedded `/`
   anchors to the vault root. Adding a pattern purges what is already indexed on the next run, via
@@ -160,6 +170,9 @@ See issues on this repo:
 - **#4** relevance floor — configurable per-lane min scores so nonsense queries return nothing
 - **#5** embedding model config — expose output dim, tie max chunk tokens to the model's context window
 - **#8** pick a better local embedder — >512 tokens, >768 dim (pairs with #5, which exposes the knobs)
+- **#10** the embedding prompt format is nomic-embed-text's, not EmbeddingGemma's — both query and
+  document sides are out-of-distribution. Query-side fix needs **no reindex** and is the cheapest
+  open experiment in the repo; document-side needs one per configuration, so it waits for #3
 - **#9** section-per-file still beats in-place on probe 1 — #6 ruled out granularity, #2 ruled out
   document identity in the vector, #11 ruled out lexical coverage
 - ~~**#6** section-level retrieval granularity — fuse on `(file_id, seq)` so a document can
@@ -169,7 +182,11 @@ See issues on this repo:
 - ~~**#7** exclude derived `*-index.md` / `templates/` from ingest, and make `exclude` glob for
   real~~ — **done**, 14.2% of chunks and 18.3% of edges removed from the eval corpus
 
-Suggested order: **#3 next**, and now with a concrete debt to pay off. Five hand-picked probes were
+Suggested order: **#10's query side, then #3.** The query-side prompt fix jumps the queue only
+because it needs no reindex — it can be A/B'd in minutes against the existing eval homes, where
+everything else here costs a rebuild per column. Its document side goes after #3 with the rest.
+
+Then **#3**, and now with a concrete debt to pay off. Five hand-picked probes were
 enough to show that #2 trades one probe for another, and not enough to say which trade is right —
 the same five gave contradictory verdicts on three configurations of the same feature. #11 then
 moved 73 of the 100 slots those verdicts were read from. #3 supplies the measurements everything

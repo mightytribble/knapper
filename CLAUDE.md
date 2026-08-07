@@ -55,7 +55,7 @@ Single binary with 26 modules behind a lib crate:
 - **LLM orchestrator:** Single Qwen3-0.6B call classifies query intent (exact/conceptual/relationship/exploratory), generates 2-4 query expansions, and sets adaptive lane weights. Results cached in `llm_cache` SQLite table (keyed by query SHA256). Falls back to heuristic pattern matching when intelligence is off
 - **Cross-encoder reranker:** Qwen3-Reranker-0.6B scores query-document relevance via Yes/No logit softmax. Runs as 4th RRF lane on top-30 candidates from pass 1
 - **llama.cpp backend:** Global `LlamaBackend` singleton via `OnceLock`. `LlamaModel` is `Send+Sync`, `LlamaContext` is `!Send` (created per-call). Metal GPU auto-detected on macOS. Models download from HuggingFace on first use with progress bar
-- **Prompt formatting:** `PromptFormat` auto-detects model family from GGUF filename. embeddinggemma uses asymmetric prefixes (`search_query:` / `search_document:`). Applied in `embed_one` (queries) and `embed_batch` (documents)
+- **Prompt formatting:** `PromptFormat` auto-detects model family from GGUF filename and applies asymmetric prefixes in `embed_one` (queries) and `embed_batch` (documents). **The `EmbeddingGemma` variant emits nomic-embed-text's `search_query:` / `search_document:` convention, not EmbeddingGemma's documented `task: … | query:` / `title: … | text:` — see issue #10**
 
 ## Data directory
 
