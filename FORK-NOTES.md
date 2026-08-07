@@ -202,25 +202,30 @@ See issues on this repo:
 - ~~**#2** contextual embedding prefix (filename / heading path / tags into every chunk)~~ —
   **built, measured, shipped off by default.** Net negative on the seed probes: +3 ranks on the
   conceptual probe, −4 (out of the window) on the exact-name non-regression probe. Both of its
-  retrieval acceptance criteria turned out to have been met already by #1 + #6. Needs #3 to decide
-  whether a length-scaled or conditional prefix is worth having.
+  retrieval acceptance criteria turned out to have been met already by #1 + #6. Whether a length-scaled or conditional prefix is worth
+  having is an open question, and a cheap one — every component is separately switchable.
 - ~~**#11** FTS indexes the 200-char snippet, not the chunk~~ — **done.** Keyword search had been
   reaching 27.6% of the corpus; `Saltmere` and four other verified-present terms returned zero hits.
   Probe 3 went @5 → **@1**, the best result any configuration has produced on it, and probe 4 held
   at @2 under the heaviest churn of any probe. Nothing regressed. Moved 73 of 100 probe slots, so
   every lexical number recorded before it is superseded.
-- **#3** retrieval eval battery — now adjudicates #2, and calibrates #4
+- **#3** more probes, drawn from real usage — *not* a battery, and not a prerequisite for anything.
+  The five seed probes catch regressions and resolve large effects; what they cannot do is settle a
+  one-up-one-down at n=5 (#14). Fix is sample count, plus negative controls and section-vs-file
+  scoring recorded separately. Calibrates #4
 - **#4** relevance floor — configurable per-lane min scores so nonsense queries return nothing
 - **#5** embedding model config — expose output dim, tie max chunk tokens to the model's context window
 - **#8** pick a better local embedder — >512 tokens, >768 dim (pairs with #5, which exposes the knobs)
 - ~~**#12** embed at the model's native dimension~~ — **done.** Every vector had been truncated to its
   first 256 of 768. The seed probes return identical verdicts at identical ranks and confidences,
-  while **76 of 100 slots moved underneath** — five hand-picked probes cannot measure a change to the
-  vector space, which is #3's job. Ruled out as the probe 1 explanation (#9). The migration ran
+  while **76 of 100 slots moved underneath**. Read at the time as the probes being blind; the better
+  reading, and the one #14 confirmed by moving them, is that the top of the ranking is robust to this
+  change and the churn sat in the tail. Ruled out as the probe 1 explanation (#9). The migration ran
   itself; storage roughly doubles. Optional Matryoshka truncation is deliberately left unbuilt
 - **#10** the embedding prompt format is nomic-embed-text's, not EmbeddingGemma's — both query and
   document sides are out-of-distribution. Query-side fix needs **no reindex** and is the cheapest
-  open experiment in the repo; document-side needs one per configuration, so it waits for #3
+  open experiment in the repo; document-side costs a reindex per configuration, which is the only
+  reason to do it second
 - ~~**#13** reuse one llama.cpp context per phase instead of one per call~~ — **done, and the
   performance premise was wrong.** All three behaviour criteria held byte-for-byte: identical index
   content, identical probes with intelligence off, identical probes with intelligence *on*. But the
@@ -238,12 +243,13 @@ See issues on this repo:
   preview). **The cost is +50% on a reranked query — 7.90 s → 11.87 s, distributions not
   overlapping.** The benefit is a wash on the seed probes: probe 3 gains the top slot
   (`developer-console > ## [3] SPELLS` displaced by Counterspell), probe 2 loses its correct section.
-  18 of 20 slots moved on the benchmark query, which is #12's churn signature — so #3 adjudicates.
+  18 of 20 slots moved. One up, one down is genuinely ambiguous at n=5 and is recorded as ambiguous;
+  it wants more queries on that question, not a hold on the queue.
   Shipped on and unswitchable, because "200 chars, or a 64-token match window if FTS found it" is not
   an alternative strategy worth preserving. `[rerank] document_title` is a switch and is off
 - **#16** `rerank_candidates` is hardcoded at 30 in four places and unreachable from `config.toml`. It
   was academic while the reranker read previews; after #14 it is the one free term in a lane that
-  costs half the query. Wanted as a knob for #3 to sweep, not as a new default — cutting it also
+  costs half the query. Wanted as a knob to sweep, not as a new default — cutting it also
   cuts what the cross-encoder can rescue from the retrieval lanes, which is the case the lane exists
   for
 - **#15** the reranker is fused as a lane instead of ordering the results — sorting on its score
@@ -264,37 +270,54 @@ See issues on this repo:
 - ~~**#7** exclude derived `*-index.md` / `templates/` from ingest, and make `exclude` glob for
   real~~ — **done**, 14.2% of chunks and 18.3% of edges removed from the eval corpus
 
-Suggested order: **#10's query side, then #3.** The query-side prompt fix jumps the queue only
-because it needs no reindex — it can be A/B'd in minutes against the existing eval homes, where
-everything else here costs a rebuild per column. Its document side goes after #3 with the rest.
+Suggested order: **#10's query side first.** It needs no reindex, so it can be A/B'd in minutes
+against the eval homes that already exist, where everything else here costs a rebuild per column.
+Its document side is the same experiment at a reindex per configuration, which is the only reason to
+do it second.
 
-#12 sharpened the argument for putting #3 next. It changed the vector space outright and the five
-probes reported *identical* verdicts at identical ranks and confidences while three quarters of the
-result slots moved. Any further work on the semantic lane — #10's document side, #8's model swap,
-#5's knobs — is unmeasurable until the battery exists.
+### Correction: the probes work, and #3 is smaller than these notes had it
 
-**#13 was the exception and is done.** It needed no battery to adjudicate — same index, same
-ranking, byte-identical output — which is also how it managed to disprove its own premise without
-waiting for #3.
+Earlier revisions of this file said, in several places, that the five probes "cannot measure" a
+retrieval change and that everything waited on #3. **That was wrong, and it came from one bad
+inference.** #12 changed the vector space outright, the probes reported identical verdicts at
+identical ranks, and 76 of 100 slots moved underneath — from which these notes concluded the
+instrument was blind. The better reading was available at the time: **the top of the ranking is
+robust to that change and the churn was in the tail nobody reads.** That is a finding about the
+retrieval stack, not a defect in the probes.
 
-**#14 is done and is the argument for #3 stated as plainly as it can be.** It is the first change
-in this fork with a certain cost (+50% query latency, measured, non-overlapping) and an unmeasurable
-benefit: on the five probes it wins one and loses one, and 18 of 20 slots moved on the benchmark
-query. It shipped anyway because it fixes an incoherence rather than trading one strategy for
-another — but that reasoning does not transfer to #15, which *is* a strategy trade. **#15 should
-wait for #3.** It is worth keeping in view while scoping #4: a cross-encoder probability
-is the calibrated score a relevance floor wants, and RRF scores demonstrably are not (the nonsense
-query's top RRF score already exceeds a legitimate third-place result).
+#14 settled it. The probes moved — probe 3 to rank 1, probe 2 off its correct section —
+deterministically, reproducing #13's recorded hash exactly on the before side. A null result in #12
+and a live one in #14 from the same five queries is an instrument working, not a broken one.
 
-Then **#3**, and now with a concrete debt to pay off. Five hand-picked probes were
-enough to show that #2 trades one probe for another, and not enough to say which trade is right —
-the same five gave contradictory verdicts on three configurations of the same feature. #11 then
-moved 73 of the 100 slots those verdicts were read from. #3 supplies the measurements everything
-else is judged by. Then **#5** (makes chunk size and dim configurable, which #3 needs to compare
-configurations), then #4 — which #11 made more pressing, not less: the FTS lane now finds genuine
-keyword matches for nonsense queries where it used to find none by accident.
+What follows is that **#3 is a sampling upgrade, not a capability upgrade.** If the shape
+*query → expected document → is it in the top N* resolves anything at n=5, then n=40 is the same
+instrument with better statistics. So #3 is not a battery to be built before work resumes; it is
+**more probes, sourced from real usage** — session transcripts, `## Coverage` headers, logged
+`/research` calls — which is hours, not a project. The three things it adds beyond sample count are
+cheap and separable: negative controls (probe 5 already is one, and has never passed in any config),
+scoring section accuracy apart from file accuracy (#6 made that observable and it just needs
+recording), and sourcing discipline, since invented queries reproduce the corpus's own phrasing and
+flatter the results.
 
-**One experiment #3 should own:** putting per-file identity (name, aliases, tags, path segments)
+**Nothing is blocked on it.** The honest limit of five probes is narrower than "unmeasurable": they
+catch regressions and resolve large effects — they caught #2's probe-4 collapse, #11's @5→@1, #14's
+two moves — and they do **not** resolve a one-up-one-down at n=5, which is exactly #14's result and
+the reason that one is recorded as ambiguous. The fix for an ambiguous result is more queries on the
+ambiguous question, not a hold on the queue.
+
+**#13 and #14 are both done and neither needed a battery.** #13 adjudicated on byte-identical
+output. #14 established a certain cost (+50% query latency, non-overlapping) against a probe result
+that splits — and shipped anyway, because it replaces an incoherence rather than trading one strategy
+for another. **#15 does not inherit a hold from that.** It is a strategy trade, so it needs a
+measurement rather than an argument, and the probes can give it one: probe 4 is the named guard for
+the exact-name regression pure rerank-ordering would amplify, and a blend measured against pure
+ordering is a two-column A/B on the homes that already exist.
+
+Then **#5** (makes chunk size and dim configurable, which comparing configurations needs), then #4 —
+which #11 made more pressing, not less: the FTS lane now finds genuine keyword matches for nonsense
+queries where it used to find none by accident.
+
+**One experiment worth queueing:** putting per-file identity (name, aliases, tags, path segments)
 into the FTS index. It is the natural follow-on from #11 and was deliberately excluded from it,
 because it reintroduces #2's failure mode in the lexical lane — a term on every chunk of a document
 is a per-file constant, and BM25 length normalisation would favour that document's *shortest* chunk.
@@ -307,6 +330,8 @@ rank (temple 21/22/23, `archivist-lenne` 25/28/32). Three explanations are now r
 ranking unit (#6), document identity in the vector (#2), and lexical coverage (#11). What is left of
 the transform's difference is
 that each section became a whole document — its own embedding computed over that text alone, its own
-docid, its own graph node. It needs #3 to diagnose against more than one query.
+docid, its own graph node. One probe cannot separate those three, so this one really does want more
+queries — but it wants them *for this question*, which is a morning's work, not a battery.
 
-`eval/` holds the seed material for #3.
+`eval/` holds the probes and the harnesses: `probe.sh` for what came back, `bench-search.sh` for how
+long it took.
