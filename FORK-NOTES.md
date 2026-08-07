@@ -72,7 +72,7 @@ Adjust the gcc version in the include path (`13`) and the python version (`pytho
 `cargo test` (full) fails to compile `tests/integration.rs` and `tests/write_pipeline.rs`:
 `unresolved import engraph::embedder`, `engraph::hnsw`, and a `walk_vault` arity mismatch.
 **These are broken on pristine upstream** — verify with `git stash && cargo clippy --all-targets`.
-Upstream PR #47 addresses them. Use `cargo test --lib` (499 tests) as the working suite.
+Upstream PR #47 addresses them. Use `cargo test --lib` (517 tests) as the working suite.
 `cargo clippy -- -D warnings`, which is what CI runs, is clean.
 
 ## Runtime gotchas
@@ -123,6 +123,8 @@ See issues on this repo:
 - **#3** retrieval eval battery — gates #2, and calibrates #4
 - **#4** relevance floor — configurable per-lane min scores so nonsense queries return nothing
 - **#5** embedding model config — expose output dim, tie max chunk tokens to the model's context window
+- **#8** pick a better local embedder — >512 tokens, >768 dim (pairs with #5, which exposes the knobs)
+- **#9** section-per-file still beats in-place on probe 1, and #6 ruled out the reason we assumed
 - ~~**#6** section-level retrieval granularity — fuse on `(file_id, seq)` so a document can
   contribute more than one section~~ — **done**, probe 3 now returns the correct section and every
   result names its heading. Did **not** fix probe 1, so `eval/section-split.py` cannot be retired
@@ -136,10 +138,10 @@ expected to fix outright turned out not to be a granularity problem. Then **#5**
 and dim configurable, which #2/#3 need to compare configurations), then #2, then #4 (needs #3's
 negative controls to calibrate).
 
-**Probe 1 is the open question #6 was expected to close.** The section-per-file transform puts
-`temple-of-the-architect` at ranks 1–4; indexing in place leaves it at 21, before and after #6. The
-ranking unit was not the difference, so something else about writing sections as files — their own
-embeddings as whole documents, their own docids, their own graph nodes — is. Worth a ticket once #3
-can measure it.
+**Probe 1 is the open question #6 was expected to close** (now #9). The section-per-file transform
+puts `temple-of-the-architect` at ranks 1–4; indexing in place leaves it at 21, before and after #6.
+The ranking unit was not the difference, so something else about writing sections as files — their
+own embeddings as whole documents, their own docids, their own graph nodes — is. It needs #3 to
+diagnose against more than one query.
 
 `eval/` holds the seed material for #3.
