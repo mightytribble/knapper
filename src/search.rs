@@ -268,10 +268,23 @@ pub fn search_with_intelligence(
     // --- Step 4: Reranker (4th lane) if available ---
     let mut rerank_results: Vec<RankedResult> = Vec::new();
     let reranker_used = if let Some(reranker) = &mut config.reranker {
-        for candidate in fused_pass1.iter().take(config.rerank_candidates) {
-            let score = reranker
-                .rerank_score(query, &candidate.snippet)
-                .unwrap_or(0.0) as f64;
+        let candidates: Vec<_> = fused_pass1.iter().take(config.rerank_candidates).collect();
+        let documents: Vec<&str> = candidates.iter().map(|c| c.snippet.as_str()).collect();
+
+        // One call for all thirty pairs, so the reranker sets up once instead of
+        // once per candidate (issue #13). A failure now costs the whole lane
+        // rather than one candidate; the failures in reach are tokenizer and
+        // decode errors, which would take every pair down anyway, and unlike the
+        // old per-pair `unwrap_or(0.0)` this one says so.
+        let scores = reranker
+            .rerank_batch(query, &documents)
+            .unwrap_or_else(|e| {
+                tracing::warn!("rerank lane unavailable: {e:#}");
+                vec![0.0; documents.len()]
+            });
+
+        for (candidate, score) in candidates.iter().zip(scores) {
+            let score = score as f64;
             rerank_results.push(RankedResult {
                 file_path: candidate.file_path.clone(),
                 file_id: candidate.file_id,
@@ -1037,6 +1050,65 @@ mod tests {
 
         // Every result names the section it came from.
         assert!(hits.iter().all(|r| r.heading.is_some()));
+    }
+
+    /// Records how the rerank lane is driven. Whether an implementation can
+    /// amortize its setup depends on being handed the whole candidate set at
+    /// once (issue #13), so "one call, not one per candidate" is a property to
+    /// hold onto rather than an implementation detail.
+    struct CountingReranker {
+        inner: llm::MockLlm,
+        batch_calls: usize,
+        pairs_scored: usize,
+    }
+
+    impl RerankModel for CountingReranker {
+        fn rerank_score(&mut self, query: &str, document: &str) -> Result<f32> {
+            self.inner.rerank_score(query, document)
+        }
+
+        fn rerank_batch(&mut self, query: &str, documents: &[&str]) -> Result<Vec<f32>> {
+            self.batch_calls += 1;
+            self.pairs_scored += documents.len();
+            documents
+                .iter()
+                .map(|d| self.inner.rerank_score(query, d))
+                .collect()
+        }
+    }
+
+    #[test]
+    fn the_rerank_lane_scores_all_its_candidates_in_one_call() {
+        let (_tmp, store, mut embedder) = indexed_vault();
+        let mut reranker = CountingReranker {
+            inner: llm::MockLlm::new(8),
+            batch_calls: 0,
+            pairs_scored: 0,
+        };
+
+        {
+            let mut config = SearchConfig {
+                orchestrator: None,
+                reranker: Some(&mut reranker),
+                store: &store,
+                rerank_candidates: 30,
+                max_chunks_per_file: 3,
+                group_by: GroupBy::Chunk,
+            };
+            let output =
+                search_with_intelligence("warding", 10, &mut embedder, &mut config).unwrap();
+            assert!(!output.results.is_empty(), "the lane produced no results");
+        }
+
+        assert_eq!(
+            reranker.batch_calls, 1,
+            "the lane must set up once, not once per candidate"
+        );
+        assert!(
+            reranker.pairs_scored > 1,
+            "expected several candidates, got {}",
+            reranker.pairs_scored
+        );
     }
 
     #[test]

@@ -222,6 +222,21 @@ impl EmbedModel for Box<dyn EmbedModel + Send> {
 pub trait RerankModel: Send {
     /// Return a relevance score in [0.0, 1.0].
     fn rerank_score(&mut self, query: &str, document: &str) -> Result<f32>;
+
+    /// Score `query` against every document, returning one score per document
+    /// in order.
+    ///
+    /// This is the shape search actually calls in — thirty candidates against
+    /// one query — and it exists so that an implementation holding a model can
+    /// set up once for the whole set instead of once per pair (issue #13). The
+    /// default is the naive loop, which is right for any implementation with no
+    /// setup to amortize.
+    fn rerank_batch(&mut self, query: &str, documents: &[&str]) -> Result<Vec<f32>> {
+        documents
+            .iter()
+            .map(|document| self.rerank_score(query, document))
+            .collect()
+    }
 }
 
 /// Orchestrator — interprets a query and produces an enriched search plan.
@@ -635,9 +650,10 @@ impl Default for ModelDefaults {
 /// vectors via llama.cpp's built-in embedding support with mean pooling + L2
 /// normalization. Supports Metal acceleration on macOS automatically.
 ///
-/// `LlamaModel` is `Send + Sync`, so this struct is `Send`. `LlamaContext` is
-/// `!Send`, so we create it per-call. The global `LlamaBackend` is referenced
-/// via `llama_backend()` — no need to store it per-struct.
+/// `LlamaModel` is `Send + Sync`, so this struct is `Send`. A `LlamaContext`
+/// borrows the model it was made from, so it cannot be a field here — but it
+/// can, and does, span a whole batch (issue #13). The global `LlamaBackend` is
+/// referenced via `llama_backend()` — no need to store it per-struct.
 pub struct LlamaEmbed {
     model: LlamaModel,
     tokenizer: FlexTokenizer,
@@ -647,7 +663,7 @@ pub struct LlamaEmbed {
 
 // Safety: LlamaModel is Send+Sync per llama-cpp-2 docs.
 // FlexTokenizer contains only Send types (tokenizers::Tokenizer is Send, shimmytok::Tokenizer is Send).
-// We never store a LlamaContext (which is !Send) — it is created per-call.
+// We never store a LlamaContext (which is !Send) — it lives inside a single call.
 unsafe impl Send for LlamaEmbed {}
 
 impl std::fmt::Debug for LlamaEmbed {
@@ -709,85 +725,142 @@ impl LlamaEmbed {
         })
     }
 
-    /// Run embedding inference and return the L2-normalized embedding.
+    /// Run embedding inference over already prompt-formatted `texts` and return
+    /// their L2-normalized vectors, in order.
     ///
-    /// The vector comes back at the model's full width. Nothing is discarded
-    /// here — optional Matryoshka truncation is a separate, opt-in feature and
-    /// must not be the silent default (issue #12).
-    fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
-        // Tokenize using llama.cpp's built-in tokenizer.
-        // Use AddBos::Never because PromptFormat already adds <bos> for embeddinggemma.
-        let tokens = self
-            .model
-            .str_to_token(text, AddBos::Never)
-            .map_err(|e| anyhow::anyhow!("tokenization failed: {e}"))?;
-        if tokens.is_empty() {
-            bail!("tokenizer returned empty token sequence");
+    /// **One llama.cpp context serves the whole slice** (issue #13). Creating
+    /// one per text was never forced by `!Send` — that constrains what may be a
+    /// struct *field*, not what may live in a loop — and it made `batch_size`
+    /// decorative, because `index_file` batches the work and this unrolled it
+    /// again. The real constraint is that `new_context` borrows the model, so
+    /// the context cannot outlive a call; a batch is the largest scope it can
+    /// have, and is the one it now gets.
+    ///
+    /// The context is sized to the longest input in the slice, trading N
+    /// right-sized KV allocations for one worst-case allocation. Each text is
+    /// encoded from a cleared cache, which is what keeps the vectors identical
+    /// to the per-call version — verified: the eval vault's index is
+    /// byte-identical across the change.
+    ///
+    /// The slice is one file's chunks, because that is where `index_file`
+    /// batches (`texts.chunks(config.batch_size)`, inside the per-file loop).
+    /// On the eval vault that is 247 contexts instead of 1598, for a saving of
+    /// at most ~2% of index time — context setup is cheap enough that the win
+    /// is small. `batch_size` is no longer ignored, but with a 6.5-chunk mean
+    /// file its default of 64 still never fills a batch.
+    ///
+    /// Vectors come back at the model's full width. Nothing is discarded here —
+    /// optional Matryoshka truncation is a separate, opt-in feature and must not
+    /// be the silent default (issue #12).
+    fn embed_formatted(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
         }
 
-        // Create a context with embeddings enabled (per-call, since LlamaContext is !Send).
-        // n_ubatch must be >= n_tokens for the encoder, and n_ctx must fit all tokens.
-        let n_tokens = tokens.len() as u32;
-        let n_ctx = std::num::NonZeroU32::new(n_tokens.max(64) + 16);
+        // Tokenize up front: the context has to be sized to the longest input
+        // in the batch before any of them can be encoded.
+        // Use AddBos::Never because PromptFormat already adds <bos> for embeddinggemma.
+        let tokenized = texts
+            .iter()
+            .map(|text| {
+                let tokens = self
+                    .model
+                    .str_to_token(text, AddBos::Never)
+                    .map_err(|e| anyhow::anyhow!("tokenization failed: {e}"))?;
+                if tokens.is_empty() {
+                    bail!("tokenizer returned empty token sequence");
+                }
+                Ok(tokens)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // n_ubatch must be >= n_tokens for the encoder, and n_ctx must fit all
+        // tokens — of the longest member, now that the context is shared.
+        let max_tokens = tokenized
+            .iter()
+            .map(|t| t.len())
+            .max()
+            .expect("texts is non-empty") as u32;
+        let n_ctx = std::num::NonZeroU32::new(max_tokens.max(64) + 16);
         let ctx_params = LlamaContextParams::default()
             .with_embeddings(true)
             .with_n_ctx(n_ctx)
-            .with_n_ubatch(n_tokens.max(512))
-            .with_n_batch(n_tokens.max(512));
+            .with_n_ubatch(max_tokens.max(512))
+            .with_n_batch(max_tokens.max(512));
         let mut ctx = self
             .model
             .new_context(llama_backend()?, ctx_params)
             .map_err(|e| anyhow::anyhow!("creating embedding context: {e}"))?;
 
-        // Create batch and add tokens — mark all as outputs for embedding.
-        let mut batch = LlamaBatch::new(tokens.len() + 16, 1);
-        batch
-            .add_sequence(&tokens, 0, true)
-            .map_err(|e| anyhow::anyhow!("adding sequence to batch: {e}"))?;
+        // One batch buffer, reused. Allocated for the longest input for the
+        // same reason the context is.
+        let mut batch = LlamaBatch::new(max_tokens as usize + 16, 1);
+        let mut vectors = Vec::with_capacity(tokenized.len());
 
-        // Encode (compute embeddings). Use encode() for embedding models.
-        ctx.encode(&mut batch)
-            .map_err(|e| anyhow::anyhow!("embedding encode failed: {e}"))?;
+        for tokens in &tokenized {
+            // Every text is its own sequence 0, encoded from an empty cache —
+            // no state carries over from the previous one.
+            batch.clear();
+            ctx.clear_kv_cache();
 
-        // Get embeddings for sequence 0 (mean pooled by llama.cpp).
-        let embeddings = ctx
-            .embeddings_seq_ith(0)
-            .map_err(|e| anyhow::anyhow!("getting embeddings: {e}"))?;
+            // Add tokens — mark all as outputs for embedding.
+            batch
+                .add_sequence(tokens, 0, true)
+                .map_err(|e| anyhow::anyhow!("adding sequence to batch: {e}"))?;
 
-        // The width llama.cpp returns must be the width we told the store to
-        // expect. A disagreement means `dim` and the model have come apart, and
-        // silently storing a short vector is how issue #12 happened.
-        if embeddings.len() != self.dim {
-            bail!(
-                "model returned {} dimensions, expected {}",
-                embeddings.len(),
-                self.dim
-            );
+            // Encode (compute embeddings). Use encode() for embedding models.
+            ctx.encode(&mut batch)
+                .map_err(|e| anyhow::anyhow!("embedding encode failed: {e}"))?;
+
+            // Get embeddings for sequence 0 (mean pooled by llama.cpp).
+            let embeddings = ctx
+                .embeddings_seq_ith(0)
+                .map_err(|e| anyhow::anyhow!("getting embeddings: {e}"))?;
+
+            // The width llama.cpp returns must be the width we told the store to
+            // expect. A disagreement means `dim` and the model have come apart, and
+            // silently storing a short vector is how issue #12 happened.
+            if embeddings.len() != self.dim {
+                bail!(
+                    "model returned {} dimensions, expected {}",
+                    embeddings.len(),
+                    self.dim
+                );
+            }
+
+            // L2 normalize — `embeddings_seq_ith` returns the raw pooled vector.
+            let norm: f32 = embeddings.iter().map(|x| x * x).sum::<f32>().sqrt();
+            vectors.push(if norm > 0.0 {
+                embeddings.iter().map(|x| x / norm).collect()
+            } else {
+                embeddings.to_vec()
+            });
         }
 
-        // L2 normalize — `embeddings_seq_ith` returns the raw pooled vector.
-        let norm: f32 = embeddings.iter().map(|x| x * x).sum::<f32>().sqrt();
-        let normalized = if norm > 0.0 {
-            embeddings.iter().map(|x| x / norm).collect()
-        } else {
-            embeddings.to_vec()
-        };
+        Ok(vectors)
+    }
 
-        Ok(normalized)
+    /// Embed a single already prompt-formatted text.
+    ///
+    /// A one-element call into [`LlamaEmbed::embed_formatted`], so single and
+    /// batch embedding cannot drift apart.
+    fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
+        let owned = [text.to_owned()];
+        self.embed_formatted(&owned)?
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("embedding returned no vector"))
     }
 }
 
 impl EmbedModel for LlamaEmbed {
     fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        // Process texts sequentially — llama.cpp context is per-call.
-        // Apply document prompt format for indexing (asymmetric models need this).
-        texts
+        // Apply document prompt format for indexing (asymmetric models need this),
+        // then hand the whole batch to one context (issue #13).
+        let formatted: Vec<String> = texts
             .iter()
-            .map(|t| {
-                let formatted = self.prompt_format.format_document("", t);
-                self.embed_text(&formatted)
-            })
-            .collect()
+            .map(|t| self.prompt_format.format_document("", t))
+            .collect();
+        self.embed_formatted(&formatted)
     }
 
     fn embed_one(&mut self, text: &str) -> Result<Vec<f32>> {
@@ -1138,7 +1211,7 @@ pub struct LlamaRerank {
 }
 
 // Safety: LlamaModel is Send+Sync per llama-cpp-2 docs.
-// LlamaContext is created per-call and never stored.
+// LlamaContext borrows the model, so it lives inside a call and is never stored.
 unsafe impl Send for LlamaRerank {}
 
 impl std::fmt::Debug for LlamaRerank {
@@ -1209,51 +1282,93 @@ impl LlamaRerank {
 
 impl RerankModel for LlamaRerank {
     fn rerank_score(&mut self, query: &str, document: &str) -> Result<f32> {
-        let input_text = format_reranker_input(query, document);
+        // One code path: a single pair is a batch of one.
+        self.rerank_batch(query, &[document])?
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("reranker returned no score"))
+    }
 
-        // Tokenize using llama.cpp's built-in tokenizer.
-        let tokens = self
-            .model
-            .str_to_token(&input_text, AddBos::Always)
-            .map_err(|e| anyhow::anyhow!("tokenization failed: {e}"))?;
-        if tokens.is_empty() {
-            bail!("tokenizer returned empty token sequence");
+    /// Score every pair through **one** llama.cpp context (issue #13).
+    ///
+    /// A reranked search scores 30 candidates; before this, that was 30 context
+    /// creations to do 30 single forward passes. The context is sized to the
+    /// longest pair and each is decoded from a cleared cache, so nothing carries
+    /// between candidates and the scores are the per-call ones.
+    ///
+    /// Measured, the saving is **not** why this is worth having: on the eval
+    /// vault a reranked query is 8.10 s either way (n=20, medians 8.105 →
+    /// 8.096). Context setup for a 0.6B model is milliseconds, and 30 of them
+    /// sit under the noise floor. What this buys is the shape — one call with
+    /// the whole candidate set, which is what issues #14 and #15 build on.
+    fn rerank_batch(&mut self, query: &str, documents: &[&str]) -> Result<Vec<f32>> {
+        if documents.is_empty() {
+            return Ok(Vec::new());
         }
 
-        // Create context per-call (LlamaContext is !Send).
-        let n_ctx = (tokens.len() + 16) as u32;
+        // Tokenize up front — the context is sized to the longest pair.
+        let tokenized = documents
+            .iter()
+            .map(|document| {
+                let input_text = format_reranker_input(query, document);
+                let tokens = self
+                    .model
+                    .str_to_token(&input_text, AddBos::Always)
+                    .map_err(|e| anyhow::anyhow!("tokenization failed: {e}"))?;
+                if tokens.is_empty() {
+                    bail!("tokenizer returned empty token sequence");
+                }
+                Ok(tokens)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let max_tokens = tokenized
+            .iter()
+            .map(|t| t.len())
+            .max()
+            .expect("documents is non-empty");
+        let n_ctx = (max_tokens + 16) as u32;
         let ctx_params = LlamaContextParams::default().with_n_ctx(std::num::NonZeroU32::new(n_ctx));
         let mut ctx = self
             .model
             .new_context(llama_backend()?, ctx_params)
             .map_err(|e| anyhow::anyhow!("creating reranker context: {e}"))?;
 
-        // Create batch with all tokens; mark last as logit-producing.
-        let mut batch = LlamaBatch::new(tokens.len() + 16, 1);
-        for (i, token) in tokens.iter().enumerate() {
-            let is_last = i == tokens.len() - 1;
-            batch
-                .add(*token, i as i32, &[0], is_last)
-                .map_err(|e| anyhow::anyhow!("adding token to reranker batch: {e}"))?;
+        let mut batch = LlamaBatch::new(max_tokens + 16, 1);
+        let mut scores = Vec::with_capacity(tokenized.len());
+
+        for tokens in &tokenized {
+            // Each pair is judged on its own, from position 0 with an empty
+            // cache — a cross-encoder score must not depend on what was scored
+            // before it.
+            batch.clear();
+            ctx.clear_kv_cache();
+
+            // Add all tokens; mark last as logit-producing.
+            for (i, token) in tokens.iter().enumerate() {
+                let is_last = i == tokens.len() - 1;
+                batch
+                    .add(*token, i as i32, &[0], is_last)
+                    .map_err(|e| anyhow::anyhow!("adding token to reranker batch: {e}"))?;
+            }
+
+            // Single forward pass through the full input.
+            ctx.decode(&mut batch)
+                .map_err(|e| anyhow::anyhow!("reranker decode failed: {e}"))?;
+
+            // Get logits for the last token position.
+            let logits = ctx.get_logits_ith(batch.n_tokens() - 1);
+
+            // Extract Yes/No logits and compute softmax probability.
+            let yes_logit = logits[self.yes_token_id as usize];
+            let no_logit = logits[self.no_token_id as usize];
+
+            let max_logit = yes_logit.max(no_logit);
+            let yes_exp = (yes_logit - max_logit).exp();
+            let no_exp = (no_logit - max_logit).exp();
+            scores.push(yes_exp / (yes_exp + no_exp));
         }
 
-        // Single forward pass through the full input.
-        ctx.decode(&mut batch)
-            .map_err(|e| anyhow::anyhow!("reranker decode failed: {e}"))?;
-
-        // Get logits for the last token position.
-        let logits = ctx.get_logits_ith(batch.n_tokens() - 1);
-
-        // Extract Yes/No logits and compute softmax probability.
-        let yes_logit = logits[self.yes_token_id as usize];
-        let no_logit = logits[self.no_token_id as usize];
-
-        let max_logit = yes_logit.max(no_logit);
-        let yes_exp = (yes_logit - max_logit).exp();
-        let no_exp = (no_logit - max_logit).exp();
-        let score = yes_exp / (yes_exp + no_exp);
-
-        Ok(score)
+        Ok(scores)
     }
 }
 
@@ -1313,6 +1428,29 @@ mod tests {
         assert_eq!(result.intent, QueryIntent::Exploratory);
         assert!(!result.expansions.is_empty());
         assert_eq!(result.expansions[0], "how does auth work");
+    }
+
+    #[test]
+    fn the_default_rerank_batch_agrees_with_scoring_each_pair() {
+        // MockLlm does not override `rerank_batch`, so this exercises the
+        // trait's default implementation — the one every backend without setup
+        // to amortize keeps (issue #13).
+        let documents = ["dragon lore", "banking regulations", "a temple at dusk"];
+        let mut mock = MockLlm::new(256);
+        let batched = mock.rerank_batch("dragon", &documents).unwrap();
+
+        let one_at_a_time: Vec<f32> = documents
+            .iter()
+            .map(|d| mock.rerank_score("dragon", d).unwrap())
+            .collect();
+
+        assert_eq!(batched, one_at_a_time, "batching must not change the scores");
+    }
+
+    #[test]
+    fn rerank_batch_of_nothing_is_no_scores() {
+        let mut mock = MockLlm::new(256);
+        assert!(mock.rerank_batch("dragon", &[]).unwrap().is_empty());
     }
 
     #[test]

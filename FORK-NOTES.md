@@ -24,6 +24,7 @@ git fetch upstream && git diff --stat upstream/main main
 | `src/prefix.rs` | contextual embedding prefix, **off by default** | this fork, issue #2 |
 | `insert_fts_chunk` | index the whole chunk, not its 200-char snippet | this fork, issue #11 |
 | `ensure_embedding_dim` | embed at the model's native width; no hidden truncation | this fork, issue #12 |
+| `embed_formatted` / `rerank_batch` | one llama.cpp context per batch, not per call | this fork, issue #13 |
 
 Cherry-picked rather than merged: PR #41 branched before upstream's #40 graph fix, so merging the
 branch wholesale would have silently reverted `src/graph.rs`.
@@ -91,12 +92,17 @@ Upstream PR #47 addresses them. Use `cargo test --lib` (533 tests) as the workin
   `embeddinggemma-300M`. Upstream PR #48 fixes it.
 - **Intelligence is not a quality dial.** Enabling it (query expansion + Qwen3 reranker, 1.6GB)
   *regressed* exact-name lookup in testing. Treat on/off as distinct configurations.
-- **Every model call creates a fresh `LlamaContext` and drops it** (issue #13). A full reindex of the
-  eval vault makes 1598 of them; a search with intelligence on makes 30 for the reranker alone. Both
-  sites blame `!Send`, which is true of the struct *field* and irrelevant to the loop — the binding
-  constraint is that `new_context<'a>(&'a self, …)` borrows the model, so a context cannot live
-  beside it in one struct. **`batch_size` is decorative on the llama path**: `index_file` chunks the
-  work into batches of 64 and `embed_batch` unrolls each batch one text at a time.
+- **A `LlamaContext` spans a batch, not a call** (this fork, issue #13). `embed_formatted` and
+  `rerank_batch` each create one context and run the whole slice through it, clearing the KV cache
+  between items. Upstream created one per text and per (query, document) pair — 1598 per reindex, 30
+  per reranked search — and blamed `!Send`, which is true of the struct *field* and irrelevant to the
+  loop; the binding constraint is that `new_context<'a>(&'a self, …)` borrows the model, so a context
+  cannot live beside it in one struct. **The latency this recovers is small: context setup for these
+  model sizes is 1–3 ms.** See `eval/probes.md`.
+- **`batch_size` is nearly inert even after #13.** `index_file` batches *within a file*
+  (`texts.chunks(config.batch_size)` sits inside the per-file loop), and the eval vault averages 6.5
+  chunks per file, so the default of 64 never fills a batch. Contexts went 1598 → 247, not 1598 → 25.
+  Batching across files is part of #13's unbuilt phase 2.
 - **The reranker never sees a chunk** (issue #14). It is handed `candidate.snippet`, which is
   `chunks.snippet`'s 200 characters for semantic and graph hits but SQLite's 64-token match window
   for FTS hits — so it judges a fraction of the text, and a different fraction depending on which
@@ -207,10 +213,15 @@ See issues on this repo:
 - **#10** the embedding prompt format is nomic-embed-text's, not EmbeddingGemma's — both query and
   document sides are out-of-distribution. Query-side fix needs **no reindex** and is the cheapest
   open experiment in the repo; document-side needs one per configuration, so it waits for #3
-- **#13** reuse one llama.cpp context per phase instead of one per call — 1598 contexts per reindex,
-  30 per reranked search, and `batch_size` unrolled to nothing. **The only open retrieval ticket
-  whose result can be verified today**: it changes no output, so byte-identical index and probes are
-  the acceptance criteria alongside wall-clock. Blocks #14
+- ~~**#13** reuse one llama.cpp context per phase instead of one per call~~ — **done, and the
+  performance premise was wrong.** All three behaviour criteria held byte-for-byte: identical index
+  content, identical probes with intelligence off, identical probes with intelligence *on*. But the
+  latency it was filed for is not there — index time 214.7 s → 210.3 s best-of-3 with the
+  distributions overlapping, and a reranked query 8.105 s → 8.096 s (n=20 medians), which is nothing.
+  Context creation costs 1–3 ms, so 30 of them cannot show up in an 8 s query. Kept for the API
+  shape #14 and #15 need — `rerank_batch` hands the reranker its whole candidate set — and for
+  deleting a comment that gave the wrong reason. Phase 2 (true multi-sequence decode) is unbuilt and
+  is where an actual speed-up would come from
 - **#14** the reranker scores a truncated preview, not the chunk — and a different fraction depending
   on the lane. Blocked on getting full text back by chunk key: it lives only in `chunks_fts`, whose
   `file_id`/`chunk_seq` are `UNINDEXED` and cannot be indexed, so this probably wants a `chunks.text`
@@ -239,10 +250,11 @@ probes reported *identical* verdicts at identical ranks and confidences while th
 result slots moved. Any further work on the semantic lane — #10's document side, #8's model swap,
 #5's knobs — is unmeasurable until the battery exists.
 
-**#13 is the exception and can go whenever.** It is a pure latency change: same index, same ranking,
-byte-identical output, so it needs no battery to adjudicate. The reranker pair behind it —
-**#13 → #14 → #15** — is otherwise the same story as everything else, and #14/#15 should be measured
-together once #3 exists. #15 is worth keeping in view while scoping #4: a cross-encoder probability
+**#13 was the exception and is done.** It needed no battery to adjudicate — same index, same
+ranking, byte-identical output — which is also how it managed to disprove its own premise without
+waiting for #3. The pair behind it, **#14 → #15**, is the same story as everything else, and the two
+should be measured together once #3 exists. #15 is worth keeping in view while scoping #4: a
+cross-encoder probability
 is the calibrated score a relevance floor wants, and RRF scores demonstrably are not (the nonsense
 query's top RRF score already exceeds a legitimate third-place result).
 
