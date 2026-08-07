@@ -23,6 +23,7 @@ git fetch upstream && git diff --stat upstream/main main
 | `chunks.seq` | chunk identity — section-level retrieval | this fork, issue #6 |
 | `src/prefix.rs` | contextual embedding prefix, **off by default** | this fork, issue #2 |
 | `insert_fts_chunk` | index the whole chunk, not its 200-char snippet | this fork, issue #11 |
+| `ensure_embedding_dim` | embed at the model's native width; no hidden truncation | this fork, issue #12 |
 
 Cherry-picked rather than merged: PR #41 branched before upstream's #40 graph fix, so merging the
 branch wholesale would have silently reverted `src/graph.rs`.
@@ -87,14 +88,24 @@ Upstream PR #47 addresses them. Use `cargo test --lib` (533 tests) as the workin
 - **MCP servers launch once per session**, so a mid-session `git checkout` leaves the server pointed
   at the previous branch's store.
 - **`engraph status` misreports the model** as `all-MiniLM-L6-v2` while actually loading
-  `embeddinggemma-300M` at `target_dim=256`. Upstream PR #48 fixes it.
+  `embeddinggemma-300M`. Upstream PR #48 fixes it.
 - **Intelligence is not a quality dial.** Enabling it (query expansion + Qwen3 reranker, 1.6GB)
   *regressed* exact-name lookup in testing. Treat on/off as distinct configurations.
-- **Every embedding is silently truncated to 256 of the model's 768 dimensions** (issue #12).
-  `LlamaEmbed::new` takes `ModelDefaults::embed_dim` (a hardcoded 256) rather than
-  `LlamaModel::n_embd()`, so the dimension does not track the configured model and a `models.embed`
-  override changes which model runs but not how much of it is kept. Every measurement in `eval/` was
-  taken at a third of the model's dimensionality.
+- **The embedding width is the model's, read from the GGUF at load time** (this fork, issue #12).
+  `LlamaEmbed::new` takes it from `LlamaModel::n_embd()`, so a `models.embed` override changes the
+  dimension along with the model. Upstream hardcoded 256 in `ModelDefaults::embed_dim` and truncated
+  every vector to its first 256 of 768 — silently, with no config key and no relationship to the
+  model loaded. **Every measurement in `eval/` recorded before this was taken at a third of the
+  model's dimensionality.**
+- **Upgrading past #12 re-indexes the vault on the first `engraph index`.** `run_index_inner` calls
+  `store.ensure_embedding_dim`, which rebuilds `chunks_vec` at the model's width and discards every
+  chunk indexed at the old one. It is automatic and prints what it is doing, but it is a full
+  reindex, and until it runs the index is unreadable: `search` and `serve` refuse to start against a
+  width the model does not produce rather than let sqlite-vec raise a shape error.
+- **`chunks_vec` does not exist until something establishes its width.** `Store::init` runs before
+  any model is loaded, so it cannot size the table and no longer guesses; a database that has never
+  been indexed simply has no vec table, and the semantic lane returns nothing. The width comes from
+  `ensure_embedding_dim` at index time, or from the first vector written.
 - **Every embedding is computed with the wrong model's prompt prefix** (issue #10).
   `PromptFormat::EmbeddingGemma` emits `<bos>search_query:` / `<bos>search_document: {title} {text}`,
   which is *nomic-embed-text*'s convention; EmbeddingGemma documents
@@ -175,14 +186,18 @@ See issues on this repo:
 - **#4** relevance floor — configurable per-lane min scores so nonsense queries return nothing
 - **#5** embedding model config — expose output dim, tie max chunk tokens to the model's context window
 - **#8** pick a better local embedder — >512 tokens, >768 dim (pairs with #5, which exposes the knobs)
-- **#12** embed at the model's native dimension — every vector is silently truncated to its first 256
-  of 768, `dim` does not track the configured model, and truncating a non-MRL model would be silent
-  corruption. Migration is free: the existing dimension-mismatch check self-heals on upgrade
+- ~~**#12** embed at the model's native dimension~~ — **done.** Every vector had been truncated to its
+  first 256 of 768. The seed probes return identical verdicts at identical ranks and confidences,
+  while **76 of 100 slots moved underneath** — five hand-picked probes cannot measure a change to the
+  vector space, which is #3's job. Ruled out as the probe 1 explanation (#9). The migration ran
+  itself; storage roughly doubles. Optional Matryoshka truncation is deliberately left unbuilt
 - **#10** the embedding prompt format is nomic-embed-text's, not EmbeddingGemma's — both query and
   document sides are out-of-distribution. Query-side fix needs **no reindex** and is the cheapest
   open experiment in the repo; document-side needs one per configuration, so it waits for #3
 - **#9** section-per-file still beats in-place on probe 1 — #6 ruled out granularity, #2 ruled out
-  document identity in the vector, #11 ruled out lexical coverage
+  document identity in the vector, #11 ruled out lexical coverage, #12 ruled out embedding
+  dimensionality. Ranks 21+ on that probe are set by graph expansion, and the confidence ladder there
+  has survived four changes to the lanes underneath it
 - ~~**#6** section-level retrieval granularity — fuse on `(file_id, seq)` so a document can
   contribute more than one section~~ — **done**, probe 3 now returns the correct section and every
   result names its heading. Did **not** fix probe 1, so `eval/section-split.py` cannot be retired
@@ -193,6 +208,11 @@ See issues on this repo:
 Suggested order: **#10's query side, then #3.** The query-side prompt fix jumps the queue only
 because it needs no reindex — it can be A/B'd in minutes against the existing eval homes, where
 everything else here costs a rebuild per column. Its document side goes after #3 with the rest.
+
+#12 sharpened the argument for putting #3 next. It changed the vector space outright and the five
+probes reported *identical* verdicts at identical ranks and confidences while three quarters of the
+result slots moved. Any further work on the semantic lane — #10's document side, #8's model swap,
+#5's knobs — is unmeasurable until the battery exists.
 
 Then **#3**, and now with a concrete debt to pay off. Five hand-picked probes were
 enough to show that #2 trades one probe for another, and not enough to say which trade is right —

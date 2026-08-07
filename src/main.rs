@@ -1244,6 +1244,7 @@ async fn main() -> Result<()> {
             let vault_path = PathBuf::from(&vault_path_str);
             let models_dir = data_dir.join("models");
             let mut embedder = engraph::llm::LlamaEmbed::new(&models_dir, &cfg)?;
+            store.verify_embedding_dim(engraph::llm::EmbedModel::dim(&embedder))?;
             let profile = config::Config::load_vault_profile().ok().flatten();
 
             match action {
@@ -1579,21 +1580,27 @@ async fn main() -> Result<()> {
 
         Command::Models { action } => {
             let defaults = engraph::llm::ModelDefaults::default();
+            // Dimensionality belongs to the model, not to a table here, and
+            // reading it means loading the GGUF (issue #12). Report what the
+            // index was actually built at instead — the number that matters
+            // operationally — and say so plainly.
+            let indexed_dim = store::Store::open(&data_dir.join("engraph.db"))
+                .ok()
+                .and_then(|s| s.vec_table_dim().ok().flatten());
             match action {
                 ModelsAction::List => {
-                    println!("{:<30} {:>5}  DESCRIPTION", "NAME", "DIM");
+                    println!("{:<30}  DESCRIPTION", "NAME");
                     println!("{}", "-".repeat(70));
-                    let desc = "Default embedding model (GGUF)";
-                    println!(
-                        "{:<30} {:>5}  {}",
-                        defaults.embed_uri, defaults.embed_dim, desc
-                    );
+                    println!("{:<30}  Default embedding model (GGUF)", defaults.embed_uri);
                 }
                 ModelsAction::Info { name } => {
                     if name == defaults.embed_uri {
                         println!("Name:        {}", defaults.embed_uri);
                         println!("Format:      GGUF");
-                        println!("Dimensions:  {}", defaults.embed_dim);
+                        match indexed_dim {
+                            Some(d) => println!("Dimensions:  {d} (as indexed)"),
+                            None => println!("Dimensions:  set by the model at load time"),
+                        }
                         println!("Description: Default embedding model (GGUF)");
                     } else {
                         eprintln!("Unknown model: {name}");

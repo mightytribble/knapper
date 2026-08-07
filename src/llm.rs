@@ -605,9 +605,13 @@ fn try_external_tokenizer(uri: &HfModelUri, models_dir: &Path) -> Option<tokeniz
 }
 
 /// Default model URIs for the intelligence layer.
+///
+/// Deliberately carries no embedding dimensionality: the dimension is the
+/// model's, read from the GGUF at load time by [`LlamaEmbed::new`], so that a
+/// `models.embed` override changes the dimension along with the model
+/// (issue #12).
 pub struct ModelDefaults {
     pub embed_uri: String,
-    pub embed_dim: usize,
     pub rerank_uri: String,
     pub expand_uri: String,
 }
@@ -616,7 +620,6 @@ impl Default for ModelDefaults {
     fn default() -> Self {
         Self {
             embed_uri: "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf".into(),
-            embed_dim: 256,
             rerank_uri: "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf"
                 .into(),
             expand_uri: "hf:Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf".into(),
@@ -681,16 +684,22 @@ impl LlamaEmbed {
         // Detect prompt format from filename.
         let prompt_format = PromptFormat::detect(&uri.filename);
 
-        // Target output dimensionality.
-        let dim = defaults.embed_dim;
-
         // Get or initialize the global llama.cpp backend, then load model.
         let backend = llama_backend()?;
         let model_params = LlamaModelParams::default();
         let model = LlamaModel::load_from_file(backend, &model_path, &model_params)
             .map_err(|e| anyhow::anyhow!("loading GGUF model {}: {e}", model_path.display()))?;
 
-        tracing::info!("loaded LlamaEmbed from {}, target_dim={}", uri_str, dim);
+        // Output dimensionality is the model's own, read from the GGUF. It is
+        // never a constant: whatever `models.embed` points at decides it, and
+        // that one value is what gets stored, indexed and queried (issue #12).
+        let dim = usize::try_from(model.n_embd())
+            .map_err(|_| anyhow::anyhow!("model reported a negative embedding dimension"))?;
+        if dim == 0 {
+            bail!("model {uri_str} reports an embedding dimension of 0");
+        }
+
+        tracing::info!("loaded LlamaEmbed from {}, dim={}", uri_str, dim);
 
         Ok(Self {
             model,
@@ -700,7 +709,11 @@ impl LlamaEmbed {
         })
     }
 
-    /// Run embedding inference and return the truncated, L2-normalized embedding.
+    /// Run embedding inference and return the L2-normalized embedding.
+    ///
+    /// The vector comes back at the model's full width. Nothing is discarded
+    /// here — optional Matryoshka truncation is a separate, opt-in feature and
+    /// must not be the silent default (issue #12).
     fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
         // Tokenize using llama.cpp's built-in tokenizer.
         // Use AddBos::Never because PromptFormat already adds <bos> for embeddinggemma.
@@ -741,20 +754,23 @@ impl LlamaEmbed {
             .embeddings_seq_ith(0)
             .map_err(|e| anyhow::anyhow!("getting embeddings: {e}"))?;
 
-        // Truncate to target dimensionality.
-        let full_dim = embeddings.len();
-        let truncated: Vec<f32> = if full_dim > self.dim {
-            embeddings[..self.dim].to_vec()
+        // The width llama.cpp returns must be the width we told the store to
+        // expect. A disagreement means `dim` and the model have come apart, and
+        // silently storing a short vector is how issue #12 happened.
+        if embeddings.len() != self.dim {
+            bail!(
+                "model returned {} dimensions, expected {}",
+                embeddings.len(),
+                self.dim
+            );
+        }
+
+        // L2 normalize — `embeddings_seq_ith` returns the raw pooled vector.
+        let norm: f32 = embeddings.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let normalized = if norm > 0.0 {
+            embeddings.iter().map(|x| x / norm).collect()
         } else {
             embeddings.to_vec()
-        };
-
-        // L2 normalize.
-        let norm: f32 = truncated.iter().map(|x| x * x).sum::<f32>().sqrt();
-        let normalized = if norm > 0.0 {
-            truncated.iter().map(|x| x / norm).collect()
-        } else {
-            truncated
         };
 
         Ok(normalized)
@@ -1357,7 +1373,7 @@ mod tests {
     fn test_model_defaults() {
         let defaults = ModelDefaults::default();
         assert!(defaults.embed_uri.starts_with("hf:"));
-        assert_eq!(defaults.embed_dim, 256);
+        // No dimension here on purpose — it belongs to the model (issue #12).
         assert!(
             defaults.embed_uri.contains("embeddinggemma"),
             "default embed model should be embeddinggemma"

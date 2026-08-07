@@ -471,6 +471,7 @@ pub fn run_search(
 
     let db_path = data_dir.join("engraph.db");
     let store = Store::open(&db_path).context("opening store")?;
+    store.verify_embedding_dim(embedder.dim())?;
 
     // Load intelligence models if enabled.
     let mut orchestrator_model: Option<Box<dyn llm::OrchestratorModel>> =

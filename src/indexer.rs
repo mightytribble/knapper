@@ -502,18 +502,6 @@ pub fn run_index(vault_path: &Path, config: &Config, rebuild: bool) -> Result<In
     let models_dir = data_dir.join("models");
     let mut embedder = crate::llm::LlamaEmbed::new(&models_dir, config)?;
 
-    // Check for embedding dimension change
-    let model_dim = embedder.dim();
-    let mut rebuild = rebuild;
-    if store.has_dimension_mismatch(model_dim)? {
-        eprintln!("Embedding model upgraded. Re-indexing vault (this may take a few minutes)...");
-        store.reset_for_reindex(model_dim)?;
-        rebuild = true; // Force full rebuild
-    }
-
-    // Store current dimension for future checks
-    store.set_meta("embedding_dim", &model_dim.to_string())?;
-
     let profile = crate::config::Config::load_vault_profile().ok().flatten();
     run_index_inner(
         vault_path,
@@ -550,6 +538,19 @@ fn run_index_inner(
     profile: Option<&VaultProfile>,
 ) -> Result<IndexResult> {
     let start = Instant::now();
+
+    // Size vector storage to the model before anything is written. On a width
+    // change this discards the index, so a full rebuild is not optional
+    // (issue #12).
+    let mut rebuild = rebuild;
+    if let Some(previous) = store.ensure_embedding_dim(embedder.dim())? {
+        eprintln!(
+            "Embedding dimension changed ({previous} -> {}). \
+             Re-indexing vault (this may take a few minutes)...",
+            embedder.dim()
+        );
+        rebuild = true;
+    }
 
     let cleaned = crate::writer::cleanup_temp_files(vault_path)?;
     if cleaned > 0 {
