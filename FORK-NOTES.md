@@ -247,6 +247,18 @@ See issues on this repo:
   it wants more queries on that question, not a hold on the queue.
   Shipped on and unswitchable, because "200 chars, or a 64-token match window if FTS found it" is not
   an alternative strategy worth preserving. `[rerank] document_title` is a switch and is off
+- **#9** the graph lane is fused as if it were an alternative ranking, and its weight locks the
+  content lanes out. `graph.rs:78` skips any neighbour already in the seed set, so graph results are
+  **disjoint from the content lanes by construction** — they can never accumulate agreement, so a
+  graph result's score is a pure function of the weight constant. At `Relationship` (graph 1.5) its
+  20 capped expansions sweep the whole top 20; at 1.0 it contributes nothing to any other probe.
+  Demonstrated: deleting the word "who" moves `temple-of-the-architect.md` from absent-from-top-20
+  to **rank 1 at 100%**. This is the answer to four ruled-out explanations — all of them tried to
+  improve a lane that could not enter the ranking. Fix is #15's pool
+- **#18** query expansion splits on words against a 16-item stopword list containing no modals and
+  no verbs, so `dragon that can take human form` becomes seven expansions including `that` and
+  `can` — ~840 result slots for one question, and `collapse_lane` then pools BM25 scores from
+  different queries and sorts them as if commensurable
 - **#17** resolve queries against a tag/alias registry and expand on what they name. Aliases are
   parsed at index time and **thrown away** — there is no registry to resolve against — and tags reach
   retrieval only as a yes/no admission test on graph expansion. Hangs on the expansion slot rather
@@ -336,15 +348,34 @@ normalisation would then favour that document's *shortest* chunk, which is exact
 Query-conditional, no per-file constant, and it reaches both lanes through the expansion slot that
 already exists.
 
-**Probe 1 is the open question #6 was expected to close** (now #9). The section-per-file transform
-puts `temple-of-the-architect` at ranks 1–4; indexing in place leaves it at 21 before #6, after #6,
-under all three prefix configurations of #2, and after #11 — where the ranks are identical to the
-rank (temple 21/22/23, `archivist-lenne` 25/28/32). Three explanations are now ruled out: the
-ranking unit (#6), document identity in the vector (#2), and lexical coverage (#11). What is left of
-the transform's difference is
-that each section became a whole document — its own embedding computed over that text alone, its own
-docid, its own graph node. One probe cannot separate those three, so this one really does want more
-queries — but it wants them *for this question*, which is a morning's work, not a battery.
+**Probe 1 is answered (#9), and the answer was never the semantic lane.** Its expected notes sat at
+ranks 21+ through #6, #2, #11 and #12 — four investigations, each reporting "no effect" and each
+read as eliminating a hypothesis. They were eliminating the same one twice removed: every one of
+them tried to make the **semantic lane better**, and probe 1's top 20 contains no semantic result at
+all. It is twenty single-vote graph expansions.
+
+The query starts with "who", which `llm.rs:922` classifies `Relationship`, which sets graph to 1.5
+against the content lanes' 0.8. Graph is capped at 20 expansions, and `weight/(60+rank)` makes its
+*worst* result (1.5/80 = 0.0188) beat the semantic lane's *best* (0.8/61 = 0.0131) by 43%. Every
+slot is taken before the semantic lane is consulted. Two-lane agreement is the only way through
+(0.8/61 × 2 = 0.0262) and probe 1 is the zero-lexical-overlap probe by construction, so agreement is
+impossible. **The probe built to isolate the semantic lane is the one query shape where the semantic
+lane cannot reach the results.**
+
+One word demonstrates it. Dropping `who` — same binary, same index — moves
+`temple-of-the-architect.md` from **absent from the top 20** to **rank 1 at 100%**, with a second
+section at rank 2 and a snippet naming Archivist Lenne.
+
+The general defect is that `graph.rs:78` skips any neighbour already in the seed set, so graph
+results are disjoint from the content lanes *by construction*. RRF fuses alternative rankings of the
+same corpus; a disjoint set can never accumulate agreement, so its score is a pure function of the
+weight constant — invisible at 1.0, total at 1.5. Fusing a recall step as though it were a ranking
+is a category error, and #15's pool removes it by construction.
+
+The section-per-file transform's win is no longer mysterious either: its sections are their own
+files, dense enough in "temple" for **both** content lanes to find them, which is the one
+configuration that clears the graph block. Consistent with everything measured, not yet measured
+directly — worth doing before `eval/section-split.py` is retired.
 
 `eval/` holds the probes and the harnesses: `probe.sh` for what came back, `bench-search.sh` for how
 long it took.
