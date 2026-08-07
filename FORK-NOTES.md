@@ -19,6 +19,7 @@ git fetch upstream && git diff --stat upstream/main main
 |---|---|---|
 | `a19f27a` | chunker overlap-stride crawl | cherry-pick of upstream PR #41 (`ec7b06b`, @jdubdevs) |
 | `structure_chunk` | structure-first chunking | this fork, issue #1 |
+| `src/exclude.rs` | glob `exclude` patterns, shared by indexer + watcher | this fork, issue #7 |
 
 Cherry-picked rather than merged: PR #41 branched before upstream's #40 graph fix, so merging the
 branch wholesale would have silently reverted `src/graph.rs`.
@@ -52,7 +53,7 @@ export LIBCLANG_PATH="$HOME/.engraph-buildenv/lib/python3.12/site-packages/clang
 export BINDGEN_EXTRA_CLANG_ARGS="-I/usr/lib/gcc/x86_64-linux-gnu/13/include -I/usr/include -I/usr/include/x86_64-linux-gnu"
 
 cargo build --release        # ~10 min cold, ~20s incremental
-cargo test --lib             # 469 pass
+cargo test --lib             # 499 pass
 ```
 
 Each env var exists for a specific failure. Omit one and you get:
@@ -68,9 +69,10 @@ Adjust the gcc version in the include path (`13`) and the python version (`pytho
 ### Known pre-existing test failures
 
 `cargo test` (full) fails to compile `tests/integration.rs` and `tests/write_pipeline.rs`:
-`unresolved import engraph::embedder`, `engraph::hnsw`. **These are broken on pristine upstream** —
-verify with `git stash && cargo test --test integration`. Upstream PR #47 addresses them.
-Use `cargo test --lib` (469 tests) as the working suite.
+`unresolved import engraph::embedder`, `engraph::hnsw`, and a `walk_vault` arity mismatch.
+**These are broken on pristine upstream** — verify with `git stash && cargo clippy --all-targets`.
+Upstream PR #47 addresses them. Use `cargo test --lib` (499 tests) as the working suite.
+`cargo clippy -- -D warnings`, which is what CI runs, is clean.
 
 ## Runtime gotchas
 
@@ -85,6 +87,15 @@ Use `cargo test --lib` (469 tests) as the working suite.
   `embeddinggemma-300M` at `target_dim=256`. Upstream PR #48 fixes it.
 - **Intelligence is not a quality dial.** Enabling it (query expansion + Qwen3 reranker, 1.6GB)
   *regressed* exact-name lookup in testing. Treat on/off as distinct configurations.
+- **`exclude` is `.gitignore`-style globs** (`src/exclude.rs`, this fork). No separator means the
+  pattern matches at any depth; a trailing `/` means a directory and its contents; an embedded `/`
+  anchors to the vault root. Adding a pattern purges what is already indexed on the next run, via
+  `diff_vault`'s deleted-files path. Upstream matched patterns as substrings, where `*.canvas` hit
+  nothing at all.
+- **Derived index files poison the graph lane.** Obsidian-style `*-index.md` cheat sheets link to
+  everything and are linked to by nothing, making them the largest out-hubs in the vault. Any two
+  notes they list become 2-hop neighbours, so graph expansion returns siblings-of-a-category rather
+  than answers. Exclude them.
 - **Retrieval is file-level, not chunk-level.** Every lane collapses to one result per `file_path`
   before fusion (`search.rs:131`, `fusion.rs:45`). However good the chunking, a document can only
   occupy one slot in the results, and the chunk that wins it may not be the relevant one. This is
@@ -102,13 +113,12 @@ See issues on this repo:
 - **#5** embedding model config — expose output dim, tie max chunk tokens to the model's context window
 - **#6** section-level retrieval granularity — dedup on `(file_path, heading)` so a document can
   contribute more than one section to the results
-- **#7** exclude derived `*-index.md` / `templates/` from ingest, and make `exclude` glob for real
-  (it is documented as globs, implemented as substring `contains`)
+- ~~**#7** exclude derived `*-index.md` / `templates/` from ingest, and make `exclude` glob for
+  real~~ — **done**, 14.2% of chunks and 18.3% of edges removed from the eval corpus
 
-Suggested order: **#7 first** (it is small, and it stops the rest being tuned against a corpus that
-is 14% derived boilerplate), then **#6** — measurement showed it is the binding constraint, and it
-raises the ceiling for #2. Then **#3** (supplies the measurements the rest are judged by), then
-**#5** (makes chunk size and dim configurable, which #2/#3 need to compare configurations), then #2,
-then #4 (needs #3's negative controls to calibrate).
+Suggested order: **#6 first** — measurement showed it is the binding constraint, and it raises the
+ceiling for #2. Then **#3** (supplies the measurements the rest are judged by), then **#5** (makes
+chunk size and dim configurable, which #2/#3 need to compare configurations), then #2, then #4
+(needs #3's negative controls to calibrate).
 
 `eval/` holds the seed material for #3.
