@@ -247,6 +247,13 @@ See issues on this repo:
   it wants more queries on that question, not a hold on the queue.
   Shipped on and unswitchable, because "200 chars, or a 64-token match window if FTS found it" is not
   an alternative strategy worth preserving. `[rerank] document_title` is a switch and is off
+- **#17** resolve queries against a tag/alias registry and expand on what they name. Aliases are
+  parsed at index time and **thrown away** — there is no registry to resolve against — and tags reach
+  retrieval only as a yes/no admission test on graph expansion. Hangs on the expansion slot rather
+  than a new lane because every expansion runs through *both* content lanes, and in RRF a second
+  lane's vote outweighs any position within one. Tags resolve semantically (a `tag_centroids` table,
+  the same machinery as `folder_centroids`), aliases lexically (`links.rs`'s fuzzy name matching).
+  Replaces the withdrawn FTS-injection experiment. Probe 4 is the guard, probe 5 the control
 - **#16** `rerank_candidates` is hardcoded at 30 in four places and unreachable from `config.toml`. It
   was academic while the reranker read previews; after #14 it is the one free term in a lane that
   costs half the query. Wanted as a knob to sweep, not as a new default — cutting it also
@@ -317,11 +324,17 @@ Then **#5** (makes chunk size and dim configurable, which comparing configuratio
 which #11 made more pressing, not less: the FTS lane now finds genuine keyword matches for nonsense
 queries where it used to find none by accident.
 
-**One experiment worth queueing:** putting per-file identity (name, aliases, tags, path segments)
-into the FTS index. It is the natural follow-on from #11 and was deliberately excluded from it,
-because it reintroduces #2's failure mode in the lexical lane — a term on every chunk of a document
-is a per-file constant, and BM25 length normalisation would favour that document's *shortest* chunk.
-Probe 4 is exactly that shape and is the probe that would catch it.
+**Withdrawn:** putting per-file identity (name, aliases, tags, path segments) into the FTS index,
+described here for several revisions as the natural follow-on from #11. It is the wrong shape, and
+the reason is the RRF arithmetic. Injecting terms changes BM25 scores, which moves positions *inside*
+the FTS lane — and a lane's whole 60-deep spread is worth 2× (`weight/(60+rank)`), while appearing in
+a *second* lane adds a whole new term, so two lanes at rank 20 beat one lane at rank 1. It would cost
+a reindex to shuffle the one dimension that barely counts, and it reintroduces #2's failure mode in
+the lexical lane besides: a term on every chunk of a document is a per-file constant, and BM25 length
+normalisation would then favour that document's *shortest* chunk, which is exactly probe 4's shape.
+**#17 replaces it** — resolve the query against a tag/alias registry and expand on what it names.
+Query-conditional, no per-file constant, and it reaches both lanes through the expansion slot that
+already exists.
 
 **Probe 1 is the open question #6 was expected to close** (now #9). The section-per-file transform
 puts `temple-of-the-architect` at ranks 1–4; indexing in place leaves it at 21 before #6, after #6,
