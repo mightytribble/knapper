@@ -91,6 +91,10 @@ See issues on this repo:
 
 - **#1** structure-first chunking (section → sub-section → paragraph → size)
 - **#2** contextual embedding prefix (filename / heading path / tags into every chunk)
-- **#3** retrieval eval battery — gates #1 and #2
+- **#3** retrieval eval battery — gates #1 and #2, and calibrates #4
+- **#4** relevance floor — configurable per-lane min scores so nonsense queries return nothing
+
+Suggested order: **#3 first** (it supplies the measurements the other three are judged by), then
+#1 and #2 (independent of each other), then #4 (needs #3's negative controls to calibrate).
 
 `eval/` holds the seed material for #3.
