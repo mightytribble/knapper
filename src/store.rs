@@ -923,6 +923,11 @@ impl Store {
     }
 
     /// Insert a chunk's text into the FTS5 table.
+    ///
+    /// `text` is the **whole chunk**, not `chunks.snippet` — this table is the
+    /// only place a chunk's full text is retained, so anything not passed here
+    /// is unreachable by keyword search (issue #11). `chunks_fts` is a standalone
+    /// FTS5 table rather than external-content, so it keeps its own copy.
     pub fn insert_fts_chunk(&self, file_id: i64, chunk_seq: i64, text: &str) -> Result<()> {
         self.conn.execute(
             "INSERT INTO chunks_fts (content, file_id, chunk_seq) VALUES (?1, ?2, ?3)",

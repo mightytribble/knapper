@@ -424,7 +424,10 @@ pub fn index_file(
             vector,
         )?;
         store.insert_vec(vector_id, vector)?;
-        store.insert_fts_chunk(file_id, chunk_seq as i64, snippet)?;
+        // FTS gets the whole chunk, not the snippet (issue #11). `snippet` is
+        // the display field on the `chunks` row; keyword search needs the text,
+        // and this is the only place it is retained.
+        store.insert_fts_chunk(file_id, chunk_seq as i64, &chunk.text)?;
     }
 
     // 7. Register tags
@@ -1390,7 +1393,8 @@ mod tests {
         assert!(!definition.snippet.contains("Archdragon"));
         assert!(!definition.snippet.contains("aliases"));
 
-        // FTS indexes the snippet, so prefix-only terms must not be searchable.
+        // FTS indexes the chunk's own text, so prefix-only terms — which are
+        // never part of it — must not be searchable.
         let by_alias = store
             .best_matching_chunk_seq(file.id, &["Wyrm".to_string()])
             .unwrap();
@@ -1402,6 +1406,55 @@ mod tests {
             .best_matching_chunk_seq(file.id, &["breath".to_string()])
             .unwrap();
         assert_eq!(by_body, Some(1));
+    }
+
+    /// Issue #11: FTS used to be given `chunk.snippet`, the leading 200
+    /// characters, so a term appearing later in a chunk was unreachable by
+    /// keyword search — 70% of the eval corpus, in practice. The display field
+    /// is still truncated; only what FTS is given changed.
+    #[test]
+    fn keyword_search_reaches_past_the_snippet_boundary() {
+        let tmp = TempDir::new().unwrap();
+        let filler = "The coast road runs north through salt marsh and low dune. ".repeat(8);
+        write_file(
+            tmp.path(),
+            "places/coast.md",
+            &format!("## The Coast Road\n\n{filler}\n\nIt ends at Saltmere.\n"),
+        );
+
+        let store = Store::open_memory().unwrap();
+        let mut embedder = crate::llm::MockLlm::new(256);
+        run_index_shared(
+            tmp.path(),
+            &Config::default(),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let file = store.get_file("places/coast.md").unwrap().unwrap();
+        let chunk = store.get_chunk_by_seq(file.id, 0).unwrap().unwrap();
+
+        // The premise: "Saltmere" is well past where the snippet stops.
+        assert!(
+            chunk.snippet.len() <= 203,
+            "snippet grew: {}",
+            chunk.snippet
+        );
+        assert!(
+            !chunk.snippet.contains("Saltmere"),
+            "fixture is too short to test anything"
+        );
+
+        assert_eq!(
+            store
+                .best_matching_chunk_seq(file.id, &["Saltmere".to_string()])
+                .unwrap(),
+            Some(0),
+            "a term past character 200 must still be searchable"
+        );
     }
 
     #[test]

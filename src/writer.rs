@@ -430,7 +430,20 @@ fn file_mtime(path: &Path) -> Result<i64> {
 }
 
 /// Pre-computed chunk data ready for store insertion.
-type ChunkData = (String, String, Vec<f32>, i64); // (heading, snippet, vector, token_count)
+///
+/// Named fields rather than a tuple because `text` and `snippet` are adjacent
+/// `String`s that go to different places — the full text to FTS, the 200-char
+/// snippet to the `chunks` row for display. Transposing them is issue #11.
+struct ChunkData {
+    heading: String,
+    /// The whole chunk, as indexed for keyword search. Not persisted anywhere
+    /// else: `chunks` has no `text` column.
+    text: String,
+    /// Leading 200 characters, the display field.
+    snippet: String,
+    vector: Vec<f32>,
+    token_count: i64,
+}
 
 /// Chunk content, embed, and return pre-computed data ready for store insertion.
 ///
@@ -453,9 +466,13 @@ fn precompute_chunks(
 
     let mut results = Vec::with_capacity(chunks.len());
     for (chunk, embedding) in chunks.into_iter().zip(embeddings) {
-        let heading = chunk.heading.unwrap_or_default();
-        let token_count = chunk.text.split_whitespace().count() as i64;
-        results.push((heading, chunk.snippet, embedding, token_count));
+        results.push(ChunkData {
+            heading: chunk.heading.unwrap_or_default(),
+            token_count: chunk.text.split_whitespace().count() as i64,
+            text: chunk.text,
+            snippet: chunk.snippet,
+            vector: embedding,
+        });
     }
     Ok(results)
 }
@@ -651,19 +668,20 @@ pub fn create_note(
         )?;
 
         let start_vid = store.next_vector_id()?;
-        for (chunk_seq, (heading, snippet, vector, token_count)) in chunk_data.iter().enumerate() {
+        for (chunk_seq, c) in chunk_data.iter().enumerate() {
             let vid = start_vid + chunk_seq as u64;
             store.insert_chunk_with_vector(
                 file_id,
                 chunk_seq as i64,
-                heading,
-                snippet,
+                &c.heading,
+                &c.snippet,
                 vid,
-                *token_count,
-                vector,
+                c.token_count,
+                &c.vector,
             )?;
-            store.insert_vec(vid, vector)?;
-            store.insert_fts_chunk(file_id, chunk_seq as i64, snippet)?;
+            store.insert_vec(vid, &c.vector)?;
+            // FTS gets the whole chunk, not the snippet (issue #11).
+            store.insert_fts_chunk(file_id, chunk_seq as i64, &c.text)?;
         }
 
         build_edges_for_file(store, file_id, &full_content)?;
@@ -699,7 +717,7 @@ pub fn create_note(
             {
                 let folder = &placement_result.folder;
                 let new_vecs: Vec<&[f32]> =
-                    chunk_data.iter().map(|(_, _, v, _)| v.as_slice()).collect();
+                    chunk_data.iter().map(|c| c.vector.as_slice()).collect();
                 if !new_vecs.is_empty() {
                     let dim = new_vecs[0].len();
                     let mut mean_vec = vec![0.0f32; dim];
@@ -807,19 +825,20 @@ pub fn append_to_note(
         )?;
 
         let start_vid = store.next_vector_id()?;
-        for (chunk_seq, (heading, snippet, vector, token_count)) in chunk_data.iter().enumerate() {
+        for (chunk_seq, c) in chunk_data.iter().enumerate() {
             let vid = start_vid + chunk_seq as u64;
             store.insert_chunk_with_vector(
                 file_id,
                 chunk_seq as i64,
-                heading,
-                snippet,
+                &c.heading,
+                &c.snippet,
                 vid,
-                *token_count,
-                vector,
+                c.token_count,
+                &c.vector,
             )?;
-            store.insert_vec(vid, vector)?;
-            store.insert_fts_chunk(file_id, chunk_seq as i64, snippet)?;
+            store.insert_vec(vid, &c.vector)?;
+            // FTS gets the whole chunk, not the snippet (issue #11).
+            store.insert_fts_chunk(file_id, chunk_seq as i64, &c.text)?;
         }
 
         build_edges_for_file(store, file_id, &new_content)?;
@@ -1591,19 +1610,20 @@ pub fn unarchive_note(
         )?;
 
         let start_vid = store.next_vector_id()?;
-        for (seq, (heading, snippet, vector, token_count)) in chunk_data.iter().enumerate() {
+        for (seq, c) in chunk_data.iter().enumerate() {
             let vid = start_vid + seq as u64;
             store.insert_chunk_with_vector(
                 file_id,
                 seq as i64,
-                heading,
-                snippet,
+                &c.heading,
+                &c.snippet,
                 vid,
-                *token_count,
-                vector,
+                c.token_count,
+                &c.vector,
             )?;
-            store.insert_vec(vid, vector)?;
-            store.insert_fts_chunk(file_id, seq as i64, snippet)?;
+            store.insert_vec(vid, &c.vector)?;
+            // FTS gets the whole chunk, not the snippet (issue #11).
+            store.insert_fts_chunk(file_id, seq as i64, &c.text)?;
         }
 
         build_edges_for_file(store, file_id, &restored_content)?;
@@ -2389,6 +2409,74 @@ mod tests {
         assert!(scalars.is_empty());
         assert!(tags.is_empty());
         assert!(aliases.is_empty());
+    }
+
+    /// Issue #11, on the write path. `precompute_chunks` is shared by
+    /// `create_note`, `append_to_note` and `unarchive_note`, and all three hand
+    /// the same field to FTS — so this covers the wiring for all of them.
+    #[test]
+    fn precompute_keeps_the_whole_chunk_for_fts_and_truncates_only_the_snippet() {
+        use crate::llm::MockLlm;
+
+        let filler = "The coast road runs north through salt marsh and low dune. ".repeat(8);
+        let content = format!("## The Coast Road\n\n{filler}\n\nIt ends at Saltmere.\n");
+        let mut embedder = MockLlm::new(256);
+
+        let data = precompute_chunks(
+            "places/coast.md",
+            &content,
+            &mut embedder,
+            PrefixConfig::default(),
+        )
+        .unwrap();
+
+        let c = &data[0];
+        assert!(c.text.contains("Saltmere"), "text was truncated");
+        assert!(
+            !c.snippet.contains("Saltmere"),
+            "snippet should still stop at 200 characters"
+        );
+        assert!(c.snippet.len() <= 203);
+    }
+
+    /// End-to-end through one of the three write paths: a term appended past
+    /// the 200-character mark must be findable by keyword afterwards.
+    #[test]
+    fn appended_text_past_the_snippet_boundary_is_searchable() {
+        use crate::llm::MockLlm;
+
+        let (_tmp, store, root) = setup_vault();
+        let mut embedder = MockLlm::new(256);
+
+        let filler = "The coast road runs north through salt marsh and low dune. ".repeat(8);
+        let file_path = root.join("coast.md");
+        std::fs::write(&file_path, "# Coast\n\n## The Coast Road\n\nOriginal.\n").unwrap();
+        let mtime = file_mtime(&file_path).unwrap();
+        store
+            .insert_file("coast.md", "hash", mtime, &[], "co123", None, None)
+            .unwrap();
+
+        append_to_note(
+            AppendInput {
+                file: "coast.md".into(),
+                content: format!("\n{filler}\n\nIt ends at Saltmere.\n"),
+                modified_by: "test".into(),
+            },
+            &store,
+            &mut embedder,
+            PrefixConfig::default(),
+            &root,
+        )
+        .unwrap();
+
+        let file = store.get_file("coast.md").unwrap().unwrap();
+        assert!(
+            store
+                .best_matching_chunk_seq(file.id, &["Saltmere".to_string()])
+                .unwrap()
+                .is_some(),
+            "a term past character 200 must still be searchable"
+        );
     }
 
     #[test]

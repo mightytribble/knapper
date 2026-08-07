@@ -638,6 +638,8 @@ Search returns **sections**. A note whose "Counterspell" and "Dispel Magic" sect
 
 `embedding_prefix` puts the document's name, path, tags, aliases and the chunk's ancestor headings into the text that is **embedded**, while what is stored, displayed and keyword-matched stays the raw chunk. It is off by default: because the prefix is the same string for every chunk of a document, it separates documents from each other at the cost of separating a document's own sections, and on the test vault that lost more on exact-name lookup than it gained on conceptual queries (`eval/probes.md`). Each component is switchable so the trade can be measured per vault.
 
+The keyword lane indexes each chunk's **full text**. `chunks.snippet` — the leading 200 characters — is the display field only; it is not what BM25 searches.
+
 `exclude` takes `.gitignore`-style globs, matched against paths relative to the vault root. A pattern with no `/` matches at any depth (`*-index.md` catches `lore/lore-index.md`); a trailing `/` means a directory and everything under it; an embedded `/` anchors the pattern to the vault root (`drafts/**`). Excluding a path that is already indexed removes it from the store — chunks, vectors, FTS entries and graph edges — on the next index run.
 
 All data stored in `~/.engraph/` — single SQLite database (~10MB typical), GGUF models, and vault profile.

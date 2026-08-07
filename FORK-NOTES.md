@@ -22,6 +22,7 @@ git fetch upstream && git diff --stat upstream/main main
 | `src/exclude.rs` | glob `exclude` patterns, shared by indexer + watcher | this fork, issue #7 |
 | `chunks.seq` | chunk identity — section-level retrieval | this fork, issue #6 |
 | `src/prefix.rs` | contextual embedding prefix, **off by default** | this fork, issue #2 |
+| `insert_fts_chunk` | index the whole chunk, not its 200-char snippet | this fork, issue #11 |
 
 Cherry-picked rather than merged: PR #41 branched before upstream's #40 graph fix, so merging the
 branch wholesale would have silently reverted `src/graph.rs`.
@@ -55,7 +56,7 @@ export LIBCLANG_PATH="$HOME/.engraph-buildenv/lib/python3.12/site-packages/clang
 export BINDGEN_EXTRA_CLANG_ARGS="-I/usr/lib/gcc/x86_64-linux-gnu/13/include -I/usr/include -I/usr/include/x86_64-linux-gnu"
 
 cargo build --release        # ~10 min cold, ~20s incremental
-cargo test --lib             # 530 pass
+cargo test --lib             # 533 pass
 ```
 
 Each env var exists for a specific failure. Omit one and you get:
@@ -73,7 +74,7 @@ Adjust the gcc version in the include path (`13`) and the python version (`pytho
 `cargo test` (full) fails to compile `tests/integration.rs` and `tests/write_pipeline.rs`:
 `unresolved import engraph::embedder`, `engraph::hnsw`, and a `walk_vault` arity mismatch.
 **These are broken on pristine upstream** — verify with `git stash && cargo clippy --all-targets`.
-Upstream PR #47 addresses them. Use `cargo test --lib` (530 tests) as the working suite.
+Upstream PR #47 addresses them. Use `cargo test --lib` (533 tests) as the working suite.
 `cargo clippy -- -D warnings`, which is what CI runs, is clean.
 
 ## Runtime gotchas
@@ -119,12 +120,21 @@ Upstream PR #47 addresses them. Use `cargo test --lib` (530 tests) as the workin
 - **Changing `[embedding_prefix]` needs `engraph index --reindex`.** Incremental indexing compares
   content hashes, so a config change alone leaves every existing vector as it was and silently mixes
   two embedding schemes in one vector space.
-- **The FTS index holds each chunk's first 200 characters, not the chunk** (issue #11). All four
-  `insert_fts_chunk` sites pass `snippet`, and the full text is never stored — `chunks` has no
-  `text` column. 79.7% of chunks on the eval vault are truncated and ~70% of the corpus cannot be
-  reached by keyword search at all; `Saltmere`, a place name in two notes, returns zero FTS hits.
-  This degrades the FTS lane *and* `best_matching_chunk_seq`, so graph-lane section anchoring is
-  affected too. Assume any lexical result predates the fix until #11 lands.
+- **`chunks_fts` is where a chunk's full text lives** (this fork, issue #11) — nowhere else does.
+  `chunks` has no `text` column, only `snippet`, the leading 200 characters kept for display. So
+  whatever is not passed to `insert_fts_chunk` is unreachable by keyword search, permanently.
+  Upstream passed `snippet` at all four sites: 79.7% of eval-vault chunks were truncated and keyword
+  search reached 27.6% of the corpus. `Saltmere`, a place name in two notes, returned zero hits.
+- **Any lexical measurement taken before #11 was taken against a 27.6%-visible index**, including
+  #6's and #7's. It moved 73 of 100 probe result slots. Fixing it changes BM25 length normalisation
+  for *every* chunk — average document length goes from a near-constant 200 characters to the real
+  distribution — so ranks move in both directions rather than simply improving.
+- **The graph lane depends on the FTS index too.** `graph.rs` picks which section a neighbour
+  matched via `store.best_matching_chunk_seq`, which queries `chunks_fts`. Before #11 it was choosing
+  sections while able to see the first 200 characters of each.
+- **Changing what goes into FTS needs `engraph index --reindex`**, for the same reason
+  `[embedding_prefix]` does: incremental indexing compares content hashes and will not notice. There
+  is no backfill possible here — the full text exists nowhere in the database to recover it from.
 - **RRF scores tie constantly**, since every lane hands out the same `weight/(k + rank)` values.
   Sorting them without a tiebreak means `HashMap` order decides the ranking, and results vary
   run-to-run — they did, from about rank 7 down, until #6 added tiebreaks in `fusion.rs` and
@@ -141,15 +151,17 @@ See issues on this repo:
   conceptual probe, −4 (out of the window) on the exact-name non-regression probe. Both of its
   retrieval acceptance criteria turned out to have been met already by #1 + #6. Needs #3 to decide
   whether a length-scaled or conditional prefix is worth having.
-- **#11** FTS indexes the 200-char snippet, not the chunk — **70% of the corpus is unreachable by
-  keyword search.** Straight defect, four-line fix, but it moves every probe rank, so it should land
-  before #3 freezes a battery against the current numbers.
+- ~~**#11** FTS indexes the 200-char snippet, not the chunk~~ — **done.** Keyword search had been
+  reaching 27.6% of the corpus; `Saltmere` and four other verified-present terms returned zero hits.
+  Probe 3 went @5 → **@1**, the best result any configuration has produced on it, and probe 4 held
+  at @2 under the heaviest churn of any probe. Nothing regressed. Moved 73 of 100 probe slots, so
+  every lexical number recorded before it is superseded.
 - **#3** retrieval eval battery — now adjudicates #2, and calibrates #4
 - **#4** relevance floor — configurable per-lane min scores so nonsense queries return nothing
 - **#5** embedding model config — expose output dim, tie max chunk tokens to the model's context window
 - **#8** pick a better local embedder — >512 tokens, >768 dim (pairs with #5, which exposes the knobs)
 - **#9** section-per-file still beats in-place on probe 1 — #6 ruled out granularity, #2 ruled out
-  document identity in the vector
+  document identity in the vector, #11 ruled out lexical coverage
 - ~~**#6** section-level retrieval granularity — fuse on `(file_id, seq)` so a document can
   contribute more than one section~~ — **done**, probe 3 now returns the correct section and every
   result names its heading. Did **not** fix probe 1, so `eval/section-split.py` cannot be retired
@@ -157,20 +169,26 @@ See issues on this repo:
 - ~~**#7** exclude derived `*-index.md` / `templates/` from ingest, and make `exclude` glob for
   real~~ — **done**, 14.2% of chunks and 18.3% of edges removed from the eval corpus
 
-Suggested order: **#11 then #3.** #11 first because it is a bug rather than a design question, and
-because it invalidates the lexical half of every measurement below — including #6's, since
-`best_matching_chunk_seq` resolves graph-lane sections through `chunks_fts`. Freezing a battery
-before fixing it would bake the defect into the baseline. Then #3, and now with a concrete debt to
-pay off. Five hand-picked probes were
+Suggested order: **#3 next**, and now with a concrete debt to pay off. Five hand-picked probes were
 enough to show that #2 trades one probe for another, and not enough to say which trade is right —
-the same five gave contradictory verdicts on three configurations of the same feature. #3 supplies
-the measurements everything else is judged by. Then **#5** (makes chunk size and dim configurable,
-which #3 needs to compare configurations), then #4 (needs #3's negative controls to calibrate).
+the same five gave contradictory verdicts on three configurations of the same feature. #11 then
+moved 73 of the 100 slots those verdicts were read from. #3 supplies the measurements everything
+else is judged by. Then **#5** (makes chunk size and dim configurable, which #3 needs to compare
+configurations), then #4 — which #11 made more pressing, not less: the FTS lane now finds genuine
+keyword matches for nonsense queries where it used to find none by accident.
+
+**One experiment #3 should own:** putting per-file identity (name, aliases, tags, path segments)
+into the FTS index. It is the natural follow-on from #11 and was deliberately excluded from it,
+because it reintroduces #2's failure mode in the lexical lane — a term on every chunk of a document
+is a per-file constant, and BM25 length normalisation would favour that document's *shortest* chunk.
+Probe 4 is exactly that shape and is the probe that would catch it.
 
 **Probe 1 is the open question #6 was expected to close** (now #9). The section-per-file transform
 puts `temple-of-the-architect` at ranks 1–4; indexing in place leaves it at 21 before #6, after #6,
-and under all three prefix configurations of #2. Two explanations are now ruled out: the ranking
-unit (#6) and document identity in the vector (#2). What is left of the transform's difference is
+under all three prefix configurations of #2, and after #11 — where the ranks are identical to the
+rank (temple 21/22/23, `archivist-lenne` 25/28/32). Three explanations are now ruled out: the
+ranking unit (#6), document identity in the vector (#2), and lexical coverage (#11). What is left of
+the transform's difference is
 that each section became a whole document — its own embedding computed over that text alone, its own
 docid, its own graph node. It needs #3 to diagnose against more than one query.
 
