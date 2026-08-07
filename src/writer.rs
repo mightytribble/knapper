@@ -12,6 +12,7 @@ use crate::indexer::build_edges_for_file;
 use crate::links;
 use crate::llm::EmbedModel;
 use crate::placement::{self, PlacementHints};
+use crate::prefix::{DocContext, PrefixConfig};
 use crate::profile::VaultProfile;
 use crate::store::Store;
 
@@ -241,7 +242,7 @@ pub fn split_frontmatter(content: &str) -> (String, String) {
 /// scalar fields plus separate lists for `tags` and `aliases`.
 ///
 /// Returns (scalars, tags, aliases).
-fn parse_frontmatter_fields(
+pub(crate) fn parse_frontmatter_fields(
     fm_block: &str,
 ) -> (BTreeMap<String, String>, Vec<String>, Vec<String>) {
     let mut scalars: BTreeMap<String, String> = BTreeMap::new();
@@ -432,11 +433,22 @@ fn file_mtime(path: &Path) -> Result<i64> {
 type ChunkData = (String, String, Vec<f32>, i64); // (heading, snippet, vector, token_count)
 
 /// Chunk content, embed, and return pre-computed data ready for store insertion.
-fn precompute_chunks(content: &str, embedder: &mut impl EmbedModel) -> Result<Vec<ChunkData>> {
+///
+/// `prefix` must match what [`crate::indexer::index_file`] used, or notes
+/// written through this path land in the same vector space as the indexed ones
+/// while having been embedded a different way.
+fn precompute_chunks(
+    rel_path: &str,
+    content: &str,
+    embedder: &mut impl EmbedModel,
+    prefix: PrefixConfig,
+) -> Result<Vec<ChunkData>> {
     let parsed = chunk_markdown(content);
     let chunks = split_oversized_chunks(parsed.chunks, &|s| s.split_whitespace().count(), 512, 50);
 
-    let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
+    let doc = DocContext::from_file(rel_path, content);
+    let embed_texts = crate::prefix::embed_texts(&doc, &chunks, prefix);
+    let texts: Vec<&str> = embed_texts.iter().map(String::as_str).collect();
     let embeddings = embedder.embed_batch(&texts)?;
 
     let mut results = Vec::with_capacity(chunks.len());
@@ -494,6 +506,7 @@ pub fn create_note(
     input: CreateNoteInput,
     store: &Store,
     embedder: &mut impl EmbedModel,
+    prefix: PrefixConfig,
     vault_path: &Path,
     profile: Option<&VaultProfile>,
 ) -> Result<WriteResult> {
@@ -611,7 +624,7 @@ pub fn create_note(
     }
 
     // Step 6: Pre-compute chunks + embeddings BEFORE transaction
-    let chunk_data = precompute_chunks(&full_content, embedder)?;
+    let chunk_data = precompute_chunks(&rel_path, &full_content, embedder, prefix)?;
 
     let content_hash = compute_content_hash(&full_content);
     let docid = generate_docid(&rel_path);
@@ -728,6 +741,7 @@ pub fn append_to_note(
     input: AppendInput,
     store: &Store,
     embedder: &mut impl EmbedModel,
+    prefix: PrefixConfig,
     vault_path: &Path,
 ) -> Result<WriteResult> {
     // Step 1: Resolve file
@@ -753,7 +767,7 @@ pub fn append_to_note(
     let new_content = format!("{}\n{}", existing_content.trim_end(), input.content);
 
     // Step 4: Pre-compute new chunks + embeddings
-    let chunk_data = precompute_chunks(&new_content, embedder)?;
+    let chunk_data = precompute_chunks(&file_record.path, &new_content, embedder, prefix)?;
 
     let content_hash = compute_content_hash(&new_content);
     let docid = file_record
@@ -1491,6 +1505,7 @@ pub fn unarchive_note(
     file: &str,
     store: &Store,
     embedder: &mut impl EmbedModel,
+    prefix: PrefixConfig,
     vault_path: &Path,
 ) -> Result<WriteResult> {
     // Resolve — the file may not be in the index (archived notes are excluded).
@@ -1558,7 +1573,7 @@ pub fn unarchive_note(
     atomic_write(&restore_full_path, &restored_content, false)?;
 
     // Index the restored note
-    let chunk_data = precompute_chunks(&restored_content, embedder)?;
+    let chunk_data = precompute_chunks(&original_path, &restored_content, embedder, prefix)?;
     let content_hash = compute_content_hash(&restored_content);
     let docid = generate_docid(&original_path);
     let mtime = file_mtime(&restore_full_path).unwrap_or(0);
@@ -2410,7 +2425,13 @@ mod tests {
             content: "\n## Appended\n\nAppended content\n".into(),
             modified_by: "test".into(),
         };
-        let result = append_to_note(append_input, &store, &mut embedder, &root);
+        let result = append_to_note(
+            append_input,
+            &store,
+            &mut embedder,
+            PrefixConfig::default(),
+            &root,
+        );
         assert!(
             result.is_ok(),
             "append after edit should not fail with mtime conflict, got: {:?}",
@@ -2464,7 +2485,13 @@ mod tests {
             content: "\n## Extra\n\nMore content\n".into(),
             modified_by: "test".into(),
         };
-        let result = append_to_note(append_input, &store, &mut embedder, &root);
+        let result = append_to_note(
+            append_input,
+            &store,
+            &mut embedder,
+            PrefixConfig::default(),
+            &root,
+        );
         assert!(
             result.is_ok(),
             "append after rewrite should not fail with mtime conflict, got: {:?}",
@@ -2516,7 +2543,13 @@ mod tests {
             content: "\n## Appended\n\nMore\n".into(),
             modified_by: "test".into(),
         };
-        let result = append_to_note(append_input, &store, &mut embedder, &root);
+        let result = append_to_note(
+            append_input,
+            &store,
+            &mut embedder,
+            PrefixConfig::default(),
+            &root,
+        );
         assert!(
             result.is_ok(),
             "append after edit_frontmatter should not fail with mtime conflict, got: {:?}",

@@ -356,7 +356,12 @@ pub fn index_file(
         .iter()
         .map(|c| embedder.token_count(&c.text))
         .collect();
-    let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
+    // Embed a contextual prefix with each chunk (issue #2). `embed_texts` is
+    // held so the batch below can borrow from it; nothing here reaches storage,
+    // which still persists `chunk.text` / `chunk.snippet` verbatim.
+    let doc = crate::prefix::DocContext::from_file(rel_path, content);
+    let embed_texts = crate::prefix::embed_texts(&doc, &chunks, config.embedding_prefix);
+    let texts: Vec<&str> = embed_texts.iter().map(String::as_str).collect();
     let mut all_vectors = Vec::with_capacity(texts.len());
     for batch in texts.chunks(config.batch_size) {
         let vectors = embedder.embed_batch(batch)?;
@@ -1296,5 +1301,121 @@ mod tests {
         let mentions = store.get_outgoing(note, Some("mention")).unwrap();
         assert_eq!(mentions.len(), 1);
         assert_eq!(mentions[0].0, person);
+    }
+
+    /// Wraps an embedder and keeps every string it was asked to embed, so a
+    /// test can compare what reached the model against what reached the store.
+    struct RecordingEmbed {
+        inner: crate::llm::MockLlm,
+        seen: Vec<String>,
+    }
+
+    impl EmbedModel for RecordingEmbed {
+        fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            self.seen.extend(texts.iter().map(|t| t.to_string()));
+            self.inner.embed_batch(texts)
+        }
+        fn token_count(&self, text: &str) -> usize {
+            self.inner.token_count(text)
+        }
+        fn dim(&self) -> usize {
+            self.inner.dim()
+        }
+    }
+
+    fn prefixed_config() -> Config {
+        Config {
+            embedding_prefix: crate::prefix::PrefixConfig::full(),
+            ..Config::default()
+        }
+    }
+
+    /// Index one file whose body never names its own subject — the archdragon
+    /// case from issue #2 — and report what the embedder saw.
+    fn index_prefixed_vault(config: &Config) -> (Store, Vec<String>) {
+        let tmp = TempDir::new().unwrap();
+        write_file(
+            tmp.path(),
+            "lore/bestiary/archdragon.md",
+            "---\nname: Archdragon\naliases:\n  - Elder Wyrm\ntags:\n  - apex\n---\n\n\
+             ## Definition\n\nRank SS, levels 150-511.\n\n\
+             ## Abilities\n\nFlight and breath.\n\n\
+             ### Combat\n\nOpens at range.\n",
+        );
+
+        let store = Store::open_memory().unwrap();
+        let mut embedder = RecordingEmbed {
+            inner: crate::llm::MockLlm::new(256),
+            seen: Vec::new(),
+        };
+        run_index_shared(tmp.path(), config, &store, &mut embedder, false, None).unwrap();
+        (store, embedder.seen)
+    }
+
+    #[test]
+    fn embedded_text_carries_document_identity() {
+        let (_store, seen) = index_prefixed_vault(&prefixed_config());
+        assert_eq!(seen.len(), 3, "one embed call per chunk: {seen:#?}");
+
+        // Every chunk, including the two whose bodies never say "Archdragon".
+        assert!(seen.iter().all(|t| t.contains("Archdragon")), "{seen:#?}");
+        assert!(
+            seen.iter()
+                .all(|t| t.contains("lore/bestiary/archdragon.md"))
+        );
+        assert!(seen.iter().all(|t| t.contains("aliases: Elder Wyrm")));
+        assert!(seen.iter().all(|t| t.contains("tags: apex")));
+
+        // `### Combat` is a sibling chunk of `## Abilities`, so its own text has
+        // lost the parent heading. The prefix is the only thing that carries it.
+        let combat = seen.iter().find(|t| t.contains("Opens at range")).unwrap();
+        assert!(combat.contains("Abilities > Combat"), "{combat}");
+    }
+
+    /// The other half of the contract: the prefix reaches the embedder and
+    /// nothing else. If it leaked, `## Definition` would be displayed with a
+    /// frontmatter preamble and `apex` would be a keyword hit on a chunk that
+    /// never mentions it.
+    #[test]
+    fn the_prefix_does_not_leak_into_storage_or_fts() {
+        let (store, _seen) = index_prefixed_vault(&prefixed_config());
+        let file = store
+            .get_file("lore/bestiary/archdragon.md")
+            .unwrap()
+            .unwrap();
+
+        let definition = store.get_chunk_by_seq(file.id, 0).unwrap().unwrap();
+        assert_eq!(definition.heading, "## Definition");
+        assert!(definition.snippet.starts_with("## Definition"));
+        assert!(!definition.snippet.contains("Archdragon"));
+        assert!(!definition.snippet.contains("aliases"));
+
+        // FTS indexes the snippet, so prefix-only terms must not be searchable.
+        let by_alias = store
+            .best_matching_chunk_seq(file.id, &["Wyrm".to_string()])
+            .unwrap();
+        assert_eq!(by_alias, None, "alias became a keyword hit");
+
+        // A term the chunk really does contain still matches, so this is not
+        // just an empty index.
+        let by_body = store
+            .best_matching_chunk_seq(file.id, &["breath".to_string()])
+            .unwrap();
+        assert_eq!(by_body, Some(1));
+    }
+
+    #[test]
+    fn disabling_the_prefix_embeds_exactly_what_is_stored() {
+        // The shipped default, not a special case.
+        let (store, seen) = index_prefixed_vault(&Config::default());
+        assert!(!Config::default().embedding_prefix.enabled);
+
+        assert!(!seen.iter().any(|t| t.contains("aliases:")), "{seen:#?}");
+        let file = store
+            .get_file("lore/bestiary/archdragon.md")
+            .unwrap()
+            .unwrap();
+        let definition = store.get_chunk_by_seq(file.id, 0).unwrap().unwrap();
+        assert!(seen.iter().any(|t| t.starts_with(&definition.snippet)));
     }
 }

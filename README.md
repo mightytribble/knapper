@@ -609,6 +609,16 @@ max_chunks_per_file = 3
 # Enable LLM-powered intelligence (query expansion + reranking)
 intelligence = true
 
+# Prepend document identity to each chunk before embedding. Off by default —
+# it helped conceptual queries and hurt exact-name lookup on the test vault.
+# Needs `engraph index --reindex` to take effect either way.
+[embedding_prefix]
+enabled = false
+# path = true      # "Archdragon — lore/bestiary/archdragon.md"
+# heading = true   # "Abilities > Combat" — ancestor sections
+# tags = true
+# aliases = true
+
 # Override models for multilingual or custom use
 [models]
 # embed = "hf:Qwen/Qwen3-Embedding-0.6B-GGUF/qwen3-embedding-0.6b-q8_0.gguf"
@@ -625,6 +635,8 @@ intelligence = true
 ```
 
 Search returns **sections**. A note whose "Counterspell" and "Dispel Magic" sections both answer a query contributes both, up to `max_chunks_per_file`, and each result names the heading it came from. Pass `--group-by file` (or set `group_by = "file"`) for one result per document, representing it by its best-matching section.
+
+`embedding_prefix` puts the document's name, path, tags, aliases and the chunk's ancestor headings into the text that is **embedded**, while what is stored, displayed and keyword-matched stays the raw chunk. It is off by default: because the prefix is the same string for every chunk of a document, it separates documents from each other at the cost of separating a document's own sections, and on the test vault that lost more on exact-name lookup than it gained on conceptual queries (`eval/probes.md`). Each component is switchable so the trade can be measured per vault.
 
 `exclude` takes `.gitignore`-style globs, matched against paths relative to the vault root. A pattern with no `/` matches at any depth (`*-index.md` catches `lore/lore-index.md`); a trailing `/` means a directory and everything under it; an embedded `/` anchors the pattern to the vault root (`drafts/**`). Excluding a path that is already indexed removes it from the store — chunks, vectors, FTS entries and graph edges — on the next index run.
 

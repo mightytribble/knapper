@@ -255,6 +255,9 @@ pub struct EngraphServer {
     /// same result shape the CLI does.
     max_chunks_per_file: usize,
     group_by: crate::config::GroupBy,
+    /// Embedding-prefix settings, for the same reason: notes written by MCP
+    /// tools share a vector space with the indexed vault.
+    embedding_prefix: crate::prefix::PrefixConfig,
 }
 
 fn read_only_err() -> McpError {
@@ -542,6 +545,7 @@ impl EngraphServer {
             input,
             &store,
             &mut *embedder,
+            self.embedding_prefix,
             &self.vault_path,
             self.profile.as_ref().as_ref(),
         )
@@ -564,8 +568,14 @@ impl EngraphServer {
             content: params.0.content,
             modified_by: "claude-code".into(),
         };
-        let result = crate::writer::append_to_note(input, &store, &mut *embedder, &self.vault_path)
-            .map_err(|e| mcp_err(&e))?;
+        let result = crate::writer::append_to_note(
+            input,
+            &store,
+            &mut *embedder,
+            self.embedding_prefix,
+            &self.vault_path,
+        )
+        .map_err(|e| mcp_err(&e))?;
         to_json_result(&result)
     }
 
@@ -646,9 +656,14 @@ impl EngraphServer {
         }
         let store = self.store.lock().await;
         let mut embedder = self.embedder.lock().await;
-        let result =
-            crate::writer::unarchive_note(&params.0.file, &store, &mut *embedder, &self.vault_path)
-                .map_err(|e| mcp_err(&e))?;
+        let result = crate::writer::unarchive_note(
+            &params.0.file,
+            &store,
+            &mut *embedder,
+            self.embedding_prefix,
+            &self.vault_path,
+        )
+        .map_err(|e| mcp_err(&e))?;
         to_json_result(&result)
     }
 
@@ -1085,6 +1100,7 @@ pub async fn run_serve(
     // Capture retrieval settings before the watcher takes ownership of `config`.
     let max_chunks_per_file = config.max_chunks_per_file;
     let group_by = config.group_by;
+    let embedding_prefix = config.embedding_prefix;
 
     let (watcher_handle, watcher_shutdown) = crate::watcher::start_watcher(
         store_arc.clone(),
@@ -1112,6 +1128,7 @@ pub async fn run_serve(
         read_only,
         max_chunks_per_file,
         group_by,
+        embedding_prefix,
     };
 
     // Cancellation token for coordinated shutdown of HTTP + MCP
@@ -1134,6 +1151,7 @@ pub async fn run_serve(
             read_only,
             max_chunks_per_file,
             group_by,
+            embedding_prefix,
         };
         let router = crate::http::build_router(api_state);
         let addr = format!("{}:{}", opts.host, opts.port);

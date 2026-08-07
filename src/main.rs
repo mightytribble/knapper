@@ -1275,6 +1275,7 @@ async fn main() -> Result<()> {
                         input,
                         &store,
                         &mut embedder,
+                        cfg.embedding_prefix,
                         &vault_path,
                         profile.as_ref(),
                     )?;
@@ -1307,8 +1308,13 @@ async fn main() -> Result<()> {
                         content,
                         modified_by: "cli".into(),
                     };
-                    let result =
-                        engraph::writer::append_to_note(input, &store, &mut embedder, &vault_path)?;
+                    let result = engraph::writer::append_to_note(
+                        input,
+                        &store,
+                        &mut embedder,
+                        cfg.embedding_prefix,
+                        &vault_path,
+                    )?;
                     if cli.json {
                         println!("{}", serde_json::to_string_pretty(&result)?);
                     } else {
@@ -1329,8 +1335,13 @@ async fn main() -> Result<()> {
                     }
                 }
                 WriteAction::Unarchive { file } => {
-                    let result =
-                        engraph::writer::unarchive_note(&file, &store, &mut embedder, &vault_path)?;
+                    let result = engraph::writer::unarchive_note(
+                        &file,
+                        &store,
+                        &mut embedder,
+                        cfg.embedding_prefix,
+                        &vault_path,
+                    )?;
                     if cli.json {
                         println!("{}", serde_json::to_string_pretty(&result)?);
                     } else {

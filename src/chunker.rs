@@ -6,8 +6,9 @@ pub struct Chunk {
     /// chunk's own heading as the last element. Empty for pre-heading content.
     ///
     /// `## Abilities` / `### Combat` yields `["Abilities", "Combat"]`. Not
-    /// persisted or embedded yet — this is the input issue #2 needs to build a
-    /// contextual embedding prefix.
+    /// persisted, but [`crate::prefix`] embeds it: a chunk's own text opens
+    /// with its own heading and no ancestor's, since `structure_chunk` makes
+    /// subsections siblings of their parent rather than children.
     pub heading_path: Vec<String>,
     /// Full chunk text (without frontmatter).
     pub text: String,

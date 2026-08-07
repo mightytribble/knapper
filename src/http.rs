@@ -47,6 +47,9 @@ pub struct ApiState {
     /// Retrieval granularity settings from `config.toml`.
     pub max_chunks_per_file: usize,
     pub group_by: crate::config::GroupBy,
+    /// Embedding-prefix settings from `config.toml`. Notes written over HTTP
+    /// must be embedded the way `engraph index` embedded the rest of the vault.
+    pub embedding_prefix: crate::prefix::PrefixConfig,
 }
 
 // ---------------------------------------------------------------------------
@@ -720,6 +723,7 @@ async fn handle_create(
         input,
         &store,
         &mut *embedder,
+        state.embedding_prefix,
         &state.vault_path,
         state.profile.as_ref().as_ref(),
     )
@@ -747,8 +751,14 @@ async fn handle_append(
         content: body.content,
         modified_by: "http-api".into(),
     };
-    let result = writer::append_to_note(input, &store, &mut *embedder, &state.vault_path)
-        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    let result = writer::append_to_note(
+        input,
+        &store,
+        &mut *embedder,
+        state.embedding_prefix,
+        &state.vault_path,
+    )
+    .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
     let full_path = state.vault_path.join(&result.path);
     record_write(&state.recent_writes, &full_path).await;
     Ok(Json(serde_json::json!(result)))
@@ -891,8 +901,14 @@ async fn handle_unarchive(
     }
     let store = state.store.lock().await;
     let mut embedder = state.embedder.lock().await;
-    let result = writer::unarchive_note(&body.file, &store, &mut *embedder, &state.vault_path)
-        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    let result = writer::unarchive_note(
+        &body.file,
+        &store,
+        &mut *embedder,
+        state.embedding_prefix,
+        &state.vault_path,
+    )
+    .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
     let full_path = state.vault_path.join(&result.path);
     record_write(&state.recent_writes, &full_path).await;
     Ok(Json(serde_json::json!(result)))
@@ -1181,6 +1197,7 @@ mod tests {
             read_only: false,
             max_chunks_per_file: crate::config::default_max_chunks_per_file(),
             group_by: crate::config::GroupBy::default(),
+            embedding_prefix: crate::prefix::PrefixConfig::default(),
         }
     }
 

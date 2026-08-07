@@ -1,0 +1,324 @@
+//! Contextual embedding prefix (issue #2). **Off by default** — see below.
+//!
+//! Only the raw chunk body reaches the embedder, so a chunk is findable only
+//! through words appearing inside its own prose. That misses two things: a
+//! document's name, which encyclopedic reference material often states once and
+//! then refers to as "it"; and a chunk's ancestor headings, which
+//! [`crate::chunker::structure_chunk`] drops when it makes a subsection a
+//! sibling of its parent rather than a child.
+//!
+//! When enabled, each chunk is embedded as a prefix plus its text, the prefix
+//! carrying the document's display name, path, aliases and tags along with the
+//! chunk's heading path. The prefix reaches the embedder and nothing else:
+//! stored `text`, `snippet` and FTS content are untouched, so it cannot leak
+//! into a displayed result or be matched as a keyword.
+//!
+//! # Why the default is off
+//!
+//! The prefix is a **per-file constant**. Adding the same string to every chunk
+//! of a document moves all of its vectors the same way, so what it buys in
+//! separation *between* documents it spends on separation *within* one — and
+//! since issue #6 the within-document ordering is what decides which section a
+//! search returns.
+//!
+//! Measured on the eval vault (`eval/probes.md`), it moved the conceptual probe
+//! from rank 5 to rank 2 and pushed the exact-name probe's answer out of the top
+//! 20 entirely. The damage scales with the prefix's share of the embedded text —
+//! a 20-token section given a 30-token identity prefix becomes mostly identity —
+//! so every component is separately switchable and the trade is left to the
+//! caller's own measurements.
+
+use serde::{Deserialize, Serialize};
+
+use crate::chunker::Chunk;
+
+/// Which components the contextual prefix carries.
+///
+/// Every component is separately switchable because prefix *length* turned out
+/// to be the thing that matters — see the module docs. The display name is the
+/// exception: it is the irreducible identity signal, so `enabled` covers it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PrefixConfig {
+    /// Build a contextual prefix at all. Off means chunks are embedded exactly
+    /// as they are stored, which is upstream's behaviour and the default.
+    pub enabled: bool,
+    /// Include the vault-relative path. Largely restates the display name for
+    /// vaults whose filenames are their titles.
+    pub path: bool,
+    /// Include the chunk's ancestor heading path. The only component that
+    /// varies between chunks of one document, so the only one that cannot
+    /// flatten them together.
+    pub heading: bool,
+    /// Include the document's frontmatter `tags`.
+    pub tags: bool,
+    /// Include the document's frontmatter `aliases`. Often near-duplicates of
+    /// the name (`Archdragon` / `Archdragons` / `Arch-Dragon`), which multiplies
+    /// the name's weight rather than adding a new signal.
+    pub aliases: bool,
+}
+
+impl Default for PrefixConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: true,
+            heading: true,
+            tags: true,
+            aliases: true,
+        }
+    }
+}
+
+impl PrefixConfig {
+    /// Every component on. What `enabled = true` in `config.toml` means before
+    /// any component is switched off, and what the eval runs were measured with.
+    pub fn full() -> Self {
+        Self {
+            enabled: true,
+            ..Self::default()
+        }
+    }
+}
+
+/// Document-level identity, parsed once per file and shared by all its chunks.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DocContext {
+    /// Frontmatter `name` if present, else the filename stem.
+    pub name: String,
+    /// Vault-relative path, as stored in `files.path`.
+    pub rel_path: String,
+    pub aliases: Vec<String>,
+    pub tags: Vec<String>,
+}
+
+impl DocContext {
+    /// Parse a file's identity from its path and raw content (frontmatter included).
+    pub fn from_file(rel_path: &str, content: &str) -> Self {
+        let (frontmatter, _body) = crate::writer::split_frontmatter(content);
+        let (scalars, tags, aliases) = crate::writer::parse_frontmatter_fields(&frontmatter);
+
+        let name = scalars
+            .get("name")
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| filename_stem(rel_path));
+
+        Self {
+            name,
+            rel_path: rel_path.to_string(),
+            aliases,
+            tags,
+        }
+    }
+
+    /// Build the prefix for one chunk. Empty when `cfg.enabled` is false, and
+    /// never ends in a newline — [`embed_text`] adds the separator.
+    fn prefix_for(&self, chunk: &Chunk, cfg: PrefixConfig) -> String {
+        if !cfg.enabled {
+            return String::new();
+        }
+
+        let mut lines: Vec<String> = Vec::with_capacity(3);
+        lines.push(match cfg.path && !self.rel_path.is_empty() {
+            true => format!("{} — {}", self.name, self.rel_path),
+            false => self.name.clone(),
+        });
+
+        // Aliases and tags share a line: both are short lists, and a line each
+        // would spend prefix budget on labels rather than terms.
+        let mut meta: Vec<String> = Vec::with_capacity(2);
+        if cfg.aliases && !self.aliases.is_empty() {
+            meta.push(format!("aliases: {}", self.aliases.join(", ")));
+        }
+        if cfg.tags && !self.tags.is_empty() {
+            meta.push(format!("tags: {}", self.tags.join(", ")));
+        }
+        if !meta.is_empty() {
+            lines.push(meta.join(" | "));
+        }
+
+        // The chunk's own text already opens with its heading line, but only its
+        // own: `### Combat` under `## Abilities` loses the parent entirely once
+        // structure_chunk makes them sibling chunks. The path restores it, in
+        // plain text rather than `#` syntax.
+        if cfg.heading && !chunk.heading_path.is_empty() {
+            lines.push(chunk.heading_path.join(" > "));
+        }
+
+        lines.join("\n")
+    }
+}
+
+/// The text one chunk is embedded as. Storage is unaffected.
+pub fn embed_text(doc: &DocContext, chunk: &Chunk, cfg: PrefixConfig) -> String {
+    let prefix = doc.prefix_for(chunk, cfg);
+    if prefix.is_empty() {
+        return chunk.text.clone();
+    }
+    format!("{prefix}\n{}", chunk.text)
+}
+
+/// [`embed_text`] over a file's chunks. Callers hold the result to borrow
+/// `&str` from, since [`crate::llm::EmbedModel::embed_batch`] takes `&[&str]`.
+pub fn embed_texts(doc: &DocContext, chunks: &[Chunk], cfg: PrefixConfig) -> Vec<String> {
+    chunks
+        .iter()
+        .map(|chunk| embed_text(doc, chunk, cfg))
+        .collect()
+}
+
+/// `lore/bestiary/archdragon.md` → `archdragon`.
+fn filename_stem(rel_path: &str) -> String {
+    std::path::Path::new(rel_path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| rel_path.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chunk(heading_path: &[&str], text: &str) -> Chunk {
+        Chunk {
+            heading: heading_path.last().map(|h| format!("## {h}")),
+            heading_path: heading_path.iter().map(|s| s.to_string()).collect(),
+            text: text.to_string(),
+            snippet: text.chars().take(200).collect(),
+        }
+    }
+
+    const ARCHDRAGON: &str = "---\nname: Archdragon\naliases:\n  - Elder Wyrm\ntags:\n  - dragon\n  - apex\n---\n\n## Definition\n**Rank**: SS\n";
+
+    #[test]
+    fn doc_context_reads_frontmatter_identity() {
+        let doc = DocContext::from_file("lore/bestiary/archdragon.md", ARCHDRAGON);
+        assert_eq!(doc.name, "Archdragon");
+        assert_eq!(doc.rel_path, "lore/bestiary/archdragon.md");
+        assert_eq!(doc.aliases, vec!["Elder Wyrm"]);
+        assert_eq!(doc.tags, vec!["dragon", "apex"]);
+    }
+
+    #[test]
+    fn doc_name_falls_back_to_the_filename_stem() {
+        let doc = DocContext::from_file("npcs/archivist-lenne.md", "No frontmatter here.\n");
+        assert_eq!(doc.name, "archivist-lenne");
+        assert!(doc.tags.is_empty());
+    }
+
+    /// The defect that motivated the issue: this chunk's text never says
+    /// "Archdragon", so before the prefix nothing in its vector did either.
+    #[test]
+    fn a_chunk_that_never_names_its_subject_is_embedded_with_the_name() {
+        let doc = DocContext::from_file("lore/bestiary/archdragon.md", ARCHDRAGON);
+        let c = chunk(
+            &["Definition"],
+            "## Definition\n**Rank**: SS • **Levels**: 150-511",
+        );
+        assert!(!c.text.contains("Archdragon"));
+
+        let embedded = embed_text(&doc, &c, PrefixConfig::full());
+        assert!(embedded.contains("Archdragon"));
+        assert!(embedded.contains("lore/bestiary/archdragon.md"));
+        assert!(embedded.ends_with(&c.text));
+    }
+
+    #[test]
+    fn ancestor_headings_survive_into_the_prefix() {
+        let doc = DocContext::from_file("lore/bestiary/archdragon.md", ARCHDRAGON);
+        let c = chunk(&["Abilities", "Combat"], "### Combat\nBreath weapon.");
+
+        let embedded = embed_text(&doc, &c, PrefixConfig::full());
+        // `Abilities` appears nowhere in the chunk's own text — structure_chunk
+        // makes subsections siblings of their parent, not children.
+        assert!(!c.text.contains("Abilities"));
+        assert!(embedded.contains("Abilities > Combat"));
+    }
+
+    #[test]
+    fn full_prefix_shape() {
+        let doc = DocContext::from_file("lore/bestiary/archdragon.md", ARCHDRAGON);
+        let c = chunk(&["Definition"], "## Definition\n**Rank**: SS");
+
+        assert_eq!(
+            embed_text(&doc, &c, PrefixConfig::full()),
+            "Archdragon — lore/bestiary/archdragon.md\n\
+             aliases: Elder Wyrm | tags: dragon, apex\n\
+             Definition\n\
+             ## Definition\n**Rank**: SS"
+        );
+    }
+
+    #[test]
+    fn tags_and_aliases_are_individually_switchable() {
+        let doc = DocContext::from_file("lore/bestiary/archdragon.md", ARCHDRAGON);
+        let c = chunk(&["Definition"], "body");
+
+        let no_tags = embed_text(
+            &doc,
+            &c,
+            PrefixConfig {
+                tags: false,
+                ..PrefixConfig::full()
+            },
+        );
+        assert!(no_tags.contains("aliases: Elder Wyrm"));
+        assert!(!no_tags.contains("tags:"));
+
+        let neither = embed_text(
+            &doc,
+            &c,
+            PrefixConfig {
+                tags: false,
+                aliases: false,
+                ..PrefixConfig::full()
+            },
+        );
+        // The whole metadata line goes, not an empty separator.
+        assert_eq!(
+            neither,
+            "Archdragon — lore/bestiary/archdragon.md\nDefinition\nbody"
+        );
+    }
+
+    #[test]
+    fn disabled_embeds_exactly_what_is_stored() {
+        let doc = DocContext::from_file("lore/bestiary/archdragon.md", ARCHDRAGON);
+        let c = chunk(&["Definition"], "## Definition\n**Rank**: SS");
+        let cfg = PrefixConfig::default();
+        assert!(
+            !cfg.enabled,
+            "the prefix is off unless config.toml turns it on"
+        );
+        assert_eq!(embed_text(&doc, &c, cfg), c.text);
+    }
+
+    #[test]
+    fn a_chunk_before_the_first_heading_gets_no_heading_line() {
+        let doc = DocContext::from_file("lore/bestiary/archdragon.md", ARCHDRAGON);
+        let c = chunk(&[], "Opening paragraph.");
+        assert_eq!(
+            embed_text(&doc, &c, PrefixConfig::full()),
+            "Archdragon — lore/bestiary/archdragon.md\n\
+             aliases: Elder Wyrm | tags: dragon, apex\n\
+             Opening paragraph."
+        );
+    }
+
+    #[test]
+    fn embed_texts_prefixes_every_chunk_and_preserves_order() {
+        let doc = DocContext::from_file("lore/bestiary/archdragon.md", ARCHDRAGON);
+        let chunks = vec![
+            chunk(&["Definition"], "first"),
+            chunk(&["Human Forms"], "second"),
+        ];
+
+        let texts = embed_texts(&doc, &chunks, PrefixConfig::full());
+        assert_eq!(texts.len(), 2);
+        assert!(texts[0].contains("Definition\nfirst"));
+        assert!(texts[1].contains("Human Forms\nsecond"));
+        assert!(texts.iter().all(|t| t.starts_with("Archdragon — ")));
+    }
+}

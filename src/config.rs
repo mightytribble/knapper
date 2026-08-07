@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+use crate::prefix::PrefixConfig;
+
 /// Model override configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -145,6 +147,12 @@ pub struct Config {
     pub max_chunks_per_file: usize,
     /// Whether search results address sections or whole documents.
     pub group_by: GroupBy,
+    /// What document identity is prepended to a chunk's text before embedding.
+    /// Affects the vector only — storage, snippets and FTS see the raw chunk.
+    /// Changing this needs `engraph index --reindex`; the incremental path
+    /// compares content hashes and will not notice.
+    #[serde(default)]
+    pub embedding_prefix: PrefixConfig,
     /// Glob patterns to exclude from indexing.
     pub exclude: Vec<String>,
     /// Number of files to process per embedding batch.
@@ -178,6 +186,7 @@ impl Default for Config {
             top_n: 5,
             max_chunks_per_file: default_max_chunks_per_file(),
             group_by: GroupBy::default(),
+            embedding_prefix: PrefixConfig::default(),
             exclude: vec![".obsidian/".to_string()],
             batch_size: 64,
             respect_gitignore: true,
@@ -343,6 +352,26 @@ batch_size = 128
         let bare: Config = toml::from_str("").unwrap();
         assert_eq!(bare.max_chunks_per_file, 3);
         assert_eq!(bare.group_by, GroupBy::Chunk);
+    }
+
+    #[test]
+    fn embedding_prefix_round_trips_and_defaults_off() {
+        let cfg: Config =
+            toml::from_str("[embedding_prefix]\nenabled = true\ntags = false\n").unwrap();
+        assert!(cfg.embedding_prefix.enabled);
+        assert!(cfg.embedding_prefix.aliases);
+        assert!(cfg.embedding_prefix.heading);
+        assert!(!cfg.embedding_prefix.tags);
+
+        // Off unless asked for: it regressed the seed probes on the eval vault
+        // (eval/probes.md, "Contextual embedding prefix (#2)").
+        let bare: Config = toml::from_str("").unwrap();
+        assert_eq!(bare.embedding_prefix, PrefixConfig::default());
+        assert!(!bare.embedding_prefix.enabled);
+
+        // Turning it on without naming components gives every component.
+        let on: Config = toml::from_str("[embedding_prefix]\nenabled = true\n").unwrap();
+        assert_eq!(on.embedding_prefix, PrefixConfig::full());
     }
 
     #[test]
