@@ -93,8 +93,10 @@ See issues on this repo:
 - **#2** contextual embedding prefix (filename / heading path / tags into every chunk)
 - **#3** retrieval eval battery — gates #1 and #2, and calibrates #4
 - **#4** relevance floor — configurable per-lane min scores so nonsense queries return nothing
+- **#5** embedding model config — expose output dim, tie max chunk tokens to the model's context window
 
-Suggested order: **#3 first** (it supplies the measurements the other three are judged by), then
-#1 and #2 (independent of each other), then #4 (needs #3's negative controls to calibrate).
+Suggested order: **#3 first** (it supplies the measurements the others are judged by), then **#5**
+(makes chunk size and dim configurable, which #1/#2/#3 all need in order to compare configurations),
+then #1 and #2 (independent of each other), then #4 (needs #3's negative controls to calibrate).
 
 `eval/` holds the seed material for #3.
