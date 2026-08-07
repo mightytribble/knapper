@@ -432,15 +432,16 @@ fn file_mtime(path: &Path) -> Result<i64> {
 /// Pre-computed chunk data ready for store insertion.
 ///
 /// Named fields rather than a tuple because `text` and `snippet` are adjacent
-/// `String`s that go to different places — the full text to FTS, the 200-char
-/// snippet to the `chunks` row for display. Transposing them is issue #11.
+/// A chunk ready for insertion.
+///
+/// It used to carry the snippet alongside the text, two `String`s bound for
+/// different columns — which is how one transposition made chunk text
+/// unrecoverable (issue #11). Since #14 the store derives the snippet from the
+/// text, so there is only one to pass and nothing to transpose.
 struct ChunkData {
     heading: String,
-    /// The whole chunk, as indexed for keyword search. Not persisted anywhere
-    /// else: `chunks` has no `text` column.
+    /// The whole chunk, for both `chunks.text` and the FTS index.
     text: String,
-    /// Leading 200 characters, the display field.
-    snippet: String,
     vector: Vec<f32>,
     token_count: i64,
 }
@@ -470,7 +471,6 @@ fn precompute_chunks(
             heading: chunk.heading.unwrap_or_default(),
             token_count: chunk.text.split_whitespace().count() as i64,
             text: chunk.text,
-            snippet: chunk.snippet,
             vector: embedding,
         });
     }
@@ -674,7 +674,7 @@ pub fn create_note(
                 file_id,
                 chunk_seq as i64,
                 &c.heading,
-                &c.snippet,
+                &c.text,
                 vid,
                 c.token_count,
                 &c.vector,
@@ -831,7 +831,7 @@ pub fn append_to_note(
                 file_id,
                 chunk_seq as i64,
                 &c.heading,
-                &c.snippet,
+                &c.text,
                 vid,
                 c.token_count,
                 &c.vector,
@@ -1616,7 +1616,7 @@ pub fn unarchive_note(
                 file_id,
                 seq as i64,
                 &c.heading,
-                &c.snippet,
+                &c.text,
                 vid,
                 c.token_count,
                 &c.vector,
@@ -2432,11 +2432,27 @@ mod tests {
 
         let c = &data[0];
         assert!(c.text.contains("Saltmere"), "text was truncated");
+
+        // The write paths hand this text to the store, which keeps it whole and
+        // derives the display snippet from it (issue #14).
+        let store = Store::open_memory().unwrap();
+        let file_id = store
+            .insert_file("places/coast.md", "h", 0, &[], "d", None, None)
+            .unwrap();
+        store
+            .insert_chunk(file_id, 0, &c.heading, &c.text, 1, c.token_count)
+            .unwrap();
+
+        let stored = store.get_chunk_by_seq(file_id, 0).unwrap().unwrap();
         assert!(
-            !c.snippet.contains("Saltmere"),
+            stored.text.contains("Saltmere"),
+            "stored text was truncated"
+        );
+        assert!(
+            !stored.snippet.contains("Saltmere"),
             "snippet should still stop at 200 characters"
         );
-        assert!(c.snippet.len() <= 203);
+        assert!(stored.snippet.len() <= 203);
     }
 
     /// End-to-end through one of the three write paths: a term appended past

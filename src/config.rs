@@ -134,6 +134,25 @@ pub fn default_max_chunks_per_file() -> usize {
     3
 }
 
+/// How the rerank lane presents a candidate to the cross-encoder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RerankConfig {
+    /// Prepend the document's title to the chunk before scoring it.
+    ///
+    /// Off, and unmeasured. This is not the experiment issue #2 lost: a prefix
+    /// added to every chunk of a file moves that file's *vectors* together and
+    /// costs within-document separation, whereas a cross-encoder scores each
+    /// pair on its own and shares no space to flatten. But "different failure
+    /// mode" is not "known to help", and the five seed probes cannot tell —
+    /// #12 changed 76 of 100 result slots without moving a single probe
+    /// verdict. So this waits on the probe battery in #3 and ships as a switch.
+    ///
+    /// The chunk's own heading is not included: the chunker already makes it
+    /// the first line of the text.
+    pub document_title: bool,
+}
+
 /// Application configuration, loaded from `~/.engraph/config.toml` with CLI overrides.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -173,6 +192,10 @@ pub struct Config {
     /// HTTP REST API settings.
     #[serde(default)]
     pub http: HttpConfig,
+    /// How the rerank lane is fed. Distinct from `models.rerank`, which only
+    /// says which reranker to load.
+    #[serde(default)]
+    pub rerank: RerankConfig,
     #[serde(default)]
     pub identity: IdentityConfig,
     #[serde(default)]
@@ -192,6 +215,7 @@ impl Default for Config {
             respect_gitignore: true,
             intelligence: None,
             models: ModelConfig::default(),
+            rerank: RerankConfig::default(),
             obsidian: ObsidianConfig::default(),
             agents: AgentsConfig::default(),
             http: HttpConfig::default(),

@@ -682,7 +682,12 @@ fn build_overlap(text: &str, token_count: &dyn Fn(&str) -> usize, overlap_tokens
     }
 }
 
-fn make_snippet(text: &str) -> String {
+/// The leading 200 characters of `text`, with `"..."` if that cut anything.
+///
+/// [`crate::store::Store::insert_chunk`] calls this too, so that a stored
+/// chunk's `snippet` column is the same derivation as a [`Chunk`]'s field
+/// rather than a second one that could drift from it.
+pub(crate) fn make_snippet(text: &str) -> String {
     if text.len() > 200 {
         let truncated: String = text.chars().take(200).collect();
         format!("{truncated}...")

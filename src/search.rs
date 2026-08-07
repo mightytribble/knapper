@@ -56,6 +56,8 @@ pub struct SearchConfig<'a> {
     pub reranker: Option<&'a mut dyn RerankModel>,
     pub store: &'a Store,
     pub rerank_candidates: usize,
+    /// How candidates are presented to the reranker.
+    pub rerank: crate::config::RerankConfig,
     /// Ceiling on how many sections of one document may appear in the results.
     pub max_chunks_per_file: usize,
     /// Whether results address sections or whole documents.
@@ -70,6 +72,7 @@ impl<'a> SearchConfig<'a> {
             reranker: None,
             store,
             rerank_candidates: 30,
+            rerank: config.rerank,
             max_chunks_per_file: config.max_chunks_per_file,
             group_by: config.group_by,
         }
@@ -93,10 +96,60 @@ pub fn search_internal(
         reranker: None,
         store,
         rerank_candidates: 30,
+        rerank: crate::config::RerankConfig::default(),
         max_chunks_per_file: crate::config::default_max_chunks_per_file(),
         group_by,
     };
     search_with_intelligence(query, top_n, embedder, &mut config)
+}
+
+/// The text the cross-encoder is asked to judge, one string per candidate.
+///
+/// Before issue #14 this was `candidate.snippet`, which is not a chunk and is
+/// not even the same fraction of one from candidate to candidate: the semantic
+/// and graph lanes attach the leading 200 characters, while the FTS lane
+/// attaches SQLite's 64-token window centred on the match. Reading the whole
+/// document jointly with the query is the only reason to pay for a
+/// cross-encoder, so it now reads `chunks.text` — a primary-key lookup, since
+/// #14 gave `chunks` its own copy.
+///
+/// A candidate whose text cannot be found falls back to its snippet. That is
+/// the pre-#14 behaviour for that one candidate, which beats scoring it against
+/// nothing.
+fn rerank_documents(
+    store: &Store,
+    candidates: &[&fusion::FusedResult],
+    settings: crate::config::RerankConfig,
+) -> Vec<String> {
+    let keys: Vec<(i64, i64)> = candidates
+        .iter()
+        .map(|c| (c.file_id, c.chunk_seq))
+        .collect();
+    let texts = store.get_chunk_texts(&keys).unwrap_or_else(|e| {
+        tracing::warn!("reranker falling back to snippets: {e:#}");
+        vec![None; keys.len()]
+    });
+
+    candidates
+        .iter()
+        .zip(texts)
+        .map(|(candidate, text)| {
+            let body = text.unwrap_or_else(|| candidate.snippet.clone());
+            if settings.document_title {
+                format!("{}\n\n{body}", document_title(&candidate.file_path))
+            } else {
+                body
+            }
+        })
+        .collect()
+}
+
+/// A document's title: its file stem, which is what an Obsidian vault names it by.
+fn document_title(file_path: &str) -> &str {
+    std::path::Path::new(file_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(file_path)
 }
 
 /// Full intelligence search pipeline.
@@ -269,7 +322,8 @@ pub fn search_with_intelligence(
     let mut rerank_results: Vec<RankedResult> = Vec::new();
     let reranker_used = if let Some(reranker) = &mut config.reranker {
         let candidates: Vec<_> = fused_pass1.iter().take(config.rerank_candidates).collect();
-        let documents: Vec<&str> = candidates.iter().map(|c| c.snippet.as_str()).collect();
+        let owned_documents = rerank_documents(config.store, &candidates, config.rerank);
+        let documents: Vec<&str> = owned_documents.iter().map(String::as_str).collect();
 
         // One call for all thirty pairs, so the reranker sets up once instead of
         // once per candidate (issue #13). A failure now costs the whole lane
@@ -1060,6 +1114,9 @@ mod tests {
         inner: llm::MockLlm,
         batch_calls: usize,
         pairs_scored: usize,
+        /// Every document the lane handed over, in order — so a test can assert
+        /// what the cross-encoder actually read (issue #14).
+        documents: Vec<String>,
     }
 
     impl RerankModel for CountingReranker {
@@ -1070,6 +1127,8 @@ mod tests {
         fn rerank_batch(&mut self, query: &str, documents: &[&str]) -> Result<Vec<f32>> {
             self.batch_calls += 1;
             self.pairs_scored += documents.len();
+            self.documents
+                .extend(documents.iter().map(|d| (*d).to_owned()));
             documents
                 .iter()
                 .map(|d| self.inner.rerank_score(query, d))
@@ -1077,14 +1136,137 @@ mod tests {
         }
     }
 
+    impl CountingReranker {
+        fn new() -> Self {
+            Self {
+                inner: llm::MockLlm::new(8),
+                batch_calls: 0,
+                pairs_scored: 0,
+                documents: Vec::new(),
+            }
+        }
+    }
+
+    /// Run a rerank-lane search and hand back what the reranker was shown.
+    fn documents_shown_to_reranker(
+        query: &str,
+        store: &Store,
+        embedder: &mut llm::MockLlm,
+        settings: crate::config::RerankConfig,
+    ) -> CountingReranker {
+        let mut reranker = CountingReranker::new();
+        {
+            let mut config = SearchConfig {
+                orchestrator: None,
+                reranker: Some(&mut reranker),
+                store,
+                rerank_candidates: 30,
+                rerank: settings,
+                max_chunks_per_file: 3,
+                group_by: GroupBy::Chunk,
+            };
+            search_with_intelligence(query, 10, embedder, &mut config).unwrap();
+        }
+        reranker
+    }
+
+    /// A vault whose chunks run past the 200-character snippet boundary, with a
+    /// term only on the far side of it.
+    fn vault_with_text_past_the_snippet_boundary() -> (tempfile::TempDir, Store, llm::MockLlm) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("rules")).unwrap();
+        let filler = "A warding effect that stops a spell mid-cast. ".repeat(8);
+        std::fs::write(
+            root.join("rules/counterspell.md"),
+            format!("## Counterspell\n\n{filler}\n\nIt cannot stop a Wyrmsbane invocation.\n"),
+        )
+        .unwrap();
+
+        let store = Store::open_memory().unwrap();
+        let mut embedder = llm::MockLlm::new(256);
+        let config = crate::config::Config::default();
+        crate::indexer::run_index_shared(root, &config, &store, &mut embedder, false, None)
+            .unwrap();
+        (tmp, store, embedder)
+    }
+
+    /// Issue #14. The rerank lane used to be handed `candidate.snippet` — the
+    /// leading 200 characters from the semantic and graph lanes, and a 64-token
+    /// match window from FTS. Reading the whole document jointly with the query
+    /// is the reason a cross-encoder exists, so it has to be given the chunk.
+    #[test]
+    fn the_reranker_is_shown_the_whole_chunk_not_the_snippet() {
+        let (_tmp, store, mut embedder) = vault_with_text_past_the_snippet_boundary();
+
+        let reranker = documents_shown_to_reranker(
+            "warding",
+            &store,
+            &mut embedder,
+            crate::config::RerankConfig::default(),
+        );
+
+        assert!(!reranker.documents.is_empty(), "the lane scored nothing");
+        assert!(
+            reranker
+                .documents
+                .iter()
+                .any(|d| d.contains("Wyrmsbane invocation")),
+            "the reranker never saw past the 200-character mark: {:?}",
+            reranker
+                .documents
+                .iter()
+                .map(|d| d.len())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The document-identity switch is off by default and unmeasured, so what is
+    /// worth pinning is that it is genuinely off — not that it helps.
+    #[test]
+    fn the_document_title_is_prepended_only_when_asked_for() {
+        let (_tmp, store, mut embedder) = vault_with_text_past_the_snippet_boundary();
+
+        let without = documents_shown_to_reranker(
+            "warding",
+            &store,
+            &mut embedder,
+            crate::config::RerankConfig::default(),
+        );
+        assert!(
+            without
+                .documents
+                .iter()
+                .all(|d| !d.starts_with("counterspell")),
+            "the title was prepended with the switch off"
+        );
+
+        let with = documents_shown_to_reranker(
+            "warding",
+            &store,
+            &mut embedder,
+            crate::config::RerankConfig {
+                document_title: true,
+            },
+        );
+        assert!(
+            with.documents
+                .iter()
+                .all(|d| d.starts_with("counterspell\n\n")),
+            "expected every document to open with the file's title"
+        );
+        assert!(
+            with.documents
+                .iter()
+                .any(|d| d.contains("Wyrmsbane invocation")),
+            "prepending the title must not replace the chunk"
+        );
+    }
+
     #[test]
     fn the_rerank_lane_scores_all_its_candidates_in_one_call() {
         let (_tmp, store, mut embedder) = indexed_vault();
-        let mut reranker = CountingReranker {
-            inner: llm::MockLlm::new(8),
-            batch_calls: 0,
-            pairs_scored: 0,
-        };
+        let mut reranker = CountingReranker::new();
 
         {
             let mut config = SearchConfig {
@@ -1092,6 +1274,7 @@ mod tests {
                 reranker: Some(&mut reranker),
                 store: &store,
                 rerank_candidates: 30,
+                rerank: crate::config::RerankConfig::default(),
                 max_chunks_per_file: 3,
                 group_by: GroupBy::Chunk,
             };
@@ -1121,6 +1304,7 @@ mod tests {
                 reranker: None,
                 store: &store,
                 rerank_candidates: 30,
+                rerank: crate::config::RerankConfig::default(),
                 max_chunks_per_file: cap,
                 group_by: GroupBy::Chunk,
             };

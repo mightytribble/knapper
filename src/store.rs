@@ -27,13 +27,21 @@ pub struct ChunkRecord {
     /// produce, so it is what search dedups and fuses on.
     pub seq: i64,
     pub heading: String,
+    /// Leading 200 characters of `text`, for display. Derived on insert, never
+    /// supplied — see [`Store::insert_chunk`].
     pub snippet: String,
+    /// The whole chunk, as chunked and as embedded.
+    ///
+    /// Empty only on a database written before the column existed whose FTS row
+    /// could not be found to backfill from. Nothing should read this without
+    /// deciding what an empty one means.
+    pub text: String,
     pub vector_id: u64,
     pub token_count: i64,
 }
 
 /// Columns selected for every [`ChunkRecord`], in the order [`chunk_from_row`] expects.
-const CHUNK_COLUMNS: &str = "id, file_id, seq, heading, snippet, vector_id, token_count";
+const CHUNK_COLUMNS: &str = "id, file_id, seq, heading, snippet, text, vector_id, token_count";
 
 /// Build a [`ChunkRecord`] from a row selecting [`CHUNK_COLUMNS`].
 fn chunk_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChunkRecord> {
@@ -43,8 +51,9 @@ fn chunk_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChunkRecord> {
         seq: row.get(2)?,
         heading: row.get(3)?,
         snippet: row.get(4)?,
-        vector_id: row.get::<_, i64>(5)? as u64,
-        token_count: row.get(6)?,
+        text: row.get(5)?,
+        vector_id: row.get::<_, i64>(6)? as u64,
+        token_count: row.get(7)?,
     })
 }
 
@@ -147,6 +156,10 @@ CREATE TABLE IF NOT EXISTS chunks (
     seq         INTEGER NOT NULL DEFAULT 0,
     heading     TEXT NOT NULL,
     snippet     TEXT NOT NULL,
+    -- The whole chunk. Added by issue #14: the reranker has to read what it
+    -- scores, and `chunks_fts` — the only other copy — cannot be keyed into
+    -- without a MATCH, because its `file_id`/`chunk_seq` are UNINDEXED.
+    text        TEXT NOT NULL DEFAULT '',
     vector_id   INTEGER UNIQUE NOT NULL,
     token_count INTEGER NOT NULL,
     vector      BLOB
@@ -312,22 +325,51 @@ impl Store {
         Ok(())
     }
 
+    /// Whether `table` already has a column named `column`.
+    fn column_exists(&self, table: &str, column: &str) -> Result<bool> {
+        let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let mut rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        Ok(rows.any(|name| name.as_deref() == Ok(column)))
+    }
+
+    /// Copy each chunk's text out of the FTS index and into `chunks.text`.
+    ///
+    /// Runs once, when the column is added. `chunks_fts.file_id`/`chunk_seq` are
+    /// UNINDEXED, so joining against them directly would rescan the FTS content
+    /// for every chunk; the temp table exists to make that one scan instead of
+    /// N. A chunk whose FTS row is missing keeps its snippet, which is a
+    /// truncation of the right text rather than the wrong text.
+    fn backfill_chunk_text(&self) -> Result<()> {
+        let has_fts: bool = self
+            .conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'chunks_fts'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            > 0;
+        if !has_fts {
+            return Ok(());
+        }
+        tracing::info!("backfilling chunks.text from the FTS index");
+        self.conn.execute_batch(
+            "CREATE TEMP TABLE _fts_text AS
+                 SELECT file_id, chunk_seq, content FROM chunks_fts;
+             CREATE INDEX _fts_text_key ON _fts_text(file_id, chunk_seq);
+             UPDATE chunks SET text = COALESCE(
+                 (SELECT content FROM _fts_text t
+                  WHERE t.file_id = chunks.file_id AND t.chunk_seq = chunks.seq),
+                 snippet
+             );
+             DROP TABLE _fts_text;",
+        )?;
+        Ok(())
+    }
+
     /// Run migrations for existing databases that may be missing newer columns.
     fn migrate(&self) -> Result<()> {
-        // Check if docid column exists on files table.
-        let has_docid: bool = {
-            let mut stmt = self.conn.prepare("PRAGMA table_info(files)")?;
-            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
-            let mut found = false;
-            for row in rows {
-                if row.as_deref() == Ok("docid") {
-                    found = true;
-                    break;
-                }
-            }
-            found
-        };
-        if !has_docid {
+        if !self.column_exists("files", "docid")? {
             self.conn
                 .execute_batch("ALTER TABLE files ADD COLUMN docid TEXT;")?;
         }
@@ -349,19 +391,7 @@ impl Store {
         // identity existed. Chunks were always inserted in document order, so the
         // ordinal of a chunk's rowid within its file is the seq the FTS index was
         // built with — that is what makes the two lanes joinable.
-        let has_chunk_seq: bool = {
-            let mut stmt = self.conn.prepare("PRAGMA table_info(chunks)")?;
-            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
-            let mut found = false;
-            for row in rows {
-                if row.as_deref() == Ok("seq") {
-                    found = true;
-                    break;
-                }
-            }
-            found
-        };
-        if !has_chunk_seq {
+        if !self.column_exists("chunks", "seq")? {
             self.conn.execute_batch(
                 "ALTER TABLE chunks ADD COLUMN seq INTEGER NOT NULL DEFAULT 0;
                  UPDATE chunks SET seq = (
@@ -373,6 +403,14 @@ impl Store {
         self.conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_chunks_file_seq ON chunks(file_id, seq);",
         )?;
+
+        // Add chunks.text, and backfill it from the FTS copy for databases
+        // indexed before the column existed (issue #14).
+        if !self.column_exists("chunks", "text")? {
+            self.conn
+                .execute_batch("ALTER TABLE chunks ADD COLUMN text TEXT NOT NULL DEFAULT '';")?;
+            self.backfill_chunk_text()?;
+        }
 
         // Check if edges table exists.
         let has_edges: bool = {
@@ -630,23 +668,29 @@ impl Store {
     /// Insert a chunk. `seq` is its 0-based position in the file and must match
     /// the `chunk_seq` given to [`insert_fts_chunk`](Self::insert_fts_chunk) for
     /// the same chunk, or the two lanes will disagree about what they retrieved.
+    ///
+    /// `text` is the **whole chunk**. The `snippet` column is derived from it
+    /// here rather than passed in: a chunk row that holds a preview but not the
+    /// text it previews is the state issue #14 exists to remove, and taking one
+    /// argument makes it unreachable.
     pub fn insert_chunk(
         &self,
         file_id: i64,
         seq: i64,
         heading: &str,
-        snippet: &str,
+        text: &str,
         vector_id: u64,
         token_count: i64,
     ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO chunks (file_id, seq, heading, snippet, vector_id, token_count)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO chunks (file_id, seq, heading, snippet, text, vector_id, token_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 file_id,
                 seq,
                 heading,
-                snippet,
+                crate::chunker::make_snippet(text),
+                text,
                 vector_id as i64,
                 token_count
             ],
@@ -655,26 +699,30 @@ impl Store {
     }
 
     /// Insert a chunk with its embedding vector stored as a BLOB.
+    ///
+    /// `text` is the whole chunk, for the reason given on
+    /// [`insert_chunk`](Self::insert_chunk).
     #[allow(clippy::too_many_arguments)]
     pub fn insert_chunk_with_vector(
         &self,
         file_id: i64,
         seq: i64,
         heading: &str,
-        snippet: &str,
+        text: &str,
         vector_id: u64,
         token_count: i64,
         vector: &[f32],
     ) -> Result<()> {
         let vector_bytes: Vec<u8> = vector.iter().flat_map(|f| f.to_le_bytes()).collect();
         self.conn.execute(
-            "INSERT INTO chunks (file_id, seq, heading, snippet, vector_id, token_count, vector)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO chunks (file_id, seq, heading, snippet, text, vector_id, token_count, vector)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 file_id,
                 seq,
                 heading,
-                snippet,
+                crate::chunker::make_snippet(text),
+                text,
                 vector_id as i64,
                 token_count,
                 vector_bytes
@@ -741,6 +789,26 @@ impl Store {
             Some(rec) => Ok(Some(rec?)),
             None => Ok(None),
         }
+    }
+
+    /// Fetch the full text of each `(file_id, seq)` in one pass.
+    ///
+    /// This is the reranker's read (issue #14): a cross-encoder has to see the
+    /// chunk, not the preview a lane happened to attach to it. An entry is
+    /// `None` when the chunk is gone or predates `chunks.text` and could not be
+    /// backfilled; the caller decides what to fall back to.
+    pub fn get_chunk_texts(&self, keys: &[(i64, i64)]) -> Result<Vec<Option<String>>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT text FROM chunks WHERE file_id = ?1 AND seq = ?2")?;
+        keys.iter()
+            .map(|(file_id, seq)| {
+                let text: Option<String> = stmt
+                    .query_row(params![file_id, seq], |row| row.get(0))
+                    .optional()?;
+                Ok(text.filter(|t| !t.is_empty()))
+            })
+            .collect()
     }
 
     // ── Tombstones ──────────────────────────────────────────────
@@ -3004,6 +3072,83 @@ mod tests {
                 .unwrap(),
             2
         );
+    }
+
+    /// Issue #14. Before `chunks.text` existed, a chunk's full text lived only
+    /// in the FTS index, which cannot be keyed into. Adding the column has to
+    /// recover it for databases already on disk, or the reranker on an
+    /// un-reindexed vault silently keeps reading previews.
+    #[test]
+    fn the_text_column_backfills_from_the_fts_index() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("legacy.db");
+
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE files (
+                     id INTEGER PRIMARY KEY, path TEXT UNIQUE NOT NULL,
+                     content_hash TEXT NOT NULL, mtime INTEGER NOT NULL,
+                     tags TEXT NOT NULL DEFAULT '[]', indexed_at TEXT NOT NULL, docid TEXT);
+                 CREATE TABLE chunks (
+                     id INTEGER PRIMARY KEY, file_id INTEGER NOT NULL, seq INTEGER NOT NULL,
+                     heading TEXT NOT NULL, snippet TEXT NOT NULL,
+                     vector_id INTEGER UNIQUE NOT NULL, token_count INTEGER NOT NULL,
+                     vector BLOB);
+                 CREATE VIRTUAL TABLE chunks_fts USING fts5(
+                     content, file_id UNINDEXED, chunk_seq UNINDEXED);
+                 INSERT INTO files (id, path, content_hash, mtime, indexed_at)
+                     VALUES (1, 'a.md', 'h', 1, 'now');
+                 INSERT INTO chunks (file_id, seq, heading, snippet, vector_id, token_count)
+                     VALUES (1, 0, 'A0', 'the preview', 10, 1),
+                            (1, 1, 'A1', 'orphan preview', 11, 1);
+                 INSERT INTO chunks_fts (content, file_id, chunk_seq)
+                     VALUES ('the preview and everything after it', 1, 0);",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&db_path).unwrap();
+
+        assert_eq!(
+            store.get_chunk_by_seq(1, 0).unwrap().unwrap().text,
+            "the preview and everything after it",
+            "the FTS copy should have been recovered"
+        );
+        assert_eq!(
+            store.get_chunk_by_seq(1, 1).unwrap().unwrap().text,
+            "orphan preview",
+            "a chunk with no FTS row keeps its snippet — a truncation of the \
+             right text beats the wrong text"
+        );
+
+        // Re-opening must not re-run the backfill over text already written.
+        drop(store);
+        let store = Store::open(&db_path).unwrap();
+        assert_eq!(
+            store.get_chunk_by_seq(1, 0).unwrap().unwrap().text,
+            "the preview and everything after it"
+        );
+    }
+
+    /// The reranker's read. A missing chunk is `None` rather than an error, so
+    /// one stale candidate cannot take the whole lane down.
+    #[test]
+    fn get_chunk_texts_reports_misses_without_failing() {
+        let store = Store::open_memory().unwrap();
+        let file_id = store
+            .insert_file("a.md", "h", 0, &[], "d", None, None)
+            .unwrap();
+        let long = "x".repeat(500);
+        store.insert_chunk(file_id, 0, "H", &long, 1, 10).unwrap();
+
+        let texts = store
+            .get_chunk_texts(&[(file_id, 0), (file_id, 9), (999, 0)])
+            .unwrap();
+
+        assert_eq!(texts[0].as_deref(), Some(long.as_str()));
+        assert_eq!(texts[1], None, "no such seq");
+        assert_eq!(texts[2], None, "no such file");
     }
 
     #[test]

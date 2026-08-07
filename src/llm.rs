@@ -1444,7 +1444,10 @@ mod tests {
             .map(|d| mock.rerank_score("dragon", d).unwrap())
             .collect();
 
-        assert_eq!(batched, one_at_a_time, "batching must not change the scores");
+        assert_eq!(
+            batched, one_at_a_time,
+            "batching must not change the scores"
+        );
     }
 
     #[test]

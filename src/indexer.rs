@@ -410,15 +410,16 @@ pub fn index_file(
 
     for (chunk_seq, chunk) in chunks.iter().enumerate() {
         let heading = chunk.heading.clone().unwrap_or_default();
-        let snippet = &chunk.snippet;
         let vector = &all_vectors[chunk_seq];
         let vector_id = start_vector_id + chunk_seq as u64;
 
+        // The whole chunk goes to storage; the store derives the snippet from
+        // it (issue #14).
         store.insert_chunk_with_vector(
             file_id,
             chunk_seq as i64,
             &heading,
-            snippet,
+            &chunk.text,
             vector_id,
             token_counts[chunk_seq] as i64,
             vector,

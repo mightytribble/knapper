@@ -25,6 +25,7 @@ git fetch upstream && git diff --stat upstream/main main
 | `insert_fts_chunk` | index the whole chunk, not its 200-char snippet | this fork, issue #11 |
 | `ensure_embedding_dim` | embed at the model's native width; no hidden truncation | this fork, issue #12 |
 | `embed_formatted` / `rerank_batch` | one llama.cpp context per batch, not per call | this fork, issue #13 |
+| `chunks.text` | the reranker scores the whole chunk, not a preview | this fork, issue #14 |
 
 Cherry-picked rather than merged: PR #41 branched before upstream's #40 graph fix, so merging the
 branch wholesale would have silently reverted `src/graph.rs`.
@@ -58,7 +59,7 @@ export LIBCLANG_PATH="$HOME/.engraph-buildenv/lib/python3.12/site-packages/clang
 export BINDGEN_EXTRA_CLANG_ARGS="-I/usr/lib/gcc/x86_64-linux-gnu/13/include -I/usr/include -I/usr/include/x86_64-linux-gnu"
 
 cargo build --release        # ~10 min cold, ~20s incremental
-cargo test --lib             # 533 pass
+cargo test --lib             # 546 pass
 ```
 
 Each env var exists for a specific failure. Omit one and you get:
@@ -76,7 +77,7 @@ Adjust the gcc version in the include path (`13`) and the python version (`pytho
 `cargo test` (full) fails to compile `tests/integration.rs` and `tests/write_pipeline.rs`:
 `unresolved import engraph::embedder`, `engraph::hnsw`, and a `walk_vault` arity mismatch.
 **These are broken on pristine upstream** — verify with `git stash && cargo clippy --all-targets`.
-Upstream PR #47 addresses them. Use `cargo test --lib` (533 tests) as the working suite.
+Upstream PR #47 addresses them. Use `cargo test --lib` (546 tests) as the working suite.
 `cargo clippy -- -D warnings`, which is what CI runs, is clean.
 
 ## Runtime gotchas
@@ -103,10 +104,17 @@ Upstream PR #47 addresses them. Use `cargo test --lib` (533 tests) as the workin
   (`texts.chunks(config.batch_size)` sits inside the per-file loop), and the eval vault averages 6.5
   chunks per file, so the default of 64 never fills a batch. Contexts went 1598 → 247, not 1598 → 25.
   Batching across files is part of #13's unbuilt phase 2.
-- **The reranker never sees a chunk** (issue #14). It is handed `candidate.snippet`, which is
-  `chunks.snippet`'s 200 characters for semantic and graph hits but SQLite's 64-token match window
-  for FTS hits — so it judges a fraction of the text, and a different fraction depending on which
-  lane found the candidate.
+- **The rerank lane is now about half of a reranked query** (this fork, issue #14). Since the
+  cross-encoder started reading whole chunks instead of 200-character previews, a warm reranked
+  search costs 11.87 s where it cost 7.90 s (n=20 medians, non-overlapping distributions). At
+  ~1.3 ms per token through Qwen3-Reranker-0.6B, 30 candidates × ~155 tokens is ~5.9 s of it. The
+  obvious lever is `rerank_candidates`, **hardcoded at 30** in all four places a `SearchConfig` is
+  built and not currently exposed in `config.toml`.
+- **`chunks.snippet` is derived, not supplied** (this fork, issue #14). `Store::insert_chunk` calls
+  the chunker's `make_snippet` on the text it is given, so a caller passes one string, not two. That
+  is what makes the transposition in #11 — where the preview went to FTS and the text went nowhere —
+  unreachable rather than merely fixed. Databases predating the column backfill from `chunks_fts` on
+  first open; the backfill is exact on the eval vault (0 mismatches, 0 empties, 1598 chunks).
 - **The reranker does not rerank** (issue #15). Its scores go into a second RRF pass as a fourth
   lane, so a calibrated probability becomes a rank and then `weight/(60+rank)`, averaged with the
   lanes it exists to correct.
@@ -222,14 +230,24 @@ See issues on this repo:
   shape #14 and #15 need — `rerank_batch` hands the reranker its whole candidate set — and for
   deleting a comment that gave the wrong reason. Phase 2 (true multi-sequence decode) is unbuilt and
   is where an actual speed-up would come from
-- **#14** the reranker scores a truncated preview, not the chunk — and a different fraction depending
-  on the lane. Blocked on getting full text back by chunk key: it lives only in `chunks_fts`, whose
-  `file_id`/`chunk_seq` are `UNINDEXED` and cannot be indexed, so this probably wants a `chunks.text`
-  column. Blocks #15
+- ~~**#14** the reranker scores a truncated preview, not the chunk~~ — **done, and it is the first
+  change here to cost something certain.** `chunks.text` landed as predicted; the index is
+  byte-identical in every pre-existing column, the new column hashes equal to `chunks_fts` in both a
+  fresh index and an in-place migration, and intelligence-off output is unchanged. The reranker was
+  reading 28% of a chunk (mean 664 chars vs a 185-char preview, 79% of chunks longer than their
+  preview). **The cost is +50% on a reranked query — 7.90 s → 11.87 s, distributions not
+  overlapping.** The benefit is a wash on the seed probes: probe 3 gains the top slot
+  (`developer-console > ## [3] SPELLS` displaced by Counterspell), probe 2 loses its correct section.
+  18 of 20 slots moved on the benchmark query, which is #12's churn signature — so #3 adjudicates.
+  Shipped on and unswitchable, because "200 chars, or a 64-token match window if FTS found it" is not
+  an alternative strategy worth preserving. `[rerank] document_title` is a switch and is off
 - **#15** the reranker is fused as a lane instead of ordering the results — sorting on its score
   would give engraph its first **absolute** confidence (today `rrf_score / max_score * 100`, so the
   top hit is always 100%) and is likely the cheapest route into #4. Also amplifies the exact-name
-  regression intelligence already causes, so #14 first and probe 4 is the guard
+  regression intelligence already causes, so probe 4 is the guard. **Unblocked**: #14 landed, so the
+  score it would sort on is now a judgement of the actual chunk. Note that #14 raised the stakes —
+  a score that only feeds `weight/(60+rank)` is a cheap thing to be wrong about, and one that
+  orders the results is not, while the lane producing it now costs half the query
 - **#9** section-per-file still beats in-place on probe 1 — #6 ruled out granularity, #2 ruled out
   document identity in the vector, #11 ruled out lexical coverage, #12 ruled out embedding
   dimensionality. Ranks 21+ on that probe are set by graph expansion, and the confidence ladder there
@@ -252,9 +270,14 @@ result slots moved. Any further work on the semantic lane — #10's document sid
 
 **#13 was the exception and is done.** It needed no battery to adjudicate — same index, same
 ranking, byte-identical output — which is also how it managed to disprove its own premise without
-waiting for #3. The pair behind it, **#14 → #15**, is the same story as everything else, and the two
-should be measured together once #3 exists. #15 is worth keeping in view while scoping #4: a
-cross-encoder probability
+waiting for #3.
+
+**#14 is done and is the argument for #3 stated as plainly as it can be.** It is the first change
+in this fork with a certain cost (+50% query latency, measured, non-overlapping) and an unmeasurable
+benefit: on the five probes it wins one and loses one, and 18 of 20 slots moved on the benchmark
+query. It shipped anyway because it fixes an incoherence rather than trading one strategy for
+another — but that reasoning does not transfer to #15, which *is* a strategy trade. **#15 should
+wait for #3.** It is worth keeping in view while scoping #4: a cross-encoder probability
 is the calibrated score a relevance floor wants, and RRF scores demonstrably are not (the nonsense
 query's top RRF score already exceeds a legitimate third-place result).
 
