@@ -90,6 +90,11 @@ Upstream PR #47 addresses them. Use `cargo test --lib` (533 tests) as the workin
   `embeddinggemma-300M` at `target_dim=256`. Upstream PR #48 fixes it.
 - **Intelligence is not a quality dial.** Enabling it (query expansion + Qwen3 reranker, 1.6GB)
   *regressed* exact-name lookup in testing. Treat on/off as distinct configurations.
+- **Every embedding is silently truncated to 256 of the model's 768 dimensions** (issue #12).
+  `LlamaEmbed::new` takes `ModelDefaults::embed_dim` (a hardcoded 256) rather than
+  `LlamaModel::n_embd()`, so the dimension does not track the configured model and a `models.embed`
+  override changes which model runs but not how much of it is kept. Every measurement in `eval/` was
+  taken at a third of the model's dimensionality.
 - **Every embedding is computed with the wrong model's prompt prefix** (issue #10).
   `PromptFormat::EmbeddingGemma` emits `<bos>search_query:` / `<bos>search_document: {title} {text}`,
   which is *nomic-embed-text*'s convention; EmbeddingGemma documents
@@ -170,6 +175,9 @@ See issues on this repo:
 - **#4** relevance floor — configurable per-lane min scores so nonsense queries return nothing
 - **#5** embedding model config — expose output dim, tie max chunk tokens to the model's context window
 - **#8** pick a better local embedder — >512 tokens, >768 dim (pairs with #5, which exposes the knobs)
+- **#12** embed at the model's native dimension — every vector is silently truncated to its first 256
+  of 768, `dim` does not track the configured model, and truncating a non-MRL model would be silent
+  corruption. Migration is free: the existing dimension-mismatch check self-heals on upgrade
 - **#10** the embedding prompt format is nomic-embed-text's, not EmbeddingGemma's — both query and
   document sides are out-of-distribution. Query-side fix needs **no reindex** and is the cheapest
   open experiment in the repo; document-side needs one per configuration, so it waits for #3
