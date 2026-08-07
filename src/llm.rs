@@ -138,10 +138,19 @@ impl LaneWeights {
                 rerank: 1.2,
                 temporal: 0.0,
             },
+            // Graph sits at 0.8 here, not above the content lanes, and this is
+            // load-bearing — see issue #9. `graph_expand` skips any neighbour
+            // already in the seed set, so the graph lane's results are disjoint
+            // from the other lanes' by construction. RRF scores agreement
+            // between rankings of the same corpus; a disjoint set can never
+            // accumulate any, so a graph result's fused score is a pure function
+            // of this constant. At 1.5 its 20 capped expansions swept the whole
+            // top 20, since 1.5/(60+20) beats 0.8/(60+1) by 43% — every content
+            // result was locked out of every "who" query.
             QueryIntent::Relationship => Self {
-                graph: 1.5,
-                semantic: 0.8,
-                fts: 0.8,
+                graph: 0.8,
+                semantic: 1.0,
+                fts: 1.0,
                 rerank: 1.0,
                 temporal: 0.0,
             },
@@ -163,6 +172,13 @@ impl LaneWeights {
     }
 
     /// Weights used when no intelligence layer is available (legacy mode).
+    ///
+    /// **Nothing calls this outside tests.** Turning intelligence off does not
+    /// reach it: `search_with_intelligence` still runs, just with
+    /// `orchestrator: None`, so the intent comes from `heuristic_orchestrate`
+    /// and the weights from [`Self::from_intent`] exactly as they do with the
+    /// models loaded. That is why issue #9's gate fired in *both*
+    /// configurations, and why the fix had to be in the table above.
     pub fn default_no_intelligence() -> Self {
         Self {
             semantic: 1.0,
@@ -1476,9 +1492,45 @@ mod tests {
 
         let relationship = LaneWeights::from_intent(&QueryIntent::Relationship);
         assert!(
-            relationship.graph > relationship.semantic,
-            "relationship should favor graph"
+            relationship.graph >= LaneWeights::from_intent(&QueryIntent::Exact).graph,
+            "relationship should still lean on the graph more than a lookup does"
         );
+    }
+
+    /// The graph lane must never outweigh a content lane, under any intent.
+    ///
+    /// Not a style rule — issue #9. `graph_expand` excludes seed files, so graph
+    /// results share no documents with the semantic or FTS lanes and can never
+    /// gain an agreement term in RRF. Their fused score is therefore just
+    /// `weight/(60+rank)`, and once that constant is large enough for the lane's
+    /// *worst* result to beat a content lane's *best*, the graph lane takes the
+    /// entire ranking. With expansions capped at 20 and `k = 60`, the crossover
+    /// is at `graph/80 > content/61`, i.e. a ratio of about 1.31.
+    ///
+    /// Holding graph at or below the content lanes keeps it inside the ranking
+    /// instead of on top of it. Delete this test only along with the
+    /// disjointness itself (#15).
+    #[test]
+    fn the_graph_lane_never_outweighs_a_content_lane() {
+        let intents = [
+            QueryIntent::Exact,
+            QueryIntent::Conceptual,
+            QueryIntent::Relationship,
+            QueryIntent::Exploratory,
+            QueryIntent::Temporal,
+        ];
+        for intent in &intents {
+            let w = LaneWeights::from_intent(intent);
+            let content = w.semantic.max(w.fts);
+            assert!(
+                w.graph <= content,
+                "{intent:?}: graph {} exceeds the strongest content lane {content} — \
+                 disjoint graph results would crowd the ranking out (#9)",
+                w.graph,
+            );
+        }
+        let w = LaneWeights::default_no_intelligence();
+        assert!(w.graph <= w.semantic.max(w.fts));
     }
 
     #[test]

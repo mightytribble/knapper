@@ -26,6 +26,7 @@ git fetch upstream && git diff --stat upstream/main main
 | `ensure_embedding_dim` | embed at the model's native width; no hidden truncation | this fork, issue #12 |
 | `embed_formatted` / `rerank_batch` | one llama.cpp context per batch, not per call | this fork, issue #13 |
 | `chunks.text` | the reranker scores the whole chunk, not a preview | this fork, issue #14 |
+| `from_intent` `Relationship` | graph no longer outweighs the content lanes | this fork, issue #9 |
 
 Cherry-picked rather than merged: PR #41 branched before upstream's #40 graph fix, so merging the
 branch wholesale would have silently reverted `src/graph.rs`.
@@ -59,7 +60,7 @@ export LIBCLANG_PATH="$HOME/.engraph-buildenv/lib/python3.12/site-packages/clang
 export BINDGEN_EXTRA_CLANG_ARGS="-I/usr/lib/gcc/x86_64-linux-gnu/13/include -I/usr/include -I/usr/include/x86_64-linux-gnu"
 
 cargo build --release        # ~10 min cold, ~20s incremental
-cargo test --lib             # 546 pass
+cargo test --lib             # 547 pass
 ```
 
 Each env var exists for a specific failure. Omit one and you get:
@@ -77,7 +78,7 @@ Adjust the gcc version in the include path (`13`) and the python version (`pytho
 `cargo test` (full) fails to compile `tests/integration.rs` and `tests/write_pipeline.rs`:
 `unresolved import engraph::embedder`, `engraph::hnsw`, and a `walk_vault` arity mismatch.
 **These are broken on pristine upstream** — verify with `git stash && cargo clippy --all-targets`.
-Upstream PR #47 addresses them. Use `cargo test --lib` (546 tests) as the working suite.
+Upstream PR #47 addresses them. Use `cargo test --lib` (547 tests) as the working suite.
 `cargo clippy -- -D warnings`, which is what CI runs, is clean.
 
 ## Runtime gotchas
@@ -247,14 +248,26 @@ See issues on this repo:
   it wants more queries on that question, not a hold on the queue.
   Shipped on and unswitchable, because "200 chars, or a 64-token match window if FTS found it" is not
   an alternative strategy worth preserving. `[rerank] document_title` is a switch and is off
-- **#9** the graph lane is fused as if it were an alternative ranking, and its weight locks the
-  content lanes out. `graph.rs:78` skips any neighbour already in the seed set, so graph results are
-  **disjoint from the content lanes by construction** — they can never accumulate agreement, so a
-  graph result's score is a pure function of the weight constant. At `Relationship` (graph 1.5) its
-  20 capped expansions sweep the whole top 20; at 1.0 it contributes nothing to any other probe.
-  Demonstrated: deleting the word "who" moves `temple-of-the-architect.md` from absent-from-top-20
-  to **rank 1 at 100%**. This is the answer to four ruled-out explanations — all of them tried to
-  improve a lane that could not enter the ranking. Fix is #15's pool
+- ~~**#9** the graph lane is fused as if it were an alternative ranking, and its weight locks the
+  content lanes out~~ — **done, and it is the largest single move in the record.** One constant:
+  `from_intent`'s `Relationship` arm, `graph 1.5 / sem 0.8 / fts 0.8` → `graph 0.8 / sem 1.0 /
+  fts 1.0`. Probe 1 lands for the first time — `temple-of-the-architect` at ranks 1, 2 and 5 and
+  `archivist-lenne` at 8 with the word "who" *present*, against absent-from-top-20 in every
+  configuration ever recorded. Probes 2–5 are byte-identical, intelligence on and off.
+  Two things came out of it that were not expected. **`default_no_intelligence()` is never called** —
+  intelligence-off still runs `search_with_intelligence`, just with `orchestrator: None`, so the
+  heuristic classifier and the weight table govern every search this engine performs and the gate was
+  firing in the baseline configuration all along. And **the graph lane's contribution at 0.8 is not
+  zero but is not evidence of value either**: with intelligence off its only appearances across the
+  five probes are two tail slots on probe 1 and two on probe 5, *the nonsense control*. A disjoint
+  set contributes most where the content lanes have least to say. The category error itself is
+  untouched and belongs to #15
+- **#19** intent classification looks inverted on two probes — with the orchestrator running,
+  `dragon that can take human form` classifies `Exact` and the bare noun `Archdragon` classifies
+  `Conceptual`. Both then show zero FTS contributions in their top 20 regardless. Picked up from
+  #9's `--explain` audit; probe 4's intelligence-on regression may live here rather than in the
+  reranker. The sharper fact is that an `fts 1.5` lane contributes nothing to a 20-slot ranking,
+  which should be explained before the classifier is touched — likely #18
 - **#18** query expansion splits on words against a 16-item stopword list containing no modals and
   no verbs, so `dragon that can take human form` becomes seven expansions including `that` and
   `can` — ~840 result slots for one question, and `collapse_lane` then pools BM25 scores from
@@ -278,14 +291,11 @@ See issues on this repo:
   score it would sort on is now a judgement of the actual chunk. Note that #14 raised the stakes —
   a score that only feeds `weight/(60+rank)` is a cheap thing to be wrong about, and one that
   orders the results is not, while the lane producing it now costs half the query
-- **#9** section-per-file still beats in-place on probe 1 — #6 ruled out granularity, #2 ruled out
-  document identity in the vector, #11 ruled out lexical coverage, #12 ruled out embedding
-  dimensionality. Ranks 21+ on that probe are set by graph expansion, and the confidence ladder there
-  has survived four changes to the lanes underneath it
 - ~~**#6** section-level retrieval granularity — fuse on `(file_id, seq)` so a document can
   contribute more than one section~~ — **done**, probe 3 now returns the correct section and every
-  result names its heading. Did **not** fix probe 1, so `eval/section-split.py` cannot be retired
-  and the Path A / Path B question stays open.
+  result names its heading. It did not fix probe 1, but #9 has: nothing about the section-per-file
+  transform is still unexplained, so **`eval/section-split.py` can be retired and the Path A /
+  Path B question is closed in favour of in-place chunking.**
 - ~~**#7** exclude derived `*-index.md` / `templates/` from ingest, and make `exclude` glob for
   real~~ — **done**, 14.2% of chunks and 18.3% of edges removed from the eval corpus
 
@@ -362,9 +372,8 @@ slot is taken before the semantic lane is consulted. Two-lane agreement is the o
 impossible. **The probe built to isolate the semantic lane is the one query shape where the semantic
 lane cannot reach the results.**
 
-One word demonstrates it. Dropping `who` — same binary, same index — moves
-`temple-of-the-architect.md` from **absent from the top 20** to **rank 1 at 100%**, with a second
-section at rank 2 and a snippet naming Archivist Lenne.
+One word demonstrated it. Dropping `who` — same binary, same index — moved
+`temple-of-the-architect.md` from **absent from the top 20** to **rank 1 at 100%**.
 
 The general defect is that `graph.rs:78` skips any neighbour already in the seed set, so graph
 results are disjoint from the content lanes *by construction*. RRF fuses alternative rankings of the
@@ -372,10 +381,22 @@ same corpus; a disjoint set can never accumulate agreement, so its score is a pu
 weight constant — invisible at 1.0, total at 1.5. Fusing a recall step as though it were a ranking
 is a category error, and #15's pool removes it by construction.
 
+**The weight is now 0.8 and the probe lands** — `temple-of-the-architect` at ranks 1, 2 and 5,
+`archivist-lenne` at 8, with `who` present. The demonstration has reversed: keeping the word now
+beats dropping it, because `who` is the only token marking this as a question about a person and the
+pipeline can finally use it. Two corrections to the paragraphs above came out of that audit. The
+gate was firing with intelligence **off** as well — `default_no_intelligence()` is dead code, and
+turning intelligence off only sets `orchestrator: None`, leaving `heuristic_orchestrate` and the same
+weight table in charge — so this was the baseline configuration's behaviour, not a
+models-loaded-only bug. And graph's contribution at 0.8 is not quite "invisible": it is two tail
+slots on probe 1 and two on probe 5, *the nonsense control*, which is what a disjoint set does when
+the content lanes have nothing to say. Full audit in `eval/probes.md`.
+
 The section-per-file transform's win is no longer mysterious either: its sections are their own
 files, dense enough in "temple" for **both** content lanes to find them, which is the one
-configuration that clears the graph block. Consistent with everything measured, not yet measured
-directly — worth doing before `eval/section-split.py` is retired.
+configuration that clears the graph block. Now confirmed from the other direction — with the weight
+corrected, in-place chunking returns the same file at the same ranks — so `eval/section-split.py`
+has no open question left and can be retired.
 
 `eval/` holds the probes and the harnesses: `probe.sh` for what came back, `bench-search.sh` for how
 long it took.
