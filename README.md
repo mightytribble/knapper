@@ -598,7 +598,7 @@ Optional config at `~/.engraph/config.toml`:
 ```toml
 vault_path = "~/Documents/MyVault"
 top_n = 10
-exclude = [".obsidian/", "node_modules/", ".git/"]
+exclude = [".obsidian/", "node_modules/", ".git/", "*-index.md", "templates/"]
 
 # Enable LLM-powered intelligence (query expansion + reranking)
 intelligence = true
@@ -617,6 +617,8 @@ intelligence = true
 [agents]
 # names = ["claude-code", "cursor"]
 ```
+
+`exclude` takes `.gitignore`-style globs, matched against paths relative to the vault root. A pattern with no `/` matches at any depth (`*-index.md` catches `lore/lore-index.md`); a trailing `/` means a directory and everything under it; an embedded `/` anchors the pattern to the vault root (`drafts/**`). Excluding a path that is already indexed removes it from the store — chunks, vectors, FTS entries and graph edges — on the next index run.
 
 All data stored in `~/.engraph/` — single SQLite database (~10MB typical), GGUF models, and vault profile.
 

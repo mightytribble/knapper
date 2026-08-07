@@ -717,6 +717,7 @@ dependencies = [
  "dialoguer",
  "dirs",
  "encoding_rs",
+ "globset",
  "ignore",
  "indicatif",
  "llama-cpp-2",

@@ -10,6 +10,7 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
 use crate::config::Config;
+use crate::exclude::ExcludeMatcher;
 use crate::indexer;
 use crate::llm::EmbedModel;
 use crate::placement;
@@ -33,8 +34,12 @@ pub fn start_watcher(
     let (tx, rx) = mpsc::channel::<Vec<WatchEvent>>(64);
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
+    // Compile the exclude globs once, here, so a bad pattern fails server startup
+    // rather than every event batch.
+    let matcher = ExcludeMatcher::new(&exclude)?;
+
     // Start producer (begins buffering events immediately)
-    let producer_handle = start_producer(vault_path.as_ref().clone(), exclude, tx, shutdown_rx);
+    let producer_handle = start_producer(vault_path.as_ref().clone(), matcher, tx, shutdown_rx);
 
     // Spawn consumer task
     let store_clone = store.clone();
@@ -92,7 +97,7 @@ pub enum WatchEvent {
 /// The producer watches the vault, debounces events, and sends batches to tx.
 pub fn start_producer(
     vault_path: PathBuf,
-    exclude: Vec<String>,
+    exclude: ExcludeMatcher,
     tx: mpsc::Sender<Vec<WatchEvent>>,
     mut shutdown_rx: oneshot::Receiver<()>,
 ) -> std::thread::JoinHandle<()> {
@@ -146,7 +151,7 @@ pub fn start_producer(
 fn process_debounced_events(
     events: &[DebouncedEvent],
     vault_path: &Path,
-    exclude: &[String],
+    exclude: &ExcludeMatcher,
 ) -> Vec<WatchEvent> {
     let mut result = Vec::new();
 
@@ -157,7 +162,7 @@ fn process_debounced_events(
             .paths
             .iter()
             .filter(|p| p.extension().map(|e| e == "md").unwrap_or(false))
-            .filter(|p| !is_excluded(p, vault_path, exclude))
+            .filter(|p| !exclude.matches_under(p, vault_path))
             .collect();
 
         if paths.is_empty() {
@@ -184,20 +189,6 @@ fn process_debounced_events(
     }
 
     result
-}
-
-/// Check if a path should be excluded (mirrors `walk_vault` logic in `indexer.rs`).
-fn is_excluded(path: &Path, vault_path: &Path, exclude: &[String]) -> bool {
-    let rel = path.strip_prefix(vault_path).unwrap_or(path);
-    let rel_str = rel.to_string_lossy();
-    exclude.iter().any(|pattern| {
-        if pattern.ends_with('/') {
-            let dir_name = pattern.trim_end_matches('/');
-            rel_str.split('/').any(|component| component == dir_name)
-        } else {
-            rel_str.contains(pattern.as_str())
-        }
-    })
 }
 
 /// Detect file moves by matching `Deleted` + `Changed` pairs via content hash.

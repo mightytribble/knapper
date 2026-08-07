@@ -180,10 +180,21 @@ impl Config {
                 .with_context(|| format!("failed to read {}", config_path.display()))?;
             let config: Config = toml::from_str(&contents)
                 .with_context(|| format!("failed to parse {}", config_path.display()))?;
+            config.validate_exclude(&config_path)?;
             Ok(config)
         } else {
             Ok(Config::default())
         }
+    }
+
+    /// Reject `exclude` patterns that will not compile, at load time.
+    ///
+    /// Without this a typo becomes a glob that matches nothing, and the only
+    /// symptom is files quietly staying in the index.
+    fn validate_exclude(&self, source: &Path) -> Result<()> {
+        crate::exclude::ExcludeMatcher::new(&self.exclude)
+            .with_context(|| format!("in {}", source.display()))?;
+        Ok(())
     }
 
     /// Merge CLI-provided values over the loaded config.
@@ -224,6 +235,7 @@ impl Config {
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let config: Config =
             toml::from_str(&contents).with_context(|| format!("parsing {}", path.display()))?;
+        config.validate_exclude(path)?;
         Ok(config)
     }
 
@@ -267,6 +279,30 @@ batch_size = 128
         assert_eq!(cfg.top_n, 10);
         assert_eq!(cfg.exclude, vec!["*.canvas", ".obsidian"]);
         assert_eq!(cfg.batch_size, 128);
+    }
+
+    #[test]
+    fn load_rejects_invalid_exclude_pattern() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "exclude = [\"[unclosed.md\"]\n").unwrap();
+
+        let err = Config::load_from(&path).unwrap_err();
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("invalid exclude pattern"),
+            "unexpected error: {chain}"
+        );
+    }
+
+    #[test]
+    fn load_accepts_glob_exclude_patterns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "exclude = [\"*-index.md\", \"templates/\"]\n").unwrap();
+
+        let cfg = Config::load_from(&path).unwrap();
+        assert_eq!(cfg.exclude, vec!["*-index.md", "templates/"]);
     }
 
     #[test]

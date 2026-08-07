@@ -11,6 +11,7 @@ use tracing::info;
 use crate::chunker::{chunk_markdown, split_oversized_chunks};
 use crate::config::Config;
 use crate::docid::generate_docid;
+use crate::exclude::ExcludeMatcher;
 use crate::graph::extract_wikilink_targets;
 use crate::llm::EmbedModel;
 use crate::profile::VaultProfile;
@@ -38,11 +39,16 @@ pub struct IndexFileResult {
 /// `.ignore` rules (within a git repo, per the crate's `require_git` default).
 /// Set it false to index files those VCS rules would skip; hidden entries
 /// (`.git/`, dotfiles) and the explicit `exclude` patterns are always skipped.
+///
+/// `exclude` holds globs — see [`ExcludeMatcher`] for the pattern syntax. An
+/// unparseable pattern is an error here rather than a filter that quietly passes
+/// everything through.
 pub fn walk_vault(
     path: &Path,
     exclude: &[String],
     respect_gitignore: bool,
 ) -> Result<Vec<PathBuf>> {
+    let matcher = ExcludeMatcher::new(exclude)?;
     let mut builder = WalkBuilder::new(path);
     if respect_gitignore {
         builder.standard_filters(true); // respect .gitignore, .ignore, hidden, etc.
@@ -77,20 +83,7 @@ pub fn walk_vault(
         }
 
         // Check exclude patterns.
-        let rel = entry_path.strip_prefix(path).unwrap_or(entry_path);
-        let rel_str = rel.to_string_lossy();
-
-        let excluded = exclude.iter().any(|pattern| {
-            // Support simple prefix/contains matching for directory patterns like ".obsidian/"
-            if pattern.ends_with('/') {
-                let dir_name = pattern.trim_end_matches('/');
-                rel_str.split('/').any(|component| component == dir_name)
-            } else {
-                rel_str.contains(pattern.as_str())
-            }
-        });
-
-        if excluded {
+        if matcher.matches_under(entry_path, path) {
             continue;
         }
 
@@ -464,6 +457,10 @@ pub fn remove_file(rel_path: &str, store: &Store) -> Result<()> {
         store.delete_vec(vid)?;
     }
     store.delete_fts_chunks_for_file(file.id)?;
+    // `unresolved_links` is keyed by path, not file id, so `delete_file` does not
+    // reach it — the rows would outlive the file and keep reporting broken links
+    // from a note that is no longer indexed.
+    store.clear_unresolved_links_for_file(&file.path)?;
     store.delete_file(file.id)?;
 
     if owns_transaction {
@@ -790,6 +787,146 @@ mod tests {
         let files = walk_vault(root, &[".obsidian/".to_string()], true).unwrap();
         assert_eq!(files.len(), 1, "expected 1 file, got {:?}", files);
         assert!(files[0].ends_with("note.md"));
+    }
+
+    #[test]
+    fn test_walk_excludes_globs_at_any_depth() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write_file(root, "lore/archdragon.md", "# Archdragon");
+        write_file(root, "lore/lore-index.md", "# Lore index");
+        write_file(root, "rules/spell-index.md", "# Spell index");
+        write_file(root, "templates/npc.md", "# NPC template");
+
+        let exclude = vec!["*-index.md".to_string(), "templates/".to_string()];
+        let files = walk_vault(root, &exclude, true).unwrap();
+
+        assert_eq!(files.len(), 1, "expected 1 file, got {:?}", files);
+        assert!(files[0].ends_with("archdragon.md"));
+    }
+
+    #[test]
+    fn test_walk_rejects_invalid_exclude_pattern() {
+        let tmp = TempDir::new().unwrap();
+        write_file(tmp.path(), "note.md", "# Note");
+
+        let err = walk_vault(tmp.path(), &["[unclosed.md".to_string()], true).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid exclude pattern"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_exclude_purges_previously_indexed_files() {
+        // Adding an exclude pattern must remove what is already in the store, not
+        // just stop future ingestion. `diff_vault` treats "in the store, absent
+        // from the walk" as deleted, which makes this work — this pins it.
+        use crate::llm::MockLlm;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write_file(
+            root,
+            "lore/archdragon.md",
+            "# Archdragon\nSee [[lore-index]].",
+        );
+        write_file(
+            root,
+            "lore/lore-index.md",
+            "# Lore index\n\n### Archdragon\nSee [[archdragon]].",
+        );
+
+        let store = Store::open_memory().unwrap();
+        let mut embedder = MockLlm::new(256);
+        let mut config = Config::default();
+
+        let result = run_index_shared(root, &config, &store, &mut embedder, false, None).unwrap();
+        assert_eq!(result.new_files, 2);
+
+        let indexed = store
+            .get_file("lore/lore-index.md")
+            .unwrap()
+            .expect("index file should be in the store");
+        let file_id = indexed.id;
+        let fts_rows = |id: i64| -> i64 {
+            store
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM chunks_fts WHERE file_id = ?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+
+        assert!(!store.get_chunks_by_file(file_id).unwrap().is_empty());
+        assert!(!store.get_vector_ids_for_file(file_id).unwrap().is_empty());
+        assert!(fts_rows(file_id) > 0);
+        assert!(
+            !store.get_outgoing(file_id, None).unwrap().is_empty(),
+            "index file should have contributed graph edges"
+        );
+
+        // Exclude it and re-index.
+        config.exclude.push("*-index.md".to_string());
+        let result = run_index_shared(root, &config, &store, &mut embedder, false, None).unwrap();
+
+        assert_eq!(result.deleted_files, 1);
+        assert!(store.get_file("lore/lore-index.md").unwrap().is_none());
+        assert!(
+            store.get_file("lore/archdragon.md").unwrap().is_some(),
+            "excluding the index file must not disturb the canonical note"
+        );
+        assert!(store.get_chunks_by_file(file_id).unwrap().is_empty());
+        assert!(store.get_vector_ids_for_file(file_id).unwrap().is_empty());
+        assert_eq!(fts_rows(file_id), 0);
+        assert!(store.get_outgoing(file_id, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_removed_file_leaves_no_unresolved_links() {
+        // `unresolved_links` is keyed by path rather than file id, so it is not
+        // reached by the usual cascade — a removed file used to keep reporting
+        // broken links forever.
+        use crate::llm::MockLlm;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write_file(root, "keeper.md", "# Keeper\nPoints at [[nowhere]].");
+        write_file(
+            root,
+            "lore-index.md",
+            "# Index\nPoints at [[also-nowhere]].",
+        );
+
+        let store = Store::open_memory().unwrap();
+        let mut embedder = MockLlm::new(256);
+        let mut config = Config::default();
+
+        run_index_shared(root, &config, &store, &mut embedder, false, None).unwrap();
+        let sources: Vec<String> = store
+            .get_unresolved_links()
+            .unwrap()
+            .into_iter()
+            .map(|(source, _)| source)
+            .collect();
+        assert_eq!(sources.len(), 2, "got {sources:?}");
+
+        config.exclude.push("*-index.md".to_string());
+        run_index_shared(root, &config, &store, &mut embedder, false, None).unwrap();
+
+        let sources: Vec<String> = store
+            .get_unresolved_links()
+            .unwrap()
+            .into_iter()
+            .map(|(source, _)| source)
+            .collect();
+        assert_eq!(
+            sources,
+            vec!["keeper.md".to_string()],
+            "the excluded file's unresolved links should be gone"
+        );
     }
 
     #[test]

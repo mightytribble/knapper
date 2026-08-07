@@ -2,6 +2,7 @@ pub mod chunker;
 pub mod config;
 pub mod context;
 pub mod docid;
+pub mod exclude;
 pub mod fts;
 pub mod fusion;
 pub mod graph;
