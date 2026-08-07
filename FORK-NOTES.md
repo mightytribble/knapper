@@ -91,6 +91,19 @@ Upstream PR #47 addresses them. Use `cargo test --lib` (533 tests) as the workin
   `embeddinggemma-300M`. Upstream PR #48 fixes it.
 - **Intelligence is not a quality dial.** Enabling it (query expansion + Qwen3 reranker, 1.6GB)
   *regressed* exact-name lookup in testing. Treat on/off as distinct configurations.
+- **Every model call creates a fresh `LlamaContext` and drops it** (issue #13). A full reindex of the
+  eval vault makes 1598 of them; a search with intelligence on makes 30 for the reranker alone. Both
+  sites blame `!Send`, which is true of the struct *field* and irrelevant to the loop — the binding
+  constraint is that `new_context<'a>(&'a self, …)` borrows the model, so a context cannot live
+  beside it in one struct. **`batch_size` is decorative on the llama path**: `index_file` chunks the
+  work into batches of 64 and `embed_batch` unrolls each batch one text at a time.
+- **The reranker never sees a chunk** (issue #14). It is handed `candidate.snippet`, which is
+  `chunks.snippet`'s 200 characters for semantic and graph hits but SQLite's 64-token match window
+  for FTS hits — so it judges a fraction of the text, and a different fraction depending on which
+  lane found the candidate.
+- **The reranker does not rerank** (issue #15). Its scores go into a second RRF pass as a fourth
+  lane, so a calibrated probability becomes a rank and then `weight/(60+rank)`, averaged with the
+  lanes it exists to correct.
 - **The embedding width is the model's, read from the GGUF at load time** (this fork, issue #12).
   `LlamaEmbed::new` takes it from `LlamaModel::n_embd()`, so a `models.embed` override changes the
   dimension along with the model. Upstream hardcoded 256 in `ModelDefaults::embed_dim` and truncated
@@ -194,6 +207,18 @@ See issues on this repo:
 - **#10** the embedding prompt format is nomic-embed-text's, not EmbeddingGemma's — both query and
   document sides are out-of-distribution. Query-side fix needs **no reindex** and is the cheapest
   open experiment in the repo; document-side needs one per configuration, so it waits for #3
+- **#13** reuse one llama.cpp context per phase instead of one per call — 1598 contexts per reindex,
+  30 per reranked search, and `batch_size` unrolled to nothing. **The only open retrieval ticket
+  whose result can be verified today**: it changes no output, so byte-identical index and probes are
+  the acceptance criteria alongside wall-clock. Blocks #14
+- **#14** the reranker scores a truncated preview, not the chunk — and a different fraction depending
+  on the lane. Blocked on getting full text back by chunk key: it lives only in `chunks_fts`, whose
+  `file_id`/`chunk_seq` are `UNINDEXED` and cannot be indexed, so this probably wants a `chunks.text`
+  column. Blocks #15
+- **#15** the reranker is fused as a lane instead of ordering the results — sorting on its score
+  would give engraph its first **absolute** confidence (today `rrf_score / max_score * 100`, so the
+  top hit is always 100%) and is likely the cheapest route into #4. Also amplifies the exact-name
+  regression intelligence already causes, so #14 first and probe 4 is the guard
 - **#9** section-per-file still beats in-place on probe 1 — #6 ruled out granularity, #2 ruled out
   document identity in the vector, #11 ruled out lexical coverage, #12 ruled out embedding
   dimensionality. Ranks 21+ on that probe are set by graph expansion, and the confidence ladder there
@@ -213,6 +238,13 @@ everything else here costs a rebuild per column. Its document side goes after #3
 probes reported *identical* verdicts at identical ranks and confidences while three quarters of the
 result slots moved. Any further work on the semantic lane — #10's document side, #8's model swap,
 #5's knobs — is unmeasurable until the battery exists.
+
+**#13 is the exception and can go whenever.** It is a pure latency change: same index, same ranking,
+byte-identical output, so it needs no battery to adjudicate. The reranker pair behind it —
+**#13 → #14 → #15** — is otherwise the same story as everything else, and #14/#15 should be measured
+together once #3 exists. #15 is worth keeping in view while scoping #4: a cross-encoder probability
+is the calibrated score a relevance floor wants, and RRF scores demonstrably are not (the nonsense
+query's top RRF score already exceeds a legitimate third-place result).
 
 Then **#3**, and now with a concrete debt to pay off. Five hand-picked probes were
 enough to show that #2 trades one probe for another, and not enough to say which trade is right —
