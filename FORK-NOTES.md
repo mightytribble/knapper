@@ -279,6 +279,21 @@ See issues on this repo:
   lane's vote outweighs any position within one. Tags resolve semantically (a `tag_centroids` table,
   the same machinery as `folder_centroids`), aliases lexically (`links.rs`'s fuzzy name matching).
   Replaces the withdrawn FTS-injection experiment. Probe 4 is the guard, probe 5 the control
+- **#20** llama.cpp runs on **4 threads regardless of the machine**. All three wrappers build from
+  `LlamaContextParams::default()` and never set `n_threads` / `n_threads_batch`; the ggml default is
+  `GGML_DEFAULT_N_THREADS = 4` with llama.cpp's own `// TODO: better default` beside it. This box has
+  16 cores, and the #9 probe runs measured 3.42× and 3.34× user/wall — just under 4. `n_threads_batch`
+  is the lever that matters, since the reranker and embedder are single forward passes rather than
+  generation. **Every latency number in `eval/` was taken on a quarter of the box.** Expect 1.5–2.5×
+  on the model-bound part, not 4× — these are bandwidth-bound 0.6B Q8 models. `rayon` is declared in
+  `Cargo.toml` with zero call sites
+- **#21** multi-sequence decode — phase 2 of #13, which built the batch *API* and then looped inside
+  it. `LlamaBatch::new(max_tokens + 16, 1)` sets `n_seq_max = 1` and `n_ctx` is sized for one
+  document, so all 30 candidates get their own forward pass. Packing them under distinct `seq_id`s
+  and decoding once is where quantized CPU inference gets its throughput. **Acceptance is bit-identical
+  scores** — sequence isolation stops being enforced by `clear_kv_cache()` and starts being enforced
+  by getting batch construction right, and a silent failure would corrupt every ranking. Measure after
+  #20 so it is not credited with headroom that was always there
 - **#16** `rerank_candidates` is hardcoded at 30 in four places and unreachable from `config.toml`. It
   was academic while the reranker read previews; after #14 it is the one free term in a lane that
   costs half the query. Wanted as a knob to sweep, not as a new default — cutting it also
