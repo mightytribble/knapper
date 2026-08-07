@@ -241,6 +241,11 @@ See issues on this repo:
   18 of 20 slots moved on the benchmark query, which is #12's churn signature — so #3 adjudicates.
   Shipped on and unswitchable, because "200 chars, or a 64-token match window if FTS found it" is not
   an alternative strategy worth preserving. `[rerank] document_title` is a switch and is off
+- **#16** `rerank_candidates` is hardcoded at 30 in four places and unreachable from `config.toml`. It
+  was academic while the reranker read previews; after #14 it is the one free term in a lane that
+  costs half the query. Wanted as a knob for #3 to sweep, not as a new default — cutting it also
+  cuts what the cross-encoder can rescue from the retrieval lanes, which is the case the lane exists
+  for
 - **#15** the reranker is fused as a lane instead of ordering the results — sorting on its score
   would give engraph its first **absolute** confidence (today `rrf_score / max_score * 100`, so the
   top hit is always 100%) and is likely the cheapest route into #4. Also amplifies the exact-name
