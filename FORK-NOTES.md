@@ -102,10 +102,13 @@ See issues on this repo:
 - **#5** embedding model config — expose output dim, tie max chunk tokens to the model's context window
 - **#6** section-level retrieval granularity — dedup on `(file_path, heading)` so a document can
   contribute more than one section to the results
+- **#7** exclude derived `*-index.md` / `templates/` from ingest, and make `exclude` glob for real
+  (it is documented as globs, implemented as substring `contains`)
 
-Suggested order: **#6 next** — measurement showed it is the binding constraint, and it raises the
-ceiling for #2. Then **#3** (supplies the measurements the rest are judged by), then **#5** (makes
-chunk size and dim configurable, which #2/#3 need to compare configurations), then #2, then #4
-(needs #3's negative controls to calibrate).
+Suggested order: **#7 first** (it is small, and it stops the rest being tuned against a corpus that
+is 14% derived boilerplate), then **#6** — measurement showed it is the binding constraint, and it
+raises the ceiling for #2. Then **#3** (supplies the measurements the rest are judged by), then
+**#5** (makes chunk size and dim configurable, which #2/#3 need to compare configurations), then #2,
+then #4 (needs #3's negative controls to calibrate).
 
 `eval/` holds the seed material for #3.
