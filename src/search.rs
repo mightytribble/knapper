@@ -408,15 +408,31 @@ pub fn search_with_intelligence(
         }
     }
 
+    // The lane no longer reads the query: its admission filter was a weaker
+    // second copy of the FTS lane, scoped to one file and run on the *original*
+    // query while the content lanes ran every expansion (#29). What it was
+    // protecting against — an unrankable score — is gone now that mass
+    // accumulates, so a structurally implicated chunk simply sorts where its
+    // mass puts it.
+    let graph_started = std::time::Instant::now();
     let graph_results = graph::graph_expand(
         config.store,
         &combined_seeds,
-        query,
-        2,
-        20,
-        graph::OFF_CHUNK_LINK_WEIGHT,
+        &graph::PprParams {
+            cap_per_file: cap,
+            ..graph::PprParams::default()
+        },
     )
     .unwrap_or_default();
+    // The lane's cost was the second-largest stage in the query before #29 and
+    // nothing reported it; `RUST_LOG=engraph::search=debug` is how the sweep
+    // reads it back, as it does for the reranker's assembled size.
+    tracing::debug!(
+        seeds = combined_seeds.len(),
+        expansions = graph_results.len(),
+        elapsed_us = graph_started.elapsed().as_micros() as u64,
+        "graph lane"
+    );
 
     // --- Step 3: RRF Pass 1 (3-lane) ---
     const RRF_K: usize = 60;

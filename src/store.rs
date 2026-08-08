@@ -1340,115 +1340,77 @@ impl Store {
         Ok(results)
     }
 
-    /// Neighbours of a *passage*, with the weight its scope earns (issue #28).
+    /// Every wikilink edge touching any of `file_ids`, oriented near-end-first.
     ///
-    /// [`get_neighbors`](Self::get_neighbors) asks "what does this file link
-    /// to"; this asks "what does this passage link to", which is the question
-    /// retrieval has been answering wrongly since #6 made everything downstream
-    /// chunk-level. A seed of `archdragon.md#Evolution` used to expand along the
-    /// links in `## Cross-links` and `## Session History` as though the matched
-    /// passage had pointed at them.
+    /// Returns `(near_file, near_seq, far_file, far_seq)`. Wikilinks are walked
+    /// in both directions — a knowledge-graph neighbour is related whichever way
+    /// the link runs — so each arm of the union puts the end *nearest* the file
+    /// asked about first. That is the end which has to match the passage in
+    /// hand; the far end is where the walk lands.
     ///
-    /// Each returned neighbour carries a weight in `[0, 1]`:
-    ///
-    /// - an edge the seed chunk owns, or one aimed at the whole document, is
-    ///   **chunk-local** and weighs 1.0;
-    /// - any other edge of the same file weighs `off_chunk_weight`, the
-    ///   product over the path when it takes more than one hop.
-    ///
-    /// `off_chunk_weight` picks the policy: `0.0` scopes hard (a passage that
-    /// points nowhere expands nowhere), `1.0` reproduces `get_neighbors`
-    /// exactly, and anything between is the two-tier discount — the document's
-    /// other links stay reachable but stop drowning out the passage's own.
-    ///
-    /// After the first hop the passage in hand is whatever the traversed edge
-    /// pointed at, so the same test applies at every depth.
-    pub fn get_neighbors_from_chunk(
-        &self,
-        file_id: i64,
-        chunk_seq: i64,
-        depth: usize,
-        off_chunk_weight: f64,
-    ) -> Result<Vec<(i64, usize, f64)>> {
-        use std::collections::VecDeque;
-        // file → (hop, weight) for the best arrival so far. Shortest hop wins;
-        // at equal hop the heavier path wins, and an improvement re-expands.
-        let mut best: std::collections::HashMap<i64, (usize, f64)> =
-            std::collections::HashMap::new();
-        let mut queue: VecDeque<(i64, i64, usize, f64)> = VecDeque::new();
-        queue.push_back((file_id, chunk_seq, 0, 1.0));
-
-        // Wikilinks are followed in both directions, as in `get_neighbors`: a
-        // knowledge-graph neighbour is related whichever way the link runs. Each
-        // arm puts the end nearest `current` last — that is the one that has to
-        // match the passage in hand.
-        let mut stmt = self.conn.prepare(
-            "SELECT to_file, to_chunk_seq, from_chunk_seq FROM edges
-             WHERE from_file = ?1 AND edge_type = 'wikilink'
-             UNION ALL
-             SELECT from_file, from_chunk_seq, to_chunk_seq FROM edges
-             WHERE to_file = ?1 AND edge_type = 'wikilink'",
-        )?;
-
-        while let Some((current, current_seq, hop, weight)) = queue.pop_front() {
-            if hop >= depth {
-                continue;
-            }
-            let rows = stmt.query_map(params![current], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            })?;
-
-            for row in rows {
-                let (neighbor_id, far_seq, near_seq) = row?;
-                if neighbor_id == file_id {
-                    continue; // never expand back onto the seed's own file
-                }
-                let local = near_seq == current_seq || near_seq == DOC_LEVEL;
-                let edge_weight = if local { 1.0 } else { off_chunk_weight };
-                if edge_weight <= 0.0 {
-                    continue;
-                }
-                let next = (hop + 1, weight * edge_weight);
-                let improved = match best.get(&neighbor_id) {
-                    Some(&(h, w)) => next.0 < h || (next.0 == h && next.1 > w),
-                    None => true,
-                };
-                if improved {
-                    best.insert(neighbor_id, next);
-                    queue.push_back((neighbor_id, far_seq, next.0, next.1));
-                }
-            }
+    /// One indexed fetch for a whole frontier, which is what replaced the
+    /// per-seed BFS in issue #29: the walk is arithmetic over this list, done in
+    /// Rust, rather than two queries per node visited.
+    pub fn incident_wikilink_edges(&self, file_ids: &[i64]) -> Result<Vec<(i64, i64, i64, i64)>> {
+        if file_ids.is_empty() {
+            return Ok(Vec::new());
         }
-
-        Ok(best
-            .into_iter()
-            .map(|(id, (hop, weight))| (id, hop, weight))
-            .collect())
+        let ph = vec!["?"; file_ids.len()].join(",");
+        let sql = format!(
+            "SELECT from_file, from_chunk_seq, to_file, to_chunk_seq FROM edges
+             WHERE edge_type = 'wikilink' AND from_file IN ({ph})
+             UNION ALL
+             SELECT to_file, to_chunk_seq, from_file, from_chunk_seq FROM edges
+             WHERE edge_type = 'wikilink' AND to_file IN ({ph})"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let bound: Vec<Box<dyn rusqlite::types::ToSql>> = file_ids
+            .iter()
+            .chain(file_ids.iter())
+            .map(|id| Box::new(*id) as Box<dyn rusqlite::types::ToSql>)
+            .collect();
+        let rows = stmt.query_map(rusqlite::params_from_iter(bound.iter()), |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+        let mut edges = Vec::new();
+        for row in rows {
+            edges.push(row?);
+        }
+        Ok(edges)
     }
 
-    /// Find files that share at least one tag with the given file.
-    pub fn get_shared_tags_files(&self, file_id: i64, limit: usize) -> Result<Vec<i64>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT f2.id
-             FROM files f1
-             JOIN files f2 ON f2.id != f1.id
-             WHERE f1.id = ?1
-             AND EXISTS (
-                 SELECT 1 FROM json_each(f1.tags) t1
-                 JOIN json_each(f2.tags) t2 ON t1.value = t2.value
-             )
-             LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![file_id, limit as i64], |row| row.get::<_, i64>(0))?;
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row?);
+    /// The chunk seqs each of `file_ids` actually has, in order.
+    ///
+    /// What a [`DOC_LEVEL`] link resolves to at *walk* time. #28 stores such a
+    /// link as one row rather than one row per target chunk; this is the other
+    /// half of that decision — the set is materialised only when a walk needs to
+    /// divide mass across it, and never in the table.
+    pub fn chunk_seqs_for_files(
+        &self,
+        file_ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, Vec<i64>>> {
+        let mut map: std::collections::HashMap<i64, Vec<i64>> = std::collections::HashMap::new();
+        if file_ids.is_empty() {
+            return Ok(map);
         }
-        Ok(results)
+        let ph = vec!["?"; file_ids.len()].join(",");
+        let sql = format!(
+            "SELECT file_id, seq FROM chunks WHERE file_id IN ({ph}) ORDER BY file_id, seq"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(file_ids.iter()), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (file_id, seq) = row?;
+            map.entry(file_id).or_default().push(seq);
+        }
+        Ok(map)
     }
 
     /// Check if a file's FTS5 content contains a term. Escapes for FTS5.
@@ -1465,10 +1427,14 @@ impl Store {
 
     /// Which chunk of `file_id` best matches any of `terms`, by BM25.
     ///
-    /// The graph lane ranks whole files but has to name a section; this is how it
-    /// names the one that actually contains the query, rather than the longest.
     /// Returns `None` when no chunk of the file matches — which is also the
     /// relevance signal `file_contains_term` used to give.
+    ///
+    /// No longer on any retrieval path: the graph lane used this to name a
+    /// section for a file it had ranked, and since #29 the walk is over chunks
+    /// and returns the chunk it reached (issue #29). Kept as the primitive that
+    /// answers "which passage of this note holds this term", which is what the
+    /// indexer's and writer's chunk-identity tests assert against.
     pub fn best_matching_chunk_seq(&self, file_id: i64, terms: &[String]) -> Result<Option<i64>> {
         if terms.is_empty() {
             return Ok(None);
@@ -1491,18 +1457,6 @@ impl Store {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             // A malformed FTS expression means no match, not a failed search.
             Err(_) => Ok(None),
-        }
-    }
-
-    /// Get the best (highest token_count) chunk for a file.
-    pub fn get_best_chunk_for_file(&self, file_id: i64) -> Result<Option<ChunkRecord>> {
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT {CHUNK_COLUMNS} FROM chunks WHERE file_id = ?1 ORDER BY token_count DESC LIMIT 1"
-        ))?;
-        let mut rows = stmt.query_map(params![file_id], chunk_from_row)?;
-        match rows.next() {
-            Some(r) => Ok(Some(r?)),
-            None => Ok(None),
         }
     }
 
@@ -3177,48 +3131,6 @@ mod tests {
     }
 
     #[test]
-    fn test_get_shared_tags_files() {
-        let store = Store::open_memory().unwrap();
-        let f1 = store
-            .insert_file(
-                "n/f1.md",
-                "h1",
-                100,
-                &["rust".to_string(), "cli".to_string()],
-                &generate_docid("n/f1.md"),
-                None,
-                None,
-            )
-            .unwrap();
-        let f2 = store
-            .insert_file(
-                "n/f2.md",
-                "h2",
-                100,
-                &["rust".to_string(), "web".to_string()],
-                &generate_docid("n/f2.md"),
-                None,
-                None,
-            )
-            .unwrap();
-        let _f3 = store
-            .insert_file(
-                "n/f3.md",
-                "h3",
-                100,
-                &["python".to_string()],
-                &generate_docid("n/f3.md"),
-                None,
-                None,
-            )
-            .unwrap();
-
-        let shared = store.get_shared_tags_files(f1, 10).unwrap();
-        assert_eq!(shared.len(), 1);
-        assert_eq!(shared[0], f2);
-    }
-
-    #[test]
     fn test_file_contains_term() {
         let store = Store::open_memory().unwrap();
         let f1 = store
@@ -3240,34 +3152,6 @@ mod tests {
         assert!(store.file_contains_term(f1, "delivery").unwrap());
         assert!(store.file_contains_term(f1, "extension").unwrap());
         assert!(!store.file_contains_term(f1, "checkout").unwrap());
-    }
-
-    #[test]
-    fn test_get_best_chunk_for_file() {
-        let store = Store::open_memory().unwrap();
-        let f1 = store
-            .insert_file(
-                "n/best.md",
-                "h1",
-                100,
-                &[],
-                &generate_docid("n/best.md"),
-                None,
-                None,
-            )
-            .unwrap();
-
-        store
-            .insert_chunk(f1, 0, "Small heading", "small snippet", 1, 10)
-            .unwrap();
-        store
-            .insert_chunk(f1, 1, "Big heading", "big snippet", 2, 100)
-            .unwrap();
-
-        let best = store.get_best_chunk_for_file(f1).unwrap().unwrap();
-        assert_eq!(best.heading, "Big heading");
-        assert_eq!(best.snippet, "big snippet");
-        assert_eq!(best.seq, 1, "identity travels with the chunk");
     }
 
     /// Insert a file with one chunk per (heading, text) pair, numbered in order.
@@ -4700,114 +4584,59 @@ mod tests {
             .unwrap()
     }
 
-    /// A hub whose `## Role` (seq 0) links to `near` and whose
-    /// `## History` (seq 1) links to `far`.
-    fn two_section_hub() -> (Store, i64, i64, i64) {
+    #[test]
+    fn an_incident_edge_is_returned_from_whichever_end_was_asked_for() {
+        // Both arms of the union orient the *near* end first, so one edge is two
+        // rows when both its files are in the frontier — that is what makes the
+        // walk undirected without storing a reverse edge.
         let store = Store::open_memory().unwrap();
-        let hub = file(&store, "hub.md");
-        let near = file(&store, "near.md");
-        let far = file(&store, "far.md");
-        store
-            .insert_edge(hub, 0, near, DOC_LEVEL, "wikilink")
-            .unwrap();
-        store
-            .insert_edge(hub, 1, far, DOC_LEVEL, "wikilink")
-            .unwrap();
-        (store, hub, near, far)
-    }
+        let a = file(&store, "a.md");
+        let b = file(&store, "b.md");
+        let c = file(&store, "c.md");
+        store.insert_edge(a, 0, b, 4, "wikilink").unwrap();
+        store.insert_edge(a, 1, c, DOC_LEVEL, "mention").unwrap();
 
-    #[test]
-    fn a_passage_expands_along_its_own_links_only() {
-        let (store, hub, near, far) = two_section_hub();
-
-        // Hard scope: `off_chunk_weight = 0`. Seeding on `## Role` reaches
-        // `near` and stops — the `## History` link is not this passage's.
-        let from_role = store.get_neighbors_from_chunk(hub, 0, 2, 0.0).unwrap();
         assert_eq!(
-            from_role.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
-            vec![near]
+            store.incident_wikilink_edges(&[a]).unwrap(),
+            vec![(a, 0, b, 4)],
+            "the mention edge is not part of the walk"
         );
-        let from_history = store.get_neighbors_from_chunk(hub, 1, 2, 0.0).unwrap();
         assert_eq!(
-            from_history
-                .iter()
-                .map(|(id, _, _)| *id)
-                .collect::<Vec<_>>(),
-            vec![far]
+            store.incident_wikilink_edges(&[b]).unwrap(),
+            vec![(b, 4, a, 0)],
+            "asked from b, the near end is b's own passage"
         );
+        let mut both = store.incident_wikilink_edges(&[a, b]).unwrap();
+        both.sort();
+        assert_eq!(both, vec![(a, 0, b, 4), (b, 4, a, 0)]);
+        assert!(store.incident_wikilink_edges(&[]).unwrap().is_empty());
     }
 
     #[test]
-    fn the_rest_of_the_document_stays_reachable_at_a_discount() {
-        // The two-tier reading that shipped: `far` is still found from `## Role`,
-        // but at half weight, so it cannot outbid the passage's own link for a
-        // truncation slot.
-        let (store, hub, near, far) = two_section_hub();
-        let mut found = store.get_neighbors_from_chunk(hub, 0, 2, 0.5).unwrap();
-        found.sort_by_key(|(id, _, _)| *id);
-        assert_eq!(found, vec![(near, 1, 1.0), (far, 1, 0.5)]);
-    }
-
-    #[test]
-    fn a_link_aimed_at_the_whole_document_reaches_every_passage() {
-        // `DOC_LEVEL` on the near end means "any chunk of this file", so a
-        // backlink into `near` is a neighbour of all of `near`'s passages.
+    fn a_documents_chunk_seqs_are_what_a_doc_level_link_resolves_to() {
         let store = Store::open_memory().unwrap();
-        let near = file(&store, "near.md");
-        let other = file(&store, "other.md");
-        store
-            .insert_edge(other, 3, near, DOC_LEVEL, "wikilink")
-            .unwrap();
-        for seq in [0, 7] {
-            let found = store.get_neighbors_from_chunk(near, seq, 1, 0.0).unwrap();
-            assert_eq!(found, vec![(other, 1, 1.0)], "from near.md#{seq}");
+        let a = file(&store, "a.md");
+        let b = file(&store, "b.md");
+        for seq in [0, 1, 2] {
+            store
+                .insert_chunk(a, seq, "## H", "text", seq as u64, 10)
+                .unwrap();
         }
-    }
+        store.insert_chunk(b, 0, "## H", "text", 9, 10).unwrap();
 
-    #[test]
-    fn full_weight_reproduces_the_file_level_walk() {
-        // `off_chunk_weight = 1.0` is the pre-#28 behaviour exactly, which is
-        // what makes the scoping constant the only variable in the measurement.
-        let (store, hub, ..) = two_section_hub();
-        let mut chunkwise: Vec<(i64, usize)> = store
-            .get_neighbors_from_chunk(hub, 0, 2, 1.0)
-            .unwrap()
-            .into_iter()
-            .map(|(id, hop, weight)| {
-                assert_eq!(weight, 1.0);
-                (id, hop)
-            })
-            .collect();
-        chunkwise.sort();
-        let mut filewise = store.get_neighbors(hub, 2).unwrap();
-        filewise.sort();
-        assert_eq!(chunkwise, filewise);
-    }
-
-    #[test]
-    fn a_deep_links_target_chunk_carries_into_the_next_hop() {
-        // `hub#0 -> mid#4 -> far`, but `mid`'s link to `far` lives in chunk 9.
-        // Under hard scope the path dies at `mid`: nothing in the passage `hub`
-        // pointed at leads onward.
-        let store = Store::open_memory().unwrap();
-        let hub = file(&store, "hub.md");
-        let mid = file(&store, "mid.md");
-        let far = file(&store, "far.md");
-        store.insert_edge(hub, 0, mid, 4, "wikilink").unwrap();
-        store
-            .insert_edge(mid, 9, far, DOC_LEVEL, "wikilink")
-            .unwrap();
-
-        let scoped = store.get_neighbors_from_chunk(hub, 0, 2, 0.0).unwrap();
-        assert_eq!(
-            scoped.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
-            vec![mid]
+        let seqs = store.chunk_seqs_for_files(&[a, b]).unwrap();
+        assert_eq!(seqs[&a], vec![0, 1, 2]);
+        assert_eq!(seqs[&b], vec![0]);
+        // A file with no chunks is absent from the map rather than present and
+        // empty — the caller has to decide what a link into it means.
+        let unchunked = file(&store, "unchunked.md");
+        assert!(
+            store
+                .chunk_seqs_for_files(&[unchunked])
+                .unwrap()
+                .get(&unchunked)
+                .is_none()
         );
-
-        // At a discount it survives, with the discount compounding over the path.
-        let mut tiered = store.get_neighbors_from_chunk(hub, 0, 2, 0.5).unwrap();
-        tiered.sort_by_key(|(id, _, _)| *id);
-        assert_eq!(tiered, vec![(mid, 1, 1.0), (far, 2, 0.5)]);
     }
 
     #[test]

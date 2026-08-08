@@ -35,6 +35,8 @@ git fetch upstream && git diff --stat upstream/main main
 | normalised seed pool | graph seeds are ranked by relevance, not by which lane's unit is bigger | this fork, issue #26 |
 | chunk-to-chunk `edges` | a link knows which passage wrote it; expansion follows the seed's own links | this fork, issue #28 |
 | `DOC_LEVEL` sentinel | an un-headed link stores one row, not one per target chunk | this fork, issue #28 |
+| `PprParams` | the graph lane is personalized PageRank over chunks: sum, not max | this fork, issue #29 |
+| `incident_wikilink_edges` | one indexed fetch per frontier, not a BFS per seed | this fork, issue #29 |
 | `.github/workflows/ci.yml` | manual dispatch only — upstream runs it on push and PR | this fork, Actions minutes |
 
 Cherry-picked rather than merged: PR #41 branched before upstream's #40 graph fix, so merging the
@@ -69,7 +71,7 @@ export LIBCLANG_PATH="$HOME/.engraph-buildenv/lib/python3.12/site-packages/clang
 export BINDGEN_EXTRA_CLANG_ARGS="-I/usr/lib/gcc/x86_64-linux-gnu/13/include -I/usr/include -I/usr/include/x86_64-linux-gnu"
 
 cargo build --release        # ~10 min cold, ~20s incremental
-cargo test --lib             # 600 pass
+cargo test --lib             # 597 pass
 ```
 
 Each env var exists for a specific failure. Omit one and you get:
@@ -87,7 +89,7 @@ Adjust the gcc version in the include path (`13`) and the python version (`pytho
 `cargo test` (full) fails to compile `tests/integration.rs` and `tests/write_pipeline.rs`:
 `unresolved import engraph::embedder`, `engraph::hnsw`, and a `walk_vault` arity mismatch.
 **These are broken on pristine upstream** — verify with `git stash && cargo clippy --all-targets`.
-Upstream PR #47 addresses them. Use `cargo test --lib` (600 tests) as the working suite.
+Upstream PR #47 addresses them. Use `cargo test --lib` (597 tests) as the working suite.
 `cargo clippy -- -D warnings`, which is what CI runs, is clean.
 
 ### CI is manual-only in this fork
@@ -396,9 +398,9 @@ See issues on this repo:
   scores and feeds fusion, `*_seeds` is normalised and feeds `merge_seeds`. Seed composition moves
   (top-10 seeds from FTS: 10/10 → 8, 6, 8 on three of four real probes; probe 1 stays 10/10) and
   **no real probe's output changes at all** — probes 1–4 byte-identical, only the nonsense control
-  moves. A correctness fix the pipeline is nearly insensitive to today, because #9 holds the graph
-  lane at or below the content lanes; **#29 is what makes it pay**, since `Σ seed_score × 1/L` would
-  otherwise be summing incommensurable units. `merge_seeds` logs `seeds`/`fts_won`/`top10_fts` at
+  moves. A correctness fix the pipeline was nearly insensitive to on the day, because #9 holds the
+  graph lane at or below the content lanes; **#29 is what made it pay**, since `Σ seed_score × 1/L`
+  would otherwise be summing incommensurable units. `merge_seeds` logs `seeds`/`fts_won`/`top10_fts` at
   DEBUG. Knock-on: `LaneWeights::from_intent` is meaningful for the first time
 - ~~**#27** — **editing any file destroys every backlink into it**~~ — **DONE.** The ticket named
   `delete_edges_for_file`'s `from_file = ?1 OR to_file = ?1` as the cause. It was a symptom: **the
@@ -430,21 +432,31 @@ See issues on this repo:
   a 1-chunk one under #29's summation. Deep links still keep the ticket's set semantics.
   **Zero deep links in the vault, so that branch has unit tests and no data.** Retrieval scopes
   expansion to the seed's own chunk at `OFF_CHUNK_LINK_WEIGHT = 0.5`; every setting from 0.0 to 0.9
-  gives the *same* output, because `graph_expand` takes the max across 60–120 seeds and only 1 of 116
+  gave the *same* output, because `graph_expand` took the max across 60–120 seeds and only 1 of 116
   expansions on probe 1 is reachable exclusively off-chunk. Probe 1 does not regress; the entire
-  effect is one insertion at rank 13 of probe 4
-- **#29** — **personalized PageRank replaces the graph lane's scoring.** The current code is legible
-  as a one-iteration PPR with the accumulation operator wrong: hop decay *is* a damping factor, two
-  hops *are* two iterations, seed scores *are* the restart distribution. Missing: **`sum` not `max`**
-  (which is the co-citation signal — today a file linked from thirteen seeds scores the same as one
-  linked from one) and **out-degree normalisation** to stop the sum re-electing the hubs. Deletes the
-  decay table, the `max` merge, `get_best_chunk_for_file` as a stand-in chunk, and **the whole
-  admission filter** — which exists only because there is no meaningful score to threshold on, and
-  which was excluding the one class of result that justifies the lane (structurally implicated,
-  textually unrelated). **Drops the disjointness skip**: a chunk that is both a content hit and
-  heavily pointed-at is the best candidate there is, and #9 could only move a threshold around it.
-  Sweep `n_iterations` (default 1), α, and `1/L` vs `1/√L`. Should also be *cheaper* — it replaces
-  55–91 per-seed BFS traversals (536–1548 ms) with one indexed edge fetch and a hashmap sum
+  effect was one insertion at rank 13 of probe 4. **The plateau ended with #29** — summing makes the
+  discount bite on both sides of the fraction, and 0.5 now beats hard scoping by two tracked targets
+- ~~**#29** — **personalized PageRank replaces the graph lane's scoring**~~ — **DONE.** The old code
+  was legible as a one-iteration PPR with the accumulation operator wrong: hop decay *is* damping,
+  two hops *are* two iterations, seed scores *are* the restart distribution. `sum` not `max` (the
+  co-citation signal), out-degree normalisation to stop the sum re-electing the hubs, and the walk
+  now runs over **chunks**, so the lane returns the passage it reached instead of guessing one.
+  Deleted: the decay table, the `max` merge, `get_best_chunk_for_file`, `get_shared_tags_files` and
+  its unordered `LIMIT 100`, the disjointness skip, and **the whole admission filter**.
+  **Three tracked targets up, one down, two hold — the best single move in `eval/probes.md` since
+  #6.** Probe 2's exact-answer section goes 6 → 1; probe 1, the acceptance criterion, improves 5 → 2;
+  probe 4 slips 3 → 4, one rank *inside* the top five, which is not the drop-out that probe guards.
+  **The lane's own cost fell from 0.76–2.08 s to 0.83–1.64 ms** — three interleaved rounds, both
+  binaries instrumented identically; the ticket's 536–1548 ms estimate was low because #23 and #26
+  had since grown the seed pool. End-to-end wall clock could not resolve it and is not claimed.
+  **Both normalisation exponents were swept and landed in opposite places**: full `1/L` on the source,
+  softened `1/√N` on the target — the ticket specified `1/N` there and it costs two targets. Two
+  iterations lose. And **#28's plateau is gone**: `OFF_CHUNK_LINK_WEIGHT` was unmeasurable under
+  `max` and now has evidence, since hard scoping costs two targets. The probe 5 diagnostic came back
+  the opposite way round from the ticket's prediction and reads worse for the old lane: graph's share
+  of the nonsense control *rose*, because **the old lane's entire visible output across five probes
+  was five results, four of them on probe 5** — the filter had suppressed it so completely that junk
+  was nearly all that survived
 - ~~**#25 (extracted from #16)** — budget the cross-encoder in **characters**~~ — **DONE.**
   `[rerank] max_document_chars`, applied to the document text before formatting and before any title
   is prepended, never to the tokenized input: `rerank_batch` reads the score from the *last* token
