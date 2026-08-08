@@ -424,8 +424,9 @@ See issues on this repo:
   poke nothing, and a hand-emptied FTS table stays empty — is the one that matters, and it holds.
   **The tests were checked against a mutant** whose `compare` always returns clean: nine fail, so
   they are evidence rather than decoration. De-risks #10, #5, #8 and #2, each of which changes the
-  model input and previously relied on someone remembering to rebuild. Also pinned the eval corpus:
-  `standalone/mcp-isekai` is tagged **`eval-corpus-v1`** at `63f33e6`.
+  model input and previously relied on someone remembering to rebuild. Also pinned the eval corpus at
+  **`63f33e6`** — see `eval/probes.md`; `standalone/mcp-isekai`'s `origin` is the live `cc-isekai`
+  repo, so the pin is a checkout that stops tracking, not a fetchable tag.
   **Layer 0 of `docs/vault-search-convergence.md`**
 - **#30 — the ranking stage: the cross-encoder sorts, and graph reaches it by reserved quota.**
   What survived #24. Graph stops being a fusion lane and becomes a candidate source keeping #29's
