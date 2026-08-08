@@ -91,7 +91,7 @@ Single vault only. Re-indexing a different vault path triggers a confirmation pr
 
 ## CI/CD
 
-- CI: `cargo fmt --check` + `cargo clippy -- -D warnings` + `cargo test --lib` on macOS + Ubuntu. Ubuntu step installs CMake.
+- CI: `cargo fmt --check` + `cargo clippy -- -D warnings` + `cargo test --lib` on macOS + Ubuntu. Ubuntu step installs CMake. **Manual dispatch only in this fork** (`gh workflow run ci.yml`) — it does not run on push or PR, so those three commands are the local gate before every commit.
 - Release: native builds on macOS arm64 (macos-14) + Linux x86_64 (ubuntu-latest). Triggered by `v*` tags
 - Homebrew: `devwhodevs/homebrew-tap` — formula builds from source tarball. Depends on `cmake` + `rust`.
 

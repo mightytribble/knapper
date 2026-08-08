@@ -28,6 +28,7 @@ git fetch upstream && git diff --stat upstream/main main
 | `chunks.text` | the reranker scores the whole chunk, not a preview | this fork, issue #14 |
 | `from_intent` `Relationship` | graph no longer outweighs the content lanes | this fork, issue #9 |
 | `resolve_n_threads` | llama.cpp runs on the machine's cores, not a constant 4 | this fork, issue #20 |
+| `.github/workflows/ci.yml` | manual dispatch only — upstream runs it on push and PR | this fork, Actions minutes |
 
 Cherry-picked rather than merged: PR #41 branched before upstream's #40 graph fix, so merging the
 branch wholesale would have silently reverted `src/graph.rs`.
@@ -81,6 +82,25 @@ Adjust the gcc version in the include path (`13`) and the python version (`pytho
 **These are broken on pristine upstream** — verify with `git stash && cargo clippy --all-targets`.
 Upstream PR #47 addresses them. Use `cargo test --lib` (551 tests) as the working suite.
 `cargo clippy -- -D warnings`, which is what CI runs, is clean.
+
+### CI is manual-only in this fork
+
+`.github/workflows/ci.yml` triggers on `workflow_dispatch` and nothing else — upstream runs it on
+every push and PR to `main`. The hosted run duplicated checks that take seconds here and billed
+Actions minutes for it, two jobs per push, with the macOS leg charged at 10× the minute rate.
+
+**So the gate is local, and it is not optional.** Before every commit:
+
+```bash
+cargo fmt --check && cargo clippy -- -D warnings && cargo test --lib
+```
+
+Run the hosted matrix deliberately (`gh workflow run ci.yml`) when a change needs checking against
+macOS or a clean Ubuntu toolchain — anything touching llama.cpp bindings, `#[cfg]` branches, or the
+build script. `resolve_n_threads` is the current example: its Linux path reads sysfs and its fallback
+has never executed on this box.
+
+`release.yml` is untouched. It fires only on `v*` tags, so it cannot go off by accident.
 
 ## Runtime gotchas
 
