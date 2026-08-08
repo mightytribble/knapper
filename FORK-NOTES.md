@@ -32,6 +32,7 @@ git fetch upstream && git diff --stat upstream/main main
 | `ensure_original` | the user's own query is always searched for | this fork, issue #23 |
 | `rerank::max_document_chars` | the cross-encoder's input is bounded; upstream has no budget at all | this fork, issue #25 |
 | re-index keeps the `files` row | editing a note no longer cascades away every backlink into it | this fork, issue #27 |
+| normalised seed pool | graph seeds are ranked by relevance, not by which lane's unit is bigger | this fork, issue #26 |
 | `.github/workflows/ci.yml` | manual dispatch only — upstream runs it on push and PR | this fork, Actions minutes |
 
 Cherry-picked rather than merged: PR #41 branched before upstream's #40 graph fix, so merging the
@@ -66,7 +67,7 @@ export LIBCLANG_PATH="$HOME/.engraph-buildenv/lib/python3.12/site-packages/clang
 export BINDGEN_EXTRA_CLANG_ARGS="-I/usr/lib/gcc/x86_64-linux-gnu/13/include -I/usr/include -I/usr/include/x86_64-linux-gnu"
 
 cargo build --release        # ~10 min cold, ~20s incremental
-cargo test --lib             # 574 pass
+cargo test --lib             # 580 pass
 ```
 
 Each env var exists for a specific failure. Omit one and you get:
@@ -84,7 +85,7 @@ Adjust the gcc version in the include path (`13`) and the python version (`pytho
 `cargo test` (full) fails to compile `tests/integration.rs` and `tests/write_pipeline.rs`:
 `unresolved import engraph::embedder`, `engraph::hnsw`, and a `walk_vault` arity mismatch.
 **These are broken on pristine upstream** — verify with `git stash && cargo clippy --all-targets`.
-Upstream PR #47 addresses them. Use `cargo test --lib` (574 tests) as the working suite.
+Upstream PR #47 addresses them. Use `cargo test --lib` (580 tests) as the working suite.
 `cargo clippy -- -D warnings`, which is what CI runs, is clean.
 
 ### CI is manual-only in this fork
@@ -379,15 +380,24 @@ See issues on this repo:
   **not** bound its share of the **results** (if a document holds the ten best sections, ten sections
   is the right answer, and #6's vote-counting reason for capping evaporates once there are no votes).
   Widen retrieval freely: it is 30–50 ms, and `sqlite-vec` is brute-force KNN so `k` is nearly free
-- **#26 (defect 2 of #24, extracted)** — **normalise each lane's scores into [0.1, 1.0] off that
-  lane's own range**, per **(lane × expansion)**, before the results are pooled. Magnus's call, and
-  the right one: rank crossing the boundary is outlier-immune, which is why RRF belongs at *final*
-  fusion, but it buys that by discarding magnitude — and within-lane spacing (0.68, then a cliff to
-  0.31) is exactly what should decide how hard a seed expands. Per expansion because BM25 magnitudes
-  are not comparable across different expansion queries either. Floor of 0.1 not 0, because
-  `seed.score * decay` feeds a sort that feeds `truncate`, so zero deletes a seed rather than
-  deprioritising it. `max == min` maps to the top of the range — probe 5's FTS lane returned exactly
-  one hit. Knock-on: `LaneWeights::from_intent` becomes meaningful for the first time
+- ~~**#26 (defect 2 of #24, extracted)** — normalise each lane's scores before they leave the lane~~
+  — **DONE.** Min-max into `[0.1, 1.0]` per `(lane × expansion)`, floor 0.1 because
+  `seed.score * decay` feeds a sort that feeds `truncate`, `max == min` to the top of the range.
+  **The ticket got the placement wrong and the probes caught it.** Normalising the pooled lanes
+  before `collapse_lane` — what #26 specified — moved three of six probe targets down, including
+  `archdragon.md` 3 → 6 on probe 4, the probe that exists to catch BM25 regressions. `score` has two
+  consumers wanting opposite things: **fusion reads rank** and wants the lane's own ordering intact,
+  **seeding reads magnitude** and wants the lanes commensurable. Per-expansion normalisation sets
+  every expansion's best hit to exactly 1.0, so a weak expansion's best ties a strong one's and the
+  pooled lane is reordered on no evidence — pure loss for the semantic lane, where `1.0 - distance`
+  *is* comparable across expansions. **Shipped as a separate seed pool**: `all_*` keeps the lane's
+  scores and feeds fusion, `*_seeds` is normalised and feeds `merge_seeds`. Seed composition moves
+  (top-10 seeds from FTS: 10/10 → 8, 6, 8 on three of four real probes; probe 1 stays 10/10) and
+  **no real probe's output changes at all** — probes 1–4 byte-identical, only the nonsense control
+  moves. A correctness fix the pipeline is nearly insensitive to today, because #9 holds the graph
+  lane at or below the content lanes; **#29 is what makes it pay**, since `Σ seed_score × 1/L` would
+  otherwise be summing incommensurable units. `merge_seeds` logs `seeds`/`fts_won`/`top10_fts` at
+  DEBUG. Knock-on: `LaneWeights::from_intent` is meaningful for the first time
 - ~~**#27** — **editing any file destroys every backlink into it**~~ — **DONE.** The ticket named
   `delete_edges_for_file`'s `from_file = ?1 OR to_file = ?1` as the cause. It was a symptom: **the
   real cause is that re-indexing deleted the `files` row**, and both `edges` columns are

@@ -254,13 +254,23 @@ pub fn search_with_intelligence(
     let weights = llm::LaneWeights::from_intent(&orchestration.intent);
 
     // --- Step 2: Run 3-lane retrieval for EACH expanded query ---
+    //
+    // Two pools per lane, holding the same hits with different score semantics:
+    // `all_*` keeps the lane's own scores and feeds fusion, `*_seeds` is
+    // normalised and feeds graph expansion. See `normalise_lane_scores` for why
+    // one pool cannot serve both (#26).
     let mut all_semantic: Vec<RankedResult> = Vec::new();
     let mut all_fts: Vec<RankedResult> = Vec::new();
+    let mut semantic_seeds: Vec<RankedResult> = Vec::new();
+    let mut fts_seeds: Vec<RankedResult> = Vec::new();
     let mut traces: Vec<ExpansionTrace> = Vec::new();
 
     for expanded_query in &orchestration.expansions {
-        let semantic_before = all_semantic.len();
-        let fts_before = all_fts.len();
+        // One expansion's hits are held apart from the pool so they can be
+        // normalised against their own range before joining it (#26).
+        let mut semantic_hits: Vec<RankedResult> = Vec::new();
+        let mut fts_hits: Vec<RankedResult> = Vec::new();
+
         // Semantic lane
         let query_vec = embedder
             .embed_one(expanded_query)
@@ -282,7 +292,7 @@ pub fn search_with_intelligence(
                     Some(chunk.heading)
                 };
 
-                all_semantic.push(RankedResult {
+                semantic_hits.push(RankedResult {
                     file_path,
                     file_id: chunk.file_id,
                     chunk_seq: chunk.seq,
@@ -315,7 +325,7 @@ pub fn search_with_intelligence(
                 .map(|c| c.heading)
                 .filter(|h| !h.is_empty());
 
-            all_fts.push(RankedResult {
+            fts_hits.push(RankedResult {
                 file_path,
                 file_id: fr.file_id,
                 chunk_seq: fr.chunk_seq,
@@ -329,9 +339,18 @@ pub fn search_with_intelligence(
         traces.push(ExpansionTrace {
             query: expanded_query.clone(),
             fts_expr: crate::fts::any_term_expr(expanded_query),
-            semantic_hits: all_semantic.len() - semantic_before,
-            fts_hits: all_fts.len() - fts_before,
+            semantic_hits: semantic_hits.len(),
+            fts_hits: fts_hits.len(),
         });
+
+        // Rescale each lane against its own range for THIS query on the way
+        // into the seed pool. Before this, `1.0 - distance` (0.2-0.7) and
+        // negated BM25 (2-17) reached `merge_seeds` raw, and every comparison
+        // between them was decided by which lane's unit was bigger (#26).
+        semantic_seeds.extend(normalised(&semantic_hits));
+        fts_seeds.extend(normalised(&fts_hits));
+        all_semantic.extend(semantic_hits);
+        all_fts.extend(fts_hits);
     }
 
     // Deduplicate across expanded queries, then bound each file's share of the
@@ -342,11 +361,24 @@ pub fn search_with_intelligence(
     let fts_results = collapse_lane(all_fts, cap);
 
     // --- Graph lane from combined seeds ---
-    let mut combined_seeds = merge_seeds(&semantic_results, &fts_results);
+    //
+    // Built from the normalised pools, not `semantic_results`/`fts_results`:
+    // the seeds are the one place a lane's *magnitude* is read rather than its
+    // rank, and magnitudes only mean something once each lane is on its own
+    // scale (#26).
+    let mut combined_seeds = merge_seeds(
+        &collapse_lane(semantic_seeds, cap),
+        &collapse_lane(fts_seeds, cap),
+    );
 
     // Inject temporal candidates as graph seeds when date_range is present.
     // Seeds are consumed by `graph_expand`, which reads only the file, so these
     // never reach fusion and their chunk identity is not used.
+    //
+    // The flat 1.0 means "top of its lane" now that the content lanes are
+    // normalised (#26). Before, it landed in the dead zone between them: always
+    // above every semantic seed, never above any FTS one — a position that
+    // described neither lane's confidence nor the date match's.
     let temporal_seeds: Vec<RankedResult> = if let Some(range) = &orchestration.date_range {
         config
             .store
@@ -533,6 +565,86 @@ pub fn search_with_intelligence(
     })
 }
 
+/// The bottom of the normalised seed range.
+///
+/// Not zero. `graph_expand` computes `seed.score * decay` and sorts the result
+/// before truncating, so a seed scored 0 is deleted from the expansion ordering
+/// rather than placed last in it — and the weakest hit of a lane is still a hit.
+const SEED_SCORE_FLOOR: f64 = 0.1;
+
+/// Rescale one lane's hits for one expanded query into `[SEED_SCORE_FLOOR, 1.0]`
+/// against their own range (issue #26).
+///
+/// The two lanes fill `RankedResult::score` from incommensurable units —
+/// `1.0 - cosine_distance`, measured at 0.2–0.7 on the eval vault, against
+/// negated BM25 at 2–17. The ranges do not overlap, so every comparison that
+/// mixed them was decided by which lane's unit was larger: `merge_seeds` handed
+/// every contested file to FTS, and the ordering that feeds `graph_expand`'s
+/// `truncate` was BM25 magnitude rather than anything about the graph.
+///
+/// Per **expansion**, not per lane-total, because BM25 is a function of term
+/// rarity, document length and corpus statistics — the same document scores
+/// differently for a rare word than a common one, so the FTS lane's magnitudes
+/// are not comparable across expansions either. `1.0 - distance` is comparable
+/// across expansions, and normalising it per expansion costs nothing.
+///
+/// Each lane is scaled against *itself*. No raw unit crosses a lane boundary,
+/// and the two lanes are never mapped onto a shared range against each other —
+/// that would be the same defect with more arithmetic.
+///
+/// This is deliberately not a rank transform. Rank is outlier-immune, which is
+/// why RRF is right at *final* fusion, but it pays for that by discarding
+/// magnitude: a lane returning 0.68 and then a cliff to 0.31 becomes "1st, 2nd",
+/// and the size of that cliff is exactly what should decide how hard a seed
+/// expands.
+///
+/// A lane with one hit — or N identical ones — has no basis to rank them, so
+/// they all map to the top of the range.
+///
+/// # Why this touches the seed pool and not the fusion pool
+///
+/// `score` has two consumers and they want opposite things. **Fusion consumes
+/// rank** — `rrf_fuse` reads position and never the number — and the rank comes
+/// from `collapse_lane` sorting the lane's own scores. Renormalising per
+/// expansion changes that sort: every expansion's best hit becomes exactly 1.0,
+/// so a weak expansion's best now ties a strong one's, and the pooled lane is
+/// reordered on no evidence. For the semantic lane that is pure loss, because
+/// `1.0 - distance` **is** comparable across expansions — same metric, same
+/// vector space. **Seeding consumes magnitude**: `graph_expand` computes
+/// `seed.score * decay`, sorts, and truncates, so the two lanes have to be on
+/// one scale or the bigger unit wins every time.
+///
+/// This was measured, not reasoned. Normalising the pool that feeds fusion —
+/// the shape #26 originally specified — moved three of six probe targets down,
+/// including `archdragon.md` 3 → 6 on probe 4, which exists precisely to catch
+/// BM25 regressions. Normalising only the seed pool leaves all four real probes
+/// byte-identical while the seed set still becomes a mix. See `eval/probes.md`.
+fn normalise_lane_scores(results: &mut [RankedResult]) {
+    let Some(max) = results.iter().map(|r| r.score).reduce(f64::max) else {
+        return;
+    };
+    let min = results
+        .iter()
+        .map(|r| r.score)
+        .reduce(f64::min)
+        .unwrap_or(max);
+    let span = max - min;
+    for r in results.iter_mut() {
+        r.score = if span > 0.0 {
+            SEED_SCORE_FLOOR + (1.0 - SEED_SCORE_FLOOR) * (r.score - min) / span
+        } else {
+            1.0
+        };
+    }
+}
+
+/// `normalise_lane_scores` against a copy, for the pool that needs both.
+fn normalised(hits: &[RankedResult]) -> Vec<RankedResult> {
+    let mut out = hits.to_vec();
+    normalise_lane_scores(&mut out);
+    out
+}
+
 /// Prepare one lane's raw hits for fusion: one entry per chunk, best score wins,
 /// sorted best-first, and at most `cap` chunks from any single file.
 ///
@@ -599,25 +711,49 @@ fn format_expansions(traces: &[ExpansionTrace]) -> String {
 }
 
 /// Merge semantic and FTS seed results, keeping the highest score per file.
+///
+/// "Highest" only means something because both lanes arrive normalised to
+/// `[SEED_SCORE_FLOOR, 1.0]` against their own ranges (#26). The comparison
+/// below reads as "which lane placed this file higher within its own results",
+/// which is a question about the file. Before #26 it read as "is negated BM25
+/// bigger than a cosine similarity", which is a question about the units, and
+/// the answer was always yes.
 fn merge_seeds(semantic: &[RankedResult], fts: &[RankedResult]) -> Vec<RankedResult> {
-    let mut by_file: HashMap<String, RankedResult> = HashMap::new();
-    for r in semantic.iter().chain(fts.iter()) {
+    let labelled = semantic
+        .iter()
+        .map(|r| (r, "semantic"))
+        .chain(fts.iter().map(|r| (r, "fts")));
+
+    let mut by_file: HashMap<String, (RankedResult, &'static str)> = HashMap::new();
+    for (r, lane) in labelled {
         let dominated = by_file
             .get(&r.file_path)
-            .is_some_and(|existing| existing.score >= r.score);
+            .is_some_and(|(existing, _)| existing.score >= r.score);
         if !dominated {
-            by_file.insert(r.file_path.clone(), r.clone());
+            by_file.insert(r.file_path.clone(), (r.clone(), lane));
         }
     }
     // Seeds drive graph expansion; a stable order keeps that reproducible.
-    let mut seeds: Vec<RankedResult> = by_file.into_values().collect();
-    seeds.sort_by(|a, b| {
+    let mut seeds: Vec<(RankedResult, &'static str)> = by_file.into_values().collect();
+    seeds.sort_by(|(a, _), (b, _)| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.chunk_key().cmp(&b.chunk_key()))
     });
-    seeds
+
+    // Which lane won, and won the top of the order. #26's whole case was a
+    // measurement of exactly this — 10 of the top 10 seeds from FTS on three of
+    // three real queries — and it took direct SQL to get, because nothing in
+    // the pipeline reported it.
+    tracing::debug!(
+        seeds = seeds.len(),
+        fts_won = seeds.iter().filter(|(_, l)| *l == "fts").count(),
+        top10_fts = seeds.iter().take(10).filter(|(_, l)| *l == "fts").count(),
+        "seed set assembled"
+    );
+
+    seeds.into_iter().map(|(r, _)| r).collect()
 }
 
 /// Run a search query and print results.
@@ -1557,6 +1693,115 @@ mod tests {
             .find(|r| r.file_path == "rules/abjuration-spells.md")
             .expect("the phrase appears in exactly one section");
         assert_eq!(hit.heading.as_deref(), Some("## Level 3 Counterspell"));
+    }
+
+    fn scored(scores: &[f64]) -> Vec<RankedResult> {
+        scores
+            .iter()
+            .enumerate()
+            .map(|(i, &score)| RankedResult {
+                file_path: format!("f{i}.md"),
+                file_id: i as i64,
+                chunk_seq: 0,
+                score,
+                heading: None,
+                snippet: String::new(),
+                docid: None,
+            })
+            .collect()
+    }
+
+    fn order_of(lane: &[RankedResult]) -> Vec<usize> {
+        let mut idx: Vec<usize> = (0..lane.len()).collect();
+        idx.sort_by(|&a, &b| lane[b].score.partial_cmp(&lane[a].score).unwrap());
+        idx
+    }
+
+    #[test]
+    fn a_lane_is_rescaled_onto_its_own_range() {
+        // Negated BM25, of the magnitude the eval vault actually produces.
+        let mut lane = scored(&[16.961, 9.693, 2.503]);
+        normalise_lane_scores(&mut lane);
+
+        assert_eq!(lane[0].score, 1.0);
+        assert_eq!(lane[2].score, SEED_SCORE_FLOOR);
+        // The middle keeps its position within the span — this is the point of
+        // normalising rather than ranking. 9.693 sits 49.7% of the way up.
+        assert!(
+            (lane[1].score - 0.5473).abs() < 1e-3,
+            "got {}",
+            lane[1].score
+        );
+    }
+
+    #[test]
+    fn the_two_lanes_become_comparable() {
+        // The defect, in one assertion. Semantic tops out at 0.686 on this vault
+        // and FTS bottoms out at 2.162, so before #26 the *worst* keyword hit
+        // outscored the *best* semantic one and `merge_seeds` handed every
+        // contested file to FTS regardless of relevance.
+        let mut semantic = scored(&[0.686, 0.426]);
+        let mut fts = scored(&[9.693, 2.162]);
+        assert!(fts[1].score > semantic[0].score, "premise");
+
+        normalise_lane_scores(&mut semantic);
+        normalise_lane_scores(&mut fts);
+
+        assert_eq!(semantic[0].score, fts[0].score, "each lane's best is 1.0");
+        assert_eq!(semantic[1].score, fts[1].score, "each lane's worst is 0.1");
+    }
+
+    #[test]
+    fn normalisation_never_scores_a_hit_at_zero() {
+        // `graph_expand` multiplies the seed score by a hop decay and sorts
+        // before truncating, so 0 would delete the weakest seed of each lane
+        // from the expansion ordering rather than putting it last.
+        let mut lane = scored(&[5.0, 4.0, 0.001]);
+        normalise_lane_scores(&mut lane);
+        assert!(lane.iter().all(|r| r.score >= SEED_SCORE_FLOOR));
+    }
+
+    #[test]
+    fn a_lane_with_nothing_to_rank_puts_everything_at_the_top() {
+        // Probe 5's FTS lane returned exactly one hit. One hit — or N identical
+        // ones — means the lane has no basis for an ordering, and the floor
+        // would understate every one of them.
+        let mut single = scored(&[4.184]);
+        normalise_lane_scores(&mut single);
+        assert_eq!(single[0].score, 1.0);
+
+        let mut tied = scored(&[3.0, 3.0, 3.0]);
+        normalise_lane_scores(&mut tied);
+        assert!(tied.iter().all(|r| r.score == 1.0));
+
+        let mut empty: Vec<RankedResult> = vec![];
+        normalise_lane_scores(&mut empty);
+    }
+
+    #[test]
+    fn the_fusion_pool_keeps_the_lanes_own_scores() {
+        // The split that makes #26 safe: `normalised` hands back a rescaled
+        // copy and leaves the caller's hits alone, so the pool that feeds
+        // `collapse_lane` — and through it the rank `rrf_fuse` reads — still
+        // carries what the lane actually said.
+        let lane = scored(&[16.961, 9.693, 2.503]);
+        let seeds = normalised(&lane);
+
+        assert_eq!(
+            lane.iter().map(|r| r.score).collect::<Vec<_>>(),
+            vec![16.961, 9.693, 2.503],
+            "the fusion pool must not be rescaled"
+        );
+        assert_eq!(seeds[0].score, 1.0);
+        assert_eq!(seeds[2].score, SEED_SCORE_FLOOR);
+    }
+
+    #[test]
+    fn normalisation_preserves_the_lanes_own_ordering() {
+        let mut lane = scored(&[2.5, 16.9, 9.6, 4.4]);
+        let before: Vec<usize> = order_of(&lane);
+        normalise_lane_scores(&mut lane);
+        assert_eq!(before, order_of(&lane));
     }
 
     #[test]
