@@ -114,6 +114,11 @@ has never executed on this box.
   re-downloads 300MB (1.6GB with intelligence enabled).
 - **MCP servers launch once per session**, so a mid-session `git checkout` leaves the server pointed
   at the previous branch's store.
+- **Backlinks rot on every save** (#27). `delete_edges_for_file` removes edges in both directions and
+  the incremental re-index restores only the file's outgoing ones, so edges *into* an edited file are
+  destroyed and never rebuilt. `get_neighbors` follows incoming edges, so the graph lane loses recall
+  progressively under `engraph serve`. Until #27 lands, `engraph index --reindex` is the repair, and
+  any graph-lane measurement should be taken on a freshly reindexed store.
 - **`engraph status` misreports the model** as `all-MiniLM-L6-v2` while actually loading
   `embeddinggemma-300M`. Upstream PR #48 fixes it.
 - **Intelligence is not a quality dial.** Enabling it (query expansion + Qwen3 reranker, 1.6GB)
@@ -374,6 +379,43 @@ See issues on this repo:
   **not** bound its share of the **results** (if a document holds the ten best sections, ten sections
   is the right answer, and #6's vote-counting reason for capping evaporates once there are no votes).
   Widen retrieval freely: it is 30–50 ms, and `sqlite-vec` is brute-force KNN so `k` is nearly free
+- **#26 (defect 2 of #24, extracted)** — **normalise each lane's scores into [0.1, 1.0] off that
+  lane's own range**, per **(lane × expansion)**, before the results are pooled. Magnus's call, and
+  the right one: rank crossing the boundary is outlier-immune, which is why RRF belongs at *final*
+  fusion, but it buys that by discarding magnitude — and within-lane spacing (0.68, then a cliff to
+  0.31) is exactly what should decide how hard a seed expands. Per expansion because BM25 magnitudes
+  are not comparable across different expansion queries either. Floor of 0.1 not 0, because
+  `seed.score * decay` feeds a sort that feeds `truncate`, so zero deletes a seed rather than
+  deprioritising it. `max == min` maps to the top of the range — probe 5's FTS lane returned exactly
+  one hit. Knock-on: `LaneWeights::from_intent` becomes meaningful for the first time
+- **#27** — **editing any file destroys every backlink into it.** `delete_edges_for_file` deletes
+  `from_file = ?1 OR to_file = ?1`; `build_edges_for_file` restores only outgoing. Confirmed 2 → 0.
+  An edge is owned by its source file's content, so re-index must delete only `from_file`; the
+  both-directions form is correct for `remove_file` and nothing else. **Invisible to the probe
+  harness by construction** — the eval vault is built by one full index, which calls `clear_edges()`,
+  so every graph-lane measurement ever taken here was on a best-case graph
+- **#28** — **wikilink edges at chunk granularity, both ends.** Today `extract_wikilink_targets` runs
+  on whole-file content and `edges` is `(from_file, to_file, edge_type)`, so a seed chunk expands
+  along every link in its document — noise proportional to document size. Store only the fine grain
+  and derive the document view with `SELECT DISTINCT`. Target side: stop stripping `[[Note#Heading]]`,
+  resolve to a chunk **set** (deep link → those chunks, document link → all of them), and never drop
+  an edge on a failed resolve. **Measured: this vault has 1,773 wikilinks and ZERO deep links**, so
+  the deep-link branch buys nothing today — build it because #29 needs the target-chunk-set concept
+  for document links regardless. **Backfillable from `chunks.text` (#14), no reindex.** Risk: chunk
+  scoping deliberately cuts recall, and probe 1 — the one probe graph demonstrably wins — surfaces
+  two `### Connections` chunks
+- **#29** — **personalized PageRank replaces the graph lane's scoring.** The current code is legible
+  as a one-iteration PPR with the accumulation operator wrong: hop decay *is* a damping factor, two
+  hops *are* two iterations, seed scores *are* the restart distribution. Missing: **`sum` not `max`**
+  (which is the co-citation signal — today a file linked from thirteen seeds scores the same as one
+  linked from one) and **out-degree normalisation** to stop the sum re-electing the hubs. Deletes the
+  decay table, the `max` merge, `get_best_chunk_for_file` as a stand-in chunk, and **the whole
+  admission filter** — which exists only because there is no meaningful score to threshold on, and
+  which was excluding the one class of result that justifies the lane (structurally implicated,
+  textually unrelated). **Drops the disjointness skip**: a chunk that is both a content hit and
+  heavily pointed-at is the best candidate there is, and #9 could only move a threshold around it.
+  Sweep `n_iterations` (default 1), α, and `1/L` vs `1/√L`. Should also be *cheaper* — it replaces
+  55–91 per-seed BFS traversals (536–1548 ms) with one indexed edge fetch and a hashmap sum
 - ~~**#25 (extracted from #16)** — budget the cross-encoder in **characters**~~ — **DONE.**
   `[rerank] max_document_chars`, applied to the document text before formatting and before any title
   is prepended, never to the tokenized input: `rerank_batch` reads the score from the *last* token
