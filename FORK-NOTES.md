@@ -381,6 +381,14 @@ See issues on this repo:
   were overruled on the way: #26 shipped per-expansion min-max normalisation rather than item 2's
   rank-crossing, and #29 deleted the disjointness skip item 3 argued for keeping. Its acceptance
   criterion that no score crosses a lane boundary is therefore false against `main`
+- **#31 — fingerprint the index.** `meta` gains `parser`/`chunker`/`link`/`fts`/`embedding`/
+  `reranker` fingerprints with §4's declared invalidation actions. Today only embedding *dimension*
+  is fingerprinted, so chunker constants, the prompt template, the tokenizer, a swapped GGUF behind
+  an unchanged filename, the FTS schema and the resolver can all change under a store that reports
+  itself healthy. #27 is the precedent for what that costs: every graph-lane number recorded before
+  it was silently on a best-case graph and nothing said so. Settled by invariant, no probe involved.
+  De-risks #10, #5, #8 and #2, each of which changes the model input and today relies on someone
+  remembering to rebuild. **Layer 0 of `docs/vault-search-convergence.md` — lands before #30**
 - **#30 — the ranking stage: the cross-encoder sorts, and graph reaches it by reserved quota.**
   What survived #24. Graph stops being a fusion lane and becomes a candidate source keeping #29's
   PPR as its reach function; **48 RRF anchors + 16 graph anchors of a 64-candidate pool, backfill
