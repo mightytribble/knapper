@@ -110,6 +110,37 @@ pub struct OrchestrationResult {
     pub date_range: Option<(i64, i64)>,
 }
 
+impl OrchestrationResult {
+    /// Put the user's own words back at the head of the expansion list if the
+    /// orchestrator left them out.
+    ///
+    /// The system prompt asks for the original query first. Qwen3-0.6B ignores
+    /// that routinely — measured on the eval vault, three of the three probes
+    /// it answered came back without it, including the bare name `Archdragon`,
+    /// which was replaced by `Archdragon character` and `Archdragon concept`.
+    /// So the exact-name probe ran with no exact name in it, which is most of
+    /// what `eval/probes.md` has been recording as "intelligence breaks probe 4"
+    /// since the file was started (#23).
+    ///
+    /// Applied on read rather than before caching, so `llm_cache` keeps what the
+    /// model actually said and rows written before this existed are repaired
+    /// without invalidation.
+    pub fn ensure_original(&mut self, query: &str) {
+        let original = query.trim();
+        if original.is_empty() {
+            return;
+        }
+        if self
+            .expansions
+            .iter()
+            .any(|e| e.trim().eq_ignore_ascii_case(original))
+        {
+            return;
+        }
+        self.expansions.insert(0, original.to_string());
+    }
+}
+
 /// Per-lane weights for the RRF fusion step.
 #[derive(Debug, Clone)]
 pub struct LaneWeights {
@@ -1911,6 +1942,45 @@ mod tests {
     #[test]
     fn test_extract_json_object_unclosed() {
         assert!(extract_json_object("{ open but never closed").is_none());
+    }
+
+    /// #23: the model is asked for the original query first and routinely
+    /// omits it, so the parser stops trusting and the caller repairs it.
+    #[test]
+    fn the_original_query_is_restored_when_the_model_drops_it() {
+        let mut result = parse_orchestration_json(
+            r#"{"intent": "conceptual", "expansions": ["Archdragon character", "Archdragon concept"]}"#,
+        )
+        .unwrap();
+        result.ensure_original("Archdragon");
+        assert_eq!(
+            result.expansions,
+            vec!["Archdragon", "Archdragon character", "Archdragon concept"]
+        );
+    }
+
+    #[test]
+    fn restoring_the_original_does_not_duplicate_one_already_present() {
+        let mut result = parse_orchestration_json(
+            r#"{"intent": "exact", "expansions": ["auth work", "authentication design"]}"#,
+        )
+        .unwrap();
+        result.ensure_original("  AUTH WORK  ");
+        assert_eq!(
+            result.expansions,
+            vec!["auth work", "authentication design"]
+        );
+    }
+
+    #[test]
+    fn restoring_the_original_ignores_a_blank_query() {
+        let mut result = OrchestrationResult {
+            intent: QueryIntent::Exploratory,
+            expansions: vec!["something".to_string()],
+            date_range: None,
+        };
+        result.ensure_original("   ");
+        assert_eq!(result.expansions, vec!["something"]);
     }
 
     #[test]

@@ -186,7 +186,7 @@ pub fn search_with_intelligence(
     config: &mut SearchConfig<'_>,
 ) -> Result<SearchOutput> {
     // --- Step 1: Orchestrate (with LLM cache when orchestrator is present) ---
-    let orchestration = match &mut config.orchestrator {
+    let mut orchestration = match &mut config.orchestrator {
         Some(orch) => {
             let cache_key = orchestration_cache_key(query);
             if let Some(cached_json) = config.store.get_llm_cache(&cache_key)? {
@@ -206,6 +206,10 @@ pub fn search_with_intelligence(
         }
         None => llm::heuristic_orchestrate(query),
     };
+    // Every source of expansions passes through here — model, cache hit,
+    // heuristic fallback — so the invariant has one entrance rather than
+    // three. #9's weight-table defect survived four tickets by having two.
+    orchestration.ensure_original(query);
     tracing::debug!(
         intent = ?orchestration.intent,
         expansions = orchestration.expansions.len(),
