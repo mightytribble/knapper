@@ -48,6 +48,26 @@ pub struct SearchOutput {
     pub results: Vec<InternalSearchResult>,
     pub fused: Vec<fusion::FusedResult>,
     pub intent: Option<crate::llm::QueryIntent>,
+    /// What each expanded query actually retrieved — the `--explain` record of
+    /// the retrieval step, as opposed to the fusion step.
+    pub expansions: Vec<ExpansionTrace>,
+}
+
+/// One expanded query and what it brought back, per lane.
+///
+/// This exists because three separate defects (#18, #22, #23) all lived in the
+/// gap between what the pipeline was asked to search for and what it searched
+/// for, and none of them were visible from the outside: `--explain` reported
+/// how the lanes were fused while saying nothing about what went into them.
+/// Reconstructing that needed direct SQL against the index.
+pub struct ExpansionTrace {
+    /// The query as run — the original, or whatever the orchestrator returned.
+    pub query: String,
+    /// The FTS5 MATCH expression this became, or `None` if it had no searchable
+    /// token and the lane was skipped.
+    pub fts_expr: Option<String>,
+    pub semantic_hits: usize,
+    pub fts_hits: usize,
 }
 
 /// Configuration for the intelligence search pipeline.
@@ -196,8 +216,11 @@ pub fn search_with_intelligence(
     // --- Step 2: Run 3-lane retrieval for EACH expanded query ---
     let mut all_semantic: Vec<RankedResult> = Vec::new();
     let mut all_fts: Vec<RankedResult> = Vec::new();
+    let mut traces: Vec<ExpansionTrace> = Vec::new();
 
     for expanded_query in &orchestration.expansions {
+        let semantic_before = all_semantic.len();
+        let fts_before = all_fts.len();
         // Semantic lane
         let query_vec = embedder
             .embed_one(expanded_query)
@@ -231,10 +254,12 @@ pub fn search_with_intelligence(
             }
         }
 
-        // FTS lane
+        // FTS lane. `fts_search_any` and not `fts_search`: the latter phrase-
+        // matches the whole string, which returned nothing for four of the five
+        // seed probes and left this lane empty for every multi-word query (#22).
         let fts_raw = config
             .store
-            .fts_search(expanded_query, top_n * 3)
+            .fts_search_any(expanded_query, top_n * 3)
             .unwrap_or_default();
 
         for fr in fts_raw {
@@ -260,6 +285,13 @@ pub fn search_with_intelligence(
                 docid,
             });
         }
+
+        traces.push(ExpansionTrace {
+            query: expanded_query.clone(),
+            fts_expr: crate::fts::any_term_expr(expanded_query),
+            semantic_hits: all_semantic.len() - semantic_before,
+            fts_hits: all_fts.len() - fts_before,
+        });
     }
 
     // Deduplicate across expanded queries, then bound each file's share of the
@@ -457,6 +489,7 @@ pub fn search_with_intelligence(
         results,
         fused: final_fused,
         intent: Some(orchestration.intent),
+        expansions: traces,
     })
 }
 
@@ -494,6 +527,35 @@ fn collapse_lane(results: Vec<RankedResult>, cap: usize) -> Vec<RankedResult> {
         *count <= cap
     });
     deduped
+}
+
+/// Render the retrieval step for `--explain`: every query that was actually
+/// run, and what each lane returned for it.
+///
+/// Hit counts are pre-collapse — what the lane read, before dedup across
+/// expansions and before the per-file cap. That is the number that answers
+/// "was anything retrieved at all", which is the question these three tickets
+/// kept turning out to hinge on.
+fn format_expansions(traces: &[ExpansionTrace]) -> String {
+    if traces.is_empty() {
+        return String::new();
+    }
+    let mut out = format!("--- Queries run ({}) ---\n", traces.len());
+    for (i, t) in traces.iter().enumerate() {
+        out.push_str(&format!(
+            "{}. {:?}\n   semantic {} · fts {}",
+            i + 1,
+            t.query,
+            t.semantic_hits,
+            t.fts_hits
+        ));
+        match &t.fts_expr {
+            Some(expr) => out.push_str(&format!("  ← {expr}\n")),
+            None => out.push_str("  ← (no searchable term; fts skipped)\n"),
+        }
+    }
+    out.push('\n');
+    out
 }
 
 /// Merge semantic and FTS seed results, keeping the highest score per file.
@@ -600,6 +662,7 @@ pub fn run_search(
         if let Some(ref intent) = output.intent {
             explain_out.push_str(&format!("Intent: {:?}\n\n", intent));
         }
+        explain_out.push_str(&format_expansions(&output.expansions));
         explain_out.push_str("--- Explain ---\n");
         for f in output.fused.iter().take(top_n) {
             explain_out.push_str(&format!("{}\n", f.file_path));
@@ -956,6 +1019,7 @@ mod tests {
             results: vec![],
             fused: vec![],
             intent: Some(crate::llm::QueryIntent::Conceptual),
+            expansions: vec![],
         };
         assert_eq!(output.intent, Some(crate::llm::QueryIntent::Conceptual));
     }
@@ -966,6 +1030,7 @@ mod tests {
             results: vec![],
             fused: vec![],
             intent: None,
+            expansions: vec![],
         };
         assert!(output.intent.is_none());
     }

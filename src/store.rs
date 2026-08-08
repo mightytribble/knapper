@@ -1076,11 +1076,26 @@ impl Store {
     /// The query is wrapped in double quotes so that FTS5 treats it as a
     /// phrase/literal rather than interpreting operators like `-`.
     pub fn fts_search(&self, query: &str, limit: usize) -> Result<Vec<FtsResult>> {
-        // Escape any double quotes in the query, then wrap in double quotes
-        // so FTS5 treats hyphens etc. as literal characters.
-        let escaped = query.replace('"', "\"\"");
-        let fts_query = format!("\"{}\"", escaped);
+        self.fts_search_expr(&crate::fts::phrase_expr(query), limit)
+    }
 
+    /// Keyword search matching **any** token of `query`, each taken literally.
+    ///
+    /// What the search lane wants, and what [`Self::fts_search`] cannot give it:
+    /// a phrase query only fires where the caller already guessed the corpus's
+    /// wording. See [`crate::fts::any_term_expr`] for the measurements (#22).
+    ///
+    /// A query with no searchable token returns no rows rather than an error.
+    pub fn fts_search_any(&self, query: &str, limit: usize) -> Result<Vec<FtsResult>> {
+        match crate::fts::any_term_expr(query) {
+            Some(expr) => self.fts_search_expr(&expr, limit),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Run a prepared FTS5 MATCH expression. Callers build the expression with
+    /// `crate::fts`, which is where the quoting rules and their reasons live.
+    fn fts_search_expr(&self, fts_query: &str, limit: usize) -> Result<Vec<FtsResult>> {
         let mut stmt = self.conn.prepare(
             "SELECT file_id, chunk_seq, bm25(chunks_fts) as score,
                     snippet(chunks_fts, 0, '<b>', '</b>', '...', 64)
