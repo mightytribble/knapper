@@ -649,7 +649,10 @@ pub async fn run_consumer(
             let store_guard = store.lock().await;
             for file_id in &affected_file_ids {
                 // Delete old edges first
-                if let Err(e) = store_guard.delete_edges_for_file(*file_id) {
+                // Outgoing only: backlinks into this file belong to other
+                // files' content, and re-indexing this one must not touch them
+                // (issue #27).
+                if let Err(e) = store_guard.delete_outgoing_edges_for_file(*file_id) {
                     tracing::warn!(file_id, error = %e, "failed to delete old edges");
                     continue;
                 }

@@ -807,10 +807,12 @@ pub fn append_to_note(
             store.delete_vec(*vid)?;
         }
 
-        // Delete old chunks, FTS, edges
+        // Delete old chunks, FTS, and the edges this file's own content owns.
+        // The `files` row stays so the id — and every backlink keyed on it —
+        // survives the rewrite; `insert_file` below upserts on `path` (#27).
         store.delete_fts_chunks_for_file(file_record.id)?;
-        store.delete_edges_for_file(file_record.id)?;
-        store.delete_file(file_record.id)?;
+        store.delete_outgoing_edges_for_file(file_record.id)?;
+        store.delete_chunks_for_file(file_record.id)?;
 
         // Re-insert file
         let mtime = file_mtime(&temp_path).unwrap_or(0);
@@ -1287,9 +1289,8 @@ pub fn move_note(
         bail!("target path already exists: {}", new_full_path.display());
     }
 
-    // Read content for re-indexing
-    let content = std::fs::read_to_string(&old_path)?;
-    let content_hash = compute_content_hash(&content);
+    // The content does not change, so the stored hash still describes the file
+    // and only the path-derived docid needs recomputing.
     let new_docid = generate_docid(&new_rel_path);
 
     // Ensure target directory exists
@@ -1297,31 +1298,20 @@ pub fn move_note(
         std::fs::create_dir_all(parent)?;
     }
 
-    // Step 2: Transaction — delete old record, insert new
+    // Step 2: Transaction — move the record to the new path.
+    //
+    // A move changes the folder, not the basename, and wikilinks resolve by
+    // basename — so every `[[note]]` pointing here still resolves and every
+    // edge stays valid. This used to delete the row and insert a fresh one,
+    // which cascaded all those edges away *and* took the note's chunks with
+    // them, leaving a moved note indexed but unsearchable (issue #27).
+    // `update_file_path` is the primitive that exists for exactly this: it
+    // keeps the id, so chunks, vectors, FTS rows and edges all follow.
     store.begin_transaction()?;
     let result = (|| -> Result<()> {
-        // Tombstone old vectors
-        let old_vids = store.get_vector_ids_for_file(file_record.id)?;
-
-        for vid in &old_vids {
-            store.delete_vec(*vid)?;
-        }
-        store.delete_fts_chunks_for_file(file_record.id)?;
-        store.delete_edges_for_file(file_record.id)?;
-        store.delete_file(file_record.id)?;
-
-        // Insert with new path (reuse existing chunks data via insert_file only for the record)
+        store.update_file_path(&file_record.path, &new_rel_path, &new_docid)?;
         let mtime = file_mtime(&old_path)?;
-        store.insert_file(
-            &new_rel_path,
-            &content_hash,
-            mtime,
-            &file_record.tags,
-            &new_docid,
-            file_record.created_by.as_deref(),
-            None,
-        )?;
-
+        store.update_file_mtime(&new_rel_path, mtime)?;
         Ok(())
     })();
 
@@ -1858,6 +1848,49 @@ mod tests {
         let store = Store::open_memory().unwrap();
         let root = tmp.path().to_path_buf();
         (tmp, store, root)
+    }
+
+    #[test]
+    fn moving_a_note_keeps_it_indexed_and_keeps_its_backlinks() {
+        // A move changes the folder, not the basename, so `[[hub]]` still
+        // resolves — nothing about the graph should change. The old code
+        // deleted the `files` row and inserted a fresh one, which cascaded the
+        // backlink away and took the note's chunks with it, leaving a moved
+        // note present in the index but absent from every search (issue #27).
+        use crate::llm::MockLlm;
+
+        let (_tmp, store, root) = setup_vault();
+        std::fs::create_dir_all(root.join("inbox")).unwrap();
+        std::fs::create_dir_all(root.join("areas")).unwrap();
+        std::fs::write(root.join("inbox/hub.md"), "# Hub\nBody text here.\n").unwrap();
+        std::fs::write(root.join("a.md"), "# A\nSee [[hub]].\n").unwrap();
+
+        let mut embedder = MockLlm::new(256);
+        let config = crate::config::Config::default();
+        crate::indexer::run_index_shared(&root, &config, &store, &mut embedder, false, None)
+            .unwrap();
+
+        let before = store.get_file("inbox/hub.md").unwrap().unwrap();
+        assert_eq!(store.get_chunks_by_file(before.id).unwrap().len(), 1);
+        assert_eq!(store.get_incoming(before.id, None).unwrap().len(), 1);
+
+        move_note("inbox/hub.md", "areas", &store, &root).unwrap();
+
+        assert!(root.join("areas/hub.md").exists());
+        assert!(store.get_file("inbox/hub.md").unwrap().is_none());
+        let after = store.get_file("areas/hub.md").unwrap().unwrap();
+        assert_eq!(after.id, before.id, "a move must not re-key the file");
+        assert_eq!(
+            store.get_chunks_by_file(after.id).unwrap().len(),
+            1,
+            "a moved note must stay searchable"
+        );
+        assert_eq!(
+            store.get_incoming(after.id, None).unwrap().len(),
+            1,
+            "[[hub]] resolves by basename, which the move did not change"
+        );
+        assert_eq!(after.docid, Some(generate_docid("areas/hub.md")));
     }
 
     #[test]

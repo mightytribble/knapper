@@ -384,14 +384,20 @@ pub fn index_file(
         store.conn().execute_batch("BEGIN DEFERRED")?;
     }
 
-    // 5. If file already exists, clean up old entries
+    // 5. If file already exists, clean up old entries.
+    //
+    // Deliberately NOT `delete_file`: the row must survive so the file keeps its
+    // id, and the id is what every backlink into this file is keyed on. Dropping
+    // the row cascades those edges away and nothing puts them back, because the
+    // files that own them are not being re-indexed (issue #27). `insert_file`
+    // below upserts on `path` and returns the same id.
     if let Some(record) = store.get_file(rel_path)? {
         let vector_ids = store.get_vector_ids_for_file(record.id)?;
         for &vid in &vector_ids {
             store.delete_vec(vid)?;
         }
         store.delete_fts_chunks_for_file(record.id)?;
-        store.delete_file(record.id)?;
+        store.delete_chunks_for_file(record.id)?;
     }
 
     // 6. Insert new file and chunks
@@ -598,14 +604,17 @@ fn run_index_inner(
         remove_file(&record.path, store)?;
     }
 
-    // Step 5: Handle changed files — delete old entries, then treat as new.
+    // Step 5: Handle changed files — just queue them.
+    //
+    // `remove_file` used to run here first. It is a *deletion*: it drops the
+    // `files` row, and `edges` CASCADEs off that row in both directions, so
+    // every backlink into a changed file died on each incremental index and
+    // nothing put it back (issue #27). Everything it cleaned up is cleaned up
+    // anyway — `index_file` clears the file's vectors, FTS rows and chunks, and
+    // `build_edges_for_file` clears its `unresolved_links` — and skipping it is
+    // what lets the file keep its id.
     let mut files_to_index: Vec<PathBuf> = new_files.clone();
     for file_path in &changed_files {
-        let rel = file_path.strip_prefix(vault_path).unwrap_or(file_path);
-        let rel_str = rel.to_string_lossy().to_string();
-        if store.get_file(&rel_str)?.is_some() {
-            remove_file(&rel_str, store)?;
-        }
         files_to_index.push(file_path.clone());
     }
 
@@ -661,6 +670,12 @@ fn run_index_inner(
         if let Some(file_record) = store.get_file(rel_path)?
             && let Some(content) = content_by_path.get(rel_path)
         {
+            // Clear what this file used to own before recomputing it. Without
+            // this the incremental path (no `clear_edges` above) can only ever
+            // add edges, because `insert_edge` is INSERT OR IGNORE — a wikilink
+            // deleted from a file would stay in the graph forever (issue #27).
+            // Incoming edges are left alone: they belong to other files.
+            store.delete_outgoing_edges_for_file(file_record.id)?;
             build_edges_for_file(store, file_record.id, content)?;
         }
     }
@@ -938,6 +953,133 @@ mod tests {
             vec!["keeper.md".to_string()],
             "the excluded file's unresolved links should be gone"
         );
+    }
+
+    /// Every edge as `(source path, target path, type)`, so two stores can be
+    /// compared without depending on file ids matching.
+    fn edge_snapshot(store: &Store) -> Vec<(String, String, String)> {
+        let paths: HashMap<i64, String> = store
+            .get_all_files()
+            .unwrap()
+            .into_iter()
+            .map(|f| (f.id, f.path))
+            .collect();
+        let mut stmt = store
+            .conn()
+            .prepare("SELECT from_file, to_file, edge_type FROM edges")
+            .unwrap();
+        let mut edges: Vec<(String, String, String)> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .unwrap()
+            .map(|r| {
+                let (from, to, kind) = r.unwrap();
+                (
+                    paths
+                        .get(&from)
+                        .cloned()
+                        .unwrap_or_else(|| format!("?{from}")),
+                    paths.get(&to).cloned().unwrap_or_else(|| format!("?{to}")),
+                    kind,
+                )
+            })
+            .collect();
+        edges.sort();
+        edges
+    }
+
+    #[test]
+    fn an_incremental_edit_and_a_full_index_agree_on_the_edges_table() {
+        // The invariant issue #27 is really about. Editing `hub.md` — which has
+        // no outgoing links at all — used to wipe both backlinks into it: the
+        // `files` row was deleted and re-inserted, and `edges` CASCADEs off it.
+        // Nothing restored them, because the files that own those edges were not
+        // re-indexed.
+        use crate::llm::MockLlm;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write_file(root, "a.md", "# A\nSee [[hub]].");
+        write_file(root, "c.md", "# C\nAlso [[hub]].");
+        write_file(root, "hub.md", "# Hub\nNo links out.");
+
+        let store = Store::open_memory().unwrap();
+        let mut embedder = MockLlm::new(256);
+        let config = Config::default();
+
+        run_index_shared(root, &config, &store, &mut embedder, false, None).unwrap();
+        let hub_id = store.get_file("hub.md").unwrap().unwrap().id;
+        assert_eq!(
+            store.get_incoming(hub_id, Some("wikilink")).unwrap().len(),
+            2,
+            "both backlinks should exist after a full index"
+        );
+
+        // Edit the hub. Its own content still has no wikilinks, so a correct
+        // incremental index changes nothing about the graph.
+        write_file(
+            root,
+            "hub.md",
+            "# Hub\nStill no links out, one word changed.",
+        );
+        run_index_shared(root, &config, &store, &mut embedder, false, None).unwrap();
+
+        let hub = store.get_file("hub.md").unwrap().unwrap();
+        assert_eq!(
+            hub.id, hub_id,
+            "re-indexing must keep the file's id — every backlink is keyed on it"
+        );
+        assert_eq!(
+            store.get_incoming(hub.id, Some("wikilink")).unwrap().len(),
+            2,
+            "editing a file must not destroy the links other files point at it"
+        );
+        assert!(
+            !store.get_chunks_by_file(hub.id).unwrap().is_empty(),
+            "the edited file should still be indexed"
+        );
+
+        // The real acceptance criterion: incremental and from-scratch agree.
+        let fresh = Store::open_memory().unwrap();
+        run_index_shared(root, &config, &fresh, &mut embedder, false, None).unwrap();
+        assert_eq!(edge_snapshot(&store), edge_snapshot(&fresh));
+    }
+
+    #[test]
+    fn an_incremental_index_drops_wikilinks_the_author_removed() {
+        // The other half of #27. `insert_edge` is INSERT OR IGNORE and the
+        // incremental path skips `clear_edges`, so without an explicit delete
+        // the graph could only ever grow: a link you deleted stayed forever.
+        use crate::llm::MockLlm;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write_file(root, "a.md", "# A\nSee [[hub]] and [[c]].");
+        write_file(root, "c.md", "# C");
+        write_file(root, "hub.md", "# Hub");
+
+        let store = Store::open_memory().unwrap();
+        let mut embedder = MockLlm::new(256);
+        let config = Config::default();
+
+        run_index_shared(root, &config, &store, &mut embedder, false, None).unwrap();
+        let a_id = store.get_file("a.md").unwrap().unwrap().id;
+        assert_eq!(store.get_outgoing(a_id, Some("wikilink")).unwrap().len(), 2);
+
+        write_file(root, "a.md", "# A\nSee [[c]]. The hub link is gone.");
+        run_index_shared(root, &config, &store, &mut embedder, false, None).unwrap();
+
+        let out = store.get_outgoing(a_id, Some("wikilink")).unwrap();
+        assert_eq!(out.len(), 1, "the removed wikilink should be gone: {out:?}");
+
+        let fresh = Store::open_memory().unwrap();
+        run_index_shared(root, &config, &fresh, &mut embedder, false, None).unwrap();
+        assert_eq!(edge_snapshot(&store), edge_snapshot(&fresh));
     }
 
     #[test]

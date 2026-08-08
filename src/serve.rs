@@ -906,8 +906,9 @@ impl EngraphServer {
         .map_err(|e| mcp_err(&e))?;
 
         // Rebuild edges for the re-indexed file
+        // Outgoing only — see issue #27.
         store
-            .delete_edges_for_file(result.file_id)
+            .delete_outgoing_edges_for_file(result.file_id)
             .map_err(|e| mcp_err(&e))?;
         crate::indexer::build_edges_for_file(&store, result.file_id, &content)
             .map_err(|e| mcp_err(&e))?;

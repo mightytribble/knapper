@@ -31,6 +31,7 @@ git fetch upstream && git diff --stat upstream/main main
 | `fts::any_term_expr` | the keyword lane matches terms, not the query as one phrase | this fork, issue #22 |
 | `ensure_original` | the user's own query is always searched for | this fork, issue #23 |
 | `rerank::max_document_chars` | the cross-encoder's input is bounded; upstream has no budget at all | this fork, issue #25 |
+| re-index keeps the `files` row | editing a note no longer cascades away every backlink into it | this fork, issue #27 |
 | `.github/workflows/ci.yml` | manual dispatch only — upstream runs it on push and PR | this fork, Actions minutes |
 
 Cherry-picked rather than merged: PR #41 branched before upstream's #40 graph fix, so merging the
@@ -65,7 +66,7 @@ export LIBCLANG_PATH="$HOME/.engraph-buildenv/lib/python3.12/site-packages/clang
 export BINDGEN_EXTRA_CLANG_ARGS="-I/usr/lib/gcc/x86_64-linux-gnu/13/include -I/usr/include -I/usr/include/x86_64-linux-gnu"
 
 cargo build --release        # ~10 min cold, ~20s incremental
-cargo test --lib             # 569 pass
+cargo test --lib             # 574 pass
 ```
 
 Each env var exists for a specific failure. Omit one and you get:
@@ -83,7 +84,7 @@ Adjust the gcc version in the include path (`13`) and the python version (`pytho
 `cargo test` (full) fails to compile `tests/integration.rs` and `tests/write_pipeline.rs`:
 `unresolved import engraph::embedder`, `engraph::hnsw`, and a `walk_vault` arity mismatch.
 **These are broken on pristine upstream** — verify with `git stash && cargo clippy --all-targets`.
-Upstream PR #47 addresses them. Use `cargo test --lib` (569 tests) as the working suite.
+Upstream PR #47 addresses them. Use `cargo test --lib` (574 tests) as the working suite.
 `cargo clippy -- -D warnings`, which is what CI runs, is clean.
 
 ### CI is manual-only in this fork
@@ -114,11 +115,10 @@ has never executed on this box.
   re-downloads 300MB (1.6GB with intelligence enabled).
 - **MCP servers launch once per session**, so a mid-session `git checkout` leaves the server pointed
   at the previous branch's store.
-- **Backlinks rot on every save** (#27). `delete_edges_for_file` removes edges in both directions and
-  the incremental re-index restores only the file's outgoing ones, so edges *into* an edited file are
-  destroyed and never rebuilt. `get_neighbors` follows incoming edges, so the graph lane loses recall
-  progressively under `engraph serve`. Until #27 lands, `engraph index --reindex` is the repair, and
-  any graph-lane measurement should be taken on a freshly reindexed store.
+- **Backlinks used to rot on every save** (#27, fixed). Any store last written by a pre-#27 build has
+  edges missing — 24 of 1084 per three files edited, on the isekai vault — and the fix does not
+  reconstruct them. `engraph index --rebuild` is the one-time repair, and any graph-lane number taken
+  before that repair is measuring a degraded graph.
 - **`engraph status` misreports the model** as `all-MiniLM-L6-v2` while actually loading
   `embeddinggemma-300M`. Upstream PR #48 fixes it.
 - **Intelligence is not a quality dial.** Enabling it (query expansion + Qwen3 reranker, 1.6GB)
@@ -388,10 +388,23 @@ See issues on this repo:
   `seed.score * decay` feeds a sort that feeds `truncate`, so zero deletes a seed rather than
   deprioritising it. `max == min` maps to the top of the range — probe 5's FTS lane returned exactly
   one hit. Knock-on: `LaneWeights::from_intent` becomes meaningful for the first time
-- **#27** — **editing any file destroys every backlink into it.** `delete_edges_for_file` deletes
-  `from_file = ?1 OR to_file = ?1`; `build_edges_for_file` restores only outgoing. Confirmed 2 → 0.
-  An edge is owned by its source file's content, so re-index must delete only `from_file`; the
-  both-directions form is correct for `remove_file` and nothing else. **Invisible to the probe
+- ~~**#27** — **editing any file destroys every backlink into it**~~ — **DONE.** The ticket named
+  `delete_edges_for_file`'s `from_file = ?1 OR to_file = ?1` as the cause. It was a symptom: **the
+  real cause is that re-indexing deleted the `files` row**, and both `edges` columns are
+  `REFERENCES files(id) ON DELETE CASCADE`. So the backlinks were gone before the explicit deletion
+  ran, and pointing that deletion at `from_file` alone would have fixed nothing. Three call paths did
+  it — `index_file` step 5, `run_index_inner` step 5 (`remove_file` on every *changed* file), and
+  `writer::update_note`. The fix keeps the row: `delete_chunks_for_file` clears the content and
+  `insert_file`'s upsert on `path` returns the same id, so every edge keyed on it survives.
+  A second, opposite defect fell out of the same reading: on the incremental path `clear_edges()` is
+  skipped and `insert_edge` is `INSERT OR IGNORE`, so nothing ever removed a wikilink the author had
+  **deleted** — the graph could only grow. `delete_outgoing_edges_for_file` before each
+  `build_edges_for_file` closes it. A third: `writer::move_note` deleted and re-inserted the row, so
+  a move cascaded the backlinks away **and took the note's chunks with it** — a moved note stayed in
+  the index and vanished from every search. It now uses `update_file_path`, which is the primitive
+  that already existed for this. **Measured on the 266-file isekai vault: editing three files
+  destroyed 24 of 1084 edges; after the fix, 1084 → 1084.** The pinned invariant is
+  `an_incremental_edit_and_a_full_index_agree_on_the_edges_table`. **Was invisible to the probe
   harness by construction** — the eval vault is built by one full index, which calls `clear_edges()`,
   so every graph-lane measurement ever taken here was on a best-case graph
 - **#28** — **wikilink edges at chunk granularity, both ends.** Today `extract_wikilink_targets` runs

@@ -1066,8 +1066,9 @@ async fn handle_reindex_file(
     )
     .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
 
+    // Outgoing only — see issue #27.
     store
-        .delete_edges_for_file(result.file_id)
+        .delete_outgoing_edges_for_file(result.file_id)
         .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
     crate::indexer::build_edges_for_file(&store, result.file_id, &content)
         .map_err(|e| ApiError::internal(&format!("{e:#}")))?;

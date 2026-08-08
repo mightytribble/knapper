@@ -657,9 +657,28 @@ impl Store {
         Ok(files)
     }
 
+    /// Delete a file's row.
+    ///
+    /// `chunks` and `edges` both reference `files(id)` `ON DELETE CASCADE`, so
+    /// this takes the file's chunks *and every edge touching it in either
+    /// direction* with it — including edges other files own. That is right when
+    /// the file is going away and wrong when it is being re-indexed, which is
+    /// why `index_file` uses [`delete_chunks_for_file`](Self::delete_chunks_for_file)
+    /// and lets `insert_file`'s upsert keep the row (issue #27).
     pub fn delete_file(&self, file_id: i64) -> Result<()> {
         self.conn
             .execute("DELETE FROM files WHERE id = ?1", params![file_id])?;
+        Ok(())
+    }
+
+    /// Delete a file's chunks without touching its `files` row.
+    ///
+    /// The re-index counterpart of [`delete_file`](Self::delete_file): keeping
+    /// the row keeps the file's id, and keeping the id keeps the edges other
+    /// files point at it.
+    pub fn delete_chunks_for_file(&self, file_id: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM chunks WHERE file_id = ?1", params![file_id])?;
         Ok(())
     }
 
@@ -858,11 +877,28 @@ impl Store {
     }
 
     /// Delete all edges involving a file (both directions: from_file OR to_file).
+    ///
+    /// Only correct when the file itself is going away. An edge is owned by its
+    /// **source** file's content, so deleting the incoming half throws away
+    /// other files' links and nothing re-creates them — those files are not
+    /// being re-indexed. Re-index paths want
+    /// [`delete_outgoing_edges_for_file`](Self::delete_outgoing_edges_for_file).
     pub fn delete_edges_for_file(&self, file_id: i64) -> Result<()> {
         self.conn.execute(
             "DELETE FROM edges WHERE from_file = ?1 OR to_file = ?1",
             params![file_id],
         )?;
+        Ok(())
+    }
+
+    /// Delete the edges a file owns — the ones its own content created.
+    ///
+    /// The partner of `indexer::build_edges_for_file`: together they recompute
+    /// exactly the set of edges this file is the author of, and leave every
+    /// backlink into it alone (issue #27).
+    pub fn delete_outgoing_edges_for_file(&self, file_id: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM edges WHERE from_file = ?1", params![file_id])?;
         Ok(())
     }
 
@@ -2561,6 +2597,58 @@ mod tests {
         // No edges in the other direction.
         assert!(store.get_outgoing(b, None).unwrap().is_empty());
         assert!(store.get_incoming(a, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn deleting_a_files_own_edges_leaves_the_backlinks_into_it() {
+        // The re-index deletion (issue #27). `b` is being re-indexed: the edges
+        // it authored go, the edge `a` authored into it stays — `a`'s content
+        // has not changed and nothing else is going to put that edge back.
+        let store = Store::open_memory().unwrap();
+        let (a, b) = setup_two_files(&store);
+
+        store.insert_edge(a, b, "wikilink").unwrap();
+        store.insert_edge(b, a, "wikilink").unwrap();
+
+        store.delete_outgoing_edges_for_file(b).unwrap();
+
+        assert!(store.get_outgoing(b, None).unwrap().is_empty());
+        assert_eq!(
+            store.get_incoming(b, None).unwrap(),
+            vec![(a, "wikilink".to_string())],
+            "a's link into b is a's to delete, not b's"
+        );
+    }
+
+    #[test]
+    fn deleting_a_files_chunks_keeps_its_row_and_its_backlinks() {
+        // `delete_file` cascades `edges` in both directions, which is what made
+        // every edit destroy backlinks. The re-index path clears chunks instead
+        // and lets `insert_file` upsert the row (issue #27).
+        let store = Store::open_memory().unwrap();
+        let (a, b) = setup_two_files(&store);
+        store.insert_edge(a, b, "wikilink").unwrap();
+
+        store.delete_chunks_for_file(b).unwrap();
+
+        assert!(store.get_chunks_by_file(b).unwrap().is_empty());
+        assert!(store.get_file("notes/b.md").unwrap().is_some());
+        assert_eq!(store.get_incoming(b, None).unwrap().len(), 1);
+
+        // And the upsert returns the same id, so the edge still points at it.
+        let reborn = store
+            .insert_file(
+                "notes/b.md",
+                "hb2",
+                101,
+                &[],
+                &generate_docid("notes/b.md"),
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(reborn, b);
+        assert_eq!(store.get_incoming(reborn, None).unwrap().len(), 1);
     }
 
     #[test]
