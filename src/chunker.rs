@@ -545,15 +545,43 @@ fn emit_section(
     }
 }
 
+/// Every number that decides where a chunk boundary falls, or how much of the
+/// previous chunk a continuation repeats.
+///
+/// They are named rather than inline because `chunker_fingerprint` hashes them
+/// (issue #31): a store built at one set of these values holds different chunks
+/// — and therefore different vectors and different FTS rows — than the same
+/// vault indexed at another, and nothing else in the database records which set
+/// was used. Changing one here is enough to make the next `engraph index`
+/// rebuild; there is no second place to remember to edit.
+pub mod limits {
+    /// Chunk size the break-point search aims for.
+    pub const TARGET_TOKENS: usize = 512;
+    /// How much of the preceding section a continuation chunk repeats, as a
+    /// percentage of [`TARGET_TOKENS`].
+    pub const OVERLAP_PCT: usize = 15;
+    /// Hard ceiling. A chunk over this is split again on sentence boundaries by
+    /// [`super::split_oversized_chunks`], which is where the *model's* input
+    /// limit enters the pipeline — an embedding model silently truncates
+    /// anything longer, so this is a chunking constant and a model-input limit
+    /// at the same time.
+    pub const MAX_TOKENS: usize = 512;
+    /// Tokens of the previous sub-chunk repeated at the head of each piece a
+    /// [`MAX_TOKENS`] split produces.
+    pub const OVERLAP_TOKENS: usize = 50;
+}
+
+pub use limits::{MAX_TOKENS, OVERLAP_PCT, OVERLAP_TOKENS, TARGET_TOKENS};
+
 /// Parse markdown content into frontmatter tags and structure-first chunks.
 ///
 /// 1. Strip YAML frontmatter (between `---` at start), parse `tags` if present.
-/// 2. Run `structure_chunk` on the body with target 512 tokens, 15% overlap.
+/// 2. Run `structure_chunk` on the body at [`TARGET_TOKENS`] / [`OVERLAP_PCT`].
 /// 3. Return `ParsedMarkdown { tags, chunks }`.
 pub fn chunk_markdown(content: &str) -> ParsedMarkdown {
     let (tags, body) = parse_frontmatter(content);
 
-    let chunks = structure_chunk(body, 512, 15);
+    let chunks = structure_chunk(body, TARGET_TOKENS, OVERLAP_PCT);
 
     ParsedMarkdown { tags, chunks }
 }

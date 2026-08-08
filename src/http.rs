@@ -1179,6 +1179,9 @@ mod tests {
         fn dim(&self) -> usize {
             384
         }
+        fn fingerprint(&self) -> String {
+            "dummy-embed".to_string()
+        }
     }
 
     fn test_api_state() -> ApiState {

@@ -1076,6 +1076,26 @@ pub async fn run_serve(
         None
     };
 
+    // Refuse to serve an index this build did not produce (issue #31).
+    //
+    // The startup reconciliation below would fix a stale store, but it runs in a
+    // spawned task and only warns on failure — so the server would answer from
+    // the old index in the meantime, which is exactly the silent wrong answer
+    // fingerprints exist to prevent. Checked here, synchronously, beside the
+    // dimension guard that already refuses to start for the same reason.
+    {
+        let rerank_fp = match &reranker {
+            Some(model) => Some(model.lock().await.fingerprint()),
+            None => None,
+        };
+        let fingerprints = crate::fingerprint::Fingerprints::compute(
+            &config,
+            &EmbedModel::fingerprint(&embedder),
+            rerank_fp.as_deref(),
+        );
+        crate::fingerprint::verify(&store, &fingerprints)?;
+    }
+
     let store_arc = Arc::new(Mutex::new(store));
     let embedder_arc: Arc<Mutex<Box<dyn EmbedModel + Send>>> =
         Arc::new(Mutex::new(Box::new(embedder) as Box<dyn EmbedModel + Send>));

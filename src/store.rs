@@ -178,6 +178,19 @@ pub struct StoreStats {
     pub mention_count: Option<usize>,
 }
 
+/// The keyword index's declaration, kept as one literal because
+/// `fts_fingerprint` hashes it (issue #31).
+///
+/// This is the one fingerprint input that needs no version constant beside it:
+/// the schema *is* the text, so any change to the column list, the tokenizer
+/// clause, or the `UNINDEXED` markers changes the digest exactly and nothing
+/// else does.
+pub const FTS_SCHEMA: &str = "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+                content,
+                file_id UNINDEXED,
+                chunk_seq UNINDEXED
+            );";
+
 const SCHEMA: &str = r#"
 PRAGMA foreign_keys = ON;
 
@@ -1204,15 +1217,30 @@ impl Store {
     /// Ensure the FTS5 virtual table exists. Called during init.
     pub fn ensure_fts_table(&self) -> Result<()> {
         self.conn
-            .execute_batch(
-                "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
-                content,
-                file_id UNINDEXED,
-                chunk_seq UNINDEXED
-            );",
-            )
+            .execute_batch(FTS_SCHEMA)
             .context("failed to create FTS5 virtual table")?;
         Ok(())
+    }
+
+    /// Discard `chunks_fts` and rebuild it from `chunks.text`.
+    ///
+    /// The action `fts_fingerprint` declares (issue #31). It reads no files and
+    /// runs no model: `chunks.text` is the whole chunk, so the keyword index is
+    /// derivable from what is already stored. That is the only reason an FTS
+    /// schema change is cheap rather than a reindex.
+    pub fn rebuild_fts(&self) -> Result<usize> {
+        self.conn
+            .execute_batch("DROP TABLE IF EXISTS chunks_fts;")?;
+        self.ensure_fts_table()?;
+        self.conn.execute_batch(
+            "INSERT INTO chunks_fts (content, file_id, chunk_seq)
+                 SELECT text, file_id, seq FROM chunks;",
+        )?;
+        Ok(self
+            .conn
+            .query_row("SELECT count(*) FROM chunks_fts", [], |row| {
+                row.get::<_, i64>(0)
+            })? as usize)
     }
 
     /// Insert a chunk's text into the FTS5 table.

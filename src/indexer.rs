@@ -149,6 +149,36 @@ pub fn diff_vault(
     Ok((new_files, changed_files, deleted))
 }
 
+/// Re-derive every edge in the vault from source, without embedding anything.
+///
+/// The action `link_fingerprint` declares (issue #31). A resolver change is not
+/// confined to the files that changed on disk: the same `[[Note]]` may now point
+/// somewhere else in every file that writes it, and no content hash can see
+/// that, because no content changed.
+///
+/// This reads the vault rather than re-deriving from `chunks.text` the way
+/// `backfill_edges_from_chunks` does, because the chunker strips frontmatter —
+/// a link written there belongs to no chunk, and a chunks-only rebuild would
+/// silently drop it. That is a vault read of every file and no model call, so it
+/// costs seconds where a reindex costs minutes.
+fn rebuild_all_edges(store: &Store, vault_path: &Path, files: &[PathBuf]) -> Result<usize> {
+    store.clear_edges()?;
+    let mut rebuilt = 0usize;
+    for path in files {
+        let rel = path.strip_prefix(vault_path).unwrap_or(path);
+        let rel_str = rel.to_string_lossy().to_string();
+        let Some(file_record) = store.get_file(&rel_str)? else {
+            continue;
+        };
+        let Ok(content) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        build_edges_for_file(store, file_record.id, &content)?;
+        rebuilt += 1;
+    }
+    Ok(rebuilt)
+}
+
 /// Resolve a wikilink target name to a file ID in the store.
 fn resolve_link_target(store: &Store, target: &str) -> Result<Option<i64>> {
     let with_ext = if target.ends_with(".md") {
@@ -401,8 +431,8 @@ pub fn index_file(
     vault_path: &Path,
     config: &Config,
 ) -> Result<IndexFileResult> {
-    let max_tokens = 512;
-    let overlap_tokens = 50;
+    let max_tokens = crate::chunker::MAX_TOKENS;
+    let overlap_tokens = crate::chunker::OVERLAP_TOKENS;
 
     // 1. Parse frontmatter for tags and created_by
     let parsed = chunk_markdown(content);
@@ -636,6 +666,34 @@ fn run_index_inner(
         rebuild = true;
     }
 
+    // Reconcile what built this index against what is running now (issue #31).
+    //
+    // No reranker fingerprint here, and deliberately none: nothing the index
+    // path writes passes through a cross-encoder, so this path has no business
+    // deciding a reranker is current. Passing `None` leaves whatever a reranked
+    // run recorded untouched rather than overwriting it with a guess.
+    let fingerprints =
+        crate::fingerprint::Fingerprints::compute(config, &embedder.fingerprint(), None);
+    let staleness = crate::fingerprint::compare(store, &fingerprints)?;
+    crate::fingerprint::warn_unrecorded(&staleness);
+    let actions = staleness.actions();
+    for mismatch in &staleness.mismatches {
+        eprintln!(
+            "{} changed since the index was built. Will {}.",
+            mismatch.key,
+            mismatch.action.describe()
+        );
+    }
+    if actions.contains(&crate::fingerprint::Action::Reindex) {
+        rebuild = true;
+    }
+    // Before the file loop, so anything indexed below lands in the new schema
+    // rather than being written into the old one and then thrown away.
+    if actions.contains(&crate::fingerprint::Action::RebuildFts) {
+        let rows = store.rebuild_fts()?;
+        info!(rows, "keyword index rebuilt from stored chunks");
+    }
+
     let cleaned = crate::writer::cleanup_temp_files(vault_path)?;
     if cleaned > 0 {
         info!(cleaned, "cleaned up incomplete writes from previous run");
@@ -757,6 +815,18 @@ fn run_index_inner(
         }
     }
 
+    // A link-resolver change rewrites every edge, including those of files that
+    // did not change (issue #31). A full rebuild has already done this from
+    // source above, so this is the incremental path's version of it: a vault
+    // read and no model, which is what makes it cheap enough to do eagerly.
+    if actions.contains(&crate::fingerprint::Action::RebuildEdges) && !rebuild {
+        let rebuilt = rebuild_all_edges(store, vault_path, &files)?;
+        info!(
+            files = rebuilt,
+            "vault graph re-derived after a link-resolver change"
+        );
+    }
+
     // Adopt chunk-granular edges on a store that predates them (issue #28).
     // Only the files touched above were rebuilt at the fine grain; the rest are
     // still document-level, and re-deriving them needs no vault read, so this
@@ -848,6 +918,11 @@ fn run_index_inner(
     {
         tracing::warn!("L1 identity extraction failed (non-fatal): {e:#}");
     }
+
+    // Last, and only on the way out (issue #31). A crash anywhere above leaves
+    // the previous fingerprints standing, so the next run repeats the work — a
+    // store never claims to match code that never finished running against it.
+    crate::fingerprint::record(store, &fingerprints)?;
 
     let duration = start.elapsed();
     info!(
@@ -1183,6 +1258,276 @@ mod tests {
         let fresh = Store::open_memory().unwrap();
         run_index_shared(root, &config, &fresh, &mut embedder, false, None).unwrap();
         assert_eq!(edge_snapshot(&store), edge_snapshot(&fresh));
+    }
+
+    // ── Fingerprints (issue #31) ──────────────────────────────────────────
+    //
+    // A changed constant and a poked `meta` row are the same thing to the code
+    // under test: a stored fingerprint that disagrees with the running one. The
+    // tests poke, because a `const` cannot be changed at runtime and rebuilding
+    // the crate per assertion is not a test.
+    //
+    // Every assertion here keys on `path`, never on `file_id`. A rebuild hands
+    // out rowids in vault-walk order, so two rebuilds at identical settings
+    // disagree on any digest keyed by id — which read as corruption once
+    // already (issue #20).
+
+    /// A three-file vault with links, indexed once, plus a recording embedder
+    /// so a later run can prove nothing reached the model.
+    fn fingerprint_fixture() -> (TempDir, Store, RecordingEmbed, Config) {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write_file(root, "a.md", "# A\nSee [[hub]].");
+        write_file(root, "c.md", "# C\nAlso [[hub]].");
+        write_file(root, "hub.md", "# Hub\nNo links out.");
+
+        let store = Store::open_memory().unwrap();
+        let mut embedder = RecordingEmbed {
+            inner: crate::llm::MockLlm::new(256),
+            seen: Vec::new(),
+        };
+        let config = Config::default();
+        run_index_shared(root, &config, &store, &mut embedder, false, None).unwrap();
+        embedder.seen.clear();
+        (tmp, store, embedder, config)
+    }
+
+    /// Every chunk as `"path#seq: text"`, sorted. Keyed on path, not id.
+    fn chunk_snapshot(store: &Store) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for file in store.get_all_files().unwrap() {
+            for chunk in store.get_chunks_by_file(file.id).unwrap() {
+                out.push(format!("{}#{}: {}", file.path, chunk.seq, chunk.text));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    fn fts_row_count(store: &Store) -> i64 {
+        store
+            .conn()
+            .query_row("SELECT count(*) FROM chunks_fts", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn an_unchanged_configuration_rebuilds_nothing() {
+        // The half of the acceptance criteria that actually matters. A
+        // fingerprint that fires on every startup is as useless as none, just
+        // slower — so this asserts on the *absence* of work, from three angles:
+        // no file re-indexed, no string handed to the model, and a keyword index
+        // emptied by hand still empty afterwards.
+        let (tmp, store, mut embedder, config) = fingerprint_fixture();
+        let before = chunk_snapshot(&store);
+
+        store.conn().execute("DELETE FROM chunks_fts", []).unwrap();
+        let result =
+            run_index_shared(tmp.path(), &config, &store, &mut embedder, false, None).unwrap();
+
+        assert_eq!(result.new_files, 0);
+        assert_eq!(result.updated_files, 0);
+        assert!(
+            embedder.seen.is_empty(),
+            "nothing should have reached the embedder: {:?}",
+            embedder.seen
+        );
+        assert_eq!(
+            fts_row_count(&store),
+            0,
+            "no fingerprint changed, so nothing should have rebuilt the keyword index"
+        );
+        assert_eq!(before, chunk_snapshot(&store));
+    }
+
+    #[test]
+    fn an_index_records_its_fingerprints() {
+        let (_tmp, store, _embedder, _config) = fingerprint_fixture();
+        for key in [
+            crate::fingerprint::PARSER,
+            crate::fingerprint::CHUNKER,
+            crate::fingerprint::LINK,
+            crate::fingerprint::FTS,
+            crate::fingerprint::EMBEDDING,
+        ] {
+            assert!(
+                store.get_meta(key.name).unwrap().is_some(),
+                "{} should be recorded after an index",
+                key.name
+            );
+        }
+        assert!(
+            store
+                .get_meta(crate::fingerprint::RERANKER.name)
+                .unwrap()
+                .is_none(),
+            "the index path scores nothing, so it must not claim a reranker is current"
+        );
+    }
+
+    #[test]
+    fn a_changed_chunker_constant_reindexes_every_file() {
+        let (tmp, store, mut embedder, config) = fingerprint_fixture();
+        store
+            .set_meta(crate::fingerprint::CHUNKER.name, "built-by-other-constants")
+            .unwrap();
+
+        let result =
+            run_index_shared(tmp.path(), &config, &store, &mut embedder, false, None).unwrap();
+
+        assert_eq!(
+            result.new_files, 3,
+            "a rebuild treats every file as new, and no file changed on disk"
+        );
+        assert!(
+            !embedder.seen.is_empty(),
+            "a rechunk must re-embed: the vectors describe text that no longer exists"
+        );
+        assert_ne!(
+            store.get_meta(crate::fingerprint::CHUNKER.name).unwrap(),
+            Some("built-by-other-constants".to_string()),
+            "the fingerprint should be current once the work is done"
+        );
+    }
+
+    #[test]
+    fn a_changed_fts_schema_rebuilds_the_keyword_index_without_re_embedding() {
+        // The action `fts_fingerprint` declares, and the reason it is cheap:
+        // `chunks.text` holds the whole chunk, so the keyword index is derivable
+        // from what is already stored. Emptying it by hand first is what proves
+        // the rebuild ran rather than that it was never needed.
+        let (tmp, store, mut embedder, config) = fingerprint_fixture();
+        let expected = chunk_snapshot(&store).len() as i64;
+        store.conn().execute("DELETE FROM chunks_fts", []).unwrap();
+        store
+            .set_meta(crate::fingerprint::FTS.name, "built-by-another-schema")
+            .unwrap();
+
+        let result =
+            run_index_shared(tmp.path(), &config, &store, &mut embedder, false, None).unwrap();
+
+        assert_eq!(
+            fts_row_count(&store),
+            expected,
+            "every chunk should be back"
+        );
+        assert_eq!(result.new_files, 0);
+        assert_eq!(result.updated_files, 0);
+        assert!(
+            embedder.seen.is_empty(),
+            "an FTS schema change must not re-embed: {:?}",
+            embedder.seen
+        );
+    }
+
+    #[test]
+    fn a_changed_link_resolver_rebuilds_edges_without_re_embedding() {
+        // A resolver change is not confined to the files that changed on disk:
+        // the same `[[Note]]` may resolve elsewhere in every file that writes
+        // it, and no content hash can see that because no content changed.
+        let (tmp, store, mut embedder, config) = fingerprint_fixture();
+        let expected = edge_snapshot(&store);
+        assert!(!expected.is_empty(), "fixture should have edges to lose");
+
+        store.clear_edges().unwrap();
+        store
+            .set_meta(crate::fingerprint::LINK.name, "built-by-another-resolver")
+            .unwrap();
+
+        let result =
+            run_index_shared(tmp.path(), &config, &store, &mut embedder, false, None).unwrap();
+
+        assert_eq!(edge_snapshot(&store), expected, "every edge should be back");
+        assert_eq!(result.new_files, 0);
+        assert_eq!(result.updated_files, 0);
+        assert!(
+            embedder.seen.is_empty(),
+            "a resolver change must not re-embed: {:?}",
+            embedder.seen
+        );
+    }
+
+    #[test]
+    fn a_changed_reranker_never_reaches_the_index_path() {
+        // The one key whose action is not a rebuild. Getting it wrong buys a
+        // needless full re-embed for a change that touched no stored byte.
+        let (tmp, store, mut embedder, config) = fingerprint_fixture();
+        store
+            .set_meta(crate::fingerprint::RERANKER.name, "some-other-reranker")
+            .unwrap();
+
+        let result =
+            run_index_shared(tmp.path(), &config, &store, &mut embedder, false, None).unwrap();
+
+        assert_eq!(result.new_files, 0);
+        assert_eq!(result.updated_files, 0);
+        assert!(embedder.seen.is_empty(), "{:?}", embedder.seen);
+        assert_eq!(
+            store
+                .get_meta(crate::fingerprint::RERANKER.name)
+                .unwrap()
+                .as_deref(),
+            Some("some-other-reranker"),
+            "the index path loads no reranker, so it must not overwrite what one recorded"
+        );
+    }
+
+    #[test]
+    fn a_pre_fingerprint_store_is_adopted_rather_than_rebuilt() {
+        // Every store written before #31 has no fingerprints. Forcing them all
+        // through a full reindex to find out whether they were stale is the same
+        // uselessness as rebuilding on every startup, just once — and there is
+        // no evidence to act on. Fingerprints protect what happens after they
+        // are first recorded.
+        let (tmp, store, mut embedder, config) = fingerprint_fixture();
+        for key in [
+            crate::fingerprint::PARSER,
+            crate::fingerprint::CHUNKER,
+            crate::fingerprint::LINK,
+            crate::fingerprint::FTS,
+            crate::fingerprint::EMBEDDING,
+        ] {
+            store
+                .conn()
+                .execute("DELETE FROM meta WHERE key = ?1", [key.name])
+                .unwrap();
+        }
+
+        let result =
+            run_index_shared(tmp.path(), &config, &store, &mut embedder, false, None).unwrap();
+
+        assert_eq!(result.new_files, 0);
+        assert_eq!(result.updated_files, 0);
+        assert!(embedder.seen.is_empty(), "{:?}", embedder.seen);
+        assert!(
+            store
+                .get_meta(crate::fingerprint::CHUNKER.name)
+                .unwrap()
+                .is_some(),
+            "and they are recorded on the way out, so the next change is caught"
+        );
+    }
+
+    #[test]
+    fn a_dimension_change_still_discards_the_index() {
+        // `embedding_fingerprint` subsumes `ensure_embedding_dim`, and this is
+        // the half that must not regress: a width change is a shape error, not
+        // merely a stale index, and it is caught before anything is written.
+        let (tmp, store, _embedder, config) = fingerprint_fixture();
+        assert!(!chunk_snapshot(&store).is_empty());
+
+        let mut wider = RecordingEmbed {
+            inner: crate::llm::MockLlm::new(512),
+            seen: Vec::new(),
+        };
+        run_index_shared(tmp.path(), &config, &store, &mut wider, false, None).unwrap();
+
+        assert_eq!(store.vec_table_dim().unwrap(), Some(512));
+        assert!(
+            !wider.seen.is_empty(),
+            "a width change must re-embed everything"
+        );
+        assert_eq!(chunk_snapshot(&store).len(), 3);
     }
 
     #[test]
@@ -1570,6 +1915,9 @@ mod tests {
         }
         fn dim(&self) -> usize {
             self.inner.dim()
+        }
+        fn fingerprint(&self) -> String {
+            self.inner.fingerprint()
         }
     }
 

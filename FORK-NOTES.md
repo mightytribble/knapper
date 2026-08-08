@@ -37,6 +37,7 @@ git fetch upstream && git diff --stat upstream/main main
 | `DOC_LEVEL` sentinel | an un-headed link stores one row, not one per target chunk | this fork, issue #28 |
 | `PprParams` | the graph lane is personalized PageRank over chunks: sum, not max | this fork, issue #29 |
 | `incident_wikilink_edges` | one indexed fetch per frontier, not a BFS per seed | this fork, issue #29 |
+| `src/fingerprint.rs` | the store knows what built it, and rebuilds only what changed | this fork, issue #31 |
 | `.github/workflows/ci.yml` | manual dispatch only — upstream runs it on push and PR | this fork, Actions minutes |
 
 Cherry-picked rather than merged: PR #41 branched before upstream's #40 graph fix, so merging the
@@ -177,7 +178,36 @@ has never executed on this box.
   called with `AddBos::Never` because the current string supplies one literally
   (`parse_special = true` in llama-cpp-2, so it does become the real BOS token) — swap the strings
   without addressing that and every embedding loses its BOS. Changing the *document* side needs
-  `--reindex`; changing the *query* side needs nothing.
+  `--reindex`; changing the *query* side needs nothing. Since #31 the reindex is no longer something
+  to remember: bump `fingerprint::PROMPT_TEMPLATE_VERSION` and the next `engraph index` does it.
+- **The store records what built it, and rebuilds only what changed** (this fork, issue #31). Six
+  keys in `meta` — `parser_`, `chunker_`, `link_`, `fts_`, `embedding_`, `reranker_fingerprint` —
+  compared at the top of every index and at the top of every read. Three costs are wildly different
+  and that is the point: on the 266-file isekai vault a chunker or embedding change is a **183 s**
+  full reindex, a link-resolver change re-derives all 1988 edges from the vault in **3.1 s**, and an
+  FTS schema change rebuilds all 1863 keyword rows from `chunks.text` in **0.1 s** with no vault read
+  at all. `reranker_fingerprint` triggers nothing — it exists to invalidate a calibrated threshold,
+  and a read that disagrees with it warns rather than blocking.
+  - **A read path refuses rather than warns.** `engraph search` and `engraph serve` fail with
+    "Run 'engraph index'" on any rebuild-class mismatch, the way `verify_embedding_dim` already does
+    on a width change. Warning to stderr would be useless here: `eval/probe.sh` sends stderr to
+    `/dev/null`, and a stale index answering a probe is exactly the silent wrong number this exists
+    to stop.
+  - **A store with no fingerprints is adopted, not rebuilt.** Every pre-#31 database is in that
+    state. There is no evidence it is stale and a forced one-time reindex for everyone is the same
+    uselessness as rebuilding on every startup. Protection starts from the first recorded value.
+  - **`reranker_fingerprint` is written by a *search*, never by an index** — the index path loads no
+    cross-encoder, so it cannot honestly claim one is current. A *mismatched* key is never
+    overwritten from a read either: doing so would consume the signal a calibrated threshold needs.
+  - **Model identity is the artifact's SHA-256, not its filename.** Hashing 640 MB costs ~0.3 s warm
+    and ~8 s cold, so it is cached in a `<model>.sha256` sidecar keyed on `(size, mtime)`. The cache
+    is keyed on metadata, the fingerprint on content — so re-downloading identical bytes rehashes and
+    rebuilds nothing.
+  - **Three algorithm versions are hand-maintained** (`PARSER_VERSION`, `CHUNKER_VERSION`,
+    `LINK_RESOLVER_VERSION`, plus `PROMPT_TEMPLATE_VERSION` and
+    `EMBEDDING_NORMALIZATION_VERSION` in `llm`). There is no runtime view of what a function does.
+    Everything that is *data* — chunk limits, the FTS schema text, config, artifact digests — is
+    hashed exactly and needs no bump.
 - **`exclude` is `.gitignore`-style globs** (`src/exclude.rs`, this fork). No separator means the
   pattern matches at any depth; a trailing `/` means a directory and its contents; an embedded `/`
   anchors to the vault root. Adding a pattern purges what is already indexed on the next run, via
@@ -381,14 +411,22 @@ See issues on this repo:
   were overruled on the way: #26 shipped per-expansion min-max normalisation rather than item 2's
   rank-crossing, and #29 deleted the disjointness skip item 3 argued for keeping. Its acceptance
   criterion that no score crosses a lane boundary is therefore false against `main`
-- **#31 — fingerprint the index.** `meta` gains `parser`/`chunker`/`link`/`fts`/`embedding`/
-  `reranker` fingerprints with §4's declared invalidation actions. Today only embedding *dimension*
-  is fingerprinted, so chunker constants, the prompt template, the tokenizer, a swapped GGUF behind
-  an unchanged filename, the FTS schema and the resolver can all change under a store that reports
-  itself healthy. #27 is the precedent for what that costs: every graph-lane number recorded before
-  it was silently on a best-case graph and nothing said so. Settled by invariant, no probe involved.
-  De-risks #10, #5, #8 and #2, each of which changes the model input and today relies on someone
-  remembering to rebuild. **Layer 0 of `docs/vault-search-convergence.md` — lands before #30**
+- ~~**#31 — fingerprint the index**~~ — **DONE.** `src/fingerprint.rs`; `meta` carries
+  `parser`/`chunker`/`link`/`fts`/`embedding`/`reranker_fingerprint`, each with one declared action,
+  compared at the top of every index and every read. Before it, only embedding *dimension* was
+  fingerprinted, so chunker constants, the prompt template, the tokenizer, a swapped GGUF behind an
+  unchanged filename, the FTS schema and the resolver could all change under a store reporting itself
+  healthy. Settled by invariant on the 266-file eval vault, all five actions poked one at a time:
+  **chunker → 266 files re-indexed, 1863 chunks byte-identical keyed on path, 182 s; link → 1988
+  edges wiped and re-derived identically in 3.1 s with nothing re-embedded; fts → 1863 keyword rows
+  wiped and rebuilt in 0.1 s with no vault read; embedding → `search` refuses with "Run 'engraph
+  index'"; reranker → `search` proceeds and the recorded value survives.** The negative half —
+  poke nothing, and a hand-emptied FTS table stays empty — is the one that matters, and it holds.
+  **The tests were checked against a mutant** whose `compare` always returns clean: nine fail, so
+  they are evidence rather than decoration. De-risks #10, #5, #8 and #2, each of which changes the
+  model input and previously relied on someone remembering to rebuild. Also pinned the eval corpus:
+  `standalone/mcp-isekai` is tagged **`eval-corpus-v1`** at `63f33e6`.
+  **Layer 0 of `docs/vault-search-convergence.md`**
 - **#30 — the ranking stage: the cross-encoder sorts, and graph reaches it by reserved quota.**
   What survived #24. Graph stops being a fusion lane and becomes a candidate source keeping #29's
   PPR as its reach function; **48 RRF anchors + 16 graph anchors of a 64-candidate pool, backfill

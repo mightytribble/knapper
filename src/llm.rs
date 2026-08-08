@@ -241,6 +241,19 @@ pub trait EmbedModel: Send {
 
     /// Dimensionality of vectors produced by this model.
     fn dim(&self) -> usize;
+
+    /// Everything about this model that decides what a stored vector *means*:
+    /// the artifact's bytes, its width, its tokenizer, the prompt template it is
+    /// fed through, and what happens to the vector afterwards.
+    ///
+    /// Feeds `embedding_fingerprint` (issue #31), which **subsumes**
+    /// `ensure_embedding_dim` — the width is one component here rather than the
+    /// only thing checked anywhere. The dimension guard stays as it is: a width
+    /// change is a shape error, not merely a stale index, and it fails harder.
+    ///
+    /// Computed once at load. A filename is not identity, so this hashes bytes,
+    /// and hashing 640 MB is not something to do per call.
+    fn fingerprint(&self) -> String;
 }
 
 // Blanket impl: `Box<dyn EmbedModel + Send>` itself implements `EmbedModel`.
@@ -263,12 +276,25 @@ impl EmbedModel for Box<dyn EmbedModel + Send> {
     fn dim(&self) -> usize {
         (**self).dim()
     }
+
+    fn fingerprint(&self) -> String {
+        (**self).fingerprint()
+    }
 }
 
 /// Cross-encoder reranker — scores a (query, document) pair.
 pub trait RerankModel: Send {
     /// Return a relevance score in [0.0, 1.0].
     fn rerank_score(&mut self, query: &str, document: &str) -> Result<f32>;
+
+    /// Everything about this reranker that decides what a score *means*: the
+    /// artifact's bytes and its Yes/No token identity.
+    ///
+    /// Feeds `reranker_fingerprint` (issue #31), the one key whose action is
+    /// not a rebuild — nothing the reranker touches is stored. What it
+    /// invalidates is any threshold calibrated against its scores, which is why
+    /// it is recorded before there is a threshold to protect.
+    fn fingerprint(&self) -> String;
 
     /// Score `query` against every document, returning one score per document
     /// in order.
@@ -358,9 +384,20 @@ impl EmbedModel for MockLlm {
     fn dim(&self) -> usize {
         self.dim
     }
+
+    fn fingerprint(&self) -> String {
+        // Width is the only thing that varies about the mock, and `hash_to_vector`
+        // is its whole algorithm. Bump the version if that changes, or a store
+        // built by an old test binary reads as current.
+        format!("mock-embed-v1:{}", self.dim)
+    }
 }
 
 impl RerankModel for MockLlm {
+    fn fingerprint(&self) -> String {
+        "mock-rerank-v1".to_string()
+    }
+
     fn rerank_score(&mut self, query: &str, document: &str) -> Result<f32> {
         // Deterministic score: Jaccard overlap of character 4-grams, clamped to [0,1].
         let ngrams = |s: &str| -> std::collections::HashSet<String> {
@@ -588,10 +625,25 @@ impl FlexTokenizer {
 }
 
 /// Load tokenizer for a model. Tries external tokenizer.json first, falls back to GGUF-embedded.
-fn load_tokenizer_for_model(uri: &HfModelUri, models_dir: &Path) -> Result<FlexTokenizer> {
+///
+/// Returns the tokenizer and its **identity** — a digest of the artifact it came
+/// from, which `embedding_fingerprint` folds in (issue #31). A tokenizer swap
+/// changes what every stored vector was built from and nothing else in the
+/// database notices, so the identity is a digest of bytes rather than a repo
+/// name. The GGUF-embedded case needs no digest of its own: it is part of the
+/// model file, which is hashed separately.
+fn load_tokenizer_for_model(
+    uri: &HfModelUri,
+    models_dir: &Path,
+) -> Result<(FlexTokenizer, String)> {
     // First try: external tokenizer.json from candidate repos.
-    if let Some(tok) = try_external_tokenizer(uri, models_dir) {
-        return Ok(FlexTokenizer::HuggingFace(Box::new(tok)));
+    if let Some((tok, tok_path)) = try_external_tokenizer(uri, models_dir) {
+        let identity = crate::fingerprint::artifact_digest(&tok_path)
+            .unwrap_or_else(|_| format!("path:{}", tok_path.display()));
+        return Ok((
+            FlexTokenizer::HuggingFace(Box::new(tok)),
+            format!("hf:{identity}"),
+        ));
     }
 
     // Fallback: load tokenizer from GGUF file metadata.
@@ -603,7 +655,10 @@ fn load_tokenizer_for_model(uri: &HfModelUri, models_dir: &Path) -> Result<FlexT
         );
         let tok = shimmytok::Tokenizer::from_gguf_file(&model_path)
             .map_err(|e| anyhow::anyhow!("loading tokenizer from GGUF metadata: {e}"))?;
-        return Ok(FlexTokenizer::Gguf(Box::new(tok)));
+        return Ok((
+            FlexTokenizer::Gguf(Box::new(tok)),
+            "gguf-embedded".to_string(),
+        ));
     }
 
     bail!(
@@ -614,7 +669,13 @@ fn load_tokenizer_for_model(uri: &HfModelUri, models_dir: &Path) -> Result<FlexT
 }
 
 /// Try downloading tokenizer.json from candidate HuggingFace repos.
-fn try_external_tokenizer(uri: &HfModelUri, models_dir: &Path) -> Option<tokenizers::Tokenizer> {
+///
+/// Returns the tokenizer with the path it was read from, so the caller can
+/// digest the artifact rather than trust the repo name it was fetched under.
+fn try_external_tokenizer(
+    uri: &HfModelUri,
+    models_dir: &Path,
+) -> Option<(tokenizers::Tokenizer, PathBuf)> {
     let mut candidates: Vec<String> = vec![uri.repo.clone()];
 
     // Non-GGUF variant: "org/model-GGUF" → "org/model"
@@ -653,13 +714,13 @@ fn try_external_tokenizer(uri: &HfModelUri, models_dir: &Path) -> Option<tokeniz
         if tok_path.exists()
             && let Ok(tok) = tokenizers::Tokenizer::from_file(&tok_path)
         {
-            return Some(tok);
+            return Some((tok, tok_path));
         }
 
         if let Ok(p) = ensure_model(&tok_uri, models_dir)
             && let Ok(tok) = tokenizers::Tokenizer::from_file(&p)
         {
-            return Some(tok);
+            return Some((tok, p));
         }
     }
 
@@ -800,6 +861,9 @@ pub struct LlamaEmbed {
     prompt_format: PromptFormat,
     /// Resolved once at load — see [`resolve_n_threads`].
     n_threads: i32,
+    /// Computed once at load, because it hashes hundreds of megabytes of GGUF.
+    /// See [`EmbedModel::fingerprint`].
+    fingerprint: String,
 }
 
 // Safety: LlamaModel is Send+Sync per llama-cpp-2 docs.
@@ -836,7 +900,7 @@ impl LlamaEmbed {
         let model_path = ensure_model(&uri, models_dir)?;
 
         // Load tokenizer: try from the same HF repo, then from the non-GGUF variant.
-        let tokenizer = load_tokenizer_for_model(&uri, models_dir)?;
+        let (tokenizer, tokenizer_identity) = load_tokenizer_for_model(&uri, models_dir)?;
 
         // Detect prompt format from filename.
         let prompt_format = PromptFormat::detect(&uri.filename);
@@ -864,12 +928,28 @@ impl LlamaEmbed {
             n_threads
         );
 
+        // Five components, none of which any other part of the database records
+        // (issue #31). `n_threads` is deliberately not among them: threads
+        // change how the arithmetic is scheduled, never its result.
+        let fingerprint = crate::fingerprint::digest(&[
+            &crate::fingerprint::artifact_digest(&model_path)?,
+            &dim.to_string(),
+            &tokenizer_identity,
+            &format!(
+                "{}:{:?}",
+                crate::fingerprint::PROMPT_TEMPLATE_VERSION,
+                prompt_format
+            ),
+            &crate::fingerprint::EMBEDDING_NORMALIZATION_VERSION.to_string(),
+        ]);
+
         Ok(Self {
             model,
             tokenizer,
             dim,
             prompt_format,
             n_threads,
+            fingerprint,
         })
     }
 
@@ -1025,6 +1105,10 @@ impl EmbedModel for LlamaEmbed {
 
     fn dim(&self) -> usize {
         self.dim
+    }
+
+    fn fingerprint(&self) -> String {
+        self.fingerprint.clone()
     }
 }
 
@@ -1372,6 +1456,8 @@ pub struct LlamaRerank {
     no_token_id: i32,
     /// Resolved once at load — see [`resolve_n_threads`].
     n_threads: i32,
+    /// Computed once at load. See [`RerankModel::fingerprint`].
+    fingerprint: String,
 }
 
 // Safety: LlamaModel is Send+Sync per llama-cpp-2 docs.
@@ -1438,16 +1524,30 @@ impl LlamaRerank {
             n_threads
         );
 
+        // The Yes/No ids are in here because they are the reranker's whole
+        // output contract: a model whose vocabulary numbers them differently
+        // produces scores on a different scale from the same weights.
+        let fingerprint = crate::fingerprint::digest(&[
+            &crate::fingerprint::artifact_digest(&model_path)?,
+            &yes_token_id.to_string(),
+            &no_token_id.to_string(),
+        ]);
+
         Ok(Self {
             model,
             yes_token_id,
             no_token_id,
             n_threads,
+            fingerprint,
         })
     }
 }
 
 impl RerankModel for LlamaRerank {
+    fn fingerprint(&self) -> String {
+        self.fingerprint.clone()
+    }
+
     fn rerank_score(&mut self, query: &str, document: &str) -> Result<f32> {
         // One code path: a single pair is a batch of one.
         self.rerank_batch(query, &[document])?

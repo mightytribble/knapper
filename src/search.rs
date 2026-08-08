@@ -826,6 +826,18 @@ pub fn run_search(
         None
     };
 
+    // Refuse to answer from an index this build did not produce (issue #31).
+    // A stale index and a real effect are indistinguishable in a result list,
+    // which is the whole reason the check is here rather than in a log line.
+    {
+        let fingerprints = crate::fingerprint::Fingerprints::compute(
+            config,
+            &llm::EmbedModel::fingerprint(&embedder),
+            reranker_model.as_ref().map(|r| r.fingerprint()).as_deref(),
+        );
+        crate::fingerprint::verify(&store, &fingerprints)?;
+    }
+
     let output = {
         let mut search_config = SearchConfig {
             orchestrator: orchestrator_model
@@ -1384,6 +1396,10 @@ mod tests {
     }
 
     impl RerankModel for CountingReranker {
+        fn fingerprint(&self) -> String {
+            RerankModel::fingerprint(&self.inner)
+        }
+
         fn rerank_score(&mut self, query: &str, document: &str) -> Result<f32> {
             self.inner.rerank_score(query, document)
         }

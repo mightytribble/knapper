@@ -1245,6 +1245,17 @@ async fn main() -> Result<()> {
             let models_dir = data_dir.join("models");
             let mut embedder = engraph::llm::LlamaEmbed::new(&models_dir, &cfg)?;
             store.verify_embedding_dim(engraph::llm::EmbedModel::dim(&embedder))?;
+            // A write indexes the note it just wrote. Doing that against an
+            // index built by different code mixes two chunkings in one store,
+            // which is worse than either of them (issue #31).
+            engraph::fingerprint::verify(
+                &store,
+                &engraph::fingerprint::Fingerprints::compute(
+                    &cfg,
+                    &engraph::llm::EmbedModel::fingerprint(&embedder),
+                    None,
+                ),
+            )?;
             let profile = config::Config::load_vault_profile().ok().flatten();
 
             match action {

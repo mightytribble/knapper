@@ -3,6 +3,7 @@ pub mod config;
 pub mod context;
 pub mod docid;
 pub mod exclude;
+pub mod fingerprint;
 pub mod fts;
 pub mod fusion;
 pub mod graph;
