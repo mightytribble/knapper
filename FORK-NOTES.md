@@ -350,18 +350,39 @@ See issues on this repo:
   by getting batch construction right, and a silent failure would corrupt every ranking. **Baseline is
   now #20's**: a query is 8.46 s, not 12.3 s, and the reranker's share of it shrank with everything
   else
-- **#16** `rerank_candidates` is hardcoded at 30 in four places and unreachable from `config.toml`. It
-  was academic while the reranker read previews; after #14 it is the one free term in a lane that
-  costs half the query. Wanted as a knob to sweep, not as a new default — cutting it also
-  cuts what the cross-encoder can rescue from the retrieval lanes, which is the case the lane exists
-  for
-- **#15** the reranker is fused as a lane instead of ordering the results — sorting on its score
+- ~~**#16** `rerank_candidates` is hardcoded at 30~~ — **superseded, and its premise was wrong.**
+  Candidate count is pinned at 30 on *both sides* of a change that doubled rerank time (#22), because
+  cost tracks candidate **text**: 12,075 → 29,431 chars, 8,433 → 16,787 ms. Fitting the two points
+  gives **87.4 ms per candidate + 0.481 ms per character**, so the count is worth 2.6 s of a 16.8 s
+  rerank and the text is worth the other 14.2 s. A budget in candidates cannot bound this — 30
+  candidates is anywhere between ~4 s and ~17 s depending which 30. Split into **#25** (the character
+  budget, shippable now) and **#24** (the rest)
+- ~~**#15** the reranker is fused as a lane~~ — **superseded by #24**, because it cannot be done
+  alone: sorting by cross-encoder score while candidates are still selected by fused rank means the
+  model sorts a shortlist RRF already decided, which is the constraint #15's own body records.
+  Original reasoning kept — sorting on its score
   would give engraph its first **absolute** confidence (today `rrf_score / max_score * 100`, so the
   top hit is always 100%) and is likely the cheapest route into #4. Also amplifies the exact-name
   regression intelligence already causes, so probe 4 is the guard. **Unblocked**: #14 landed, so the
   score it would sort on is now a judgement of the actual chunk. Note that #14 raised the stakes —
   a score that only feeds `weight/(60+rank)` is a cheap thing to be wrong about, and one that
   orders the results is not, while the lane producing it now costs half the query
+- **#24 (the ranking-stage redesign, Magnus's design)** — per-lane quota seeding, cross-encoder
+  sorts. Semantic and FTS each hand graph *their* top N; graph resolves the union to distinct files
+  and expands from those; **rank crosses the lane boundary, never score**; graph becomes a candidate
+  source rather than a fusion lane; the cross-encoder sorts instead of voting. Two caps split by job
+  — bound one document's share of the **shortlist** (the model cannot rank what it never saw), do
+  **not** bound its share of the **results** (if a document holds the ten best sections, ten sections
+  is the right answer, and #6's vote-counting reason for capping evaporates once there are no votes).
+  Widen retrieval freely: it is 30–50 ms, and `sqlite-vec` is brute-force KNN so `k` is nearly free
+- **#25 (extracted from #16)** — budget the cross-encoder in **characters**. Applied to the document
+  text before formatting, never to the tokenized input: `rerank_batch` reads the score from the
+  *last* token position, which is the assistant scaffolding after the document, so truncating that
+  sequence's tail removes the thing being read. Also bounds a third cost — `n_ctx` and
+  `LlamaBatch::new` are sized to the **longest** pair, so one 2195-char outlier inflates the
+  allocation for all 30. Ships off (`0` = unlimited), then sweep. Honest tension: this is the lever
+  **#14** removed, but in a different regime — #14's effective cap truncated 79.7% of chunks, where
+  1200/1600 touch 15.3%/7.7% of this vault
 - ~~**#6** section-level retrieval granularity — fuse on `(file_id, seq)` so a document can
   contribute more than one section~~ — **done**, probe 3 now returns the correct section and every
   result names its heading. It did not fix probe 1, but #9 has: nothing about the section-per-file
@@ -369,6 +390,32 @@ See issues on this repo:
   Path B question is closed in favour of in-place chunking.**
 - ~~**#7** exclude derived `*-index.md` / `templates/` from ingest, and make `exclude` glob for
   real~~ — **done**, 14.2% of chunks and 18.3% of edges removed from the eval corpus
+
+**THE SEED MERGE COMPARES SCORES FROM DIFFERENT SCALES (2026-08-07, found while measuring #22; no
+ticket of its own — it is defect 2 of #24).** `merge_seeds` keys on file path and keeps the highest
+score per file, but the lanes fill that field from incommensurable units: semantic writes
+`1.0 - distance`, FTS writes negated BM25. Measured, the ranges **do not overlap** — semantic
+0.206–0.686 across four queries, FTS 2.162–16.961. So **every FTS-seeded file outranks every
+semantic-seeded file, always**: a total ordering by lane, not a ranking by relevance, with the top
+ten seeds 10-from-FTS on 3 of 3 real queries. It propagates, because `graph_expand` computes
+`expansion_score = seed.score * decay` and then truncates at 20 — BM25 magnitudes decide which
+expansions reach fusion at all. The graph lane is documented as expanding from the best of both
+lanes; it expands almost exclusively from keyword hits, which makes it redundant with the FTS lane
+rather than complementary, and leaves it contributing least where the semantic lane is the only
+thing working. **Dormant until #22** — the FTS lane previously returned zero rows for any multi-word
+query, so seeds were purely semantic and all on one scale. Fixing the keyword lane woke it up, and
+it should have been in #22's measurement.
+
+**STAGE TIMINGS (2026-08-07, three queries, steady state) — the cross-encoder is 85–96% of a
+query.** semantic 28–36 ms (including the embedding), FTS 4–17 ms, graph 536–1548 ms, **rerank
+9,490–16,140 ms**; totals 11.1 / 11.9 / 16.9 s. Three consequences: running the content lanes
+concurrently would save **~15 ms** and is not worth doing (and would contend for the same cores
+#20 already saturates); **graph is the second cost at 5–14%**, which is worth weighing against #9's
+finding that at weight 0.8 its main contribution is to probe 5, the nonsense control; and **#21 is
+live again** — it attacks the 87 ms/candidate term, worth 2.6 s now the reranker is 16 s rather
+than the 4 s it was after #20. Graph is also **not a peer of the other two lanes**: it consumes
+`merge_seeds(semantic, fts)`, so it is a second stage by data dependency and could never be in the
+same gather.
 
 Suggested order: **#10's query side first.** It needs no reindex, so it can be A/B'd in minutes
 against the eval homes that already exist, where everything else here costs a rebuild per column.
