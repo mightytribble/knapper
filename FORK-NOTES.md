@@ -30,6 +30,7 @@ git fetch upstream && git diff --stat upstream/main main
 | `resolve_n_threads` | llama.cpp runs on the machine's cores, not a constant 4 | this fork, issue #20 |
 | `fts::any_term_expr` | the keyword lane matches terms, not the query as one phrase | this fork, issue #22 |
 | `ensure_original` | the user's own query is always searched for | this fork, issue #23 |
+| `rerank::max_document_chars` | the cross-encoder's input is bounded; upstream has no budget at all | this fork, issue #25 |
 | `.github/workflows/ci.yml` | manual dispatch only — upstream runs it on push and PR | this fork, Actions minutes |
 
 Cherry-picked rather than merged: PR #41 branched before upstream's #40 graph fix, so merging the
@@ -64,7 +65,7 @@ export LIBCLANG_PATH="$HOME/.engraph-buildenv/lib/python3.12/site-packages/clang
 export BINDGEN_EXTRA_CLANG_ARGS="-I/usr/lib/gcc/x86_64-linux-gnu/13/include -I/usr/include -I/usr/include/x86_64-linux-gnu"
 
 cargo build --release        # ~10 min cold, ~20s incremental
-cargo test --lib             # 563 pass
+cargo test --lib             # 569 pass
 ```
 
 Each env var exists for a specific failure. Omit one and you get:
@@ -82,7 +83,7 @@ Adjust the gcc version in the include path (`13`) and the python version (`pytho
 `cargo test` (full) fails to compile `tests/integration.rs` and `tests/write_pipeline.rs`:
 `unresolved import engraph::embedder`, `engraph::hnsw`, and a `walk_vault` arity mismatch.
 **These are broken on pristine upstream** — verify with `git stash && cargo clippy --all-targets`.
-Upstream PR #47 addresses them. Use `cargo test --lib` (563 tests) as the working suite.
+Upstream PR #47 addresses them. Use `cargo test --lib` (569 tests) as the working suite.
 `cargo clippy -- -D warnings`, which is what CI runs, is clean.
 
 ### CI is manual-only in this fork
@@ -373,14 +374,16 @@ See issues on this repo:
   **not** bound its share of the **results** (if a document holds the ten best sections, ten sections
   is the right answer, and #6's vote-counting reason for capping evaporates once there are no votes).
   Widen retrieval freely: it is 30–50 ms, and `sqlite-vec` is brute-force KNN so `k` is nearly free
-- **#25 (extracted from #16)** — budget the cross-encoder in **characters**. Applied to the document
-  text before formatting, never to the tokenized input: `rerank_batch` reads the score from the
-  *last* token position, which is the assistant scaffolding after the document, so truncating that
-  sequence's tail removes the thing being read. Also bounds a third cost — `n_ctx` and
-  `LlamaBatch::new` are sized to the **longest** pair, so one 2195-char outlier inflates the
-  allocation for all 30. Ships off (`0` = unlimited), then sweep. Honest tension: this is the lever
-  **#14** removed, but in a different regime — #14's effective cap truncated 79.7% of chunks, where
-  1200/1600 touch 15.3%/7.7% of this vault
+- ~~**#25 (extracted from #16)** — budget the cross-encoder in **characters**~~ — **DONE.**
+  `[rerank] max_document_chars`, applied to the document text before formatting and before any title
+  is prepended, never to the tokenized input: `rerank_batch` reads the score from the *last* token
+  position, which is the assistant scaffolding after the document, so truncating that sequence's tail
+  removes the thing being read. Also bounds a third cost — `n_ctx` and `LlamaBatch::new` are sized to
+  the **longest** pair, so one 2195-char outlier inflates the allocation for all 30. **Swept three
+  rounds and shipped defaulting to 1000**, not off: 82% of the text kept, 12% of query latency back,
+  two probe targets up and none down. 600 gives back 26% and costs probe 4 a rank. The honest tension
+  with **#14** survives measurement — #14's effective cap truncated 79.7% of chunks where 1000 cuts
+  18% of the text, and the two ranks #14 won both hold
 - ~~**#6** section-level retrieval granularity — fuse on `(file_id, seq)` so a document can
   contribute more than one section~~ — **done**, probe 3 now returns the correct section and every
   result names its heading. It did not fix probe 1, but #9 has: nothing about the section-per-file
@@ -414,6 +417,25 @@ compute-bound with the cores saturated at `n_threads = 8`. **This is the second 
 has failed in this subsystem**: #13 amortised context creation and bought nothing because a context
 costs 1–3 ms. Both assumed per-call overhead mattered in a workload that is ~99% arithmetic. Test it
 as a standalone benchmark before building anything.
+
+Confirmed end-to-end by the **#25 sweep** (three rounds, five caps): query time tracks rerank
+characters at **0.44–0.55 ms/char**, which is the same 1.867 ms/token at the measured 3.16–3.43
+chars/token. The sweep's own intercept is *not* usable — its caps span only 61%–100% of the text, and
+extrapolating to zero puts the fixed term anywhere between 1.9 s and 4.1 s per query. So the fixed
+term remains un-measured rather than measured-as-zero, and #21's standalone benchmark is still the
+only thing that can settle it.
+
+**LATENCY ON THIS BOX HAS A 15% BETWEEN-PROCESS FLOOR (2026-08-07, #25).** Repeating the same five
+probes at the same config in **three fresh `engraph serve` processes** gave 61.9 / 63.4 / 64.5 /
+71.3 s on byte-identical input. Within one process the spread is 1–5%. So any latency comparison that
+restarts the server between arms needs interleaved rounds and `min` across them, or it is reading
+process noise as a result — the first #25 sweep did exactly that and produced a plausible threshold
+effect that did not exist. `eval/sweep-rerank-chars.py` does the rounds and now also **aborts if the
+server process exits** and **refuses a run whose DEBUG trace count does not match the searches it
+timed**: a leftover server holding the port made every subsequent server fail to bind while the
+health check kept passing against the orphan, and 75 queries were silently answered by one uncapped
+process. The resulting table — every cap identical in latency and rank — is indistinguishable from a
+correct measurement of a deterministic reranker.
 
 **THE SEED MERGE COMPARES SCORES FROM DIFFERENT SCALES (2026-08-07, found while measuring #22; no
 ticket of its own — it is defect 2 of #24).** `merge_seeds` keys on file path and keeps the highest

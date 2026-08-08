@@ -150,18 +150,54 @@ fn rerank_documents(
         vec![None; keys.len()]
     });
 
-    candidates
+    let documents: Vec<String> = candidates
         .iter()
         .zip(texts)
         .map(|(candidate, text)| {
-            let body = text.unwrap_or_else(|| candidate.snippet.clone());
+            let text = text.unwrap_or_else(|| candidate.snippet.clone());
+            // Truncate first, then prepend the title, so a title can never be
+            // the thing the cap cuts off.
+            let body = truncate_chars(text, settings.max_document_chars);
             if settings.document_title {
                 format!("{}\n\n{body}", document_title(&candidate.file_path))
             } else {
                 body
             }
         })
-        .collect()
+        .collect();
+
+    // The one measurement that predicts this query's latency. Recorded because
+    // every finding in #22 through #25 needed stage-level numbers that did not
+    // exist, and end-to-end timings cannot separate "more candidates" from
+    // "longer candidates".
+    tracing::debug!(
+        candidates = documents.len(),
+        chars = documents.iter().map(|d| d.len()).sum::<usize>(),
+        longest_chars = documents.iter().map(|d| d.len()).max().unwrap_or(0),
+        cap = settings.max_document_chars,
+        "rerank input assembled"
+    );
+
+    documents
+}
+
+/// Keep at most `max_chars` characters of `text`; 0 means keep all of it.
+///
+/// Characters, not bytes: cutting a UTF-8 string at an arbitrary byte offset
+/// panics, and a vault that holds an em-dash should not be able to crash a
+/// search. Nothing is appended to mark the cut — an ellipsis would be one more
+/// token for the model to read and nothing downstream shows this text to a
+/// person, since results carry their own snippet.
+fn truncate_chars(mut text: String, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return text;
+    }
+    // `nth` returns None when the string is already short enough, which is the
+    // common case and costs one pass over at most `max_chars` characters.
+    if let Some((byte_offset, _)) = text.char_indices().nth(max_chars) {
+        text.truncate(byte_offset);
+    }
+    text
 }
 
 /// A document's title: its file stem, which is what an Obsidian vault names it by.
@@ -1316,6 +1352,7 @@ mod tests {
             &mut embedder,
             crate::config::RerankConfig {
                 document_title: true,
+                ..Default::default()
             },
         );
         assert!(
@@ -1330,6 +1367,106 @@ mod tests {
                 .any(|d| d.contains("Wyrmsbane invocation")),
             "prepending the title must not replace the chunk"
         );
+    }
+
+    /// Issue #25. The cross-encoder's cost is very nearly linear in the text it
+    /// is handed, so this cap is what bounds query latency — and it has to hold
+    /// per candidate, since `n_ctx` is sized to the longest pair in the batch.
+    #[test]
+    fn the_character_cap_bounds_every_document_the_reranker_sees() {
+        let (_tmp, store, mut embedder) = vault_with_text_past_the_snippet_boundary();
+
+        // Explicitly unlimited rather than `default()`, which now carries a cap
+        // of its own — this arm has to be the thing the cap is measured against.
+        let uncapped = documents_shown_to_reranker(
+            "warding",
+            &store,
+            &mut embedder,
+            crate::config::RerankConfig {
+                max_document_chars: 0,
+                ..Default::default()
+            },
+        );
+        assert!(
+            uncapped.documents.iter().any(|d| d.chars().count() > 120),
+            "the fixture stopped producing a document long enough to cap"
+        );
+
+        let capped = documents_shown_to_reranker(
+            "warding",
+            &store,
+            &mut embedder,
+            crate::config::RerankConfig {
+                max_document_chars: 120,
+                ..Default::default()
+            },
+        );
+        assert!(!capped.documents.is_empty(), "the lane scored nothing");
+        assert!(
+            capped.documents.iter().all(|d| d.chars().count() <= 120),
+            "a document ran past the cap: {:?}",
+            capped
+                .documents
+                .iter()
+                .map(|d| d.chars().count())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            capped.documents.len(),
+            uncapped.documents.len(),
+            "capping the text must not change which candidates are scored"
+        );
+    }
+
+    /// The cap applies to the chunk, not to the assembled pair, so the switch in
+    /// `document_title` cannot be the thing it cuts off.
+    #[test]
+    fn the_character_cap_never_eats_the_document_title() {
+        let (_tmp, store, mut embedder) = vault_with_text_past_the_snippet_boundary();
+
+        let capped = documents_shown_to_reranker(
+            "warding",
+            &store,
+            &mut embedder,
+            crate::config::RerankConfig {
+                document_title: true,
+                max_document_chars: 20,
+            },
+        );
+        assert!(!capped.documents.is_empty(), "the lane scored nothing");
+        assert!(
+            capped
+                .documents
+                .iter()
+                .all(|d| d.starts_with("counterspell\n\n")),
+            "a title was truncated away: {:?}",
+            capped.documents
+        );
+    }
+
+    #[test]
+    fn a_cap_of_zero_keeps_the_whole_document() {
+        let text = "a".repeat(5_000);
+        assert_eq!(truncate_chars(text.clone(), 0), text);
+    }
+
+    #[test]
+    fn text_shorter_than_the_cap_is_returned_unchanged() {
+        assert_eq!(truncate_chars("short".to_string(), 100), "short");
+        assert_eq!(truncate_chars("exact".to_string(), 5), "exact");
+        assert_eq!(truncate_chars(String::new(), 100), "");
+    }
+
+    /// Truncating on a byte offset would panic here rather than return a short
+    /// string, and an em-dash in a vault is not an exotic input.
+    #[test]
+    fn the_cap_counts_characters_not_bytes() {
+        // Four characters, eleven bytes.
+        let text = "é—漢字".to_string();
+        assert_eq!(text.len(), 11);
+        assert_eq!(truncate_chars(text.clone(), 2), "é—");
+        assert_eq!(truncate_chars(text.clone(), 4), text);
+        assert_eq!(truncate_chars(text, 3).chars().count(), 3);
     }
 
     #[test]

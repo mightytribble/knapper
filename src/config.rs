@@ -150,8 +150,18 @@ pub fn default_max_chunks_per_file() -> usize {
     3
 }
 
+/// Default ceiling on how much of one candidate the cross-encoder reads.
+///
+/// Picked from the sweep in `eval/probes.md` (#25), three rounds over the five
+/// seed probes: 1000 characters keeps 82% of the text, gives back 12% of query
+/// latency, and moves no probe down — two move up. 600 gives back 26% but costs
+/// probe 4 a rank, which is the guard #15 and #25 both name.
+pub fn default_max_document_chars() -> usize {
+    1000
+}
+
 /// How the rerank lane presents a candidate to the cross-encoder.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RerankConfig {
     /// Prepend the document's title to the chunk before scoring it.
@@ -167,6 +177,38 @@ pub struct RerankConfig {
     /// The chunk's own heading is not included: the chunker already makes it
     /// the first line of the text.
     pub document_title: bool,
+
+    /// Ceiling on how much of one candidate's text the cross-encoder reads.
+    /// 0 means unlimited, which is what shipped before issue #25.
+    ///
+    /// Defaults to `default_max_document_chars()`, which is measured rather
+    /// than chosen — see there.
+    ///
+    /// The cross-encoder is 85–96% of a query, and its cost is very nearly
+    /// linear in the tokens it is handed: measured over four queries of thirty
+    /// candidates, `ctx.decode()` was 99.0–99.3% of the call and a least-squares
+    /// fit put the fixed per-candidate term at *negative* 48 ms. So this is the
+    /// one knob that bounds query latency, and bounding it in candidates —
+    /// `rerank_candidates` — does not, since thirty candidates is anywhere
+    /// between 4 s and 17 s depending which thirty.
+    ///
+    /// Characters rather than tokens because at this boundary the tokens do not
+    /// exist yet and the tokenizer belongs to whichever `RerankModel` is loaded.
+    /// Measured char/token ratio on real candidates is 3.16–3.43.
+    ///
+    /// A cap also bounds a second cost: `n_ctx` and the batch are sized to the
+    /// *longest* pair in the set (`llm.rs`), so one outlier inflates the
+    /// allocation for every candidate, not only its own.
+    pub max_document_chars: usize,
+}
+
+impl Default for RerankConfig {
+    fn default() -> Self {
+        Self {
+            document_title: false,
+            max_document_chars: default_max_document_chars(),
+        }
+    }
 }
 
 /// Application configuration, loaded from `~/.engraph/config.toml` with CLI overrides.
@@ -335,6 +377,25 @@ mod tests {
         assert_eq!(cfg.batch_size, 64);
         assert_eq!(cfg.exclude, vec![".obsidian/"]);
         assert!(cfg.vault_path.is_none());
+    }
+
+    /// Issue #25. The cap is the only knob that bounds query latency, so a
+    /// config that never mentions `[rerank]` still has to get one — and an
+    /// explicit `0` still has to mean unlimited.
+    #[test]
+    fn the_rerank_character_cap_defaults_on_and_zero_means_unlimited() {
+        let bare: Config = toml::from_str("").unwrap();
+        assert_eq!(bare.rerank.max_document_chars, 1000);
+        assert!(!bare.rerank.document_title);
+
+        let titled: Config = toml::from_str("[rerank]\ndocument_title = true\n").unwrap();
+        assert_eq!(
+            titled.rerank.max_document_chars, 1000,
+            "naming one key in the section must not silently unlimit the other"
+        );
+
+        let unlimited: Config = toml::from_str("[rerank]\nmax_document_chars = 0\n").unwrap();
+        assert_eq!(unlimited.rerank.max_document_chars, 0);
     }
 
     #[test]
