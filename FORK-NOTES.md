@@ -366,7 +366,7 @@ See issues on this repo:
   cost tracks candidate **text**: 12,075 → 29,431 chars, 8,433 → 16,787 ms with the count pinned at 30
   on both sides. A budget in candidates cannot bound this — 30 candidates is anywhere between ~4 s and
   ~17 s depending which 30. Split into **#25** (the text budget, shippable now) and **#24** (the rest)
-- ~~**#15** the reranker is fused as a lane~~ — **superseded by #24**, because it cannot be done
+- ~~**#15** the reranker is fused as a lane~~ — **superseded by #30**, because it cannot be done
   alone: sorting by cross-encoder score while candidates are still selected by fused rank means the
   model sorts a shortlist RRF already decided, which is the constraint #15's own body records.
   Original reasoning kept — sorting on its score
@@ -376,14 +376,23 @@ See issues on this repo:
   score it would sort on is now a judgement of the actual chunk. Note that #14 raised the stakes —
   a score that only feeds `weight/(60+rank)` is a cheap thing to be wrong about, and one that
   orders the results is not, while the lane producing it now costs half the query
-- **#24 (the ranking-stage redesign, Magnus's design)** — per-lane quota seeding, cross-encoder
-  sorts. Semantic and FTS each hand graph *their* top N; graph resolves the union to distinct files
-  and expands from those; **rank crosses the lane boundary, never score**; graph becomes a candidate
-  source rather than a fusion lane; the cross-encoder sorts instead of voting. Two caps split by job
-  — bound one document's share of the **shortlist** (the model cannot rank what it never saw), do
-  **not** bound its share of the **results** (if a document holds the ten best sections, ten sections
-  is the right answer, and #6's vote-counting reason for capping evaporates once there are no votes).
-  Widen retrieval freely: it is 30–50 ms, and `sqlite-vec` is brute-force KNN so `k` is nearly free
+- ~~**#24 (the ranking-stage redesign, Magnus's design)**~~ — **closed, replaced by #30.** Four
+  tickets were extracted from it and shipped (#25, #26, #28, #29), and two of its own prescriptions
+  were overruled on the way: #26 shipped per-expansion min-max normalisation rather than item 2's
+  rank-crossing, and #29 deleted the disjointness skip item 3 argued for keeping. Its acceptance
+  criterion that no score crosses a lane boundary is therefore false against `main`
+- **#30 — the ranking stage: the cross-encoder sorts, and graph reaches it by reserved quota.**
+  What survived #24. Graph stops being a fusion lane and becomes a candidate source keeping #29's
+  PPR as its reach function; **48 RRF anchors + 16 graph anchors of a 64-candidate pool, backfill
+  either way** — a routing guarantee, not a score bonus, answering the shut-out defect at the stage
+  where the shortlist is decided rather than at seeding. The cross-encoder sorts and nothing
+  reblends. Two caps split by job — bound one document's share of the **shortlist** (the model
+  cannot rank what it never saw), do **not** bound its share of the **results** (if a document holds
+  the ten best sections, ten sections is the right answer, and #6's vote-counting reason for capping
+  evaporates once there are no votes); this conflicts with §9.1 of the vault-search design, and #30
+  is the side being shipped. Control is a `ranking = "legacy" | "sorted"` switch reproducing current
+  output byte-for-byte; `LaneWeights::from_intent`'s graph arm is deleted rather than retuned.
+  Layer 1 of `docs/vault-search-convergence.md`
 - ~~**#26 (defect 2 of #24, extracted)** — normalise each lane's scores before they leave the lane~~
   — **DONE.** Min-max into `[0.1, 1.0]` per `(lane × expansion)`, floor 0.1 because
   `seed.score * decay` feeds a sort that feeds `truncate`, `max == min` to the top of the range.
