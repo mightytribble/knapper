@@ -352,11 +352,9 @@ See issues on this repo:
   else
 - ~~**#16** `rerank_candidates` is hardcoded at 30~~ — **superseded, and its premise was wrong.**
   Candidate count is pinned at 30 on *both sides* of a change that doubled rerank time (#22), because
-  cost tracks candidate **text**: 12,075 → 29,431 chars, 8,433 → 16,787 ms. Fitting the two points
-  gives **87.4 ms per candidate + 0.481 ms per character**, so the count is worth 2.6 s of a 16.8 s
-  rerank and the text is worth the other 14.2 s. A budget in candidates cannot bound this — 30
-  candidates is anywhere between ~4 s and ~17 s depending which 30. Split into **#25** (the character
-  budget, shippable now) and **#24** (the rest)
+  cost tracks candidate **text**: 12,075 → 29,431 chars, 8,433 → 16,787 ms with the count pinned at 30
+  on both sides. A budget in candidates cannot bound this — 30 candidates is anywhere between ~4 s and
+  ~17 s depending which 30. Split into **#25** (the text budget, shippable now) and **#24** (the rest)
 - ~~**#15** the reranker is fused as a lane~~ — **superseded by #24**, because it cannot be done
   alone: sorting by cross-encoder score while candidates are still selected by fused rank means the
   model sorts a shortlist RRF already decided, which is the constraint #15's own body records.
@@ -391,6 +389,32 @@ See issues on this repo:
 - ~~**#7** exclude derived `*-index.md` / `templates/` from ingest, and make `exclude` glob for
   real~~ — **done**, 14.2% of chunks and 18.3% of edges removed from the eval corpus
 
+**THE RERANKER IS 99% ARITHMETIC — MEASURED, after a two-point solve told me otherwise (2026-08-07).**
+Timing the stages inside `rerank_batch`, four queries at 30 candidates: **`ctx.decode()` is 99.0–99.3%
+of the call.** Tokenizing all 30, creating the context, thirty `clear_kv_cache()` calls, batch
+construction, logit extraction and the DB fetch total **96–121 ms for the entire candidate set** —
+~3.5 ms each. Per-token cost is flat at 1.816–1.918 ms and a least-squares fit for a fixed
+per-candidate term returns **−48 ms**, i.e. there is no such term:
+
+```
+rerank ≈ total_tokens × 1.867 ms        (chars/token measured 3.16–3.43, not the assumed 4)
+```
+
+**I had published `87.4 ms per candidate + 0.481 ms per char` in #24, #25 and here.** It came from
+solving two equations for two unknowns — an exact solve has no residual and will hand back whatever
+term it is asked for. Corrected in all three places. **General lesson: an exact solve is not a fit;
+it cannot disagree with the data it was built from, so it is evidence of nothing.**
+
+Consequence for **#21**: its premise is mostly gone. The per-candidate overhead it exists to amortise
+is ~0.1 s across the batch, not the 2.6 s I claimed one message earlier. The one hypothesis left is
+**GEMM efficiency** — one batch of 8,575 tokens versus thirty of ~286 — and that prior is weaker than
+it looks, because the intuition that batching wins big comes from autoregressive *generation*
+(memory-bandwidth-bound matrix-vector), while this is *prompt processing*, already matrix-matrix and
+compute-bound with the cores saturated at `n_threads = 8`. **This is the second time this reasoning
+has failed in this subsystem**: #13 amortised context creation and bought nothing because a context
+costs 1–3 ms. Both assumed per-call overhead mattered in a workload that is ~99% arithmetic. Test it
+as a standalone benchmark before building anything.
+
 **THE SEED MERGE COMPARES SCORES FROM DIFFERENT SCALES (2026-08-07, found while measuring #22; no
 ticket of its own — it is defect 2 of #24).** `merge_seeds` keys on file path and keeps the highest
 score per file, but the lanes fill that field from incommensurable units: semantic writes
@@ -411,9 +435,9 @@ query.** semantic 28–36 ms (including the embedding), FTS 4–17 ms, graph 536
 9,490–16,140 ms**; totals 11.1 / 11.9 / 16.9 s. Three consequences: running the content lanes
 concurrently would save **~15 ms** and is not worth doing (and would contend for the same cores
 #20 already saturates); **graph is the second cost at 5–14%**, which is worth weighing against #9's
-finding that at weight 0.8 its main contribution is to probe 5, the nonsense control; and **#21 is
-live again** — it attacks the 87 ms/candidate term, worth 2.6 s now the reranker is 16 s rather
-than the 4 s it was after #20. Graph is also **not a peer of the other two lanes**: it consumes
+finding that at weight 0.8 its main contribution is to probe 5, the nonsense control; and **#21 is *not* revived** —
+the per-candidate term it targets measures ~3.5 ms, not the 87 ms a two-point solve suggested; see
+the section above. Graph is also **not a peer of the other two lanes**: it consumes
 `merge_seeds(semantic, fts)`, so it is a second stage by data dependency and could never be in the
 same gather.
 
