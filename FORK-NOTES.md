@@ -28,6 +28,8 @@ git fetch upstream && git diff --stat upstream/main main
 | `chunks.text` | the reranker scores the whole chunk, not a preview | this fork, issue #14 |
 | `from_intent` `Relationship` | graph no longer outweighs the content lanes | this fork, issue #9 |
 | `resolve_n_threads` | llama.cpp runs on the machine's cores, not a constant 4 | this fork, issue #20 |
+| `fts::any_term_expr` | the keyword lane matches terms, not the query as one phrase | this fork, issue #22 |
+| `ensure_original` | the user's own query is always searched for | this fork, issue #23 |
 | `.github/workflows/ci.yml` | manual dispatch only — upstream runs it on push and PR | this fork, Actions minutes |
 
 Cherry-picked rather than merged: PR #41 branched before upstream's #40 graph fix, so merging the
@@ -62,7 +64,7 @@ export LIBCLANG_PATH="$HOME/.engraph-buildenv/lib/python3.12/site-packages/clang
 export BINDGEN_EXTRA_CLANG_ARGS="-I/usr/lib/gcc/x86_64-linux-gnu/13/include -I/usr/include -I/usr/include/x86_64-linux-gnu"
 
 cargo build --release        # ~10 min cold, ~20s incremental
-cargo test --lib             # 551 pass
+cargo test --lib             # 563 pass
 ```
 
 Each env var exists for a specific failure. Omit one and you get:
@@ -80,7 +82,7 @@ Adjust the gcc version in the include path (`13`) and the python version (`pytho
 `cargo test` (full) fails to compile `tests/integration.rs` and `tests/write_pipeline.rs`:
 `unresolved import engraph::embedder`, `engraph::hnsw`, and a `walk_vault` arity mismatch.
 **These are broken on pristine upstream** — verify with `git stash && cargo clippy --all-targets`.
-Upstream PR #47 addresses them. Use `cargo test --lib` (551 tests) as the working suite.
+Upstream PR #47 addresses them. Use `cargo test --lib` (563 tests) as the working suite.
 `cargo clippy -- -D warnings`, which is what CI runs, is clean.
 
 ### CI is manual-only in this fork
@@ -283,6 +285,25 @@ See issues on this repo:
   five probes are two tail slots on probe 1 and two on probe 5, *the nonsense control*. A disjoint
   set contributes most where the content lanes have least to say. The category error itself is
   untouched and belongs to #15
+- ~~**#22** `fts_search` phrase-quotes every query~~ — **done, and it had never worked.** The whole
+  query went to FTS5 in double quotes, making it a phrase query, so a multi-word query matched only
+  where the caller had already guessed the corpus's wording. **Four of the five seed probes retrieved
+  zero rows from the keyword lane**; the only one that worked was the single-word probe. That is the
+  answer to #19's open question — probes 2 and 4 contributed nothing from FTS because the lane was
+  empty, not because it was outweighed. `fts::any_term_expr` quotes each token and joins with `OR`,
+  which keeps every token literal (`BRE-1234`, `#a1b2c3`, `C++`) while letting BM25 do IDF weighting
+  inside one expression. `Store::fts_search` keeps phrase semantics for `context.rs`, where identity
+  resolution needs them. **Not measurable without #23** — see below
+- ~~**#23** the orchestrator drops the original query~~ — **done in part.** The prompt asks for the
+  original first and Qwen3-0.6B omitted it in three of three probes it answered, including replacing
+  the bare name `Archdragon` with `Archdragon character` and `Archdragon concept`. So the exact-name
+  probe ran with no exact name in it, and the 34-hit, 7.068-BM25 query that would have answered it
+  was never issued. `ensure_original` repairs the list in `search_with_intelligence`, after **every**
+  source — model, cache hit, heuristic — because #9 showed what a rule with two entrances costs.
+  Applied on read, so old cache rows are fixed without invalidation. **The provenance half is not
+  done**: `orchestrate` still swallows failures into `heuristic_orchestrate` and the caller still
+  writes the result as `model = 'orchestrator'`, so two of the five cached probes are heuristic
+  word-splits wearing that label
 - ~~**#20** llama.cpp runs on 4 threads regardless of the machine~~ — **done, and the first latency
   ticket that actually pays.** All three wrappers inherited `GGML_DEFAULT_N_THREADS = 4` — a
   constant, on every machine, carrying llama.cpp's own `// TODO: better default`. `models.n_threads`
