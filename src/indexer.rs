@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -12,10 +12,10 @@ use crate::chunker::{chunk_markdown, split_oversized_chunks};
 use crate::config::Config;
 use crate::docid::generate_docid;
 use crate::exclude::ExcludeMatcher;
-use crate::graph::extract_wikilink_targets;
+use crate::graph::{Wikilink, extract_wikilinks};
 use crate::llm::EmbedModel;
 use crate::profile::VaultProfile;
-use crate::store::{FileRecord, Store};
+use crate::store::{DOC_LEVEL, FileRecord, Store};
 
 /// Summary of an indexing run.
 pub struct IndexResult {
@@ -177,9 +177,9 @@ fn resolve_link_target(store: &Store, target: &str) -> Result<Option<i64>> {
     Ok(matches.first().map(|f| f.id))
 }
 
-/// Build wikilink edges for a single file.
+/// Build wikilink edges for a single file, at chunk granularity on both ends.
 ///
-/// For each `[[target]]` wikilink in `content`:
+/// For each `[[target]]` wikilink:
 /// - If target resolves: insert ONE directed edge from source → target.
 ///   Wikilinks are directional — the reverse edge should only exist if
 ///   the target's own content contains a wikilink back to source. (That
@@ -187,6 +187,18 @@ fn resolve_link_target(store: &Store, target: &str) -> Result<Option<i64>> {
 ///   the target file with its own content.)
 /// - If target doesn't resolve: record in `unresolved_links` for
 ///   downstream broken-wikilink tooling.
+///
+/// Both ends of the edge name a passage where one can be named (issue #28):
+///
+/// - **Source**: the chunk whose text held the link. Read from the store, so
+///   **the file's chunks must already be inserted when this is called** — every
+///   caller does that, and `an_edges_source_chunk_is_the_one_that_held_the_link`
+///   is the guard. A link in text no chunk holds — frontmatter, which the
+///   chunker strips — is attributed to [`DOC_LEVEL`], which is why `content` is
+///   still a parameter: the chunks alone cannot see it.
+/// - **Target**: the chunks under the named `#Heading`, or [`DOC_LEVEL`] for a
+///   plain `[[Note]]`. A heading that no longer resolves degrades to
+///   [`DOC_LEVEL`] as well — never to nothing.
 ///
 /// Clears pre-existing `unresolved_links` entries for the source file
 /// before re-recording, so this is safe to call repeatedly during
@@ -200,25 +212,85 @@ pub fn build_edges_for_file(store: &Store, file_id: i64, content: &str) -> Resul
     // Clear stale unresolved entries for this file before re-recording.
     store.clear_unresolved_links_for_file(&source_path)?;
 
-    let targets = extract_wikilink_targets(content);
-    for target in targets {
-        match resolve_link_target(store, &target)? {
-            Some(target_id) if target_id != file_id => {
-                store.insert_edge(file_id, target_id, "wikilink")?;
-                // NOTE: do NOT insert a reverse edge here. Wikilinks are
-                // directional — the reverse edge is inserted (if it exists)
-                // when build_edges_for_file is called on the target file
-                // with its own content.
-            }
-            Some(_) => {
-                // Self-link — ignore
-            }
-            None => {
-                store.insert_unresolved_link(&source_path, &target)?;
+    // Which passage each link came from. A link in more than one chunk gets an
+    // edge from each — the multiplicity the old file-level UNIQUE discarded.
+    let mut sources: HashMap<Wikilink, Vec<i64>> = HashMap::new();
+    for chunk in store.get_chunks_by_file(file_id)? {
+        for link in extract_wikilinks(&chunk.text) {
+            sources.entry(link).or_default().push(chunk.seq);
+        }
+    }
+    // Anything the whole file contains but no chunk claims is unattributable.
+    for link in extract_wikilinks(content) {
+        sources.entry(link).or_insert_with(|| vec![DOC_LEVEL]);
+    }
+
+    for (link, from_seqs) in sources {
+        let Some(target_id) = resolve_link_target(store, &link.target)? else {
+            store.insert_unresolved_link(&source_path, &link.target)?;
+            continue;
+        };
+        if target_id == file_id {
+            continue; // self-link
+        }
+        // A deep link names chunks; a plain one, or a heading that has since
+        // been renamed, names the document.
+        let to_seqs = match &link.heading {
+            Some(h) => match store.chunk_seqs_with_heading(target_id, h)? {
+                seqs if seqs.is_empty() => vec![DOC_LEVEL],
+                seqs => seqs,
+            },
+            None => vec![DOC_LEVEL],
+        };
+        for &from_seq in &from_seqs {
+            for &to_seq in &to_seqs {
+                store.insert_edge(file_id, from_seq, target_id, to_seq, "wikilink")?;
             }
         }
     }
     Ok(())
+}
+
+/// Re-derive every wikilink edge from `chunks.text`, with no vault read (#28).
+///
+/// The adoption path for a store written before edges had chunk granularity.
+/// `chunks.text` has held every chunk's content since #14, so the whole edge
+/// table can be rebuilt from the database — nothing is re-read, re-chunked or
+/// re-embedded, and a 250-file vault takes well under a second.
+///
+/// Document-level rows the migration carried over are cleared first, *except*
+/// for pairs no chunk turns out to account for. Those are the links the chunker
+/// never sees — frontmatter — and dropping them would lose edges a full reindex
+/// keeps. That exception is the only reason this is not a plain
+/// `clear_edges` + rebuild.
+pub fn backfill_edges_from_chunks(store: &Store) -> Result<usize> {
+    let files = store.get_all_files()?;
+    let before: HashSet<(i64, i64)> = store.wikilink_pairs()?.into_iter().collect();
+
+    for file in &files {
+        store.delete_outgoing_edges_for_file(file.id)?;
+    }
+    for file in &files {
+        // `content` is the chunks and nothing else here — there is no vault read
+        // to find frontmatter in, so unattributable links are restored below
+        // from what the pre-#28 table already knew.
+        let chunks = store.get_chunks_by_file(file.id)?;
+        let content = chunks
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        build_edges_for_file(store, file.id, &content)?;
+    }
+
+    let after: HashSet<(i64, i64)> = store.wikilink_pairs()?.into_iter().collect();
+    let mut restored = 0;
+    for (from_file, to_file) in before.difference(&after) {
+        store.insert_edge(*from_file, DOC_LEVEL, *to_file, DOC_LEVEL, "wikilink")?;
+        restored += 1;
+    }
+    store.set_meta("edges_backfill_pending", "0")?;
+    Ok(restored)
 }
 
 /// Load people entities from the People folder.
@@ -290,6 +362,11 @@ pub fn extract_aliases_from_frontmatter(content: &str) -> Option<Vec<String>> {
 }
 
 /// Detect people mentions and create edges.
+///
+/// These stay at [`DOC_LEVEL`] on both ends. A mention is a name appearing
+/// somewhere in the file, and nothing here narrows it to a passage; #28 gave
+/// the fine grain to wikilinks, which are the only edges graph expansion
+/// follows.
 pub fn build_people_edges(
     store: &Store,
     file_id: i64,
@@ -305,7 +382,7 @@ pub fn build_people_edges(
             .iter()
             .any(|name| content_lower.contains(&name.to_lowercase()));
         if mentioned {
-            store.insert_edge(file_id, *person_id, "mention")?;
+            store.insert_edge(file_id, DOC_LEVEL, *person_id, DOC_LEVEL, "mention")?;
         }
     }
     Ok(())
@@ -680,6 +757,26 @@ fn run_index_inner(
         }
     }
 
+    // Adopt chunk-granular edges on a store that predates them (issue #28).
+    // Only the files touched above were rebuilt at the fine grain; the rest are
+    // still document-level, and re-deriving them needs no vault read, so this
+    // costs a fraction of a second even when nothing else changed. `--rebuild`
+    // has already done the work from source.
+    if store.needs_edge_backfill()? {
+        if rebuild {
+            // `clear_edges` above plus the loop just run rebuilt every edge from
+            // the vault itself, which is strictly better than the backfill.
+            store.set_meta("edges_backfill_pending", "0")?;
+        } else {
+            info!("re-deriving edges at chunk granularity from stored chunks");
+            let unattributed = backfill_edges_from_chunks(store)?;
+            info!(
+                unattributed,
+                "edges re-derived; the remainder are links no chunk contains"
+            );
+        }
+    }
+
     // People detection (if configured via vault profile)
     if let Some(p) = profile
         && let Some(people_folder) = &p.structure.folders.people
@@ -955,38 +1052,44 @@ mod tests {
         );
     }
 
-    /// Every edge as `(source path, target path, type)`, so two stores can be
-    /// compared without depending on file ids matching.
-    fn edge_snapshot(store: &Store) -> Vec<(String, String, String)> {
+    /// Every edge as `"source#seq -> target#seq (type)"`, so two stores can be
+    /// compared without depending on file ids matching. Chunk seqs included:
+    /// they are half the table since #28.
+    fn edge_snapshot(store: &Store) -> Vec<String> {
         let paths: HashMap<i64, String> = store
             .get_all_files()
             .unwrap()
             .into_iter()
             .map(|f| (f.id, f.path))
             .collect();
+        let name = |id: i64, seq: i64| {
+            let path = paths.get(&id).cloned().unwrap_or_else(|| format!("?{id}"));
+            if seq == DOC_LEVEL {
+                path
+            } else {
+                format!("{path}#{seq}")
+            }
+        };
         let mut stmt = store
             .conn()
-            .prepare("SELECT from_file, to_file, edge_type FROM edges")
+            .prepare(
+                "SELECT from_file, from_chunk_seq, to_file, to_chunk_seq, edge_type FROM edges",
+            )
             .unwrap();
-        let mut edges: Vec<(String, String, String)> = stmt
+        let mut edges: Vec<String> = stmt
             .query_map([], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
                 ))
             })
             .unwrap()
             .map(|r| {
-                let (from, to, kind) = r.unwrap();
-                (
-                    paths
-                        .get(&from)
-                        .cloned()
-                        .unwrap_or_else(|| format!("?{from}")),
-                    paths.get(&to).cloned().unwrap_or_else(|| format!("?{to}")),
-                    kind,
-                )
+                let (from, from_seq, to, to_seq, kind) = r.unwrap();
+                format!("{} -> {} ({kind})", name(from, from_seq), name(to, to_seq))
             })
             .collect();
         edges.sort();
@@ -1614,5 +1717,287 @@ mod tests {
             .unwrap();
         let definition = store.get_chunk_by_seq(file.id, 0).unwrap().unwrap();
         assert!(seen.iter().any(|t| t.starts_with(&definition.snippet)));
+    }
+
+    // ── Chunk-granular edges (#28) ───────────────────────────────
+
+    /// Index a vault of `(path, content)` with the mock embedder and hand back
+    /// the store.
+    fn index_vault(root: &Path, files: &[(&str, &str)]) -> Store {
+        use crate::llm::MockLlm;
+        for (path, content) in files {
+            write_file(root, path, content);
+        }
+        let store = Store::open_memory().unwrap();
+        let mut embedder = MockLlm::new(256);
+        run_index_shared(root, &Config::default(), &store, &mut embedder, false, None).unwrap();
+        store
+    }
+
+    #[test]
+    fn an_edges_source_chunk_is_the_one_that_held_the_link() {
+        // The point of #28. `hub.md` links to `near` from `## Role` and to
+        // `far` from `## Session History`; before this, a seed matching either
+        // section expanded to both.
+        let tmp = TempDir::new().unwrap();
+        let store = index_vault(
+            tmp.path(),
+            &[
+                (
+                    "hub.md",
+                    "# Hub\n## Role\nIt does the thing, with [[near]].\n\n## Session History\nLong ago, [[far]] happened.\n",
+                ),
+                ("near.md", "# Near\nnothing here"),
+                ("far.md", "# Far\nnothing here"),
+            ],
+        );
+
+        let hub = store.get_file("hub.md").unwrap().unwrap();
+        let seq_of = |heading: &str| {
+            store
+                .get_chunks_by_file(hub.id)
+                .unwrap()
+                .into_iter()
+                .find(|c| c.heading.contains(heading))
+                .unwrap_or_else(|| panic!("no chunk headed {heading}"))
+                .seq
+        };
+
+        assert_eq!(
+            edge_snapshot(&store),
+            vec![
+                format!("hub.md#{} -> near.md (wikilink)", seq_of("Role")),
+                format!("hub.md#{} -> far.md (wikilink)", seq_of("Session History")),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_document_level_view_is_what_it_always_was() {
+        // #28's first acceptance criterion: storing the finer grain must lose
+        // nothing. A document's link set is the union of its chunks'.
+        let tmp = TempDir::new().unwrap();
+        let store = index_vault(
+            tmp.path(),
+            &[
+                (
+                    "hub.md",
+                    "# Hub\n## Role\nSee [[near]] and [[far]].\n\n## History\nStill [[near]], plus [[far]].\n",
+                ),
+                ("near.md", "# Near\nBack to [[hub]]."),
+                ("far.md", "# Far\nnothing here"),
+            ],
+        );
+
+        let paths: HashMap<i64, String> = store
+            .get_all_files()
+            .unwrap()
+            .into_iter()
+            .map(|f| (f.id, f.path))
+            .collect();
+        let mut pairs: Vec<(String, String)> = store
+            .wikilink_pairs()
+            .unwrap()
+            .into_iter()
+            .map(|(from, to)| (paths[&from].clone(), paths[&to].clone()))
+            .collect();
+        pairs.sort();
+
+        assert_eq!(
+            pairs,
+            vec![
+                ("hub.md".to_string(), "far.md".to_string()),
+                ("hub.md".to_string(), "near.md".to_string()),
+                ("near.md".to_string(), "hub.md".to_string()),
+            ],
+            "the derived document view must match what the old file-level table held"
+        );
+        // And the fine grain really is finer: hub links to each target twice,
+        // from two different sections.
+        assert_eq!(edge_snapshot(&store).len(), 5);
+    }
+
+    #[test]
+    fn a_deep_link_lands_on_the_chunks_under_that_heading() {
+        let tmp = TempDir::new().unwrap();
+        let store = index_vault(
+            tmp.path(),
+            &[
+                ("hub.md", "# Hub\nSee [[dragon#Human Forms]] for detail."),
+                (
+                    "dragon.md",
+                    "# Dragon\n## Origin\nBorn of fire.\n\n## Human Forms\nIt walks as a man.\n",
+                ),
+            ],
+        );
+
+        let dragon = store.get_file("dragon.md").unwrap().unwrap();
+        let human_forms = store
+            .get_chunks_by_file(dragon.id)
+            .unwrap()
+            .into_iter()
+            .find(|c| c.heading.contains("Human Forms"))
+            .unwrap()
+            .seq;
+
+        assert_eq!(
+            edge_snapshot(&store),
+            vec![format!("hub.md#0 -> dragon.md#{human_forms} (wikilink)")]
+        );
+    }
+
+    #[test]
+    fn a_deep_link_to_a_renamed_heading_degrades_to_the_document() {
+        // "Never drop an edge on a failed resolve." A deep link is more fragile
+        // than a plain one and the graph must not lose recall over a retitle.
+        let tmp = TempDir::new().unwrap();
+        let store = index_vault(
+            tmp.path(),
+            &[
+                ("hub.md", "# Hub\nSee [[dragon#Alternate Form]]."),
+                (
+                    "dragon.md",
+                    "# Dragon\n## Origin\nBorn of fire.\n\n## Human Forms\nIt walks as a man.\n",
+                ),
+            ],
+        );
+
+        assert_eq!(
+            edge_snapshot(&store),
+            vec!["hub.md#0 -> dragon.md (wikilink)".to_string()],
+            "the link must survive at document level, not vanish"
+        );
+    }
+
+    #[test]
+    fn a_link_no_chunk_contains_is_attributed_to_the_document() {
+        // Frontmatter is stripped before chunking, so a link there belongs to no
+        // passage. Obsidian allows them, and dropping them would shrink the
+        // document-level view the previous test pins.
+        let tmp = TempDir::new().unwrap();
+        let store = index_vault(
+            tmp.path(),
+            &[
+                (
+                    "hub.md",
+                    "---\nrelated: \"[[near]]\"\n---\n# Hub\nNo links in the body.\n",
+                ),
+                ("near.md", "# Near\nnothing here"),
+            ],
+        );
+
+        assert_eq!(
+            edge_snapshot(&store),
+            vec!["hub.md -> near.md (wikilink)".to_string()]
+        );
+    }
+
+    #[test]
+    fn backfilling_from_stored_chunks_reproduces_a_full_index() {
+        // #28's second acceptance criterion, and the whole adoption story: the
+        // edge table can be rebuilt from `chunks.text` alone (#14), so no vault
+        // is re-read, nothing is re-chunked and nothing is re-embedded.
+        let tmp = TempDir::new().unwrap();
+        let store = index_vault(
+            tmp.path(),
+            &[
+                (
+                    "hub.md",
+                    "# Hub\n## Role\nSee [[near]] and [[dragon#Human Forms]].\n\n## History\n[[far]] once.\n",
+                ),
+                ("near.md", "# Near\nBack to [[hub]]."),
+                ("far.md", "# Far\nnothing here"),
+                (
+                    "dragon.md",
+                    "# Dragon\n## Origin\nBorn of fire.\n\n## Human Forms\nIt walks as a man.\n",
+                ),
+            ],
+        );
+        let from_index = edge_snapshot(&store);
+        assert!(!from_index.is_empty());
+
+        // Wipe every edge and rebuild from the database alone.
+        store.clear_edges().unwrap();
+        backfill_edges_from_chunks(&store).unwrap();
+
+        assert_eq!(edge_snapshot(&store), from_index);
+    }
+
+    #[test]
+    fn the_backfill_keeps_edges_no_chunk_can_account_for() {
+        // The backfill sees `chunks.text`, and the chunker strips frontmatter,
+        // so a frontmatter link is invisible to it. It is visible to the
+        // document-level row the #28 migration carried over, and that row is
+        // what stands in for it — otherwise adopting the new grain would silently
+        // drop edges a full reindex keeps.
+        let tmp = TempDir::new().unwrap();
+        let store = index_vault(
+            tmp.path(),
+            &[
+                (
+                    "hub.md",
+                    "---\nrelated: \"[[near]]\"\n---\n# Hub\nAlso [[far]] in the body.\n",
+                ),
+                ("near.md", "# Near\nnothing here"),
+                ("far.md", "# Far\nnothing here"),
+            ],
+        );
+        let from_index = edge_snapshot(&store);
+
+        backfill_edges_from_chunks(&store).unwrap();
+        assert_eq!(edge_snapshot(&store), from_index);
+    }
+
+    #[test]
+    fn an_index_run_adopts_the_new_grain_without_reindexing() {
+        // #28's last acceptance criterion. The store is complete and unchanged;
+        // the only work left is re-deriving edges, and that touches no file.
+        let tmp = TempDir::new().unwrap();
+        let store = index_vault(
+            tmp.path(),
+            &[
+                (
+                    "hub.md",
+                    "# Hub\n## Role\nSee [[near]].\n\n## History\n[[far]] once.\n",
+                ),
+                ("near.md", "# Near\nnothing here"),
+                ("far.md", "# Far\nnothing here"),
+            ],
+        );
+        let expected = edge_snapshot(&store);
+
+        // Coarsen the table to exactly what the migration leaves behind, and
+        // raise the flag it raises.
+        store
+            .conn()
+            .execute_batch(&format!(
+                "DELETE FROM edges;
+                 INSERT INTO edges (from_file, from_chunk_seq, to_file, to_chunk_seq, edge_type)
+                     SELECT DISTINCT f.id, {DOC_LEVEL}, t.id, {DOC_LEVEL}, 'wikilink'
+                     FROM files f, files t WHERE f.path = 'hub.md' AND t.path <> 'hub.md';"
+            ))
+            .unwrap();
+        store.set_meta("edges_backfill_pending", "1").unwrap();
+        assert_ne!(edge_snapshot(&store), expected);
+
+        use crate::llm::MockLlm;
+        let mut embedder = MockLlm::new(256);
+        let result = run_index_shared(
+            tmp.path(),
+            &Config::default(),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            (result.new_files, result.updated_files),
+            (0, 0),
+            "nothing should have been re-indexed"
+        );
+        assert_eq!(edge_snapshot(&store), expected);
+        assert!(!store.needs_edge_backfill().unwrap());
     }
 }

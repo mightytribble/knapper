@@ -33,6 +33,8 @@ git fetch upstream && git diff --stat upstream/main main
 | `rerank::max_document_chars` | the cross-encoder's input is bounded; upstream has no budget at all | this fork, issue #25 |
 | re-index keeps the `files` row | editing a note no longer cascades away every backlink into it | this fork, issue #27 |
 | normalised seed pool | graph seeds are ranked by relevance, not by which lane's unit is bigger | this fork, issue #26 |
+| chunk-to-chunk `edges` | a link knows which passage wrote it; expansion follows the seed's own links | this fork, issue #28 |
+| `DOC_LEVEL` sentinel | an un-headed link stores one row, not one per target chunk | this fork, issue #28 |
 | `.github/workflows/ci.yml` | manual dispatch only — upstream runs it on push and PR | this fork, Actions minutes |
 
 Cherry-picked rather than merged: PR #41 branched before upstream's #40 graph fix, so merging the
@@ -67,7 +69,7 @@ export LIBCLANG_PATH="$HOME/.engraph-buildenv/lib/python3.12/site-packages/clang
 export BINDGEN_EXTRA_CLANG_ARGS="-I/usr/lib/gcc/x86_64-linux-gnu/13/include -I/usr/include -I/usr/include/x86_64-linux-gnu"
 
 cargo build --release        # ~10 min cold, ~20s incremental
-cargo test --lib             # 580 pass
+cargo test --lib             # 600 pass
 ```
 
 Each env var exists for a specific failure. Omit one and you get:
@@ -85,7 +87,7 @@ Adjust the gcc version in the include path (`13`) and the python version (`pytho
 `cargo test` (full) fails to compile `tests/integration.rs` and `tests/write_pipeline.rs`:
 `unresolved import engraph::embedder`, `engraph::hnsw`, and a `walk_vault` arity mismatch.
 **These are broken on pristine upstream** — verify with `git stash && cargo clippy --all-targets`.
-Upstream PR #47 addresses them. Use `cargo test --lib` (580 tests) as the working suite.
+Upstream PR #47 addresses them. Use `cargo test --lib` (600 tests) as the working suite.
 `cargo clippy -- -D warnings`, which is what CI runs, is clean.
 
 ### CI is manual-only in this fork
@@ -417,16 +419,20 @@ See issues on this repo:
   `an_incremental_edit_and_a_full_index_agree_on_the_edges_table`. **Was invisible to the probe
   harness by construction** — the eval vault is built by one full index, which calls `clear_edges()`,
   so every graph-lane measurement ever taken here was on a best-case graph
-- **#28** — **wikilink edges at chunk granularity, both ends.** Today `extract_wikilink_targets` runs
-  on whole-file content and `edges` is `(from_file, to_file, edge_type)`, so a seed chunk expands
-  along every link in its document — noise proportional to document size. Store only the fine grain
-  and derive the document view with `SELECT DISTINCT`. Target side: stop stripping `[[Note#Heading]]`,
-  resolve to a chunk **set** (deep link → those chunks, document link → all of them), and never drop
-  an edge on a failed resolve. **Measured: this vault has 1,773 wikilinks and ZERO deep links**, so
-  the deep-link branch buys nothing today — build it because #29 needs the target-chunk-set concept
-  for document links regardless. **Backfillable from `chunks.text` (#14), no reindex.** Risk: chunk
-  scoping deliberately cuts recall, and probe 1 — the one probe graph demonstrably wins — surfaces
-  two `### Connections` chunks
+- ~~**#28** — **wikilink edges at chunk granularity, both ends**~~ — **DONE.** `edges` gained
+  `from_chunk_seq` / `to_chunk_seq` and the unique key widened to the full chunk-to-chunk identity.
+  1084 rows became 1697 and the derived `SELECT DISTINCT from_file, to_file` view stayed **identical**,
+  which is the criterion that proves nothing was lost. Backfilled from `chunks.text` in **3.4 s with
+  no vault read**, byte-identical to a 158.9 s `--rebuild`. **Departed from the ticket on one point:**
+  an un-headed `[[Note]]` stores a `DOC_LEVEL` sentinel instead of one row per target chunk —
+  materialising would have been 7,215 rows on the to-side alone and would make an edge's row count
+  proportional to the target document's size, i.e. a 37-chunk note reading as 37× the endorsement of
+  a 1-chunk one under #29's summation. Deep links still keep the ticket's set semantics.
+  **Zero deep links in the vault, so that branch has unit tests and no data.** Retrieval scopes
+  expansion to the seed's own chunk at `OFF_CHUNK_LINK_WEIGHT = 0.5`; every setting from 0.0 to 0.9
+  gives the *same* output, because `graph_expand` takes the max across 60–120 seeds and only 1 of 116
+  expansions on probe 1 is reachable exclusively off-chunk. Probe 1 does not regress; the entire
+  effect is one insertion at rank 13 of probe 4
 - **#29** — **personalized PageRank replaces the graph lane's scoring.** The current code is legible
   as a one-iteration PPR with the accumulation operator wrong: hop decay *is* a damping factor, two
   hops *are* two iterations, seed scores *are* the restart distribution. Missing: **`sum` not `max`**

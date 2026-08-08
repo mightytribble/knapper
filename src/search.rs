@@ -408,8 +408,15 @@ pub fn search_with_intelligence(
         }
     }
 
-    let graph_results =
-        graph::graph_expand(config.store, &combined_seeds, query, 2, 20).unwrap_or_default();
+    let graph_results = graph::graph_expand(
+        config.store,
+        &combined_seeds,
+        query,
+        2,
+        20,
+        graph::OFF_CHUNK_LINK_WEIGHT,
+    )
+    .unwrap_or_default();
 
     // --- Step 3: RRF Pass 1 (3-lane) ---
     const RRF_K: usize = 60;

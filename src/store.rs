@@ -43,6 +43,52 @@ pub struct ChunkRecord {
 /// Columns selected for every [`ChunkRecord`], in the order [`chunk_from_row`] expects.
 const CHUNK_COLUMNS: &str = "id, file_id, seq, heading, snippet, text, vector_id, token_count";
 
+/// The `chunk_seq` standing for "the document as a whole" on either end of an edge.
+///
+/// Edges are chunk-to-chunk (issue #28), but not every link names a chunk. On the
+/// source end this is a link the indexer could not attribute to a passage; on the
+/// target end it is a plain `[[Note]]`, or a `[[Note#Section]]` whose heading no
+/// longer resolves. Reading it as "every chunk of that file" is what keeps the
+/// document-level view — `SELECT DISTINCT from_file, to_file` — complete.
+///
+/// A sentinel rather than `NULL` because SQLite counts two NULLs as *distinct*
+/// in a `UNIQUE` constraint, which would quietly stop `INSERT OR IGNORE` from
+/// deduplicating the commonest edge there is.
+pub const DOC_LEVEL: i64 = -1;
+
+/// The `edges` table, as created fresh and as rebuilt by the #28 migration.
+///
+/// The unique key is the full chunk-to-chunk identity: one row per
+/// (source passage, target passage, kind). A document's link set is exactly the
+/// union of its chunks', so only the fine grain is stored and the coarse view is
+/// derived — a stored copy of a derivable fact is a copy that can drift.
+const EDGES_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS edges (
+    id             INTEGER PRIMARY KEY,
+    from_file      INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    from_chunk_seq INTEGER NOT NULL DEFAULT -1,
+    to_file        INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    to_chunk_seq   INTEGER NOT NULL DEFAULT -1,
+    edge_type      TEXT NOT NULL,
+    UNIQUE(from_file, from_chunk_seq, to_file, to_chunk_seq, edge_type)
+);
+CREATE INDEX IF NOT EXISTS idx_edges_from ON edges(from_file, from_chunk_seq);
+CREATE INDEX IF NOT EXISTS idx_edges_to ON edges(to_file, to_chunk_seq);
+CREATE INDEX IF NOT EXISTS idx_edges_type ON edges(edge_type);";
+
+/// Reduce a heading to the form two spellings of the same section share.
+///
+/// Strips the leading `#`s a stored heading carries and a link's does not,
+/// case-folds, and drops the `(cont.)` suffix the chunker appends when it splits
+/// an oversized section — a `[[Note#Events]]` means `## Events (cont.)` too.
+fn normalise_heading(heading: &str) -> String {
+    heading
+        .trim_start_matches('#')
+        .trim()
+        .trim_end_matches("(cont.)")
+        .trim()
+        .to_lowercase()
+}
+
 /// Build a [`ChunkRecord`] from a row selecting [`CHUNK_COLUMNS`].
 fn chunk_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChunkRecord> {
     Ok(ChunkRecord {
@@ -421,18 +467,32 @@ impl Store {
             rows.next().is_some()
         };
         if !has_edges {
-            self.conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS edges (
-                    id         INTEGER PRIMARY KEY,
-                    from_file  INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
-                    to_file    INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
-                    edge_type  TEXT NOT NULL,
-                    UNIQUE(from_file, to_file, edge_type)
-                );
-                CREATE INDEX IF NOT EXISTS idx_edges_from ON edges(from_file);
-                CREATE INDEX IF NOT EXISTS idx_edges_to ON edges(to_file);
-                CREATE INDEX IF NOT EXISTS idx_edges_type ON edges(edge_type);",
-            )?;
+            self.conn.execute_batch(EDGES_SCHEMA)?;
+        } else if !self.column_exists("edges", "from_chunk_seq")? {
+            // Widen edges to chunk granularity (issue #28). The unique key gains
+            // two columns, which `ALTER TABLE` cannot do, so the table is rebuilt.
+            //
+            // Existing rows carry across at [`DOC_LEVEL`] on both ends — the
+            // grain they were written at, and a truthful statement of what the
+            // old schema knew. That leaves the store behaving exactly as it did
+            // before until something re-derives the fine grain from `chunks.text`;
+            // `indexer::backfill_edges_from_chunks` is that something, and the
+            // `edges_backfill_pending` flag is how it learns it has work.
+            self.conn.execute_batch(&format!(
+                "ALTER TABLE edges RENAME TO edges_pre28;
+                 -- The old indexes followed the rename and still own their names,
+                 -- so `CREATE INDEX IF NOT EXISTS` below would silently no-op and
+                 -- leave the new table unindexed once `edges_pre28` is dropped.
+                 DROP INDEX IF EXISTS idx_edges_from;
+                 DROP INDEX IF EXISTS idx_edges_to;
+                 DROP INDEX IF EXISTS idx_edges_type;
+                 {EDGES_SCHEMA}
+                 INSERT INTO edges (from_file, from_chunk_seq, to_file, to_chunk_seq, edge_type)
+                     SELECT from_file, {DOC_LEVEL}, to_file, {DOC_LEVEL}, edge_type
+                     FROM edges_pre28;
+                 DROP TABLE edges_pre28;"
+            ))?;
+            self.set_meta("edges_backfill_pending", "1")?;
         }
 
         // Folder centroids table
@@ -784,6 +844,34 @@ impl Store {
         Ok(chunks)
     }
 
+    /// The seqs of a file's chunks sitting under `heading`.
+    ///
+    /// A deep link's target end (issue #28). Plural because `(file, heading)` is
+    /// not unique: the chunker splits an oversized section into `## Events` and
+    /// `## Events (cont.)`, and a link to `#Events` means both.
+    ///
+    /// Empty when nothing matches — a renamed heading. The caller degrades that
+    /// to [`DOC_LEVEL`] rather than dropping the link, because a deep link is
+    /// more fragile than a plain one and the graph must not lose recall over a
+    /// retitled section.
+    pub fn chunk_seqs_with_heading(&self, file_id: i64, heading: &str) -> Result<Vec<i64>> {
+        let wanted = normalise_heading(heading);
+        let mut stmt = self
+            .conn
+            .prepare("SELECT seq, heading FROM chunks WHERE file_id = ?1 ORDER BY seq")?;
+        let rows = stmt.query_map(params![file_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut seqs = Vec::new();
+        for row in rows {
+            let (seq, stored) = row?;
+            if normalise_heading(&stored) == wanted {
+                seqs.push(seq);
+            }
+        }
+        Ok(seqs)
+    }
+
     pub fn get_chunk_by_vector_id(&self, vector_id: u64) -> Result<Option<ChunkRecord>> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {CHUNK_COLUMNS} FROM chunks WHERE vector_id = ?1"
@@ -867,11 +955,23 @@ impl Store {
 
     // ── Edges ──────────────────────────────────────────────────
 
-    /// Insert an edge. Uses INSERT OR IGNORE for the UNIQUE constraint.
-    pub fn insert_edge(&self, from_file: i64, to_file: i64, edge_type: &str) -> Result<()> {
+    /// Insert a chunk-to-chunk edge. Uses INSERT OR IGNORE for the UNIQUE constraint.
+    ///
+    /// Pass [`DOC_LEVEL`] for an end that names no passage. The source end is
+    /// the chunk whose text contained the link; the target end is the chunk a
+    /// `#Heading` resolved to.
+    pub fn insert_edge(
+        &self,
+        from_file: i64,
+        from_chunk_seq: i64,
+        to_file: i64,
+        to_chunk_seq: i64,
+        edge_type: &str,
+    ) -> Result<()> {
         self.conn.execute(
-            "INSERT OR IGNORE INTO edges (from_file, to_file, edge_type) VALUES (?1, ?2, ?3)",
-            params![from_file, to_file, edge_type],
+            "INSERT OR IGNORE INTO edges (from_file, from_chunk_seq, to_file, to_chunk_seq, edge_type)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![from_file, from_chunk_seq, to_file, to_chunk_seq, edge_type],
         )?;
         Ok(())
     }
@@ -902,13 +1002,44 @@ impl Store {
         Ok(())
     }
 
+    /// The document-level view of the wikilink graph: distinct `(from, to)` pairs.
+    ///
+    /// A document's link set is the union of its chunks', so this is derived
+    /// rather than stored (issue #28) — a stored copy could drift from the rows
+    /// it summarises, and this cannot.
+    pub fn wikilink_pairs(&self) -> Result<Vec<(i64, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT from_file, to_file FROM edges WHERE edge_type = 'wikilink'",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let mut pairs = Vec::new();
+        for row in rows {
+            pairs.push(row?);
+        }
+        Ok(pairs)
+    }
+
+    /// Whether this store's edges are still at the pre-#28 document grain.
+    ///
+    /// Set by the migration that widened the table and cleared by
+    /// `indexer::backfill_edges_from_chunks`. Until then the store is correct,
+    /// just coarse: every edge reads as document-to-document, which is what it
+    /// meant when it was written.
+    pub fn needs_edge_backfill(&self) -> Result<bool> {
+        Ok(self.get_meta("edges_backfill_pending")?.as_deref() == Some("1"))
+    }
+
     /// Clear all edges (used during --rebuild).
     pub fn clear_edges(&self) -> Result<()> {
         self.conn.execute("DELETE FROM edges", [])?;
         Ok(())
     }
 
-    /// Get outgoing edges, optionally filtered by type.
+    /// Get outgoing edges at document granularity, optionally filtered by type.
+    ///
+    /// `DISTINCT` because the stored grain is chunk-to-chunk (issue #28): a note
+    /// linked from four passages is four rows and one relationship, and every
+    /// caller of this wants the relationship.
     pub fn get_outgoing(
         &self,
         file_id: i64,
@@ -918,7 +1049,7 @@ impl Store {
         match edge_type {
             Some(et) => {
                 let mut stmt = self.conn.prepare(
-                    "SELECT to_file, edge_type FROM edges WHERE from_file = ?1 AND edge_type = ?2",
+                    "SELECT DISTINCT to_file, edge_type FROM edges WHERE from_file = ?1 AND edge_type = ?2",
                 )?;
                 let rows = stmt.query_map(params![file_id, et], |row| {
                     Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
@@ -928,9 +1059,9 @@ impl Store {
                 }
             }
             None => {
-                let mut stmt = self
-                    .conn
-                    .prepare("SELECT to_file, edge_type FROM edges WHERE from_file = ?1")?;
+                let mut stmt = self.conn.prepare(
+                    "SELECT DISTINCT to_file, edge_type FROM edges WHERE from_file = ?1",
+                )?;
                 let rows = stmt.query_map(params![file_id], |row| {
                     Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
                 })?;
@@ -942,7 +1073,9 @@ impl Store {
         Ok(results)
     }
 
-    /// Get incoming edges, optionally filtered by type.
+    /// Get incoming edges at document granularity, optionally filtered by type.
+    ///
+    /// `DISTINCT` for the reason given on [`get_outgoing`](Self::get_outgoing).
     pub fn get_incoming(
         &self,
         file_id: i64,
@@ -952,7 +1085,7 @@ impl Store {
         match edge_type {
             Some(et) => {
                 let mut stmt = self.conn.prepare(
-                    "SELECT from_file, edge_type FROM edges WHERE to_file = ?1 AND edge_type = ?2",
+                    "SELECT DISTINCT from_file, edge_type FROM edges WHERE to_file = ?1 AND edge_type = ?2",
                 )?;
                 let rows = stmt.query_map(params![file_id, et], |row| {
                     Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
@@ -962,9 +1095,9 @@ impl Store {
                 }
             }
             None => {
-                let mut stmt = self
-                    .conn
-                    .prepare("SELECT from_file, edge_type FROM edges WHERE to_file = ?1")?;
+                let mut stmt = self.conn.prepare(
+                    "SELECT DISTINCT from_file, edge_type FROM edges WHERE to_file = ?1",
+                )?;
                 let rows = stmt.query_map(params![file_id], |row| {
                     Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
                 })?;
@@ -1205,6 +1338,96 @@ impl Store {
             }
         }
         Ok(results)
+    }
+
+    /// Neighbours of a *passage*, with the weight its scope earns (issue #28).
+    ///
+    /// [`get_neighbors`](Self::get_neighbors) asks "what does this file link
+    /// to"; this asks "what does this passage link to", which is the question
+    /// retrieval has been answering wrongly since #6 made everything downstream
+    /// chunk-level. A seed of `archdragon.md#Evolution` used to expand along the
+    /// links in `## Cross-links` and `## Session History` as though the matched
+    /// passage had pointed at them.
+    ///
+    /// Each returned neighbour carries a weight in `[0, 1]`:
+    ///
+    /// - an edge the seed chunk owns, or one aimed at the whole document, is
+    ///   **chunk-local** and weighs 1.0;
+    /// - any other edge of the same file weighs `off_chunk_weight`, the
+    ///   product over the path when it takes more than one hop.
+    ///
+    /// `off_chunk_weight` picks the policy: `0.0` scopes hard (a passage that
+    /// points nowhere expands nowhere), `1.0` reproduces `get_neighbors`
+    /// exactly, and anything between is the two-tier discount — the document's
+    /// other links stay reachable but stop drowning out the passage's own.
+    ///
+    /// After the first hop the passage in hand is whatever the traversed edge
+    /// pointed at, so the same test applies at every depth.
+    pub fn get_neighbors_from_chunk(
+        &self,
+        file_id: i64,
+        chunk_seq: i64,
+        depth: usize,
+        off_chunk_weight: f64,
+    ) -> Result<Vec<(i64, usize, f64)>> {
+        use std::collections::VecDeque;
+        // file → (hop, weight) for the best arrival so far. Shortest hop wins;
+        // at equal hop the heavier path wins, and an improvement re-expands.
+        let mut best: std::collections::HashMap<i64, (usize, f64)> =
+            std::collections::HashMap::new();
+        let mut queue: VecDeque<(i64, i64, usize, f64)> = VecDeque::new();
+        queue.push_back((file_id, chunk_seq, 0, 1.0));
+
+        // Wikilinks are followed in both directions, as in `get_neighbors`: a
+        // knowledge-graph neighbour is related whichever way the link runs. Each
+        // arm puts the end nearest `current` last — that is the one that has to
+        // match the passage in hand.
+        let mut stmt = self.conn.prepare(
+            "SELECT to_file, to_chunk_seq, from_chunk_seq FROM edges
+             WHERE from_file = ?1 AND edge_type = 'wikilink'
+             UNION ALL
+             SELECT from_file, from_chunk_seq, to_chunk_seq FROM edges
+             WHERE to_file = ?1 AND edge_type = 'wikilink'",
+        )?;
+
+        while let Some((current, current_seq, hop, weight)) = queue.pop_front() {
+            if hop >= depth {
+                continue;
+            }
+            let rows = stmt.query_map(params![current], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?;
+
+            for row in rows {
+                let (neighbor_id, far_seq, near_seq) = row?;
+                if neighbor_id == file_id {
+                    continue; // never expand back onto the seed's own file
+                }
+                let local = near_seq == current_seq || near_seq == DOC_LEVEL;
+                let edge_weight = if local { 1.0 } else { off_chunk_weight };
+                if edge_weight <= 0.0 {
+                    continue;
+                }
+                let next = (hop + 1, weight * edge_weight);
+                let improved = match best.get(&neighbor_id) {
+                    Some(&(h, w)) => next.0 < h || (next.0 == h && next.1 > w),
+                    None => true,
+                };
+                if improved {
+                    best.insert(neighbor_id, next);
+                    queue.push_back((neighbor_id, far_seq, next.0, next.1));
+                }
+            }
+        }
+
+        Ok(best
+            .into_iter()
+            .map(|(id, (hop, weight))| (id, hop, weight))
+            .collect())
     }
 
     /// Find files that share at least one tag with the given file.
@@ -2584,7 +2807,9 @@ mod tests {
         let store = Store::open_memory().unwrap();
         let (a, b) = setup_two_files(&store);
 
-        store.insert_edge(a, b, "wikilink").unwrap();
+        store
+            .insert_edge(a, DOC_LEVEL, b, DOC_LEVEL, "wikilink")
+            .unwrap();
 
         let out = store.get_outgoing(a, None).unwrap();
         assert_eq!(out.len(), 1);
@@ -2607,8 +2832,12 @@ mod tests {
         let store = Store::open_memory().unwrap();
         let (a, b) = setup_two_files(&store);
 
-        store.insert_edge(a, b, "wikilink").unwrap();
-        store.insert_edge(b, a, "wikilink").unwrap();
+        store
+            .insert_edge(a, DOC_LEVEL, b, DOC_LEVEL, "wikilink")
+            .unwrap();
+        store
+            .insert_edge(b, DOC_LEVEL, a, DOC_LEVEL, "wikilink")
+            .unwrap();
 
         store.delete_outgoing_edges_for_file(b).unwrap();
 
@@ -2627,7 +2856,9 @@ mod tests {
         // and lets `insert_file` upsert the row (issue #27).
         let store = Store::open_memory().unwrap();
         let (a, b) = setup_two_files(&store);
-        store.insert_edge(a, b, "wikilink").unwrap();
+        store
+            .insert_edge(a, DOC_LEVEL, b, DOC_LEVEL, "wikilink")
+            .unwrap();
 
         store.delete_chunks_for_file(b).unwrap();
 
@@ -2668,8 +2899,12 @@ mod tests {
             .unwrap();
 
         // a -> b, c -> a
-        store.insert_edge(a, b, "wikilink").unwrap();
-        store.insert_edge(c, a, "mention").unwrap();
+        store
+            .insert_edge(a, DOC_LEVEL, b, DOC_LEVEL, "wikilink")
+            .unwrap();
+        store
+            .insert_edge(c, DOC_LEVEL, a, DOC_LEVEL, "mention")
+            .unwrap();
 
         // Delete edges for file a — should remove both.
         store.delete_edges_for_file(a).unwrap();
@@ -2697,8 +2932,12 @@ mod tests {
             .unwrap();
 
         // a -> b, b -> c
-        store.insert_edge(a, b, "wikilink").unwrap();
-        store.insert_edge(b, c, "mention").unwrap();
+        store
+            .insert_edge(a, DOC_LEVEL, b, DOC_LEVEL, "wikilink")
+            .unwrap();
+        store
+            .insert_edge(b, DOC_LEVEL, c, DOC_LEVEL, "mention")
+            .unwrap();
 
         // Delete file b — CASCADE should remove both edges.
         store.delete_file(b).unwrap();
@@ -2712,14 +2951,20 @@ mod tests {
         let store = Store::open_memory().unwrap();
         let (a, b) = setup_two_files(&store);
 
-        store.insert_edge(a, b, "wikilink").unwrap();
-        store.insert_edge(a, b, "wikilink").unwrap(); // duplicate
+        store
+            .insert_edge(a, DOC_LEVEL, b, DOC_LEVEL, "wikilink")
+            .unwrap();
+        store
+            .insert_edge(a, DOC_LEVEL, b, DOC_LEVEL, "wikilink")
+            .unwrap(); // duplicate
 
         let out = store.get_outgoing(a, None).unwrap();
         assert_eq!(out.len(), 1);
 
         // Same pair with different type is NOT a duplicate.
-        store.insert_edge(a, b, "mention").unwrap();
+        store
+            .insert_edge(a, DOC_LEVEL, b, DOC_LEVEL, "mention")
+            .unwrap();
         let out = store.get_outgoing(a, None).unwrap();
         assert_eq!(out.len(), 2);
     }
@@ -2740,8 +2985,12 @@ mod tests {
             )
             .unwrap();
 
-        store.insert_edge(a, b, "wikilink").unwrap();
-        store.insert_edge(a, c, "mention").unwrap();
+        store
+            .insert_edge(a, DOC_LEVEL, b, DOC_LEVEL, "wikilink")
+            .unwrap();
+        store
+            .insert_edge(a, DOC_LEVEL, c, DOC_LEVEL, "mention")
+            .unwrap();
 
         let wikilinks = store.get_outgoing(a, Some("wikilink")).unwrap();
         assert_eq!(wikilinks.len(), 1);
@@ -2799,8 +3048,12 @@ mod tests {
             )
             .unwrap();
 
-        store.insert_edge(f1, f2, "wikilink").unwrap();
-        store.insert_edge(f1, f3, "wikilink").unwrap();
+        store
+            .insert_edge(f1, DOC_LEVEL, f2, DOC_LEVEL, "wikilink")
+            .unwrap();
+        store
+            .insert_edge(f1, DOC_LEVEL, f3, DOC_LEVEL, "wikilink")
+            .unwrap();
 
         let neighbors = store.get_neighbors(f1, 1).unwrap();
         assert_eq!(neighbors.len(), 2);
@@ -2864,9 +3117,15 @@ mod tests {
             .unwrap();
 
         // f1 -> f2 -> f3 -> f4
-        store.insert_edge(f1, f2, "wikilink").unwrap();
-        store.insert_edge(f2, f3, "wikilink").unwrap();
-        store.insert_edge(f3, f4, "wikilink").unwrap();
+        store
+            .insert_edge(f1, DOC_LEVEL, f2, DOC_LEVEL, "wikilink")
+            .unwrap();
+        store
+            .insert_edge(f2, DOC_LEVEL, f3, DOC_LEVEL, "wikilink")
+            .unwrap();
+        store
+            .insert_edge(f3, DOC_LEVEL, f4, DOC_LEVEL, "wikilink")
+            .unwrap();
 
         let neighbors = store.get_neighbors(f1, 2).unwrap();
         assert_eq!(neighbors.len(), 2);
@@ -2905,7 +3164,9 @@ mod tests {
             .unwrap();
 
         // f2 links to f1; f1 has no outgoing links of its own.
-        store.insert_edge(f2, f1, "wikilink").unwrap();
+        store
+            .insert_edge(f2, DOC_LEVEL, f1, DOC_LEVEL, "wikilink")
+            .unwrap();
 
         // Neighbor discovery is undirected: f1's neighbors include its
         // backlink f2 even though f1 has no outgoing edge.
@@ -3303,9 +3564,15 @@ mod tests {
             )
             .unwrap();
 
-        store.insert_edge(a, b, "wikilink").unwrap();
-        store.insert_edge(a, c, "wikilink").unwrap();
-        store.insert_edge(b, c, "mention").unwrap();
+        store
+            .insert_edge(a, DOC_LEVEL, b, DOC_LEVEL, "wikilink")
+            .unwrap();
+        store
+            .insert_edge(a, DOC_LEVEL, c, DOC_LEVEL, "wikilink")
+            .unwrap();
+        store
+            .insert_edge(b, DOC_LEVEL, c, DOC_LEVEL, "mention")
+            .unwrap();
 
         let stats = store.get_edge_stats().unwrap();
         assert_eq!(stats.total_edges, 3);
@@ -3505,8 +3772,12 @@ mod tests {
         let f2 = store
             .insert_file("b.md", "h2", 100, &[], "b2", None, None)
             .unwrap();
-        store.insert_edge(f1, f2, "wikilink").unwrap();
-        store.insert_edge(f2, f1, "wikilink").unwrap();
+        store
+            .insert_edge(f1, DOC_LEVEL, f2, DOC_LEVEL, "wikilink")
+            .unwrap();
+        store
+            .insert_edge(f2, DOC_LEVEL, f1, DOC_LEVEL, "wikilink")
+            .unwrap();
         assert_eq!(store.edge_count_for_file(f1).unwrap(), 2);
         assert_eq!(store.edge_count_for_file(f2).unwrap(), 2);
     }
@@ -3552,9 +3823,15 @@ mod tests {
         let f3 = store
             .insert_file("c.md", "h3", 100, &[], "c3", None, None)
             .unwrap();
-        store.insert_edge(f1, f2, "wikilink").unwrap();
-        store.insert_edge(f2, f1, "wikilink").unwrap();
-        store.insert_edge(f1, f3, "wikilink").unwrap();
+        store
+            .insert_edge(f1, DOC_LEVEL, f2, DOC_LEVEL, "wikilink")
+            .unwrap();
+        store
+            .insert_edge(f2, DOC_LEVEL, f1, DOC_LEVEL, "wikilink")
+            .unwrap();
+        store
+            .insert_edge(f1, DOC_LEVEL, f3, DOC_LEVEL, "wikilink")
+            .unwrap();
         let counts = store.edge_counts_for_files(&[f1, f2, f3]).unwrap();
         assert_eq!(*counts.get(&f1).unwrap(), 3);
         assert_eq!(*counts.get(&f2).unwrap(), 2);
@@ -4166,8 +4443,12 @@ mod tests {
         let file_id2 = store
             .insert_file("other.md", "hash2", 100, &[], "oth123", None, None)
             .unwrap();
-        store.insert_edge(file_id, file_id2, "wikilink").unwrap();
-        store.insert_edge(file_id2, file_id, "wikilink").unwrap();
+        store
+            .insert_edge(file_id, DOC_LEVEL, file_id2, DOC_LEVEL, "wikilink")
+            .unwrap();
+        store
+            .insert_edge(file_id2, DOC_LEVEL, file_id, DOC_LEVEL, "wikilink")
+            .unwrap();
 
         // Verify data exists
         assert!(store.get_file("delete-me.md").unwrap().is_some());
@@ -4409,5 +4690,247 @@ mod tests {
 
         assert_eq!(store.get_identity_facts(0).unwrap().len(), 1);
         assert_eq!(store.get_identity_facts(1).unwrap().len(), 0);
+    }
+
+    // ── Chunk-granular edges (#28) ───────────────────────────────
+
+    fn file(store: &Store, path: &str) -> i64 {
+        store
+            .insert_file(path, "h", 100, &[], &generate_docid(path), None, None)
+            .unwrap()
+    }
+
+    /// A hub whose `## Role` (seq 0) links to `near` and whose
+    /// `## History` (seq 1) links to `far`.
+    fn two_section_hub() -> (Store, i64, i64, i64) {
+        let store = Store::open_memory().unwrap();
+        let hub = file(&store, "hub.md");
+        let near = file(&store, "near.md");
+        let far = file(&store, "far.md");
+        store
+            .insert_edge(hub, 0, near, DOC_LEVEL, "wikilink")
+            .unwrap();
+        store
+            .insert_edge(hub, 1, far, DOC_LEVEL, "wikilink")
+            .unwrap();
+        (store, hub, near, far)
+    }
+
+    #[test]
+    fn a_passage_expands_along_its_own_links_only() {
+        let (store, hub, near, far) = two_section_hub();
+
+        // Hard scope: `off_chunk_weight = 0`. Seeding on `## Role` reaches
+        // `near` and stops — the `## History` link is not this passage's.
+        let from_role = store.get_neighbors_from_chunk(hub, 0, 2, 0.0).unwrap();
+        assert_eq!(
+            from_role.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
+            vec![near]
+        );
+        let from_history = store.get_neighbors_from_chunk(hub, 1, 2, 0.0).unwrap();
+        assert_eq!(
+            from_history
+                .iter()
+                .map(|(id, _, _)| *id)
+                .collect::<Vec<_>>(),
+            vec![far]
+        );
+    }
+
+    #[test]
+    fn the_rest_of_the_document_stays_reachable_at_a_discount() {
+        // The two-tier reading that shipped: `far` is still found from `## Role`,
+        // but at half weight, so it cannot outbid the passage's own link for a
+        // truncation slot.
+        let (store, hub, near, far) = two_section_hub();
+        let mut found = store.get_neighbors_from_chunk(hub, 0, 2, 0.5).unwrap();
+        found.sort_by_key(|(id, _, _)| *id);
+        assert_eq!(found, vec![(near, 1, 1.0), (far, 1, 0.5)]);
+    }
+
+    #[test]
+    fn a_link_aimed_at_the_whole_document_reaches_every_passage() {
+        // `DOC_LEVEL` on the near end means "any chunk of this file", so a
+        // backlink into `near` is a neighbour of all of `near`'s passages.
+        let store = Store::open_memory().unwrap();
+        let near = file(&store, "near.md");
+        let other = file(&store, "other.md");
+        store
+            .insert_edge(other, 3, near, DOC_LEVEL, "wikilink")
+            .unwrap();
+        for seq in [0, 7] {
+            let found = store.get_neighbors_from_chunk(near, seq, 1, 0.0).unwrap();
+            assert_eq!(found, vec![(other, 1, 1.0)], "from near.md#{seq}");
+        }
+    }
+
+    #[test]
+    fn full_weight_reproduces_the_file_level_walk() {
+        // `off_chunk_weight = 1.0` is the pre-#28 behaviour exactly, which is
+        // what makes the scoping constant the only variable in the measurement.
+        let (store, hub, ..) = two_section_hub();
+        let mut chunkwise: Vec<(i64, usize)> = store
+            .get_neighbors_from_chunk(hub, 0, 2, 1.0)
+            .unwrap()
+            .into_iter()
+            .map(|(id, hop, weight)| {
+                assert_eq!(weight, 1.0);
+                (id, hop)
+            })
+            .collect();
+        chunkwise.sort();
+        let mut filewise = store.get_neighbors(hub, 2).unwrap();
+        filewise.sort();
+        assert_eq!(chunkwise, filewise);
+    }
+
+    #[test]
+    fn a_deep_links_target_chunk_carries_into_the_next_hop() {
+        // `hub#0 -> mid#4 -> far`, but `mid`'s link to `far` lives in chunk 9.
+        // Under hard scope the path dies at `mid`: nothing in the passage `hub`
+        // pointed at leads onward.
+        let store = Store::open_memory().unwrap();
+        let hub = file(&store, "hub.md");
+        let mid = file(&store, "mid.md");
+        let far = file(&store, "far.md");
+        store.insert_edge(hub, 0, mid, 4, "wikilink").unwrap();
+        store
+            .insert_edge(mid, 9, far, DOC_LEVEL, "wikilink")
+            .unwrap();
+
+        let scoped = store.get_neighbors_from_chunk(hub, 0, 2, 0.0).unwrap();
+        assert_eq!(
+            scoped.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
+            vec![mid]
+        );
+
+        // At a discount it survives, with the discount compounding over the path.
+        let mut tiered = store.get_neighbors_from_chunk(hub, 0, 2, 0.5).unwrap();
+        tiered.sort_by_key(|(id, _, _)| *id);
+        assert_eq!(tiered, vec![(mid, 1, 1.0), (far, 2, 0.5)]);
+    }
+
+    #[test]
+    fn the_two_ends_of_an_edge_are_independent() {
+        // The unique key is the full chunk-to-chunk identity, so the same pair
+        // of files can be joined by several distinct passages.
+        let store = Store::open_memory().unwrap();
+        let a = file(&store, "a.md");
+        let b = file(&store, "b.md");
+        for (from, to) in [(0, 2), (0, 5), (1, 2)] {
+            store.insert_edge(a, from, b, to, "wikilink").unwrap();
+        }
+        store.insert_edge(a, 0, b, 2, "wikilink").unwrap(); // duplicate
+
+        let count: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 3, "INSERT OR IGNORE must still dedupe");
+        assert_eq!(store.wikilink_pairs().unwrap(), vec![(a, b)]);
+        assert_eq!(
+            store.get_outgoing(a, Some("wikilink")).unwrap().len(),
+            1,
+            "the document-level view collapses them back to one relationship"
+        );
+    }
+
+    #[test]
+    fn chunk_seqs_with_heading_finds_a_split_section() {
+        // `(file, heading)` is not unique: an oversized section becomes
+        // `## Events` and `## Events (cont.)`, and a link to `#Events` means both.
+        let store = Store::open_memory().unwrap();
+        let f = file(&store, "session.md");
+        for (seq, heading) in [
+            (0, "## Summary"),
+            (1, "## Events"),
+            (2, "## Events (cont.)"),
+        ] {
+            store
+                .insert_chunk_with_vector(f, seq, heading, "text", seq as u64, 1, &[0.0])
+                .unwrap();
+        }
+        assert_eq!(
+            store.chunk_seqs_with_heading(f, "Events").unwrap(),
+            vec![1, 2]
+        );
+        assert_eq!(
+            store.chunk_seqs_with_heading(f, "summary").unwrap(),
+            vec![0]
+        );
+        assert!(
+            store
+                .chunk_seqs_with_heading(f, "Aftermath")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_pre_28_store_keeps_its_edges_at_the_document_level() {
+        // The migration rebuilds the table to widen the unique key, which is the
+        // one operation that could silently lose the whole graph.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("engraph.db");
+        let (a, b) = {
+            let store = Store::open(&path).unwrap();
+            let a = file(&store, "a.md");
+            let b = file(&store, "b.md");
+            (a, b)
+        };
+
+        // Put the old schema back, rows and all.
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(&format!(
+                "DROP TABLE edges;
+                 CREATE TABLE edges (
+                     id INTEGER PRIMARY KEY,
+                     from_file INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                     to_file INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                     edge_type TEXT NOT NULL,
+                     UNIQUE(from_file, to_file, edge_type)
+                 );
+                 CREATE INDEX idx_edges_from ON edges(from_file);
+                 CREATE INDEX idx_edges_to ON edges(to_file);
+                 CREATE INDEX idx_edges_type ON edges(edge_type);
+                 INSERT INTO edges (from_file, to_file, edge_type)
+                     VALUES ({a}, {b}, 'wikilink'), ({b}, {a}, 'mention');"
+            ))
+            .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        assert!(
+            store.needs_edge_backfill().unwrap(),
+            "the store should know its edges are still coarse"
+        );
+        assert_eq!(store.wikilink_pairs().unwrap(), vec![(a, b)]);
+        assert_eq!(
+            store.get_incoming(a, Some("mention")).unwrap(),
+            vec![(b, "mention".to_string())]
+        );
+        let seqs: Vec<(i64, i64)> = store
+            .conn()
+            .prepare("SELECT from_chunk_seq, to_chunk_seq FROM edges")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(seqs, vec![(DOC_LEVEL, DOC_LEVEL); 2]);
+
+        // The rebuilt table has to keep its indexes: the old ones followed the
+        // rename and would have been dropped along with the old table.
+        let indexes: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND tbl_name='edges'
+                 AND name LIKE 'idx_edges_%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexes, 3);
     }
 }

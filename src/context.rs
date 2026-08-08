@@ -748,7 +748,7 @@ pub fn context_topic_with_search(
 mod tests {
     use super::*;
     use crate::docid::generate_docid;
-    use crate::store::Store;
+    use crate::store::{DOC_LEVEL, Store};
     use tempfile::TempDir;
 
     fn setup_vault() -> (TempDir, Store, std::path::PathBuf) {
@@ -774,8 +774,12 @@ mod tests {
 
         let f1 = store.get_file("note.md").unwrap().unwrap().id;
         let f2 = store.get_file("other.md").unwrap().unwrap().id;
-        store.insert_edge(f1, f2, "wikilink").unwrap();
-        store.insert_edge(f2, f1, "wikilink").unwrap();
+        store
+            .insert_edge(f1, DOC_LEVEL, f2, DOC_LEVEL, "wikilink")
+            .unwrap();
+        store
+            .insert_edge(f2, DOC_LEVEL, f1, DOC_LEVEL, "wikilink")
+            .unwrap();
 
         (tmp, store, root)
     }
@@ -920,7 +924,9 @@ mod tests {
         let f2 = store
             .insert_file("daily.md", "h2", 100, &[], "bbb222", None, None)
             .unwrap();
-        store.insert_edge(f2, f1, "mention").unwrap();
+        store
+            .insert_edge(f2, DOC_LEVEL, f1, DOC_LEVEL, "mention")
+            .unwrap();
         store
             .insert_chunk(f2, 0, "# Daily", "Talked to John about Rust.", 10, 20)
             .unwrap();
@@ -984,8 +990,12 @@ mod tests {
         let f2 = store
             .insert_file("01-Projects/child.md", "h2", 100, &[], "bbb222", None, None)
             .unwrap();
-        store.insert_edge(f2, f1, "wikilink").unwrap();
-        store.insert_edge(f1, f2, "wikilink").unwrap();
+        store
+            .insert_edge(f2, DOC_LEVEL, f1, DOC_LEVEL, "wikilink")
+            .unwrap();
+        store
+            .insert_edge(f1, DOC_LEVEL, f2, DOC_LEVEL, "wikilink")
+            .unwrap();
 
         let params = ContextParams {
             store: &store,
@@ -1112,7 +1122,9 @@ mod tests {
         let f2 = store
             .insert_file("related.md", "h2", 100, &[], "bbb222", None, None)
             .unwrap();
-        store.insert_edge(f1, f2, "wikilink").unwrap();
+        store
+            .insert_edge(f1, DOC_LEVEL, f2, DOC_LEVEL, "wikilink")
+            .unwrap();
 
         let params = ContextParams {
             store: &store,

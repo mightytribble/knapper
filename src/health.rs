@@ -133,7 +133,7 @@ pub fn generate_health_report(store: &Store, config: &HealthConfig) -> Result<He
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::Store;
+    use crate::store::{DOC_LEVEL, Store};
 
     fn setup_health_store() -> Store {
         let store = Store::open_memory().unwrap();
@@ -156,7 +156,9 @@ mod tests {
             )
             .unwrap();
         // Add edge: linked.md → orphan.md (both files are "connected")
-        store.insert_edge(linked_id, orphan_id, "wikilink").unwrap();
+        store
+            .insert_edge(linked_id, DOC_LEVEL, orphan_id, DOC_LEVEL, "wikilink")
+            .unwrap();
         store
     }
 
@@ -185,7 +187,9 @@ mod tests {
         let other_id = store
             .insert_file("other.md", "h3", 100, &[], "d3", None, None)
             .unwrap();
-        store.insert_edge(iso_id, other_id, "wikilink").unwrap();
+        store
+            .insert_edge(iso_id, DOC_LEVEL, other_id, DOC_LEVEL, "wikilink")
+            .unwrap();
 
         let config = HealthConfig {
             daily_folder: None,
