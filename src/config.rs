@@ -14,6 +14,22 @@ pub struct ModelConfig {
     pub rerank: Option<String>,
     /// Override expansion/orchestrator model URI.
     pub expand: Option<String>,
+    /// How many threads llama.cpp may use per forward pass.
+    ///
+    /// `None` means the machine's **physical core count** — SMT siblings are
+    /// not counted, and that distinction is worth more than it sounds: on an
+    /// 8-core/16-thread box, 8 threads runs a query in 8.4 s and 16 runs it in
+    /// 15 s, worse than the 4 this replaced. llama.cpp's library default is the
+    /// constant `GGML_DEFAULT_N_THREADS = 4` regardless of hardware, carrying
+    /// its own `// TODO: better default`, and engraph used to inherit it —
+    /// so every model call ran on four threads of whatever box it was on
+    /// (issue #20).
+    ///
+    /// Set this to override: to leave headroom for other work, or because a
+    /// sweep found a better number for the machine (12 beat 8 on the box above).
+    /// Threads change only how the arithmetic is scheduled, never its result —
+    /// see [`crate::llm::resolve_n_threads`].
+    pub n_threads: Option<usize>,
 }
 
 /// Obsidian integration configuration.

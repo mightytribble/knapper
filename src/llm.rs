@@ -658,6 +658,98 @@ impl Default for ModelDefaults {
     }
 }
 
+/// llama.cpp's own thread default, used only when the machine will say nothing
+/// at all about how many cores it has.
+const FALLBACK_N_THREADS: i32 = 4;
+
+/// Physical cores, or `None` if the platform will not say.
+///
+/// Counts distinct `thread_siblings` masks in sysfs — one entry per physical
+/// core, with an SMT pair sharing a mask. This is llama.cpp's own rule, from
+/// `common/common.cpp::cpu_get_num_physical_cores`, which is what its CLI feeds
+/// to `n_threads`; only the *library* default is the flat 4 that engraph used to
+/// inherit.
+///
+/// Linux only, deliberately. Everywhere else the caller falls back to
+/// `available_parallelism()`, which is right on the platforms that matter here:
+/// Apple Silicon has no SMT, so its logical count already is a core count.
+fn physical_cores() -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut siblings = std::collections::HashSet::new();
+        // Bounded: a missing entry ends the enumeration, and the cap keeps a
+        // strange sysfs from spinning.
+        for cpu in 0..4096 {
+            let path = format!("/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings");
+            match std::fs::read_to_string(&path) {
+                Ok(mask) => {
+                    siblings.insert(mask.trim().to_string());
+                }
+                Err(_) => break,
+            }
+        }
+        if !siblings.is_empty() {
+            return Some(siblings.len());
+        }
+    }
+    None
+}
+
+/// How many threads llama.cpp may use for a forward pass (issue #20).
+///
+/// `models.n_threads` if set, otherwise the machine's **physical** core count.
+/// It is not llama.cpp's library default, which is the constant
+/// `GGML_DEFAULT_N_THREADS = 4` on every machine — the binding crate pins it in
+/// a doctest (`assert_eq!(params.n_threads(), 4)`) and llama.cpp annotates it
+/// `// TODO: better default`. Inheriting it ran this 16-thread box on four
+/// threads; the #9 audit runs showed a user/wall ratio of 3.42× and 3.34×,
+/// which is what four compute threads plus serial overhead looks like.
+///
+/// **Physical, not logical, and that is measured rather than assumed.** On this
+/// 8-core/16-thread machine, query latency falls from 12.3 s at 4 threads to
+/// 8.4 s at 8, bottoms at 7.4 s around 12 — and then *collapses to 15 s at 16*,
+/// worse than the four-thread default it replaced, with the spread widening
+/// from ±0.4 s to ±3 s. Running both SMT siblings of a core turns every ggml
+/// barrier into a wait on a thread that is contending for the same execution
+/// units.
+///
+/// The obvious reading of that cliff — "leave the OS some headroom" — is wrong,
+/// and the check is in `eval/probes.md`: pinned to eight *distinct* cores so the
+/// box looks non-SMT, `n_threads = 8` is the fastest setting tried and does not
+/// degrade at all. Threads equal to cores is fine; threads equal to *siblings*
+/// is not. So the default keys off cores, which also leaves it safe on the
+/// machines where physical and logical are the same number.
+///
+/// 12 was faster still here (7.4 s vs 8.4 s), but 1.5× physical is a number
+/// this box happens to like, not a rule — `models.n_threads` is how a machine
+/// that has been swept gets to use its own answer.
+///
+/// **This must never change a score.** Thread count decides how the arithmetic
+/// is scheduled, not what it is. Any output that moves with it is a bug in
+/// llama.cpp or in how we build the batch, and would matter more than the
+/// latency. Verified: the five seed probes and the served JSON payload are
+/// byte-identical at 4, 8, 12 and 16 threads.
+///
+/// Both context knobs get this value. `n_threads` governs single-token
+/// autoregressive decode and `n_threads_batch` governs multi-token forward
+/// passes, and engraph is nearly all of the latter: the reranker decodes a
+/// whole ~155-token pair and reads the final logits, the embedder encodes a
+/// chunk, and only the orchestrator generates — one short JSON object per
+/// uncached query.
+pub fn resolve_n_threads(config: &crate::config::Config) -> i32 {
+    let n = config
+        .models
+        .n_threads
+        .or_else(physical_cores)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(FALLBACK_N_THREADS as usize)
+        });
+    // A zero or absurd value would be worse than the default it replaced.
+    i32::try_from(n.max(1)).unwrap_or(i32::MAX)
+}
+
 // ── LlamaEmbed — GGUF embedding model via llama.cpp ──────────────────────────
 
 /// GGUF embedding model loaded via llama.cpp.
@@ -675,6 +767,8 @@ pub struct LlamaEmbed {
     tokenizer: FlexTokenizer,
     dim: usize,
     prompt_format: PromptFormat,
+    /// Resolved once at load — see [`resolve_n_threads`].
+    n_threads: i32,
 }
 
 // Safety: LlamaModel is Send+Sync per llama-cpp-2 docs.
@@ -731,13 +825,20 @@ impl LlamaEmbed {
             bail!("model {uri_str} reports an embedding dimension of 0");
         }
 
-        tracing::info!("loaded LlamaEmbed from {}, dim={}", uri_str, dim);
+        let n_threads = resolve_n_threads(config);
+        tracing::info!(
+            "loaded LlamaEmbed from {}, dim={}, n_threads={}",
+            uri_str,
+            dim,
+            n_threads
+        );
 
         Ok(Self {
             model,
             tokenizer,
             dim,
             prompt_format,
+            n_threads,
         })
     }
 
@@ -802,7 +903,9 @@ impl LlamaEmbed {
             .with_embeddings(true)
             .with_n_ctx(n_ctx)
             .with_n_ubatch(max_tokens.max(512))
-            .with_n_batch(max_tokens.max(512));
+            .with_n_batch(max_tokens.max(512))
+            .with_n_threads(self.n_threads)
+            .with_n_threads_batch(self.n_threads);
         let mut ctx = self
             .model
             .new_context(llama_backend()?, ctx_params)
@@ -1055,6 +1158,8 @@ Be concise. Only return the JSON object."#;
 /// `llama_backend()`.
 pub struct LlamaOrchestrator {
     model: LlamaModel,
+    /// Resolved once at load — see [`resolve_n_threads`].
+    n_threads: i32,
 }
 
 // Safety: LlamaModel is Send+Sync per llama-cpp-2 docs.
@@ -1092,9 +1197,14 @@ impl LlamaOrchestrator {
                 anyhow::anyhow!("loading orchestrator model {}: {e}", model_path.display())
             })?;
 
-        tracing::info!("loaded LlamaOrchestrator from {}", uri_str);
+        let n_threads = resolve_n_threads(config);
+        tracing::info!(
+            "loaded LlamaOrchestrator from {}, n_threads={}",
+            uri_str,
+            n_threads
+        );
 
-        Ok(Self { model })
+        Ok(Self { model, n_threads })
     }
 
     /// Format a chat prompt in Qwen3 ChatML format.
@@ -1120,7 +1230,12 @@ impl LlamaOrchestrator {
 
         // Create context per-call (LlamaContext is !Send).
         let n_ctx = (tokens.len() + max_tokens + 16) as u32;
-        let ctx_params = LlamaContextParams::default().with_n_ctx(std::num::NonZeroU32::new(n_ctx));
+        // The one place `n_threads` (as opposed to `n_threads_batch`) does any
+        // work: the loop below decodes a single token at a time.
+        let ctx_params = LlamaContextParams::default()
+            .with_n_ctx(std::num::NonZeroU32::new(n_ctx))
+            .with_n_threads(self.n_threads)
+            .with_n_threads_batch(self.n_threads);
         let mut ctx = self
             .model
             .new_context(llama_backend()?, ctx_params)
@@ -1224,6 +1339,8 @@ pub struct LlamaRerank {
     model: LlamaModel,
     yes_token_id: i32,
     no_token_id: i32,
+    /// Resolved once at load — see [`resolve_n_threads`].
+    n_threads: i32,
 }
 
 // Safety: LlamaModel is Send+Sync per llama-cpp-2 docs.
@@ -1281,17 +1398,20 @@ impl LlamaRerank {
             .map(|t| t.0)
             .ok_or_else(|| anyhow::anyhow!("model tokenizer returned no tokens for 'No'"))?;
 
+        let n_threads = resolve_n_threads(config);
         tracing::info!(
-            "loaded LlamaRerank from {}, yes_id={}, no_id={}",
+            "loaded LlamaRerank from {}, yes_id={}, no_id={}, n_threads={}",
             uri_str,
             yes_token_id,
-            no_token_id
+            no_token_id,
+            n_threads
         );
 
         Ok(Self {
             model,
             yes_token_id,
             no_token_id,
+            n_threads,
         })
     }
 }
@@ -1343,7 +1463,12 @@ impl RerankModel for LlamaRerank {
             .max()
             .expect("documents is non-empty");
         let n_ctx = (max_tokens + 16) as u32;
-        let ctx_params = LlamaContextParams::default().with_n_ctx(std::num::NonZeroU32::new(n_ctx));
+        // `n_threads_batch` is the one that matters here: each candidate is a
+        // single multi-token forward pass, with no generation at all (#20).
+        let ctx_params = LlamaContextParams::default()
+            .with_n_ctx(std::num::NonZeroU32::new(n_ctx))
+            .with_n_threads(self.n_threads)
+            .with_n_threads_batch(self.n_threads);
         let mut ctx = self
             .model
             .new_context(llama_backend()?, ctx_params)
@@ -1393,6 +1518,74 @@ impl RerankModel for LlamaRerank {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Unset means the machine, not llama.cpp's constant 4 (issue #20).
+    ///
+    /// The bug this guards is silent: inheriting `GGML_DEFAULT_N_THREADS` is not
+    /// an error, produces correct output, and simply runs the models on four
+    /// threads of whatever box they are on. The only visible symptom was a
+    /// user/wall ratio pinned just under 4.
+    #[test]
+    fn n_threads_defaults_to_the_machine() {
+        let config = crate::config::Config::default();
+        assert_eq!(config.models.n_threads, None, "unset by default");
+
+        let expected = physical_cores().unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(FALLBACK_N_THREADS as usize)
+        }) as i32;
+        assert_eq!(resolve_n_threads(&config), expected);
+        assert!(resolve_n_threads(&config) >= 1);
+    }
+
+    /// The default counts cores, not SMT siblings (issue #20).
+    ///
+    /// Logical count is the tempting default and it is the *worst* setting
+    /// measured on this box: 15 s a query against 12 s for the four threads it
+    /// was replacing, because both siblings of a core end up in the same ggml
+    /// barrier. Skipped where sysfs cannot answer.
+    #[test]
+    fn the_default_counts_cores_not_siblings() {
+        let Some(physical) = physical_cores() else {
+            return;
+        };
+        let logical = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(physical);
+        assert!(physical >= 1);
+        assert!(
+            physical <= logical,
+            "physical cores ({physical}) cannot exceed logical CPUs ({logical})"
+        );
+        assert_eq!(
+            resolve_n_threads(&crate::config::Config::default()),
+            physical as i32
+        );
+    }
+
+    /// An explicit setting wins, including one that asks for fewer threads than
+    /// the machine has — leaving headroom is a legitimate reason to set this.
+    #[test]
+    fn n_threads_honours_an_explicit_setting() {
+        let mut config = crate::config::Config::default();
+        for n in [1, 2, 4, 8, 64] {
+            config.models.n_threads = Some(n);
+            assert_eq!(resolve_n_threads(&config), n as i32);
+        }
+    }
+
+    /// Zero threads is not a request llama.cpp can serve; clamp rather than pass
+    /// it through and fail at context creation.
+    #[test]
+    fn n_threads_never_resolves_below_one() {
+        let mut config = crate::config::Config::default();
+        config.models.n_threads = Some(0);
+        assert_eq!(resolve_n_threads(&config), 1);
+
+        config.models.n_threads = Some(usize::MAX);
+        assert!(resolve_n_threads(&config) > 0, "must not overflow negative");
+    }
 
     #[test]
     fn test_mock_embed_deterministic() {

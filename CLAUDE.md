@@ -6,7 +6,7 @@ Local knowledge graph + intelligence layer for Obsidian vaults. Rust CLI + MCP s
 
 Single binary with 26 modules behind a lib crate:
 
-- `config.rs` — loads `~/.engraph/config.toml` and `vault.toml`, merges CLI args, provides `data_dir()`. Includes `intelligence: Option<bool>`, `max_chunks_per_file` + `group_by` (retrieval granularity), `[embedding_prefix]` (contextual prefix composition, off by default), `[rerank]` (`document_title`, prepends the file's title to a candidate before the cross-encoder scores it — off by default and unmeasured; distinct from `models.rerank`, which only names the model), `[models]` section for model overrides, `[obsidian]` section (CLI path, enabled flag), and `[agents]` section (registered AI agent names). `Config::save()` writes back to disk.
+- `config.rs` — loads `~/.engraph/config.toml` and `vault.toml`, merges CLI args, provides `data_dir()`. Includes `intelligence: Option<bool>`, `max_chunks_per_file` + `group_by` (retrieval granularity), `[embedding_prefix]` (contextual prefix composition, off by default), `[rerank]` (`document_title`, prepends the file's title to a candidate before the cross-encoder scores it — off by default and unmeasured; distinct from `models.rerank`, which only names the model), `[models]` section for model overrides plus `n_threads` (llama.cpp threads per forward pass; unset means physical cores — see `llm::resolve_n_threads`), `[obsidian]` section (CLI path, enabled flag), and `[agents]` section (registered AI agent names). `Config::save()` writes back to disk.
 - `chunker.rs` — smart chunking with break-point scoring algorithm. Finds optimal split points considering headings, code fences, blank lines, and thematic breaks. `split_oversized_chunks()` handles token-aware secondary splitting with overlap
 - `docid.rs` — deterministic 6-char hex IDs for files (SHA-256 of path, truncated). Shown in search results for quick reference
 - `llm.rs` — ML inference via llama.cpp (Rust bindings: `llama-cpp-2`). Three traits: `EmbedModel` (embeddings), `RerankModel` (cross-encoder scoring; `rerank_batch` takes the whole candidate set so an implementation can set up once), `OrchestratorModel` (query intent + expansion). Three llama.cpp implementations: `LlamaEmbed` (embeddinggemma-300M GGUF on Metal GPU), `LlamaOrchestrator` (Qwen3-0.6B for query analysis + expansion), `LlamaRerank` (Qwen3-Reranker-0.6B for relevance scoring). Global `LlamaBackend` via `OnceLock`. A `LlamaContext` cannot be a struct field (it borrows the model) but does span a whole batch: `LlamaEmbed::embed_formatted` and `LlamaRerank::rerank_batch` each build one and clear the KV cache between items. Also: `MockLlm` for testing, `HfModelUri` for model download, `FlexTokenizer` (HuggingFace tokenizers + shimmytok GGUF fallback), `PromptFormat` for model-family prompt templates, `heuristic_orchestrate()` fast path, `LaneWeights` per query intent
@@ -54,7 +54,7 @@ Single binary with 26 modules behind a lib crate:
 - **Vault profiles:** `engraph init` auto-detects vault structure and writes `vault.toml`
 - **LLM orchestrator:** Single Qwen3-0.6B call classifies query intent (exact/conceptual/relationship/exploratory), generates 2-4 query expansions, and sets adaptive lane weights. Results cached in `llm_cache` SQLite table (keyed by query SHA256). Falls back to heuristic pattern matching when intelligence is off
 - **Cross-encoder reranker:** Qwen3-Reranker-0.6B scores query-document relevance via Yes/No logit softmax. Runs as 4th RRF lane on top-30 candidates from pass 1. It reads each candidate's whole `chunks.text`, not the lane-dependent preview it used to get — which is why the lane is roughly half the cost of a reranked query (`eval/probes.md`, #14)
-- **llama.cpp backend:** Global `LlamaBackend` singleton via `OnceLock`. `LlamaModel` is `Send+Sync`, `LlamaContext` is `!Send` (created per-call). Metal GPU auto-detected on macOS. Models download from HuggingFace on first use with progress bar
+- **llama.cpp backend:** Global `LlamaBackend` singleton via `OnceLock`. `LlamaModel` is `Send+Sync`, `LlamaContext` is `!Send` (created per-call). Metal GPU auto-detected on macOS. Models download from HuggingFace on first use with progress bar. Every context sets `n_threads` + `n_threads_batch` from `resolve_n_threads`, which defaults to **physical cores** — llama.cpp's library default is a flat `GGML_DEFAULT_N_THREADS = 4` on any machine, and counting logical CPUs instead is measurably *worse* than that on an SMT box (issue #20)
 - **Prompt formatting:** `PromptFormat` auto-detects model family from GGUF filename and applies asymmetric prefixes in `embed_one` (queries) and `embed_batch` (documents). **The `EmbeddingGemma` variant emits nomic-embed-text's `search_query:` / `search_document:` convention, not EmbeddingGemma's documented `task: … | query:` / `title: … | text:` — see issue #10**
 
 ## Data directory
@@ -85,7 +85,7 @@ Single vault only. Re-indexing a different vault path triggers a confirmation pr
 
 ## Testing
 
-- Unit tests in each module (`cargo test --lib`) — 547 tests, no network required
+- Unit tests in each module (`cargo test --lib`) — 551 tests, no network required
 - Integration tests (`cargo test --test integration -- --ignored`) — require GGUF model download
 - Build requires CMake (for llama.cpp C++ compilation)
 

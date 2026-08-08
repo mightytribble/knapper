@@ -27,6 +27,7 @@ git fetch upstream && git diff --stat upstream/main main
 | `embed_formatted` / `rerank_batch` | one llama.cpp context per batch, not per call | this fork, issue #13 |
 | `chunks.text` | the reranker scores the whole chunk, not a preview | this fork, issue #14 |
 | `from_intent` `Relationship` | graph no longer outweighs the content lanes | this fork, issue #9 |
+| `resolve_n_threads` | llama.cpp runs on the machine's cores, not a constant 4 | this fork, issue #20 |
 
 Cherry-picked rather than merged: PR #41 branched before upstream's #40 graph fix, so merging the
 branch wholesale would have silently reverted `src/graph.rs`.
@@ -60,7 +61,7 @@ export LIBCLANG_PATH="$HOME/.engraph-buildenv/lib/python3.12/site-packages/clang
 export BINDGEN_EXTRA_CLANG_ARGS="-I/usr/lib/gcc/x86_64-linux-gnu/13/include -I/usr/include -I/usr/include/x86_64-linux-gnu"
 
 cargo build --release        # ~10 min cold, ~20s incremental
-cargo test --lib             # 547 pass
+cargo test --lib             # 551 pass
 ```
 
 Each env var exists for a specific failure. Omit one and you get:
@@ -78,7 +79,7 @@ Adjust the gcc version in the include path (`13`) and the python version (`pytho
 `cargo test` (full) fails to compile `tests/integration.rs` and `tests/write_pipeline.rs`:
 `unresolved import engraph::embedder`, `engraph::hnsw`, and a `walk_vault` arity mismatch.
 **These are broken on pristine upstream** — verify with `git stash && cargo clippy --all-targets`.
-Upstream PR #47 addresses them. Use `cargo test --lib` (547 tests) as the working suite.
+Upstream PR #47 addresses them. Use `cargo test --lib` (551 tests) as the working suite.
 `cargo clippy -- -D warnings`, which is what CI runs, is clean.
 
 ## Runtime gotchas
@@ -262,6 +263,27 @@ See issues on this repo:
   five probes are two tail slots on probe 1 and two on probe 5, *the nonsense control*. A disjoint
   set contributes most where the content lanes have least to say. The category error itself is
   untouched and belongs to #15
+- ~~**#20** llama.cpp runs on 4 threads regardless of the machine~~ — **done, and the first latency
+  ticket that actually pays.** All three wrappers inherited `GGML_DEFAULT_N_THREADS = 4` — a
+  constant, on every machine, carrying llama.cpp's own `// TODO: better default`. `models.n_threads`
+  now defaults to **physical cores**: query 12.32 s → 8.46 s (1.46×), reindex 213 s → 171 s (1.26×),
+  with the probes byte-identical and every rebuilt embedding bit-identical.
+  **The obvious default would have shipped a regression.** `available_parallelism()` reports 16 on
+  this 8-core/16-thread box, and 16 threads measures **15 s a query — slower than the 4 it
+  replaces**, with the spread widening from ±0.4 s to ±3 s. The curve peaks at 12 (7.35 s) and falls
+  off a cliff by 14. The tempting explanation, "leave the OS headroom", is wrong and was tested:
+  pinned to eight *distinct* cores so the box looks non-SMT, 8 threads on 8 visible CPUs is the
+  fastest setting and degrades not at all. Threads equal to cores is fine; threads equal to siblings
+  is not. So the default counts cores, the way llama.cpp's own CLI does
+  (`cpu_get_num_physical_cores`) — only its *library* default is the flat 4. 12 is faster still here
+  and the default does not take it: 1.5× physical is a number this box likes, not a rule, which is
+  what the config key is for.
+  Two things fell out. Every latency number recorded before this was taken at 4 threads — #13's
+  210 s reindex and the ~11.9 s query both reproduced exactly at 4, which is independent confirmation
+  of the diagnosis. And **`--rebuild` does not produce a reproducible database**: `file_id` is a rowid
+  handed out in vault-walk order, so two rebuilds at the *same* thread count disagree on any digest
+  keyed by it. Pre-existing and unrelated, but it briefly looked like corruption — index comparisons
+  must key on `path`
 - **#19** intent classification looks inverted on two probes — with the orchestrator running,
   `dragon that can take human form` classifies `Exact` and the bare noun `Archdragon` classifies
   `Conceptual`. Both then show zero FTS contributions in their top 20 regardless. Picked up from
@@ -279,21 +301,14 @@ See issues on this repo:
   lane's vote outweighs any position within one. Tags resolve semantically (a `tag_centroids` table,
   the same machinery as `folder_centroids`), aliases lexically (`links.rs`'s fuzzy name matching).
   Replaces the withdrawn FTS-injection experiment. Probe 4 is the guard, probe 5 the control
-- **#20** llama.cpp runs on **4 threads regardless of the machine**. All three wrappers build from
-  `LlamaContextParams::default()` and never set `n_threads` / `n_threads_batch`; the ggml default is
-  `GGML_DEFAULT_N_THREADS = 4` with llama.cpp's own `// TODO: better default` beside it. This box has
-  16 cores, and the #9 probe runs measured 3.42× and 3.34× user/wall — just under 4. `n_threads_batch`
-  is the lever that matters, since the reranker and embedder are single forward passes rather than
-  generation. **Every latency number in `eval/` was taken on a quarter of the box.** Expect 1.5–2.5×
-  on the model-bound part, not 4× — these are bandwidth-bound 0.6B Q8 models. `rayon` is declared in
-  `Cargo.toml` with zero call sites
 - **#21** multi-sequence decode — phase 2 of #13, which built the batch *API* and then looped inside
   it. `LlamaBatch::new(max_tokens + 16, 1)` sets `n_seq_max = 1` and `n_ctx` is sized for one
   document, so all 30 candidates get their own forward pass. Packing them under distinct `seq_id`s
   and decoding once is where quantized CPU inference gets its throughput. **Acceptance is bit-identical
   scores** — sequence isolation stops being enforced by `clear_kv_cache()` and starts being enforced
-  by getting batch construction right, and a silent failure would corrupt every ranking. Measure after
-  #20 so it is not credited with headroom that was always there
+  by getting batch construction right, and a silent failure would corrupt every ranking. **Baseline is
+  now #20's**: a query is 8.46 s, not 12.3 s, and the reranker's share of it shrank with everything
+  else
 - **#16** `rerank_candidates` is hardcoded at 30 in four places and unreachable from `config.toml`. It
   was academic while the reranker read previews; after #14 it is the one free term in a lane that
   costs half the query. Wanted as a knob to sweep, not as a new default — cutting it also
