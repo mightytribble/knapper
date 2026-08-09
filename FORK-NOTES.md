@@ -619,14 +619,22 @@ See issues on this repo:
   merges before any code. Blocks #44
 - **#44** a bold-only line is a heading the chunker cannot see — `**Skills**` is structure to a reader
   and a paragraph to `emit_section`, so **33% of the bestiary's structure markers never reach a
-  breadcrumb**. Splitting cannot fix it: `Chunk::from_section` gives later pieces the parent's
+  breadcrumb**. The vault cannot separate two candidate guards: all 219 bold-only lines are inside a
+  section and all 73 that are not are preamble stat lines, so the content test and a
+  "not before the first heading" test agree on every instance. Splitting cannot fix it: `Chunk::from_section` gives later pieces the parent's
   `heading_path` unchanged, and 112 of 1598 continuation chunks carry no breadcrumb their parent did
   not. Probed as a vault edit on a scratch copy: **P7's answer becomes a 363-char `### Spells` chunk
   at rank 1** where it was buried at character 1038 of a 1061-char `## Stat Block`, and **P2's becomes
   `### Notes` at 99.73%** against 98.02%. The choice is vault-authoring against a chunker rule; the
   chunker version generalises to any Obsidian vault in this house style. Blocked by #43 — the first
   probe pass destroyed N10's abstention, and that was #43's bug
-- **#41** does the keyword lane's breadcrumb column still earn its default? — #37 shipped
+- **#41** does the keyword lane's breadcrumb column still earn its default? — a third arm is worth
+  having beside on/off: **drop the note title from the heading path when it equals the leading
+  heading.** `prefix::breadcrumb` does not dedupe, and 64 of 1598 breadcrumbs (4%) read `X > X` —
+  memory files opening with a `##` that restates the note name. §5.4 writes the rule
+  `Note Title > H1 > H2 > H3`, but the corpus has **1303 `##`, 79 `###` and no H1 at all**: Obsidian
+  identifies a note by filename, so the H1 slot is unfilled by convention and the rule has only ever
+  run degenerate. A vault written H1-as-title would duplicate on every chunk. #37 shipped
   `[fts] heading_path = true` on one reading: it returns `## Level 4 Silence` to probe 3, an answer
   the embedding limb of the same rule dropped. #38 removed that embedding limb, and the answer is now
   present without the column. Measured against the new default the column moves 80 of 360 slots and
