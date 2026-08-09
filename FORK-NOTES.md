@@ -45,6 +45,7 @@ git fetch upstream && git diff --stat upstream/main main
 | `ranking::apply_answer_floor` | a query with no candidate above the floor returns no results | this fork, issue #34 |
 | `[embedding_prompt]` | EmbeddingGemma is fed the prompt format its model card documents | this fork, issue #10 |
 | `DocumentTitle` | the document template's `title:` field is selectable; the vault's breadcrumb is one of its values | this fork, issues #36, #38 |
+| `BreadcrumbRoot` | a breadcrumb leads with the file path, so its first segment resolves to a file on disk | this fork, issue #46 |
 | `chunks_fts` external content | the keyword index is derived from the chunk table, and indexes the breadcrumb beside the body | this fork, issue #37 |
 | `.github/workflows/ci.yml` | manual dispatch only — upstream runs it on push and PR | this fork, Actions minutes |
 
@@ -599,6 +600,27 @@ See issues on this repo:
   limb is what pays that off. With the embedding limb off, the pair is there without it.
   **The defaults are verified end to end.** A home with no `[embedding_prompt]` block and no `[fts]`
   block, indexed from empty, reproduces the explicit arm on 360 of 360 result slots
+- ~~**#46** the breadcrumb root should be the file path, not a frontmatter key engraph does not own~~
+  — **DONE.** `breadcrumb_root = "path"` ships: `lore/bestiary/lesser-dragon.md > Stat Block`.
+  **`name:` was never engraph's key.** The engine read it and never wrote it, it is a cc-isekai
+  convention, and Obsidian gives meaning to `aliases` / `tags` / `cssclasses` alone — a note's title
+  is its filename. Another vault's `name: Aragorn` on a character sheet would have become that note's
+  breadcrumb whatever the file was called.
+  **The control is exact**: `name` on the new binary, after a full re-index, reproduces the pre-#46
+  binary on 360 of 360 result slots.
+  **The arm costs nothing measurable.** Every tracked target holds rank and score, the above-floor
+  count is identical on all eighteen queries, and 18 of 360 slots move — on two negatives, everything
+  below 0.35%. No positive query changes in any slot. It survives losing `name` because the path
+  carries the same terms: of 252 files with `name:`, the path recovers 189 fully, 61 partly and loses
+  2, one of which #7 excludes.
+  **It cannot show a benefit, and did not test the risk.** The gain is that a breadcrumb quoted away
+  from its result object still names a file — a property of the string, not the ranking. And folder
+  names now enter the keyword index on every chunk beneath them, but **0 of the 18 pool queries
+  contain a folder term**, so that dilution is untested rather than absent.
+  Two knots come undone: the 64 `X > X` breadcrumbs are gone, which **closes #41's third arm**, and an
+  H1 becomes an ordinary heading level with no consumption rule. `stem` is recorded as unusable — 14
+  stems name more than one file. `writer::extract_title` is untouched; naming a file being created is
+  a different job
 - **#45** score the positive queries against a ground-truth responsive set, not against churn — the
   two metrics this file has used are both broken. *"Result slots that moved"* counts change and calls
   it quality; *"read the swaps against the vault"* inspects only what differs between arms, so it

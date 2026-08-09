@@ -36,6 +36,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::chunker::Chunk;
+use crate::config::BreadcrumbRoot;
 use crate::llm::{DocumentTitle, EmbedDoc};
 
 /// Which components the contextual prefix carries.
@@ -91,8 +92,14 @@ impl PrefixConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DocContext {
     /// Frontmatter `name` if present, else the filename stem.
+    ///
+    /// Not the breadcrumb root since #46 — `name` is a convention engraph reads
+    /// and never writes, and it is not Obsidian's. See [`BreadcrumbRoot`].
     pub name: String,
-    /// Vault-relative path, as stored in `files.path`.
+    /// The filename without its extension or folders. Not identifying: 14 stems
+    /// in the calibration vault name more than one file.
+    pub stem: String,
+    /// Vault-relative path, as stored in `files.path`. The breadcrumb root.
     pub rel_path: String,
     pub aliases: Vec<String>,
     pub tags: Vec<String>,
@@ -113,6 +120,7 @@ impl DocContext {
 
         Self {
             name,
+            stem: filename_stem(rel_path),
             rel_path: rel_path.to_string(),
             aliases,
             tags,
@@ -177,6 +185,11 @@ fn embed_text(doc: &DocContext, chunk: &Chunk, cfg: PrefixConfig) -> String {
 pub struct EmbedComposition {
     pub prefix: PrefixConfig,
     pub title: DocumentTitle,
+    /// What leads the breadcrumb (issue #46). Travels with the other two for
+    /// the same reason they travel together: it changes what a stored vector
+    /// means, and a caller that threads one and forgets it writes into a space
+    /// it does not share.
+    pub root: BreadcrumbRoot,
 }
 
 impl EmbedComposition {
@@ -184,6 +197,7 @@ impl EmbedComposition {
         Self {
             prefix: config.embedding_prefix,
             title: config.embedding_prompt.document_title,
+            root: config.breadcrumb_root,
         }
     }
 }
@@ -217,7 +231,7 @@ pub fn embed_inputs(doc: &DocContext, chunks: &[Chunk], cfg: EmbedComposition) -
     chunks
         .iter()
         .map(|chunk| EmbedInput {
-            title: title_for(doc, chunk, cfg.title),
+            title: title_for(doc, chunk, cfg.title, cfg.root),
             text: embed_text(doc, chunk, cfg.prefix),
         })
         .collect()
@@ -227,11 +241,11 @@ pub fn embed_inputs(doc: &DocContext, chunks: &[Chunk], cfg: EmbedComposition) -
 ///
 /// An empty result is the documented literal `none` — see
 /// [`crate::llm::PromptFormat::format_document`].
-fn title_for(doc: &DocContext, chunk: &Chunk, cfg: DocumentTitle) -> String {
+fn title_for(doc: &DocContext, chunk: &Chunk, cfg: DocumentTitle, root: BreadcrumbRoot) -> String {
     match cfg {
         DocumentTitle::None => String::new(),
         DocumentTitle::Note => doc.name.clone(),
-        DocumentTitle::Breadcrumb => breadcrumb(doc, chunk),
+        DocumentTitle::Breadcrumb => breadcrumb(doc, chunk, root),
     }
 }
 
@@ -244,10 +258,15 @@ fn title_for(doc: &DocContext, chunk: &Chunk, cfg: DocumentTitle) -> String {
 /// over (issue #37). One function, because two compositions of the same rule
 /// eventually disagree, and the disagreement would be invisible: each limb
 /// looks correct on its own.
-pub fn breadcrumb(doc: &DocContext, chunk: &Chunk) -> String {
+pub fn breadcrumb(doc: &DocContext, chunk: &Chunk, root: BreadcrumbRoot) -> String {
+    let head = match root {
+        BreadcrumbRoot::Path => doc.rel_path.as_str(),
+        BreadcrumbRoot::Name => doc.name.as_str(),
+        BreadcrumbRoot::Stem => doc.stem.as_str(),
+    };
     let mut parts: Vec<&str> = Vec::with_capacity(1 + chunk.heading_path.len());
-    if !doc.name.is_empty() {
-        parts.push(&doc.name);
+    if !head.is_empty() {
+        parts.push(head);
     }
     parts.extend(chunk.heading_path.iter().map(String::as_str));
     parts.join(" > ")
@@ -279,7 +298,11 @@ pub struct LexicalFields {
 /// The counterpart of [`embed_inputs`], and shared by the same two callers for
 /// the same reason: `indexer::index_file` and `writer::precompute_chunks` write
 /// rows into one table.
-pub fn lexical_fields(doc: &DocContext, chunks: &[Chunk]) -> Vec<LexicalFields> {
+pub fn lexical_fields(
+    doc: &DocContext,
+    chunks: &[Chunk],
+    root: BreadcrumbRoot,
+) -> Vec<LexicalFields> {
     let mut tags: Vec<&str> = doc.tags.iter().map(String::as_str).collect();
     tags.sort_unstable();
     tags.dedup();
@@ -288,7 +311,7 @@ pub fn lexical_fields(doc: &DocContext, chunks: &[Chunk]) -> Vec<LexicalFields> 
     chunks
         .iter()
         .map(|chunk| LexicalFields {
-            heading_path: breadcrumb(doc, chunk),
+            heading_path: breadcrumb(doc, chunk, root),
             tags_text: tags_text.clone(),
         })
         .collect()
@@ -312,6 +335,7 @@ mod tests {
     fn the_lexical_fields_are_a_breadcrumb_and_the_sorted_tags() {
         let doc = DocContext {
             name: "Archdragon".into(),
+            stem: "archdragon".into(),
             rel_path: "lore/archdragon.md".into(),
             aliases: vec![],
             tags: vec!["zebra".into(), "apex".into(), "apex".into()],
@@ -321,10 +345,21 @@ mod tests {
             chunk(&[], "No heading here."),
         ];
 
-        let fields = lexical_fields(&doc, &chunks);
-        assert_eq!(fields[0].heading_path, "Archdragon > Abilities > Combat");
-        assert_eq!(fields[1].heading_path, "Archdragon");
+        // The path leads, extension included: a breadcrumb whose first segment
+        // names a file on disk (issue #46).
+        let fields = lexical_fields(&doc, &chunks, BreadcrumbRoot::Path);
+        assert_eq!(
+            fields[0].heading_path,
+            "lore/archdragon.md > Abilities > Combat"
+        );
+        assert_eq!(fields[1].heading_path, "lore/archdragon.md");
         assert!(fields.iter().all(|f| f.tags_text == "apex zebra"));
+
+        // The control #46 was measured against, and the two rejected roots.
+        let named = lexical_fields(&doc, &chunks, BreadcrumbRoot::Name);
+        assert_eq!(named[0].heading_path, "Archdragon > Abilities > Combat");
+        let stem = lexical_fields(&doc, &chunks, BreadcrumbRoot::Stem);
+        assert_eq!(stem[0].heading_path, "archdragon > Abilities > Combat");
     }
 
     /// One rule, one composition: the string the keyword index stores is the
@@ -333,20 +368,31 @@ mod tests {
     fn both_limbs_of_the_rule_carry_one_string() {
         let doc = DocContext {
             name: "Archdragon".into(),
+            stem: "archdragon".into(),
             rel_path: "lore/archdragon.md".into(),
             aliases: vec![],
             tags: vec![],
         };
         let chunks = [chunk(&["Abilities"], "Flight.")];
-        let composition = EmbedComposition {
-            prefix: PrefixConfig::default(),
-            title: DocumentTitle::Breadcrumb,
-        };
 
-        assert_eq!(
-            embed_inputs(&doc, &chunks, composition)[0].title,
-            lexical_fields(&doc, &chunks)[0].heading_path
-        );
+        // Every root, because the invariant is that the two limbs agree — not
+        // that either of them says any particular thing.
+        for root in [
+            BreadcrumbRoot::Path,
+            BreadcrumbRoot::Name,
+            BreadcrumbRoot::Stem,
+        ] {
+            let composition = EmbedComposition {
+                prefix: PrefixConfig::default(),
+                title: DocumentTitle::Breadcrumb,
+                root,
+            };
+            assert_eq!(
+                embed_inputs(&doc, &chunks, composition)[0].title,
+                lexical_fields(&doc, &chunks, root)[0].heading_path,
+                "{root:?}"
+            );
+        }
     }
 
     fn chunk(heading_path: &[&str], text: &str) -> Chunk {
@@ -489,6 +535,7 @@ mod tests {
             EmbedComposition {
                 prefix: PrefixConfig::full(),
                 title: DocumentTitle::None,
+                root: BreadcrumbRoot::default(),
             },
         );
         assert_eq!(inputs.len(), 2);
@@ -556,7 +603,7 @@ mod tests {
     }
 
     #[test]
-    fn the_breadcrumb_is_the_note_title_then_every_ancestor_heading() {
+    fn the_breadcrumb_is_the_file_path_then_every_ancestor_heading() {
         let doc = DocContext::from_file("lore/bestiary/archdragon.md", ARCHDRAGON);
         let chunks = [chunk(
             &["Abilities", "Combat"],
@@ -564,7 +611,7 @@ mod tests {
         )];
         assert_eq!(
             titles(&doc, &chunks, DocumentTitle::Breadcrumb),
-            vec!["Archdragon > Abilities > Combat".to_string()]
+            vec!["lore/bestiary/archdragon.md > Abilities > Combat".to_string()]
         );
     }
 
@@ -572,7 +619,7 @@ mod tests {
     /// the sections of one document, so it cannot move all of a file's vectors
     /// the same way. The note title alone can, and does.
     #[test]
-    fn the_breadcrumb_varies_between_sections_of_one_document_and_the_note_title_does_not() {
+    fn the_breadcrumb_varies_between_sections_of_one_document_and_the_file_path_does_not() {
         let doc = DocContext::from_file("lore/bestiary/archdragon.md", ARCHDRAGON);
         let chunks = [
             chunk(&["Definition"], "first"),
@@ -583,17 +630,17 @@ mod tests {
         assert_eq!(note[0], note[1]);
 
         let breadcrumb = titles(&doc, &chunks, DocumentTitle::Breadcrumb);
-        assert_eq!(breadcrumb[0], "Archdragon > Definition");
-        assert_eq!(breadcrumb[1], "Archdragon > Human Forms");
+        assert_eq!(breadcrumb[0], "lore/bestiary/archdragon.md > Definition");
+        assert_eq!(breadcrumb[1], "lore/bestiary/archdragon.md > Human Forms");
     }
 
     #[test]
-    fn a_chunk_before_the_first_heading_has_the_note_title_as_its_whole_breadcrumb() {
+    fn a_chunk_before_the_first_heading_has_the_file_path_as_its_whole_breadcrumb() {
         let doc = DocContext::from_file("lore/bestiary/archdragon.md", ARCHDRAGON);
         let chunks = [chunk(&[], "Opening paragraph.")];
         assert_eq!(
             titles(&doc, &chunks, DocumentTitle::Breadcrumb),
-            vec!["Archdragon".to_string()]
+            vec!["lore/bestiary/archdragon.md".to_string()]
         );
     }
 
@@ -637,7 +684,7 @@ mod tests {
         );
 
         let as_doc = inputs[0].as_doc();
-        assert_eq!(as_doc.title, "Archdragon > Definition");
+        assert_eq!(as_doc.title, "lore/bestiary/archdragon.md > Definition");
         assert_eq!(as_doc.text, "body");
     }
 }

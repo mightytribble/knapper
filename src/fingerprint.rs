@@ -189,6 +189,9 @@ impl Fingerprints {
             chunker: digest(&[
                 &CHUNKER_VERSION.to_string(),
                 &CHUNK_RECORD_VERSION.to_string(),
+                // #46: the breadcrumb root is written into `chunks.heading_path`,
+                // a stored column, so changing it rewrites every chunk row.
+                &format!("{:?}", config.breadcrumb_root),
                 &limits::TARGET_TOKENS.to_string(),
                 &limits::OVERLAP_PCT.to_string(),
                 &limits::MAX_TOKENS.to_string(),
@@ -569,6 +572,47 @@ mod tests {
         let comparison = compare(&store, &changed).unwrap();
         assert_eq!(comparison.mismatches.len(), 1);
         assert_eq!(comparison.mismatches[0].key, EMBEDDING.name);
+    }
+
+    /// The breadcrumb root is written into `chunks.heading_path`, a stored
+    /// column, so it has to reach the chunker's key and not only the embedding
+    /// one — the keyword index is declared over that column and would otherwise
+    /// look healthy while holding the other root's strings (issue #46).
+    #[test]
+    fn a_changed_breadcrumb_root_demands_a_reindex() {
+        let store = Store::open_memory().unwrap();
+        record(&store, &fps()).unwrap();
+
+        let mut config = Config::default();
+        config.breadcrumb_root = crate::config::BreadcrumbRoot::Name;
+        let changed = Fingerprints::compute(&config, "embed-model-abc", Some("rerank-model-xyz"));
+
+        let comparison = compare(&store, &changed).unwrap();
+        assert_eq!(comparison.mismatches[0].key, CHUNKER.name);
+        assert_eq!(comparison.actions(), BTreeSet::from([Action::Reindex]));
+    }
+
+    /// Each root is a distinct fingerprint, not merely distinct from the
+    /// default, so a switch between two non-default arms re-indexes too.
+    #[test]
+    fn every_breadcrumb_root_fingerprints_differently() {
+        use crate::config::BreadcrumbRoot;
+
+        let digests: Vec<String> = [
+            BreadcrumbRoot::Path,
+            BreadcrumbRoot::Name,
+            BreadcrumbRoot::Stem,
+        ]
+        .into_iter()
+        .map(|root| {
+            let mut config = Config::default();
+            config.breadcrumb_root = root;
+            Fingerprints::compute(&config, "embed-model-abc", None).chunker
+        })
+        .collect();
+
+        let unique: BTreeSet<&String> = digests.iter().collect();
+        assert_eq!(unique.len(), 3, "{digests:?}");
     }
 
     #[test]

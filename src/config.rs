@@ -231,6 +231,48 @@ impl Default for RerankConfig {
     }
 }
 
+/// What leads a chunk's breadcrumb — the segment before the heading stack
+/// (issue #46).
+///
+/// The breadcrumb is one string with two readers: the embedding limb puts it in
+/// the document template's `title:` field, and the lexical limb stores it in
+/// `chunks.heading_path`, which is a column the keyword index is declared over.
+/// So this key decides what both of them see.
+///
+/// It is a component of the **chunker** digest, because `heading_path` is a
+/// stored column: changing it rewrites every chunk row, which is
+/// `Action::Reindex`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BreadcrumbRoot {
+    /// The vault-relative path, extension included —
+    /// `lore/bestiary/lesser-dragon.md > Stat Block`. The default.
+    ///
+    /// A breadcrumb trail that resolves: the first segment names a file on
+    /// disk, so a breadcrumb quoted away from its result object is still
+    /// actionable. FTS5's unicode61 tokeniser dissolves the separators, so the
+    /// folders are matchable terms — which is how `memories/tandi/session-009.md`
+    /// yields `tandi` with no frontmatter at all.
+    #[default]
+    Path,
+    /// Frontmatter `name`, else the filename stem. What shipped before #46.
+    ///
+    /// **`name` is not engraph's key and not Obsidian's.** Obsidian gives
+    /// meaning to `aliases`, `tags` and `cssclasses`; a note's title is its
+    /// filename. `name:` is a cc-isekai convention that this engine reads and
+    /// never writes, and it is a natural property key for a note *about* a
+    /// person, so another vault's `name: Aragorn` would become that note's
+    /// breadcrumb whatever the file is called. Kept as the control #46 was
+    /// measured against, and for a vault that wants it.
+    Name,
+    /// The filename stem alone, no extension and no folders.
+    ///
+    /// **Not identifying.** 14 stems in the calibration vault are shared by more
+    /// than one file, covering 36 of 259 — `session-002` names five different
+    /// notes. Here for completeness, not for use.
+    Stem,
+}
+
 /// What the keyword lane indexes beside a chunk's body, and how each part is
 /// weighted (issue #37).
 ///
@@ -548,6 +590,10 @@ pub struct Config {
     /// What the keyword lane indexes beside the chunk body (issue #37).
     #[serde(default)]
     pub fts: FtsConfig,
+    /// What leads a chunk's breadcrumb, before the heading stack (issue #46).
+    /// A chunker-digest component, so changing it re-indexes the vault.
+    #[serde(default)]
+    pub breadcrumb_root: BreadcrumbRoot,
     #[serde(default)]
     pub identity: IdentityConfig,
     #[serde(default)]
@@ -561,6 +607,7 @@ impl Default for Config {
             top_n: 5,
             max_chunks_per_file: default_max_chunks_per_file(),
             group_by: GroupBy::default(),
+            breadcrumb_root: BreadcrumbRoot::default(),
             embedding_prefix: PrefixConfig::default(),
             embedding_prompt: EmbeddingPromptConfig::default(),
             exclude: vec![".obsidian/".to_string()],

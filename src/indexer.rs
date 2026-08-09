@@ -476,7 +476,7 @@ pub fn index_file(
     // What the keyword lane is shown, stored on the chunk row itself (issue
     // #37). The same `doc`, so the breadcrumb here and the breadcrumb in the
     // title field above are one string.
-    let lexical = crate::prefix::lexical_fields(&doc, &chunks);
+    let lexical = crate::prefix::lexical_fields(&doc, &chunks, config.breadcrumb_root);
     let docs: Vec<crate::llm::EmbedDoc<'_>> = inputs
         .iter()
         .map(crate::prefix::EmbedInput::as_doc)
@@ -2139,7 +2139,7 @@ mod tests {
             .find(|(_, body)| body.contains("Opens at range"))
             .map(|(title, _)| title)
             .unwrap();
-        assert_eq!(combat, "Archdragon > Abilities > Combat");
+        assert_eq!(combat, "lore/bestiary/archdragon.md > Abilities > Combat");
 
         // Distinct per section, which is the property #2's per-file prefix
         // lacked.
@@ -2264,9 +2264,9 @@ mod tests {
         assert_eq!(
             stored,
             vec![
-                "Archdragon > Definition",
-                "Archdragon > Abilities",
-                "Archdragon > Abilities > Combat",
+                "lore/bestiary/archdragon.md > Definition",
+                "lore/bestiary/archdragon.md > Abilities",
+                "lore/bestiary/archdragon.md > Abilities > Combat",
             ]
         );
 

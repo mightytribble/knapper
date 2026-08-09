@@ -489,7 +489,7 @@ fn precompute_chunks(
     let embeddings = embedder.embed_batch(&docs)?;
     // Composed from the same `doc` as the embed inputs, so a note written here
     // and the same note indexed by `index_file` carry one breadcrumb (issue #37).
-    let lexical = crate::prefix::lexical_fields(&doc, &chunks);
+    let lexical = crate::prefix::lexical_fields(&doc, &chunks, embed.root);
 
     let mut results = Vec::with_capacity(chunks.len());
     for ((chunk, embedding), lexical) in chunks.into_iter().zip(embeddings).zip(lexical) {
