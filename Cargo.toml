@@ -51,6 +51,11 @@ tokio-util = "0.7"
 
 [features]
 default = []
+# Compiles llama.cpp's CUDA backend. Deliberately out of `default`: it needs a
+# CUDA toolkit on the box, and CI's macOS and Ubuntu legs have none. All three
+# model loads already pass `LlamaModelParams::default()`, whose `n_gpu_layers`
+# is -1 — every layer — so the offload happens with no source change here.
+cuda = ["llama-cpp-2/cuda"]
 
 [dev-dependencies]
 tempfile = "3"

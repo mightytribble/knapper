@@ -40,6 +40,8 @@ git fetch upstream && git diff --stat upstream/main main
 | `src/fingerprint.rs` | the store knows what built it, and rebuilds only what changed | this fork, issue #31 |
 | `src/ranking.rs` | the cross-encoder sorts the shortlist; the graph reaches it by reserved quota | this fork, issue #30 |
 | `format_reranker_input` | the cross-encoder is asked the question its model card documents | this fork, issue #32 |
+| `cuda` cargo feature | llama.cpp compiles its CUDA backend; off by default | this fork, issue #33 |
+| `llm::device_identity` | the compute device is read at load and fingerprinted | this fork, issue #33 |
 | `.github/workflows/ci.yml` | manual dispatch only — upstream runs it on push and PR | this fork, Actions minutes |
 
 Cherry-picked rather than merged: PR #41 branched before upstream's #40 graph fix, so merging the
@@ -74,7 +76,7 @@ export LIBCLANG_PATH="$HOME/.engraph-buildenv/lib/python3.12/site-packages/clang
 export BINDGEN_EXTRA_CLANG_ARGS="-I/usr/lib/gcc/x86_64-linux-gnu/13/include -I/usr/include -I/usr/include/x86_64-linux-gnu"
 
 cargo build --release        # ~10 min cold, ~20s incremental
-cargo test --lib             # 597 pass
+cargo test --lib             # 642 pass
 ```
 
 Each env var exists for a specific failure. Omit one and you get:
@@ -87,12 +89,56 @@ Each env var exists for a specific failure. Omit one and you get:
 
 Adjust the gcc version in the include path (`13`) and the python version (`python3.12`) to match the box.
 
+### The CUDA build (issue #33)
+
+**Also no sudo.** The `cuda` feature is out of `default`, so the build above is unchanged and CI's
+macOS and Ubuntu legs — which have no toolkit — are unaffected. `cargo clippy -- -D warnings` passes
+with and without it.
+
+The toolkit goes in `$HOME` because the runfile installer takes a `--toolkitpath`. **Install the
+toolkit only**: the `--driver` component is a Linux display driver and installing it breaks the WSL
+GPU passthrough that makes any of this work.
+
+```bash
+# 1. Toolkit, user-local (~4.4 GB download, ~7 GB installed)
+curl -fLO https://developer.download.nvidia.com/compute/cuda/12.6.3/local_installers/cuda_12.6.3_560.35.05_linux.run
+env -u DISPLAY bash cuda_12.6.3_560.35.05_linux.run --nox11 --silent --toolkit \
+    --toolkitpath="$HOME/.engraph-cuda" --no-man-page --override --tmpdir=/some/large/tmp
+
+# 2. Build (the four vars above still apply)
+export PATH="$HOME/.engraph-cuda/bin:$PATH"
+export CUDAToolkit_ROOT="$HOME/.engraph-cuda"   # find_package(CUDAToolkit)
+export CUDA_LIBRARY_PATH="$HOME/.engraph-cuda"  # the linker search path — see below
+export CUDAARCHS=89                             # Ada; ggml's default is `native`, same answer here
+
+cargo build --release --features cuda
+```
+
+Two of these are not guessable from the ticket, and each is a silent build failure:
+
+| trap | what happens |
+|---|---|
+| `CUDA_LIBRARY_PATH` vs `CUDA_PATH` | `find_cuda_helper::find_cuda_lib_dirs` reads **only** `CUDA_LIBRARY_PATH` on Linux (`CUDA_PATH` is the Windows path), then joins `lib64` onto each entry — so it wants the toolkit **root**, not `lib64`. Set `CUDA_PATH` instead and the link fails on `cudart_static` |
+| `--nox11` | the makeself wrapper sees `$DISPLAY` (WSLg sets it) with no tty and tries to `exec xterm`, failing with `exec: -title: not found` before the installer runs at all |
+| `--log-file`, `--defaultroot` | not options in the 12.6 installer. It exits `Unknown option:` and installs nothing |
+| `sh` instead of `bash` | the runfile is a bash script; dash dies at line 461 |
+
+`llama-cpp-sys-2` links CUDA **statically** on Linux (`cudart_static`, `cublas_static`,
+`cublasLt_static`, `culibos`), which is why the PyPI `nvidia-*-cu12` wheels are not a shortcut — they
+ship the shared libraries. The runfile toolkit has all four. `-lcuda` resolves against
+`lib64/stubs/libcuda.so` at link time and the real driver at run time, from
+`/usr/lib/wsl/lib/libcuda.so.1`, which WSL already puts on the loader path.
+
+The CUDA binary is **701 MB** against 25 MB for the CPU one — statically linked kernels. Keep the
+two in separate target directories (`CARGO_TARGET_DIR`) if you want both, because a feature change
+relinks the same path and a rebuild each way costs the llama.cpp compile.
+
 ### Known pre-existing test failures
 
 `cargo test` (full) fails to compile `tests/integration.rs` and `tests/write_pipeline.rs`:
 `unresolved import engraph::embedder`, `engraph::hnsw`, and a `walk_vault` arity mismatch.
 **These are broken on pristine upstream** — verify with `git stash && cargo clippy --all-targets`.
-Upstream PR #47 addresses them. Use `cargo test --lib` (597 tests) as the working suite.
+Upstream PR #47 addresses them. Use `cargo test --lib` (642 tests) as the working suite.
 `cargo clippy -- -D warnings`, which is what CI runs, is clean.
 
 ### CI is manual-only in this fork
@@ -302,6 +348,28 @@ has never executed on this box.
   Sorting them without a tiebreak means `HashMap` order decides the ranking, and results vary
   run-to-run — they did, from about rank 7 down, until #6 added tiebreaks in `fusion.rs` and
   `graph.rs`. Worth remembering before trusting any A/B measurement taken before that.
+- **The GPU is a build-time choice and a runtime reading** (this fork, issue #33). `--features cuda`
+  compiles the backend; nothing in `llm.rs` asks for offload, because all three model loads already
+  pass `LlamaModelParams::default()` and its `n_gpu_layers` is -1. What device the process actually
+  got is read at load by `llm::device_identity` and folded into both model fingerprints, so
+  **swapping between a CPU and a CUDA binary forces a re-embed each way.** On a derived store that
+  is a wait, not a loss.
+- **A hidden or unavailable GPU falls back to CPU silently, and the fingerprint is what catches it.**
+  `CUDA_VISIBLE_DEVICES=""` against a GPU-built store loads `device=cpu` with no error and then the
+  read path refuses on `embedding_fingerprint`. One binary can therefore produce either device's
+  vectors in one session, which is why the component is a runtime value and not
+  `cfg!(feature = "cuda")`.
+- **VRAM is shared with the Windows session.** 16376 MiB total, ~3.3 GB in use by Windows while
+  measuring. `engraph serve` adds **1768 MiB** with all three models resident; `engraph index` adds
+  ~570 MiB, because indexing loads the embedder alone. Genuine exhaustion-at-load was **not** induced
+  here, so llama.cpp's behaviour in that case is untested on this box — only the device-absent path
+  above is known, and it is clean.
+- **`engraph status` does not report the device.** The only place the resolved device is visible is
+  the `loaded LlamaEmbed …` / `loaded LlamaRerank …` line at `RUST_LOG=engraph=info`.
+- **GPU numbers and CPU numbers are different baselines.** `eval/probes.md`'s CUDA section is a fresh
+  baseline for exactly this reason: the kernels are not bitwise identical, the embeddings differ in
+  the low bits, and the retrieved candidate set differs with them. Comparing a GPU rank table with a
+  CPU one measures the backend, not the change under test.
 
 ## Open work
 

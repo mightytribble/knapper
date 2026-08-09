@@ -12,6 +12,7 @@ use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
+use llama_cpp_2::{LlamaBackendDeviceType, list_llama_ggml_backend_devices};
 
 static BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
 /// Mutex used only during the first initialization of `BACKEND`.
@@ -33,6 +34,91 @@ pub fn llama_backend() -> Result<&'static LlamaBackend> {
     // Suppress llama.cpp's noisy Metal/model loading logs to stderr.
     backend.void_logs();
     Ok(BACKEND.get_or_init(|| backend))
+}
+
+/// The compute device llama.cpp resolved for this process, as a stable string.
+///
+/// Folded into [`LlamaEmbed`]'s and [`LlamaRerank`]'s fingerprints (issue #33).
+/// CUDA and CPU kernels are not bitwise identical, so a store built on one and
+/// extended on the other holds vectors from two devices while reporting itself
+/// healthy — the exact silent staleness `fingerprint` exists to end.
+///
+/// Read at load rather than from `cfg!(feature = "cuda")`. A compile-time token
+/// records the *intent* to offload; only a runtime one records what the process
+/// actually got. VRAM on this box is shared with the Windows host, so one binary
+/// can come up on either device depending on what was free at the time.
+///
+/// `memory_free` is deliberately not a component: it moves between two runs of
+/// the same binary on the same device, and a fingerprint that changes when
+/// nothing did is a full re-index nobody asked for.
+pub fn device_identity() -> String {
+    // The ggml device registry is populated by backend init, so asking before
+    // that would answer `cpu` on a CUDA build — a wrong reading that stamps a
+    // GPU-built index as CPU-built, which is the one outcome this must not have.
+    // Every caller has already initialized it; the `OnceLock` makes this a get.
+    if llama_backend().is_err() {
+        return "unknown".to_string();
+    }
+
+    let mut accelerators: Vec<String> = list_llama_ggml_backend_devices()
+        .into_iter()
+        .filter(|device| device.device_type != LlamaBackendDeviceType::Cpu)
+        .map(|device| format!("{}/{}", device.backend, device.description))
+        .collect();
+    // The registry's order is the order backends registered themselves, which is
+    // not a promise. Sorting makes the string depend on the set, not the walk.
+    accelerators.sort();
+    accelerators.dedup();
+
+    if accelerators.is_empty() {
+        "cpu".to_string()
+    } else {
+        accelerators.join("+")
+    }
+}
+
+/// Compose `embedding_fingerprint`'s model half from its six components.
+///
+/// Separate from [`LlamaEmbed::new`] so the composition can be exercised without
+/// a GGUF on disk or a GPU in the box: what issue #33 needs to hold is that two
+/// devices give two fingerprints, and that is a property of this function alone.
+///
+/// `n_threads` is deliberately absent — threads change how the arithmetic is
+/// scheduled, never its result. `device` is present for the opposite reason.
+fn embed_fingerprint(
+    artifact: &str,
+    dim: usize,
+    tokenizer_identity: &str,
+    prompt_format: &PromptFormat,
+    device: &str,
+) -> String {
+    crate::fingerprint::digest(&[
+        artifact,
+        &dim.to_string(),
+        tokenizer_identity,
+        &format!(
+            "{}:{:?}",
+            crate::fingerprint::PROMPT_TEMPLATE_VERSION,
+            prompt_format
+        ),
+        &crate::fingerprint::EMBEDDING_NORMALIZATION_VERSION.to_string(),
+        device,
+    ])
+}
+
+/// Compose `reranker_fingerprint`'s model half. Separate from
+/// [`LlamaRerank::new`] for the same reason as [`embed_fingerprint`].
+///
+/// The Yes/No ids are components because they are the reranker's whole output
+/// contract: a model whose vocabulary numbers them differently produces scores
+/// on a different scale from the same weights.
+fn rerank_fingerprint(artifact: &str, yes_token_id: i32, no_token_id: i32, device: &str) -> String {
+    crate::fingerprint::digest(&[
+        artifact,
+        &yes_token_id.to_string(),
+        &no_token_id.to_string(),
+        device,
+    ])
 }
 
 // ── Prompt format ────────────────────────────────────────────────────────────
@@ -921,27 +1007,22 @@ impl LlamaEmbed {
         }
 
         let n_threads = resolve_n_threads(config);
+        let device = device_identity();
         tracing::info!(
-            "loaded LlamaEmbed from {}, dim={}, n_threads={}",
+            "loaded LlamaEmbed from {}, dim={}, n_threads={}, device={}",
             uri_str,
             dim,
-            n_threads
+            n_threads,
+            device
         );
 
-        // Five components, none of which any other part of the database records
-        // (issue #31). `n_threads` is deliberately not among them: threads
-        // change how the arithmetic is scheduled, never its result.
-        let fingerprint = crate::fingerprint::digest(&[
+        let fingerprint = embed_fingerprint(
             &crate::fingerprint::artifact_digest(&model_path)?,
-            &dim.to_string(),
+            dim,
             &tokenizer_identity,
-            &format!(
-                "{}:{:?}",
-                crate::fingerprint::PROMPT_TEMPLATE_VERSION,
-                prompt_format
-            ),
-            &crate::fingerprint::EMBEDDING_NORMALIZATION_VERSION.to_string(),
-        ]);
+            &prompt_format,
+            &device,
+        );
 
         Ok(Self {
             model,
@@ -1518,22 +1599,26 @@ impl LlamaRerank {
             .ok_or_else(|| anyhow::anyhow!("model tokenizer returned no tokens for 'No'"))?;
 
         let n_threads = resolve_n_threads(config);
+        let device = device_identity();
         tracing::info!(
-            "loaded LlamaRerank from {}, yes_id={}, no_id={}, n_threads={}",
+            "loaded LlamaRerank from {}, yes_id={}, no_id={}, n_threads={}, device={}",
             uri_str,
             yes_token_id,
             no_token_id,
-            n_threads
+            n_threads,
+            device
         );
 
-        // The Yes/No ids are in here because they are the reranker's whole
-        // output contract: a model whose vocabulary numbers them differently
-        // produces scores on a different scale from the same weights.
-        let fingerprint = crate::fingerprint::digest(&[
+        // The device is a component because the logits those ids index shift
+        // with the kernels that produced them, and this fingerprint's declared
+        // action — discarding calibrated thresholds — is exactly the right
+        // response to a score scale that moved underneath them (issue #33).
+        let fingerprint = rerank_fingerprint(
             &crate::fingerprint::artifact_digest(&model_path)?,
-            &yes_token_id.to_string(),
-            &no_token_id.to_string(),
-        ]);
+            yes_token_id,
+            no_token_id,
+            &device,
+        );
 
         Ok(Self {
             model,
@@ -2194,5 +2279,64 @@ mod tests {
         let json = r#"{"intent":"exact","expansions":["BRE-1234"]}"#;
         let result = parse_orchestration_json(json).unwrap();
         assert!(result.date_range.is_none());
+    }
+
+    /// The same weights on two devices are two fingerprints (issue #33).
+    ///
+    /// CUDA and CPU kernels are not bitwise identical, so a store built on one
+    /// and extended on the other holds mixed-provenance vectors. Without the
+    /// device as a component that store reports itself healthy, which is the
+    /// silent staleness #31 exists to end. Needs no GPU: the property under
+    /// test belongs to the composition, not to the hardware.
+    #[test]
+    fn the_device_changes_the_embedding_fingerprint() {
+        let on_cpu =
+            embed_fingerprint("artifact", 768, "tok", &PromptFormat::EmbeddingGemma, "cpu");
+        let on_gpu = embed_fingerprint(
+            "artifact",
+            768,
+            "tok",
+            &PromptFormat::EmbeddingGemma,
+            "CUDA/NVIDIA GeForce RTX 4070 Ti",
+        );
+        assert_ne!(
+            on_cpu, on_gpu,
+            "same model, two devices — the fingerprints must differ or the reindex never fires"
+        );
+
+        // And it is only the device that moved: the same one agrees with itself.
+        assert_eq!(
+            on_cpu,
+            embed_fingerprint("artifact", 768, "tok", &PromptFormat::EmbeddingGemma, "cpu"),
+            "the composition must be stable for a fixed device"
+        );
+    }
+
+    /// Same property for the reranker, whose declared action is discarding
+    /// calibrated thresholds rather than a reindex — the right response to a
+    /// score scale that moved underneath them.
+    #[test]
+    fn the_device_changes_the_reranker_fingerprint() {
+        let on_cpu = rerank_fingerprint("artifact", 9693, 2152, "cpu");
+        let on_gpu = rerank_fingerprint("artifact", 9693, 2152, "CUDA/NVIDIA GeForce RTX 4070 Ti");
+        assert_ne!(on_cpu, on_gpu);
+        assert_eq!(on_cpu, rerank_fingerprint("artifact", 9693, 2152, "cpu"));
+    }
+
+    /// A box with no accelerator resolves to `cpu`, and the answer does not
+    /// depend on how much VRAM happened to be free — `memory_free` is excluded
+    /// precisely so that two runs of one binary on one device agree.
+    #[test]
+    fn the_device_identity_is_stable_across_calls() {
+        let first = device_identity();
+        let second = device_identity();
+        assert_eq!(
+            first, second,
+            "device identity must not drift between calls"
+        );
+        assert!(
+            !first.is_empty(),
+            "there is always a device, even if it is cpu"
+        );
     }
 }
