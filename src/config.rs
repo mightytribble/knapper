@@ -678,6 +678,31 @@ batch_size = 128
     }
 
     #[test]
+    fn document_title_round_trips_and_defaults_to_the_breadcrumb() {
+        use crate::llm::DocumentTitle;
+
+        // `none` is the control, and the only value that has to be spelled out:
+        // it is what every store built before this key existed holds, so a
+        // measurement against that baseline must name it (issue #36).
+        let cfg: Config =
+            toml::from_str("[embedding_prompt]\ndocument_title = \"none\"\n").unwrap();
+        assert_eq!(cfg.embedding_prompt.document_title, DocumentTitle::None);
+        // Naming the third key leaves the other two at the model card's pair.
+        assert_eq!(cfg.embedding_prompt.document, DocumentTemplate::Documented);
+
+        let note: Config =
+            toml::from_str("[embedding_prompt]\ndocument_title = \"note\"\n").unwrap();
+        assert_eq!(note.embedding_prompt.document_title, DocumentTitle::Note);
+
+        // The design's breadcrumb ships (§5.4).
+        let bare: Config = toml::from_str("").unwrap();
+        assert_eq!(
+            bare.embedding_prompt.document_title,
+            DocumentTitle::Breadcrumb
+        );
+    }
+
+    #[test]
     fn parse_partial_config_uses_defaults() {
         let toml_str = r#"top_n = 20"#;
         let cfg: Config = toml::from_str(toml_str).unwrap();

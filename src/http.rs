@@ -53,7 +53,7 @@ pub struct ApiState {
     pub ranking: crate::config::RankingConfig,
     /// Embedding-prefix settings from `config.toml`. Notes written over HTTP
     /// must be embedded the way `engraph index` embedded the rest of the vault.
-    pub embedding_prefix: crate::prefix::PrefixConfig,
+    pub embed: crate::prefix::EmbedComposition,
 }
 
 // ---------------------------------------------------------------------------
@@ -729,7 +729,7 @@ async fn handle_create(
         input,
         &store,
         &mut *embedder,
-        state.embedding_prefix,
+        state.embed,
         &state.vault_path,
         state.profile.as_ref().as_ref(),
     )
@@ -761,7 +761,7 @@ async fn handle_append(
         input,
         &store,
         &mut *embedder,
-        state.embedding_prefix,
+        state.embed,
         &state.vault_path,
     )
     .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
@@ -911,7 +911,7 @@ async fn handle_unarchive(
         &body.file,
         &store,
         &mut *embedder,
-        state.embedding_prefix,
+        state.embed,
         &state.vault_path,
     )
     .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
@@ -1173,8 +1173,11 @@ mod tests {
     /// `ApiState` in tests that don't exercise search/context endpoints.
     struct DummyEmbedder;
     impl crate::llm::EmbedModel for DummyEmbedder {
-        fn embed_batch(&mut self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
-            Ok(texts.iter().map(|_| vec![0.0; 384]).collect())
+        fn embed_batch(
+            &mut self,
+            docs: &[crate::llm::EmbedDoc<'_>],
+        ) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(docs.iter().map(|_| vec![0.0; 384]).collect())
         }
         fn token_count(&self, text: &str) -> usize {
             text.split_whitespace().count()
@@ -1209,7 +1212,7 @@ mod tests {
             group_by: crate::config::GroupBy::default(),
             rerank: crate::config::RerankConfig::default(),
             ranking: crate::config::RankingConfig::default(),
-            embedding_prefix: crate::prefix::PrefixConfig::default(),
+            embed: crate::prefix::EmbedComposition::default(),
         }
     }
 

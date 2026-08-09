@@ -261,7 +261,7 @@ pub struct EngraphServer {
     ranking: crate::config::RankingConfig,
     /// Embedding-prefix settings, for the same reason: notes written by MCP
     /// tools share a vector space with the indexed vault.
-    embedding_prefix: crate::prefix::PrefixConfig,
+    embed: crate::prefix::EmbedComposition,
 }
 
 fn read_only_err() -> McpError {
@@ -565,7 +565,7 @@ impl EngraphServer {
             input,
             &store,
             &mut *embedder,
-            self.embedding_prefix,
+            self.embed,
             &self.vault_path,
             self.profile.as_ref().as_ref(),
         )
@@ -592,7 +592,7 @@ impl EngraphServer {
             input,
             &store,
             &mut *embedder,
-            self.embedding_prefix,
+            self.embed,
             &self.vault_path,
         )
         .map_err(|e| mcp_err(&e))?;
@@ -680,7 +680,7 @@ impl EngraphServer {
             &params.0.file,
             &store,
             &mut *embedder,
-            self.embedding_prefix,
+            self.embed,
             &self.vault_path,
         )
         .map_err(|e| mcp_err(&e))?;
@@ -1144,7 +1144,7 @@ pub async fn run_serve(
     let group_by = config.group_by;
     let rerank = config.rerank;
     let ranking = config.ranking;
-    let embedding_prefix = config.embedding_prefix;
+    let embed = crate::prefix::EmbedComposition::from_config(&config);
 
     let (watcher_handle, watcher_shutdown) = crate::watcher::start_watcher(
         store_arc.clone(),
@@ -1174,7 +1174,7 @@ pub async fn run_serve(
         group_by,
         rerank,
         ranking,
-        embedding_prefix,
+        embed,
     };
 
     // Cancellation token for coordinated shutdown of HTTP + MCP
@@ -1199,7 +1199,7 @@ pub async fn run_serve(
             group_by,
             rerank,
             ranking,
-            embedding_prefix,
+            embed,
         };
         let router = crate::http::build_router(api_state);
         let addr = format!("{}:{}", opts.host, opts.port);

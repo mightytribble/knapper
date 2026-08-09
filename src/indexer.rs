@@ -463,14 +463,22 @@ pub fn index_file(
         .iter()
         .map(|c| embedder.token_count(&c.text))
         .collect();
-    // Embed a contextual prefix with each chunk (issue #2). `embed_texts` is
-    // held so the batch below can borrow from it; nothing here reaches storage,
-    // which still persists `chunk.text` / `chunk.snippet` verbatim.
+    // What the embedder is shown: the title field (issue #36) and a body that
+    // carries the contextual prefix when it is on (issue #2). `inputs` is held
+    // so the batch below can borrow from it; nothing here reaches storage, which
+    // still persists `chunk.text` / `chunk.snippet` verbatim.
     let doc = crate::prefix::DocContext::from_file(rel_path, content);
-    let embed_texts = crate::prefix::embed_texts(&doc, &chunks, config.embedding_prefix);
-    let texts: Vec<&str> = embed_texts.iter().map(String::as_str).collect();
-    let mut all_vectors = Vec::with_capacity(texts.len());
-    for batch in texts.chunks(config.batch_size) {
+    let inputs = crate::prefix::embed_inputs(
+        &doc,
+        &chunks,
+        crate::prefix::EmbedComposition::from_config(config),
+    );
+    let docs: Vec<crate::llm::EmbedDoc<'_>> = inputs
+        .iter()
+        .map(crate::prefix::EmbedInput::as_doc)
+        .collect();
+    let mut all_vectors = Vec::with_capacity(docs.len());
+    for batch in docs.chunks(config.batch_size) {
         let vectors = embedder.embed_batch(batch)?;
         all_vectors.extend(vectors);
     }
@@ -1282,10 +1290,7 @@ mod tests {
         write_file(root, "hub.md", "# Hub\nNo links out.");
 
         let store = Store::open_memory().unwrap();
-        let mut embedder = RecordingEmbed {
-            inner: crate::llm::MockLlm::new(256),
-            seen: Vec::new(),
-        };
+        let mut embedder = RecordingEmbed::new(256);
         let config = Config::default();
         run_index_shared(root, &config, &store, &mut embedder, false, None).unwrap();
         embedder.seen.clear();
@@ -1516,10 +1521,7 @@ mod tests {
         let (tmp, store, _embedder, config) = fingerprint_fixture();
         assert!(!chunk_snapshot(&store).is_empty());
 
-        let mut wider = RecordingEmbed {
-            inner: crate::llm::MockLlm::new(512),
-            seen: Vec::new(),
-        };
+        let mut wider = RecordingEmbed::new(512);
         run_index_shared(tmp.path(), &config, &store, &mut wider, false, None).unwrap();
 
         assert_eq!(store.vec_table_dim().unwrap(), Some(512));
@@ -1903,12 +1905,25 @@ mod tests {
     struct RecordingEmbed {
         inner: crate::llm::MockLlm,
         seen: Vec<String>,
+        /// The title field each body was paired with (issue #36).
+        titles: Vec<String>,
+    }
+
+    impl RecordingEmbed {
+        fn new(dim: usize) -> Self {
+            Self {
+                inner: crate::llm::MockLlm::new(dim),
+                seen: Vec::new(),
+                titles: Vec::new(),
+            }
+        }
     }
 
     impl EmbedModel for RecordingEmbed {
-        fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-            self.seen.extend(texts.iter().map(|t| t.to_string()));
-            self.inner.embed_batch(texts)
+        fn embed_batch(&mut self, docs: &[crate::llm::EmbedDoc<'_>]) -> Result<Vec<Vec<f32>>> {
+            self.seen.extend(docs.iter().map(|d| d.text.to_string()));
+            self.titles.extend(docs.iter().map(|d| d.title.to_string()));
+            self.inner.embed_batch(docs)
         }
         fn token_count(&self, text: &str) -> usize {
             self.inner.token_count(text)
@@ -1928,9 +1943,16 @@ mod tests {
         }
     }
 
+    fn title_config(title: crate::llm::DocumentTitle) -> Config {
+        let mut config = Config::default();
+        config.embedding_prompt.document_title = title;
+        config
+    }
+
     /// Index one file whose body never names its own subject — the archdragon
     /// case from issue #2 — and report what the embedder saw.
-    fn index_prefixed_vault(config: &Config) -> (Store, Vec<String>) {
+
+    fn index_prefixed_vault(config: &Config) -> (Store, RecordingEmbed) {
         let tmp = TempDir::new().unwrap();
         write_file(
             tmp.path(),
@@ -1942,17 +1964,14 @@ mod tests {
         );
 
         let store = Store::open_memory().unwrap();
-        let mut embedder = RecordingEmbed {
-            inner: crate::llm::MockLlm::new(256),
-            seen: Vec::new(),
-        };
+        let mut embedder = RecordingEmbed::new(256);
         run_index_shared(tmp.path(), config, &store, &mut embedder, false, None).unwrap();
-        (store, embedder.seen)
+        (store, embedder)
     }
 
     #[test]
     fn embedded_text_carries_document_identity() {
-        let (_store, seen) = index_prefixed_vault(&prefixed_config());
+        let seen = index_prefixed_vault(&prefixed_config()).1.seen;
         assert_eq!(seen.len(), 3, "one embed call per chunk: {seen:#?}");
 
         // Every chunk, including the two whose bodies never say "Archdragon".
@@ -1976,7 +1995,7 @@ mod tests {
     /// never mentions it.
     #[test]
     fn the_prefix_does_not_leak_into_storage_or_fts() {
-        let (store, _seen) = index_prefixed_vault(&prefixed_config());
+        let (store, _embedder) = index_prefixed_vault(&prefixed_config());
         let file = store
             .get_file("lore/bestiary/archdragon.md")
             .unwrap()
@@ -2055,7 +2074,8 @@ mod tests {
     #[test]
     fn disabling_the_prefix_embeds_exactly_what_is_stored() {
         // The shipped default, not a special case.
-        let (store, seen) = index_prefixed_vault(&Config::default());
+        let (store, embedder) = index_prefixed_vault(&Config::default());
+        let seen = embedder.seen;
         assert!(!Config::default().embedding_prefix.enabled);
 
         assert!(!seen.iter().any(|t| t.contains("aliases:")), "{seen:#?}");
@@ -2065,6 +2085,125 @@ mod tests {
             .unwrap();
         let definition = store.get_chunk_by_seq(file.id, 0).unwrap().unwrap();
         assert!(seen.iter().any(|t| t.starts_with(&definition.snippet)));
+    }
+
+    // ── The title field (#36) ────────────────────────────────────
+
+    /// The breadcrumb reaches the embedder as a *field*, chunk by chunk, with
+    /// the body untouched. Run against `Config::default()`, because the
+    /// breadcrumb is the shipped default and that is part of the contract.
+    #[test]
+    fn the_breadcrumb_reaches_the_embedder_as_the_title_field() {
+        let (_store, embedder) = index_prefixed_vault(&Config::default());
+        let (titles, seen) = (embedder.titles, embedder.seen);
+        assert_eq!(titles.len(), 3, "one title per chunk: {titles:#?}");
+
+        // `### Combat` is a sibling chunk of `## Abilities`, so its own text has
+        // lost the parent heading. Here the title field carries the whole
+        // lineage, note name included.
+        let combat = titles
+            .iter()
+            .zip(&seen)
+            .find(|(_, body)| body.contains("Opens at range"))
+            .map(|(title, _)| title)
+            .unwrap();
+        assert_eq!(combat, "Archdragon > Abilities > Combat");
+
+        // Distinct per section, which is the property #2's per-file prefix
+        // lacked.
+        let mut sorted = titles.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 3, "{titles:#?}");
+
+        // And the body is the raw chunk: no prefix, no breadcrumb.
+        assert!(
+            seen.iter().all(|t| !t.contains(" > ")),
+            "the title leaked into the body: {seen:#?}"
+        );
+    }
+
+    /// `none` sends no title, which is what every store built before this key
+    /// existed holds. It is the control every measurement in `eval/probes.md` is
+    /// taken against, so it has to stay reachable.
+    #[test]
+    fn the_none_setting_sends_no_title_at_all() {
+        let (_store, embedder) =
+            index_prefixed_vault(&title_config(crate::llm::DocumentTitle::None));
+        assert!(
+            embedder.titles.iter().all(String::is_empty),
+            "{:#?}",
+            embedder.titles
+        );
+    }
+
+    /// `note` is the arm that behaves like #2's prefix: one constant for the
+    /// whole file.
+    #[test]
+    fn the_note_arm_sends_one_constant_title_for_every_chunk() {
+        let (_store, embedder) =
+            index_prefixed_vault(&title_config(crate::llm::DocumentTitle::Note));
+
+        assert_eq!(embedder.titles.len(), 3);
+        assert!(
+            embedder.titles.iter().all(|t| t == "Archdragon"),
+            "{:#?}",
+            embedder.titles
+        );
+    }
+
+    /// A note written through the write pipeline lands in the same vector space
+    /// as an indexed one, so both paths have to compose the embedder's input the
+    /// same way. Two compositions that *can* disagree eventually do, which is
+    /// why they share one `EmbedComposition` and one `embed_inputs`.
+    #[test]
+    fn the_write_pipeline_and_the_indexer_embed_a_chunk_identically() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let store = Store::open_memory().unwrap();
+        let mut embedder = RecordingEmbed::new(256);
+        let config = title_config(crate::llm::DocumentTitle::Breadcrumb);
+        let content = "---\nname: Archdragon\n---\n\n\
+                       ## Definition\n\nRank SS.\n\n\
+                       ## Abilities\n\nFlight.\n";
+
+        let written = crate::writer::create_note(
+            crate::writer::CreateNoteInput {
+                content: content.to_string(),
+                filename: Some("archdragon".into()),
+                type_hint: None,
+                tags: vec![],
+                folder: Some("lore".into()),
+                created_by: "test".into(),
+                auto_link: Some(false),
+            },
+            &store,
+            &mut embedder,
+            crate::prefix::EmbedComposition::from_config(&config),
+            root,
+            None,
+        )
+        .unwrap();
+        let from_write = std::mem::take(&mut embedder.titles);
+        assert!(
+            from_write.iter().any(|t| t.contains(" > ")),
+            "the write path sent no breadcrumb: {from_write:#?}"
+        );
+
+        let path = written.path.clone();
+        let on_disk = std::fs::read_to_string(root.join(&path)).unwrap();
+        index_file(
+            &path,
+            &on_disk,
+            "a-new-hash",
+            &store,
+            &mut embedder,
+            root,
+            &config,
+        )
+        .unwrap();
+
+        assert_eq!(from_write, embedder.titles);
     }
 
     // ── Chunk-granular edges (#28) ───────────────────────────────

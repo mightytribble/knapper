@@ -182,10 +182,15 @@ impl Fingerprints {
                 &crate::store::DOC_LEVEL.to_string(),
             ]),
             fts: digest(&[crate::store::FTS_SCHEMA]),
-            // The prefix is embedding input, not chunk content: it changes the
-            // vector and leaves `chunks.text`, the snippet and FTS untouched
-            // (issue #2). So it belongs here and not in `chunker`.
-            embedding: digest(&[embed_model, &prefix_identity(config)]),
+            // The prefix and the title field are embedding input, not chunk
+            // content: they change the vector and leave `chunks.text`, the
+            // snippet and FTS untouched (issues #2 and #36). So they belong here
+            // and not in `chunker`.
+            embedding: digest(&[
+                embed_model,
+                &prefix_identity(config),
+                &document_title_identity(config),
+            ]),
             reranker: rerank_model.map(|model| {
                 digest(&[
                     model,
@@ -222,6 +227,19 @@ fn prefix_identity(config: &Config) -> String {
     format!(
         "prefix(enabled={},path={},heading={},tags={},aliases={})",
         p.enabled, p.path, p.heading, p.tags, p.aliases
+    )
+}
+
+/// Which string fills the document template's `title:` field (issue #36).
+///
+/// A separate component from [`prefix_identity`] and from the model's own
+/// `template_id`, because it is a third independent choice: the same model and
+/// the same template write different vectors for `none`, `note` and
+/// `breadcrumb`.
+fn document_title_identity(config: &Config) -> String {
+    format!(
+        "document_title({})",
+        config.embedding_prompt.document_title.id()
     )
 }
 
@@ -534,6 +552,48 @@ mod tests {
         let comparison = compare(&store, &changed).unwrap();
         assert_eq!(comparison.mismatches.len(), 1);
         assert_eq!(comparison.mismatches[0].key, EMBEDDING.name);
+    }
+
+    #[test]
+    fn a_changed_document_title_demands_a_reindex() {
+        // The title field is embedding input on the same terms as #2's prefix:
+        // no stored byte and no content hash can see it change (issue #36).
+        let store = Store::open_memory().unwrap();
+        record(&store, &fps()).unwrap();
+
+        let mut config = Config::default();
+        config.embedding_prompt.document_title = crate::llm::DocumentTitle::None;
+        let changed = Fingerprints::compute(&config, "embed-model-abc", Some("rerank-model-xyz"));
+
+        let comparison = compare(&store, &changed).unwrap();
+        assert_eq!(comparison.mismatches.len(), 1);
+        assert_eq!(comparison.mismatches[0].key, EMBEDDING.name);
+        assert_eq!(comparison.actions(), BTreeSet::from([Action::Reindex]));
+    }
+
+    /// Each of the three arms of #36 must be a distinct fingerprint, not merely
+    /// distinct from the default: `note` and `breadcrumb` write different
+    /// vectors from each other as well.
+    #[test]
+    fn every_document_title_setting_fingerprints_differently() {
+        use crate::llm::DocumentTitle;
+
+        let digests: Vec<String> = [
+            DocumentTitle::None,
+            DocumentTitle::Note,
+            DocumentTitle::Breadcrumb,
+        ]
+        .into_iter()
+        .map(|title| {
+            let mut config = Config::default();
+            config.embedding_prompt.document_title = title;
+            Fingerprints::compute(&config, "embed-model-abc", None).embedding
+        })
+        .collect();
+
+        assert_ne!(digests[0], digests[1]);
+        assert_ne!(digests[1], digests[2]);
+        assert_ne!(digests[0], digests[2]);
     }
 
     #[test]

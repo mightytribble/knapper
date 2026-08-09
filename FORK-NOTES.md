@@ -44,6 +44,7 @@ git fetch upstream && git diff --stat upstream/main main
 | `llm::device_identity` | the compute device is read at load and fingerprinted | this fork, issue #33 |
 | `ranking::apply_answer_floor` | a query with no candidate above the floor returns no results | this fork, issue #34 |
 | `[embedding_prompt]` | EmbeddingGemma is fed the prompt format its model card documents | this fork, issue #10 |
+| `DocumentTitle` | the document template's `title:` field is filled by the vault, not by the literal `none` | this fork, issue #36 |
 | `.github/workflows/ci.yml` | manual dispatch only — upstream runs it on push and PR | this fork, Actions minutes |
 
 Cherry-picked rather than merged: PR #41 branched before upstream's #40 graph fix, so merging the
@@ -172,8 +173,18 @@ has never executed on this box.
 - **MCP servers launch once per session**, so a mid-session `git checkout` leaves the server pointed
   at the previous branch's store.
 - **The eval store lives at `standalone/mcp-isekai/.engraph-eval/`**, indexed by a CUDA build at the
-  documented prompt templates (#10), and the corpus it indexes is
-  not frozen. Every measurement from #26 to #29 was taken on a 247-file / 1598-chunk store; the
+  documented prompt templates (#10) and at `document_title = "breadcrumb"` (#36). Its
+  `embedding_fingerprint` is `d41cc349`, which is the same value as the #36 breadcrumb arm. The four
+  #36 arm homes stay beside it as `.engraph-i36-*`, and the `.engraph-i36x-*` homes are the same four
+  arms with #7's exclusion on. The two control arms name `document_title = "none"` in their own
+  `config.toml`, because the default no longer gives it.
+  **The store itself does not exclude derived files.** Its `exclude` is `[".obsidian/"]`, so
+  `*-index.md` and `templates/` are in the corpus. Issue #7 measured that exclusion as a clear gain and
+  the baseline never adopted it. Every table in `eval/probes.md` from #26 to #10 therefore holds about
+  29% derived rows in the window, and the graph lane in each of them runs over six hub files that have
+  no incoming edges. #36's tables use the exclusion. The other tables need a re-run before they can be
+  compared with them.
+  The corpus the store indexes is not frozen. Every measurement from #26 to #29 was taken on a 247-file / 1598-chunk store; the
   pinned vault at `63f33e6` is 266 / 1863 / 1988 edges, because `standalone/mcp-isekai` tracks the
   live `cc-isekai` repo and it grew in between. Rank tables from either side of that are not
   comparable. Earlier stores lived in session scratchpads and expired with the sessions.
@@ -251,9 +262,11 @@ has never executed on this box.
     `documented` on `Conceptual` alone — two of the eighteen calibration queries, and no tracked
     target. `Archdragon` classifies as `Conceptual` (#19), so it asks the exact-name guard a
     question.
-  - **`title:` holds the literal `none`.** The design's breadcrumb rule fills that field with
-    `Note Title > H1 > H2 > H3` (#36), and it needs `heading_path` persisted plus a per-text title
-    through `EmbedModel::embed_batch`.
+  - **`document_title` decides what fills the `title:` field** (#36). `breadcrumb` ships, and it is
+    `Note Title > H1 > H2 > H3`. `none` is the literal the model card gives for a document with no
+    title, and it is the control. `note` is the note's title alone, and it breaks exact-name lookup.
+    The key is a fingerprint component, so a change to it re-indexes the vault. **A store built before
+    #36 re-indexes once on upgrade**, because the default is no longer what that store holds.
 - **The cross-encoder sorts the results; it used to vote on them** (this fork, issue #30). Two
   content lanes are fused by RRF, graph and temporal candidates are routed into the shortlist by
   **reserved quota** (`[ranking] candidates = 30`, `graph_reserve = 8`, `temporal_reserve = 4`), and
@@ -457,18 +470,48 @@ See issues on this repo:
   `status`, and provenance replacing `score`/`confidence` **on the MCP and HTTP payloads only** —
   §7.3's boundary is the consumer, not the field, and the CLI keeps the percentage `probe.sh` reads.
   Settled by ordering that must not move. **Layer 2, second half**
-- **#36** the breadcrumb rule's embedding limb — `Note Title > H1 > H2 > H3` in the `title:` field,
-  which holds the literal `none` today. Needs `heading_path` persisted on `chunks` and a per-text
-  title through `EmbedModel::embed_batch`, so the trait and both test embedders move. **The heading
-  path is the one component of #2's prefix that is not a per-file constant**, which is the mechanism
-  #2 lost to, and #2 never measured it alone — both its columns carried `name — path`. Arms are
-  note-title, full breadcrumb, and the body-concatenated control the design excludes. Probe 3 is the
-  target, probes 4 and 2 the guards
+- ~~**#36** the breadcrumb rule's embedding limb~~ — **DONE.**
+  `[embedding_prompt] document_title` selects what fills the `title:` field. The values are `none`,
+  `note` and `breadcrumb`. `breadcrumb` is design §5.4's rule and is the current default.
+  `EmbedModel::embed_batch` takes `EmbedDoc` pairs, so the title belongs to the document and not to the
+  model. `prefix::embed_inputs` composes both fields, and `EmbedComposition` carries the two settings as
+  one value. That keeps the indexer and the write pipeline in one vector space. `chunks.heading_path` is
+  not stored: the embedding limb reads the chunker's in-process value, and no other code needs the column
+  until #37.
+  **The arms were measured twice.** The first pass kept the derived files, and derived files then held
+  28.6% to 30.0% of the result slots. Two findings were artifacts of that corpus. `note` appeared to
+  gain a rank on probe 2, through `lore-index.md`, and the gain is absent from the clean corpus. `note`
+  and the body control appeared to lose probe 4 to a list of links in `lore-index.md`. Every table in
+  `eval/probes.md` for #36 now uses `exclude = ["*-index.md", "templates/"]`, which is #7's setting, and
+  0 of 1440 result slots hold a derived file.
+  `note` and the body control lose the exact-name answer and gain nothing.
+  `archdragon.md > ## Definition` has rank 1 at 99.97% in the control, and it is absent from the top 20
+  in both. That is #2's failure. A file-level table cannot see it, because `## Stat Block` holds rank 1
+  for the file in every arm. The body control also destroys abstention: N10 goes from 1.61% to 97.87%
+  and returns one result above the floor, which no floor can reject.
+  **Arm A against arm B confirms the mechanism the issue predicted.** The note title is a per-file
+  constant, and it loses probe 4. The breadcrumb is different for each section, and it keeps probe 4. The
+  body control carries the same variable string and loses probe 4, so the field and the body are not
+  equivalent. Probe 3, the named target, had no headroom, because it has had rank 1 since #10.
+  `answer_floor = 0.30` needs no new fit for the control, `note` or `breadcrumb`.
+  **`breadcrumb` holds every tracked answer and makes the secondary results worse.** It swaps 22 results
+  below the answers in the six positive queries. Probe 3 loses `## Level 6 Antimagic Shell` (*"spells
+  cannot be cast"*) and `## Level 4 Silence` (*"cannot cast spells of any school"*), and gains
+  `## Level 3 Invisibility` at rank 3. Probe 6 loses `## Level 9 Restore Object` and puts
+  `## Level 3 Heal` above the floor. Probe 7 loses the right entity. Probe 4 gains a little. Probes 1
+  and 2 are noise. Each reading is a manual check against the vault text.
+  An aggregate of `confidence` cannot judge that churn, because the score is the sort key and a redundant
+  window gets the highest mean. Probe 4 shows the metric with the wrong sign.
+  **The default accepts that cost.** `breadcrumb` is §5.4's rule, it costs no tracked answer, and the
+  rule's three limbs carry the same string. #37 puts the breadcrumb in the lexical lane, where a heading
+  term is matched and not averaged into a vector, so the embedding limb is measured again after #37 and
+  is not closed now. #3 is the evidence still owed
 - **#37** the breadcrumb rule's lexical limb — `content='chunks'` with sync triggers, `heading_path`
   and `tags_text` as indexed FTS columns, `bm25(chunks_fts, 1.0, 3.0, 4.0)`. Makes #11's bug class
   structurally impossible and is the cheap form of what #2 attempted in the embedding. The schema and
-  the weights are two measurements. Shares the stored `heading_path` with #36. Layer 3; closes half
-  of #17
+  the weights are two measurements. It **owns** the stored `heading_path` column: #36 shipped
+  without it, because the embedding limb reads the chunker's in-process value and nothing else did.
+  Layer 3; closes half of #17
 - **#5** embedding model config — expose output dim, tie max chunk tokens to the model's context window
 - **#8** pick a better local embedder — >512 tokens, >768 dim (pairs with #5, which exposes the knobs)
 - ~~**#12** embed at the model's native dimension~~ — **done.** Every vector had been truncated to its
@@ -495,7 +538,7 @@ See issues on this repo:
   an unrelated 91.0% candidate above `## Human Forms`. And **`per_intent` is inert** — two of
   eighteen queries, no tracked target. Both halves ship documented anyway, because two ranks over
   seven targets is inside what this instrument can resolve, the model card specifies a *pair*, and
-  #36 can only be measured from the documented document template.
+  #36 could only be measured from the documented document template.
   **`answer_floor` needs no refit**: every cell gives the same 29.64% midpoint, from an unchanged
   6.77% highest rejectable negative and 52.52% lowest correct answer.
   Also fixed in passing: `placement::try_semantic_placement` embedded a note's content with the

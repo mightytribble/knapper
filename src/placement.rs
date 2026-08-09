@@ -245,8 +245,16 @@ fn try_semantic_placement(
     // half of the model's pair — the centroids it is compared against are means
     // of vectors written by `embed_batch`. Embedding it as a *query* puts the
     // two sides of an asymmetric model in one cosine (issue #10).
+    //
+    // The title field is the same argument one level down (issue #36): under a
+    // non-`none` `[embedding_prompt] document_title` the centroids are means of
+    // titled vectors, so an untitled note here would be the same mismatch. The
+    // note has no path yet — placement is what decides it — so its frontmatter
+    // `name` is the whole of the identity available, and a note without one
+    // falls back to the literal `none` on both sides.
+    let title = crate::prefix::DocContext::from_file("", content).name;
     let embedding = embedder
-        .embed_batch(&[content])?
+        .embed_batch(&[crate::llm::EmbedDoc::new(&title, content)])?
         .pop()
         .ok_or_else(|| anyhow::anyhow!("embedding returned no vector"))?;
 

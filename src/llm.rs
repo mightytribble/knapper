@@ -138,6 +138,54 @@ pub enum DocumentTemplate {
     Documented,
 }
 
+/// What fills the document template's `title:` field (issue #36).
+///
+/// The documented template has such a field, and before this key existed every
+/// stored vector carried the literal `none` in it. The vault knows what belongs
+/// there, and [`Self::Breadcrumb`] is what the design puts there.
+///
+/// Like [`DocumentTemplate`], the choice decides what a stored vector means, so
+/// it is a component of `embedding_fingerprint` and switching it re-indexes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DocumentTitle {
+    /// The literal `none`. What every store held before this key existed, and
+    /// the control the other two were measured against.
+    None,
+    /// The note's effective title: frontmatter `name`, else the filename stem.
+    ///
+    /// **Do not use this.** It is a per-file constant, which is the mechanism
+    /// issue #2 lost to, and it reproduces #2's failure exactly: the exact-name
+    /// probe's answer leaves the top 20 (`eval/probes.md`).
+    Note,
+    /// `Note Title > H1 > H2 > H3` — the note's title and the chunk's ancestor
+    /// headings. The design's breadcrumb, and the default.
+    ///
+    /// The one component of document identity that is **not** a per-file
+    /// constant, which is what separates this from issue #2: the heading path
+    /// differs between the sections of one document, so it cannot flatten them
+    /// together the way #2's prefix did. Measured against `None` it holds every
+    /// tracked answer at its rank and reshuffles two thirds of the result slots
+    /// beneath them. Whether that reshuffle is an improvement is **open**: the
+    /// seed probes cannot see it, and the engine's own cross-encoder scores
+    /// cannot judge it, because they are the sort key that produced the window.
+    /// It ships because it is the design's rule and it costs no tracked answer —
+    /// see `eval/probes.md`, and #3 for the labels that would settle it.
+    #[default]
+    Breadcrumb,
+}
+
+impl DocumentTitle {
+    /// The spelling `embedding_fingerprint` hashes.
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Note => "note",
+            Self::Breadcrumb => "breadcrumb",
+        }
+    }
+}
+
 /// Which query template the `EmbeddingGemma` prompt format writes (issue #10).
 ///
 /// A query is embedded and discarded, so this is **not** a fingerprint
@@ -302,12 +350,13 @@ impl DocumentTemplate {
 }
 
 /// `[embedding_prompt]` — which EmbeddingGemma templates this instance writes
-/// (issue #10). Both sides default to the legacy convention, so a build that
-/// sets neither key is unchanged.
+/// (issue #10), and what it puts in the document template's `title:` field
+/// (issue #36). The templates default to the model card's own pair, and the
+/// title field to the design's breadcrumb.
 ///
-/// The two halves have very different costs. `document` is a fingerprint
-/// component and changing it re-indexes the vault; `query` is read per search
-/// and changing it costs nothing.
+/// The keys have very different costs. `document` and `document_title` are
+/// fingerprint components and changing either re-indexes the vault; `query` is
+/// read per search and changing it costs nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct EmbeddingPromptConfig {
@@ -315,6 +364,10 @@ pub struct EmbeddingPromptConfig {
     pub document: DocumentTemplate,
     /// The template every query is embedded through.
     pub query: QueryTemplate,
+    /// What fills the document template's `title:` field (issue #36). A
+    /// fingerprint component, like `document`. `none` is the control, and it is
+    /// what every store built before this key existed holds.
+    pub document_title: DocumentTitle,
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -459,14 +512,40 @@ impl LaneWeights {
 
 // ── Traits ───────────────────────────────────────────────────────────────────
 
+/// One document as the embedder is shown it: the two fields the document half of
+/// an asymmetric template has (issue #36).
+///
+/// The title is a *field*, not a prefix. It reaches
+/// [`PromptFormat::format_document`] and nothing else — storage, snippets and
+/// FTS keep the raw chunk — and what goes in it is
+/// [`DocumentTitle`]'s decision, made once per chunk by
+/// [`crate::prefix::embed_inputs`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmbedDoc<'a> {
+    pub title: &'a str,
+    pub text: &'a str,
+}
+
+impl<'a> EmbedDoc<'a> {
+    pub fn new(title: &'a str, text: &'a str) -> Self {
+        Self { title, text }
+    }
+
+    /// A document with nothing for the title field, which the documented
+    /// template spells as the literal `none`.
+    pub fn untitled(text: &'a str) -> Self {
+        Self { title: "", text }
+    }
+}
+
 /// Embedding backend — converts text into dense float vectors.
 pub trait EmbedModel: Send {
-    /// Embed a batch of texts in one call.
-    fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>>;
+    /// Embed a batch of documents in one call.
+    fn embed_batch(&mut self, docs: &[EmbedDoc<'_>]) -> Result<Vec<Vec<f32>>>;
 
-    /// Convenience wrapper for a single text.
+    /// Convenience wrapper for a single untitled text.
     fn embed_one(&mut self, text: &str) -> Result<Vec<f32>> {
-        let mut results = self.embed_batch(&[text])?;
+        let mut results = self.embed_batch(&[EmbedDoc::untitled(text)])?;
         results
             .pop()
             .ok_or_else(|| anyhow::anyhow!("embed_batch returned empty results"))
@@ -510,8 +589,8 @@ pub trait EmbedModel: Send {
 // `&mut *guard` (which is `&mut Box<dyn EmbedModel + Send>`) to any
 // function taking `&mut impl EmbedModel`.
 impl EmbedModel for Box<dyn EmbedModel + Send> {
-    fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        (**self).embed_batch(texts)
+    fn embed_batch(&mut self, docs: &[EmbedDoc<'_>]) -> Result<Vec<Vec<f32>>> {
+        (**self).embed_batch(docs)
     }
 
     fn embed_one(&mut self, text: &str) -> Result<Vec<f32>> {
@@ -579,6 +658,18 @@ impl MockLlm {
         Self { dim }
     }
 
+    /// Produce a deterministic vector for a document, title field included.
+    ///
+    /// A document with no title hashes exactly its text, so the mock keeps
+    /// writing the vectors it wrote before the title field existed and only a
+    /// test that sets one sees any change.
+    fn hash_doc(&self, doc: EmbedDoc<'_>) -> Vec<f32> {
+        match doc.title.is_empty() {
+            true => self.hash_to_vector(doc.text),
+            false => self.hash_to_vector(&format!("title: {} | text: {}", doc.title, doc.text)),
+        }
+    }
+
     /// Produce a deterministic L2-normalised vector from `text` via SHA-256.
     pub fn hash_to_vector(&self, text: &str) -> Vec<f32> {
         let mut raw: Vec<f32> = Vec::with_capacity(self.dim);
@@ -618,8 +709,8 @@ impl MockLlm {
 }
 
 impl EmbedModel for MockLlm {
-    fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        Ok(texts.iter().map(|t| self.hash_to_vector(t)).collect())
+    fn embed_batch(&mut self, docs: &[EmbedDoc<'_>]) -> Result<Vec<Vec<f32>>> {
+        Ok(docs.iter().map(|d| self.hash_doc(*d)).collect())
     }
 
     fn embed_one(&mut self, text: &str) -> Result<Vec<f32>> {
@@ -1333,12 +1424,12 @@ impl LlamaEmbed {
 }
 
 impl EmbedModel for LlamaEmbed {
-    fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+    fn embed_batch(&mut self, docs: &[EmbedDoc<'_>]) -> Result<Vec<Vec<f32>>> {
         // Apply document prompt format for indexing (asymmetric models need this),
         // then hand the whole batch to one context (issue #13).
-        let formatted: Vec<String> = texts
+        let formatted: Vec<String> = docs
             .iter()
-            .map(|t| self.prompt_format.format_document("", t))
+            .map(|d| self.prompt_format.format_document(d.title, d.text))
             .collect();
         self.embed_formatted(&formatted)
     }
@@ -1999,9 +2090,31 @@ mod tests {
     #[test]
     fn test_mock_embed_batch() {
         let mut mock = MockLlm::new(256);
-        let vecs = mock.embed_batch(&["a", "b", "c"]).unwrap();
+        let vecs = mock
+            .embed_batch(&[
+                EmbedDoc::untitled("a"),
+                EmbedDoc::untitled("b"),
+                EmbedDoc::untitled("c"),
+            ])
+            .unwrap();
         assert_eq!(vecs.len(), 3);
         assert!(vecs.iter().all(|v| v.len() == 256));
+    }
+
+    /// The mock has to see the title field, or no test of what fills it (#36)
+    /// could tell a change from a no-op. An untitled document keeps the vector
+    /// the mock wrote before the field existed.
+    #[test]
+    fn the_mock_hashes_the_title_field_and_an_untitled_document_is_unchanged() {
+        let mut mock = MockLlm::new(256);
+
+        let untitled = mock.embed_batch(&[EmbedDoc::untitled("body")]).unwrap();
+        assert_eq!(untitled[0], mock.hash_to_vector("body"));
+
+        let titled = mock
+            .embed_batch(&[EmbedDoc::new("Archdragon > Definition", "body")])
+            .unwrap();
+        assert_ne!(titled[0], untitled[0]);
     }
 
     #[test]

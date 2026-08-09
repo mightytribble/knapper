@@ -1,4 +1,9 @@
-//! Contextual embedding prefix (issue #2). **Off by default** — see below.
+//! What a chunk is embedded as: the document template's `title:` field
+//! (issue #36) and the body, which can carry a contextual prefix (issue #2,
+//! **off by default** — see below). [`embed_inputs`] composes both, and it is the
+//! one composition the indexer and the write pipeline share.
+//!
+//! # The contextual prefix
 //!
 //! Only the raw chunk body reaches the embedder, so a chunk is findable only
 //! through words appearing inside its own prose. That misses two things: a
@@ -31,6 +36,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::chunker::Chunk;
+use crate::llm::{DocumentTitle, EmbedDoc};
 
 /// Which components the contextual prefix carries.
 ///
@@ -151,8 +157,8 @@ impl DocContext {
     }
 }
 
-/// The text one chunk is embedded as. Storage is unaffected.
-pub fn embed_text(doc: &DocContext, chunk: &Chunk, cfg: PrefixConfig) -> String {
+/// The body one chunk is embedded as. Storage is unaffected.
+fn embed_text(doc: &DocContext, chunk: &Chunk, cfg: PrefixConfig) -> String {
     let prefix = doc.prefix_for(chunk, cfg);
     if prefix.is_empty() {
         return chunk.text.clone();
@@ -160,13 +166,80 @@ pub fn embed_text(doc: &DocContext, chunk: &Chunk, cfg: PrefixConfig) -> String 
     format!("{prefix}\n{}", chunk.text)
 }
 
-/// [`embed_text`] over a file's chunks. Callers hold the result to borrow
-/// `&str` from, since [`crate::llm::EmbedModel::embed_batch`] takes `&[&str]`.
-pub fn embed_texts(doc: &DocContext, chunks: &[Chunk], cfg: PrefixConfig) -> Vec<String> {
+/// Everything that decides what a chunk is embedded as: the title field
+/// (issue #36) and how the body is composed (issue #2).
+///
+/// The two travel together because both paths into the embedder —
+/// [`crate::indexer::index_file`] and the write pipeline — have to use the same
+/// pair. A caller that threads one and forgets the other writes vectors into a
+/// space it does not share, and nothing downstream can tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EmbedComposition {
+    pub prefix: PrefixConfig,
+    pub title: DocumentTitle,
+}
+
+impl EmbedComposition {
+    pub fn from_config(config: &crate::config::Config) -> Self {
+        Self {
+            prefix: config.embedding_prefix,
+            title: config.embedding_prompt.document_title,
+        }
+    }
+}
+
+/// One chunk exactly as the embedder is shown it: the title field and the body.
+///
+/// Owned, because callers hold the whole file's worth and borrow
+/// [`EmbedDoc`]s from it — [`crate::llm::EmbedModel::embed_batch`] takes
+/// borrowed pairs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbedInput {
+    /// What fills the document template's `title:` field (issue #36).
+    pub title: String,
+    /// The body, prefix included when `[embedding_prefix]` is on (issue #2).
+    pub text: String,
+}
+
+impl EmbedInput {
+    pub fn as_doc(&self) -> EmbedDoc<'_> {
+        EmbedDoc::new(&self.title, &self.text)
+    }
+}
+
+/// What a file's chunks are embedded as, both fields, in one place.
+///
+/// Both callers of the embed path go through this — `indexer::index_file` and
+/// `writer::precompute_chunks` — because a note written through the write
+/// pipeline lands in the same vector space as an indexed one, and two
+/// compositions that can disagree eventually do.
+pub fn embed_inputs(doc: &DocContext, chunks: &[Chunk], cfg: EmbedComposition) -> Vec<EmbedInput> {
     chunks
         .iter()
-        .map(|chunk| embed_text(doc, chunk, cfg))
+        .map(|chunk| EmbedInput {
+            title: title_for(doc, chunk, cfg.title),
+            text: embed_text(doc, chunk, cfg.prefix),
+        })
         .collect()
+}
+
+/// The string that fills the document template's `title:` field (issue #36).
+///
+/// An empty result is the documented literal `none` — see
+/// [`crate::llm::PromptFormat::format_document`].
+fn title_for(doc: &DocContext, chunk: &Chunk, cfg: DocumentTitle) -> String {
+    match cfg {
+        DocumentTitle::None => String::new(),
+        DocumentTitle::Note => doc.name.clone(),
+        DocumentTitle::Breadcrumb => {
+            let mut parts: Vec<&str> = Vec::with_capacity(1 + chunk.heading_path.len());
+            if !doc.name.is_empty() {
+                parts.push(&doc.name);
+            }
+            parts.extend(chunk.heading_path.iter().map(String::as_str));
+            parts.join(" > ")
+        }
+    }
 }
 
 /// `lore/bestiary/archdragon.md` → `archdragon`.
@@ -308,17 +381,166 @@ mod tests {
     }
 
     #[test]
-    fn embed_texts_prefixes_every_chunk_and_preserves_order() {
+    fn embed_inputs_prefixes_every_chunk_and_preserves_order() {
         let doc = DocContext::from_file("lore/bestiary/archdragon.md", ARCHDRAGON);
         let chunks = vec![
             chunk(&["Definition"], "first"),
             chunk(&["Human Forms"], "second"),
         ];
 
-        let texts = embed_texts(&doc, &chunks, PrefixConfig::full());
-        assert_eq!(texts.len(), 2);
-        assert!(texts[0].contains("Definition\nfirst"));
-        assert!(texts[1].contains("Human Forms\nsecond"));
-        assert!(texts.iter().all(|t| t.starts_with("Archdragon — ")));
+        let inputs = embed_inputs(
+            &doc,
+            &chunks,
+            EmbedComposition {
+                prefix: PrefixConfig::full(),
+                title: DocumentTitle::None,
+            },
+        );
+        assert_eq!(inputs.len(), 2);
+        assert!(inputs[0].text.contains("Definition\nfirst"));
+        assert!(inputs[1].text.contains("Human Forms\nsecond"));
+        assert!(inputs.iter().all(|i| i.text.starts_with("Archdragon — ")));
+    }
+
+    // ── The title field (#36) ────────────────────────────────────────────────
+
+    fn titles(doc: &DocContext, chunks: &[Chunk], cfg: DocumentTitle) -> Vec<String> {
+        embed_inputs(
+            doc,
+            chunks,
+            EmbedComposition {
+                title: cfg,
+                ..Default::default()
+            },
+        )
+        .into_iter()
+        .map(|i| i.title)
+        .collect()
+    }
+
+    #[test]
+    fn the_none_title_is_empty_which_the_template_spells_none() {
+        let doc = DocContext::from_file("lore/bestiary/archdragon.md", ARCHDRAGON);
+        let chunks = [chunk(
+            &["Abilities", "Combat"],
+            "### Combat\nBreath weapon.",
+        )];
+        assert_eq!(
+            titles(&doc, &chunks, DocumentTitle::None),
+            vec![String::new()]
+        );
+    }
+
+    /// The shipped default, asserted where the composition is (§5.4).
+    #[test]
+    fn the_default_title_is_the_breadcrumb() {
+        let doc = DocContext::from_file("lore/bestiary/archdragon.md", ARCHDRAGON);
+        let chunks = [chunk(
+            &["Abilities", "Combat"],
+            "### Combat\nBreath weapon.",
+        )];
+        assert_eq!(
+            titles(&doc, &chunks, DocumentTitle::default()),
+            vec!["Archdragon > Abilities > Combat".to_string()]
+        );
+    }
+
+    #[test]
+    fn the_note_title_is_the_documents_effective_name() {
+        let doc = DocContext::from_file("lore/bestiary/archdragon.md", ARCHDRAGON);
+        let chunks = [chunk(
+            &["Abilities", "Combat"],
+            "### Combat\nBreath weapon.",
+        )];
+        assert_eq!(
+            titles(&doc, &chunks, DocumentTitle::Note),
+            vec!["Archdragon".to_string()]
+        );
+    }
+
+    #[test]
+    fn the_breadcrumb_is_the_note_title_then_every_ancestor_heading() {
+        let doc = DocContext::from_file("lore/bestiary/archdragon.md", ARCHDRAGON);
+        let chunks = [chunk(
+            &["Abilities", "Combat"],
+            "### Combat\nBreath weapon.",
+        )];
+        assert_eq!(
+            titles(&doc, &chunks, DocumentTitle::Breadcrumb),
+            vec!["Archdragon > Abilities > Combat".to_string()]
+        );
+    }
+
+    /// The mechanism that separates #36 from #2: the breadcrumb differs between
+    /// the sections of one document, so it cannot move all of a file's vectors
+    /// the same way. The note title alone can, and does.
+    #[test]
+    fn the_breadcrumb_varies_between_sections_of_one_document_and_the_note_title_does_not() {
+        let doc = DocContext::from_file("lore/bestiary/archdragon.md", ARCHDRAGON);
+        let chunks = [
+            chunk(&["Definition"], "first"),
+            chunk(&["Human Forms"], "second"),
+        ];
+
+        let note = titles(&doc, &chunks, DocumentTitle::Note);
+        assert_eq!(note[0], note[1]);
+
+        let breadcrumb = titles(&doc, &chunks, DocumentTitle::Breadcrumb);
+        assert_eq!(breadcrumb[0], "Archdragon > Definition");
+        assert_eq!(breadcrumb[1], "Archdragon > Human Forms");
+    }
+
+    #[test]
+    fn a_chunk_before_the_first_heading_has_the_note_title_as_its_whole_breadcrumb() {
+        let doc = DocContext::from_file("lore/bestiary/archdragon.md", ARCHDRAGON);
+        let chunks = [chunk(&[], "Opening paragraph.")];
+        assert_eq!(
+            titles(&doc, &chunks, DocumentTitle::Breadcrumb),
+            vec!["Archdragon".to_string()]
+        );
+    }
+
+    /// The title is a field, not a prefix: `chunks.text` and the FTS index keep
+    /// the raw chunk, so it cannot leak into a displayed result or be matched as
+    /// a keyword. Same contract as #2's prefix.
+    #[test]
+    fn the_title_field_does_not_touch_the_body() {
+        let doc = DocContext::from_file("lore/bestiary/archdragon.md", ARCHDRAGON);
+        let body = "## Definition\n**Rank**: SS";
+
+        for cfg in [
+            DocumentTitle::None,
+            DocumentTitle::Note,
+            DocumentTitle::Breadcrumb,
+        ] {
+            let chunks = [chunk(&["Definition"], body)];
+            let inputs = embed_inputs(
+                &doc,
+                &chunks,
+                EmbedComposition {
+                    title: cfg,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(inputs[0].text, body, "{cfg:?} changed the body");
+        }
+    }
+
+    #[test]
+    fn as_doc_borrows_both_fields() {
+        let doc = DocContext::from_file("lore/bestiary/archdragon.md", ARCHDRAGON);
+        let chunks = [chunk(&["Definition"], "body")];
+        let inputs = embed_inputs(
+            &doc,
+            &chunks,
+            EmbedComposition {
+                title: DocumentTitle::Breadcrumb,
+                ..Default::default()
+            },
+        );
+
+        let as_doc = inputs[0].as_doc();
+        assert_eq!(as_doc.title, "Archdragon > Definition");
+        assert_eq!(as_doc.text, "body");
     }
 }

@@ -1287,7 +1287,7 @@ async fn main() -> Result<()> {
                         input,
                         &store,
                         &mut embedder,
-                        cfg.embedding_prefix,
+                        engraph::prefix::EmbedComposition::from_config(&cfg),
                         &vault_path,
                         profile.as_ref(),
                     )?;
@@ -1324,7 +1324,7 @@ async fn main() -> Result<()> {
                         input,
                         &store,
                         &mut embedder,
-                        cfg.embedding_prefix,
+                        engraph::prefix::EmbedComposition::from_config(&cfg),
                         &vault_path,
                     )?;
                     if cli.json {
@@ -1351,7 +1351,7 @@ async fn main() -> Result<()> {
                         &file,
                         &store,
                         &mut embedder,
-                        cfg.embedding_prefix,
+                        engraph::prefix::EmbedComposition::from_config(&cfg),
                         &vault_path,
                     )?;
                     if cli.json {
