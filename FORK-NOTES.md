@@ -251,8 +251,9 @@ has never executed on this box.
     `documented` on `Conceptual` alone — two of the eighteen calibration queries, and no tracked
     target. `Archdragon` classifies as `Conceptual` (#19), so it asks the exact-name guard a
     question.
-  - **`title:` holds the literal `none`.** Putting the document's own identity there is #36, and it
-    needs a per-text title through `EmbedModel::embed_batch`.
+  - **`title:` holds the literal `none`.** The design's breadcrumb rule fills that field with
+    `Note Title > H1 > H2 > H3` (#36), and it needs `heading_path` persisted plus a per-text title
+    through `EmbedModel::embed_batch`.
 - **The cross-encoder sorts the results; it used to vote on them** (this fork, issue #30). Two
   content lanes are fused by RRF, graph and temporal candidates are routed into the shortlist by
   **reserved quota** (`[ranking] candidates = 30`, `graph_reserve = 8`, `temporal_reserve = 4`), and
@@ -456,11 +457,18 @@ See issues on this repo:
   `status`, and provenance replacing `score`/`confidence` **on the MCP and HTTP payloads only** —
   §7.3's boundary is the consumer, not the field, and the CLI keeps the percentage `probe.sh` reads.
   Settled by ordering that must not move. **Layer 2, second half**
-- **#36** document identity in EmbeddingGemma's `title:` field, which holds the literal `none` today.
-  Needs a per-text title through `EmbedModel::embed_batch`, so the trait and both test embedders
-  move. Carries #2's failure mode — a per-file constant is still a per-file constant wherever it is
-  placed — and #2 is the reason to expect it can lose. Probe 2 is the guard, since its answer is one
-  section of a file whose other sections compete with it
+- **#36** the breadcrumb rule's embedding limb — `Note Title > H1 > H2 > H3` in the `title:` field,
+  which holds the literal `none` today. Needs `heading_path` persisted on `chunks` and a per-text
+  title through `EmbedModel::embed_batch`, so the trait and both test embedders move. **The heading
+  path is the one component of #2's prefix that is not a per-file constant**, which is the mechanism
+  #2 lost to, and #2 never measured it alone — both its columns carried `name — path`. Arms are
+  note-title, full breadcrumb, and the body-concatenated control the design excludes. Probe 3 is the
+  target, probes 4 and 2 the guards
+- **#37** the breadcrumb rule's lexical limb — `content='chunks'` with sync triggers, `heading_path`
+  and `tags_text` as indexed FTS columns, `bm25(chunks_fts, 1.0, 3.0, 4.0)`. Makes #11's bug class
+  structurally impossible and is the cheap form of what #2 attempted in the embedding. The schema and
+  the weights are two measurements. Shares the stored `heading_path` with #36. Layer 3; closes half
+  of #17
 - **#5** embedding model config — expose output dim, tie max chunk tokens to the model's context window
 - **#8** pick a better local embedder — >512 tokens, >768 dim (pairs with #5, which exposes the knobs)
 - ~~**#12** embed at the model's native dimension~~ — **done.** Every vector had been truncated to its
