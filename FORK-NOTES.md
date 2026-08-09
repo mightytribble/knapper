@@ -30,7 +30,7 @@ git fetch upstream && git diff --stat upstream/main main
 | `resolve_n_threads` | llama.cpp runs on the machine's cores, not a constant 4 | this fork, issue #20 |
 | `fts::any_term_expr` | the keyword lane matches terms, not the query as one phrase | this fork, issue #22 |
 | `ensure_original` | the user's own query is always searched for | this fork, issue #23 |
-| `rerank::max_document_chars` | the cross-encoder's input is bounded; upstream has no budget at all | this fork, issue #25 |
+| `rerank::max_document_chars` | the cross-encoder's input *can* be bounded; upstream has no budget at all. Ships off — see #42 | this fork, issues #25, #42 |
 | re-index keeps the `files` row | editing a note no longer cascades away every backlink into it | this fork, issue #27 |
 | normalised seed pool | graph seeds are ranked by relevance, not by which lane's unit is bigger | this fork, issue #26 |
 | chunk-to-chunk `edges` | a link knows which passage wrote it; expansion follows the seed's own links | this fork, issue #28 |
@@ -884,7 +884,30 @@ See issues on this repo:
   rounds and shipped defaulting to 1000**, not off: 82% of the text kept, 12% of query latency back,
   two probe targets up and none down. 600 gives back 26% and costs probe 4 a rank. The honest tension
   with **#14** survives measurement — #14's effective cap truncated 79.7% of chunks where 1000 cuts
-  18% of the text, and the two ranks #14 won both hold
+  18% of the text, and the two ranks #14 won both hold.
+  **#42 took the cap back off.** The 12% was a CPU number; on CUDA the same cap saves 3.6%
+- ~~**#42** the cross-encoder's character cap is a CPU-era trade, and it is cutting answers off
+  chunks~~ — **DONE.** `max_document_chars` ships at **0**, unlimited.
+  **The cap was truncating answers, not padding.** Probe 7's answering sentence starts at character
+  1038 of a 1061-character chunk, and probe 2's best answer at 1098 of 1207 — so the cross-encoder
+  scored both on their subject and never read the line that answers the question. Across the vault,
+  333 of 1598 chunks are over the cap and **14.8% of the corpus never reached the cross-encoder**.
+  **The latency it bought is gone.** Eighteen queries, one warm server per arm, three interleaved
+  rounds, `min` per query: 8.745 s capped against 9.064 s uncapped. **3.6%, or 18 ms on a 490 ms
+  query**, against #25's 12.3% on the CPU build.
+  **Probe 2's two lost ranks are the instrument failing, not the arm.** #25 and #30 both recorded
+  `archdragon.md > ## Human Forms` dropping from rank 4 when the cap comes off, and both read it as a
+  cost. Its *score* is unchanged at 80.73%; it drops because two previously truncated chunks moved
+  above it, and both answer the query — `medium-dragon.md > ## Stat Block` at 98.02% answers it
+  better, naming the youngest dragons able to take human form. **A tracked target's rank falls the
+  same way when a better result passes it as when a worse one does.** Probe 7 shows the same shape
+  with the sign visible: rank 1 held, score 97.56% → 98.35%.
+  **The cost is the two negatives #34 already records as unrejectable**, N4 and N11, which gain two
+  above-floor results each. Every other negative and probe 5 are identical, best score and every
+  slot. `answer_floor` needs no refit: the same 29.64% midpoint.
+  The key stays settable, because #25's trade is still real on a CPU build. **Every table in
+  `eval/probes.md` above the #42 section was measured at cap 1000**, so rank tables from either side
+  of it are not comparable
 - ~~**#6** section-level retrieval granularity — fuse on `(file_id, seq)` so a document can
   contribute more than one section~~ — **done**, probe 3 now returns the correct section and every
   result names its heading. It did not fix probe 1, but #9 has: nothing about the section-per-file
@@ -1063,5 +1086,8 @@ configuration that clears the graph block. Now confirmed from the other directio
 corrected, in-place chunking returns the same file at the same ranks — so `eval/section-split.py`
 has no open question left and can be retired.
 
-`eval/` holds the probes and the harnesses: `probe.sh` for what came back, `bench-search.sh` for how
-long it took.
+`eval/` holds the probes and the harnesses: `pool.sh` runs the eighteen-query calibration pool and
+keeps the JSON, `probe.sh` says what came back for one query, `bench-search.sh` times one query in a
+warm server and `bench-pool.sh` times the whole pool the same way. Use `bench-pool.sh` for anything
+that touches the rerank lane: a cap or a candidate count does nothing for a query whose candidates
+are already short, and an average over five probes hides that.

@@ -153,12 +153,21 @@ pub fn default_max_chunks_per_file() -> usize {
 
 /// Default ceiling on how much of one candidate the cross-encoder reads.
 ///
-/// Picked from the sweep in `eval/probes.md` (#25), three rounds over the five
-/// seed probes: 1000 characters keeps 82% of the text, gives back 12% of query
-/// latency, and moves no probe down — two move up. 600 gives back 26% but costs
-/// probe 4 a rank, which is the guard #15 and #25 both name.
+/// **Unlimited.** #25 fit a 1000-character cap on a CPU build, where it kept 82%
+/// of the text and gave back 12.3% of query latency. #33 moved the cross-encoder
+/// to CUDA and the trade collapsed: measured over the eighteen calibration
+/// queries against one warm server, the cap now saves 3.6% — 18 ms on a 490 ms
+/// query — and it truncates 14.8% of the corpus, because 333 of 1598 chunks are
+/// longer than it (`eval/probes.md`, #42).
+///
+/// What it truncates is answers. Probe 7's answering sentence starts at
+/// character 1038 of a 1061-character chunk and probe 2's best answer at
+/// character 1098 of 1207, so the cross-encoder scored both chunks on their
+/// subject alone and never read the line that answers the question.
+///
+/// The key stays for a CPU build, where #25's trade still holds.
 pub fn default_max_document_chars() -> usize {
-    1000
+    0
 }
 
 /// How the rerank lane presents a candidate to the cross-encoder.
@@ -187,12 +196,11 @@ pub struct RerankConfig {
     pub document_title: bool,
 
     /// Ceiling on how much of one candidate's text the cross-encoder reads.
-    /// 0 means unlimited, which is what shipped before issue #25.
+    /// 0 means unlimited, and 0 is the default — see
+    /// `default_max_document_chars()` for why the cap came off (#42).
     ///
-    /// Defaults to `default_max_document_chars()`, which is measured rather
-    /// than chosen — see there.
-    ///
-    /// The cross-encoder is 85–96% of a query, and its cost is very nearly
+    /// The cross-encoder is 85–96% of a query *on a CPU build*, and there its
+    /// cost is very nearly
     /// linear in the tokens it is handed: measured over four queries of thirty
     /// candidates, `ctx.decode()` was 99.0–99.3% of the call and a least-squares
     /// fit put the fixed per-candidate term at *negative* 48 ms. So this is the
@@ -203,6 +211,10 @@ pub struct RerankConfig {
     /// Characters rather than tokens because at this boundary the tokens do not
     /// exist yet and the tokenizer belongs to whichever `RerankModel` is loaded.
     /// Measured char/token ratio on real candidates is 3.16–3.43.
+    ///
+    /// Setting it is a `reranker_fingerprint` change, whose action is
+    /// `InvalidateThresholds` — no re-index and no keyword-index rebuild, so a
+    /// sweep of this key costs one config edit per arm.
     ///
     /// A cap also bounds a second cost: `n_ctx` and the batch are sized to the
     /// *longest* pair in the set (`llm.rs`), so one outlier inflates the
@@ -665,13 +677,14 @@ mod tests {
         assert!(cfg.vault_path.is_none());
     }
 
-    /// Issue #25. The cap is the only knob that bounds query latency, so a
-    /// config that never mentions `[rerank]` still has to get one — and an
-    /// explicit `0` still has to mean unlimited.
+    /// Issues #25 and #42. The cap ships off, because on a CUDA build it saves
+    /// 3.6% of query time and truncates 14.8% of the corpus — including the
+    /// sentences that answer two of the calibration probes. It stays settable
+    /// for a CPU build, where #25's trade still holds.
     #[test]
-    fn the_rerank_character_cap_defaults_on_and_zero_means_unlimited() {
+    fn the_rerank_character_cap_defaults_off_and_a_cap_is_opt_in() {
         let bare: Config = toml::from_str("").unwrap();
-        assert_eq!(bare.rerank.max_document_chars, 1000);
+        assert_eq!(bare.rerank.max_document_chars, 0, "0 means unlimited");
         assert!(
             bare.rerank.document_title,
             "the candidate has to name the document it came from once the \
@@ -680,12 +693,12 @@ mod tests {
 
         let titled: Config = toml::from_str("[rerank]\ndocument_title = true\n").unwrap();
         assert_eq!(
-            titled.rerank.max_document_chars, 1000,
-            "naming one key in the section must not silently unlimit the other"
+            titled.rerank.max_document_chars, 0,
+            "naming one key in the section must not silently cap the other"
         );
 
-        let unlimited: Config = toml::from_str("[rerank]\nmax_document_chars = 0\n").unwrap();
-        assert_eq!(unlimited.rerank.max_document_chars, 0);
+        let capped: Config = toml::from_str("[rerank]\nmax_document_chars = 1000\n").unwrap();
+        assert_eq!(capped.rerank.max_document_chars, 1000);
     }
 
     #[test]
