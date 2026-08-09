@@ -257,6 +257,8 @@ pub struct EngraphServer {
     group_by: crate::config::GroupBy,
     /// Rerank-lane settings from `config.toml`.
     rerank: crate::config::RerankConfig,
+    /// Ranking-stage settings from `config.toml`.
+    ranking: crate::config::RankingConfig,
     /// Embedding-prefix settings, for the same reason: notes written by MCP
     /// tools share a vector space with the indexed vault.
     embedding_prefix: crate::prefix::PrefixConfig,
@@ -411,6 +413,7 @@ impl EngraphServer {
             rerank: self.rerank,
             max_chunks_per_file: self.max_chunks_per_file,
             group_by: self.group_by,
+            ranking: self.ranking,
         };
 
         let output =
@@ -1126,6 +1129,7 @@ pub async fn run_serve(
     let max_chunks_per_file = config.max_chunks_per_file;
     let group_by = config.group_by;
     let rerank = config.rerank;
+    let ranking = config.ranking;
     let embedding_prefix = config.embedding_prefix;
 
     let (watcher_handle, watcher_shutdown) = crate::watcher::start_watcher(
@@ -1155,6 +1159,7 @@ pub async fn run_serve(
         max_chunks_per_file,
         group_by,
         rerank,
+        ranking,
         embedding_prefix,
     };
 
@@ -1179,6 +1184,7 @@ pub async fn run_serve(
             max_chunks_per_file,
             group_by,
             rerank,
+            ranking,
             embedding_prefix,
         };
         let router = crate::http::build_router(api_state);

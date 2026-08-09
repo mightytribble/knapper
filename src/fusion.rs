@@ -44,6 +44,7 @@ pub struct FusedResult {
 }
 
 /// Per-lane contribution details for --explain output.
+#[derive(Debug, Clone)]
 pub struct LaneContribution {
     pub lane_name: String,
     pub rank: usize,

@@ -38,6 +38,8 @@ git fetch upstream && git diff --stat upstream/main main
 | `PprParams` | the graph lane is personalized PageRank over chunks: sum, not max | this fork, issue #29 |
 | `incident_wikilink_edges` | one indexed fetch per frontier, not a BFS per seed | this fork, issue #29 |
 | `src/fingerprint.rs` | the store knows what built it, and rebuilds only what changed | this fork, issue #31 |
+| `src/ranking.rs` | the cross-encoder sorts the shortlist; the graph reaches it by reserved quota | this fork, issue #30 |
+| `format_reranker_input` | the cross-encoder is asked the question its model card documents | this fork, issue #32 |
 | `.github/workflows/ci.yml` | manual dispatch only — upstream runs it on push and PR | this fork, Actions minutes |
 
 Cherry-picked rather than merged: PR #41 branched before upstream's #40 graph fix, so merging the
@@ -121,6 +123,16 @@ has never executed on this box.
   re-downloads 300MB (1.6GB with intelligence enabled).
 - **MCP servers launch once per session**, so a mid-session `git checkout` leaves the server pointed
   at the previous branch's store.
+- **The eval store lives at `standalone/mcp-isekai/.engraph-eval/`** and the corpus it indexes is
+  not frozen. Every measurement from #26 to #29 was taken on a 247-file / 1598-chunk store; the
+  pinned vault at `63f33e6` is 266 / 1863 / 1988 edges, because `standalone/mcp-isekai` tracks the
+  live `cc-isekai` repo and it grew in between. Rank tables from either side of that are not
+  comparable. Earlier stores lived in session scratchpads and expired with the sessions.
+- **`top_n` is part of the measurement, not a display setting.** Both content lanes retrieve
+  `top_n * 3` per expansion, so a probe table taken at 5 and one taken at 20 are different
+  experiments — probe 2's tracked answer is absent at 5 and rank 1 at 20. `eval/probes.md`'s tables
+  are at 20. The orchestration cache (`llm_cache`, keyed on the query) is what holds expansions
+  constant across variants, so reusing one warm store is the control rather than a shortcut.
 - **Backlinks used to rot on every save** (#27, fixed). Any store last written by a pre-#27 build has
   edges missing — 24 of 1084 per three files edited, on the isekai vault — and the fix does not
   reconstruct them. `engraph index --rebuild` is the one-time repair, and any graph-lane number taken
@@ -180,6 +192,39 @@ has never executed on this box.
   without addressing that and every embedding loses its BOS. Changing the *document* side needs
   `--reindex`; changing the *query* side needs nothing. Since #31 the reindex is no longer something
   to remember: bump `fingerprint::PROMPT_TEMPLATE_VERSION` and the next `engraph index` does it.
+- **The cross-encoder sorts the results; it used to vote on them** (this fork, issue #30). Two
+  content lanes are fused by RRF, graph and temporal candidates are routed into the shortlist by
+  **reserved quota** (`[ranking] candidates = 30`, `graph_reserve = 8`, `temporal_reserve = 4`), and
+  the model's probability is the order. Nothing reblends; `tiebreak` decides exact ties only.
+  `[ranking] mode = "legacy"` restores the five-lane fusion and reproduces pre-#30 output byte for
+  byte — it is the control the change was measured against, and it stays for that.
+  - **The shortlist is capped and the results are not.** Bound what the model is shown, because it
+    cannot rank what it never saw; do not bound what it returns, because ranking is its job. So one
+    document can own the top of the answer, which under the legacy stage `max_chunks_per_file` cut
+    at three. `group_by = "file"` still collapses to one result per document.
+  - **A build with no reranker configured keeps the legacy stage.** The documented 3:1 interleave is
+    the fallback for a model that *should* be there, and it is what a failed `rerank_batch` takes —
+    labelled `(degraded ordering)` on stdout, because stderr is where a warning goes to be
+    discarded. With `intelligence = false` the interleave measured two tracked targets down and one
+    up against the fusion, so a deliberate configuration is not treated as a degradation.
+  - **The graph reserve is inert on this corpus and ships anyway.** 20 graph candidates generated
+    per query, 8–19 admitted, **none reaching the output** — the model scores every graph-only
+    candidate below every content candidate, and `graph_reserve = 0` is byte-identical on all five
+    probes. What it buys is that those are now three numbers in a log line rather than an inference
+    from a ranking, which is the state #9 could not get out of.
+  - **Confidence means two different things and one of them is not a probability.** Under sorting it
+    is the cross-encoder's own score — probe 5, the nonsense control, reports 0% where it used to
+    report 100%. Under the degraded interleave it is a **position**, since nothing calibrated that
+    order. Layer 2 of the convergence plan replaces the percentage with provenance and a status.
+- **The reranker was being asked a question its model card does not document** (this fork, issue
+  #32). Qwen3-Reranker-0.6B specifies a fixed system prompt, an `<Instruct>/<Query>/<Document>`
+  body, an **empty `<think></think>` block** before the answer, and lowercase `yes`/`no` as the
+  scored tokens; `format_reranker_input` matched none of them, so the logits being read came from a
+  distribution that was never about yes or no. Same family as #10. **It survived because the score
+  was a vote**: correcting it leaves the legacy stage's top four unchanged on every probe. Under
+  #30 it is the difference between probe 3's answer at rank 16 and at rank 1, and between a nonsense
+  query scoring 8% and scoring 0%. `[rerank] document_title` ships on for the same reason — a
+  section that reads `## Evolution / - Previous: Medium Dragon` never names the document it is from.
 - **The store records what built it, and rebuilds only what changed** (this fork, issue #31). Six
   keys in `meta` — `parser_`, `chunker_`, `link_`, `fts_`, `embedding_`, `reranker_fingerprint` —
   compared at the top of every index and at the top of every read. Three costs are wildly different
@@ -428,18 +473,36 @@ See issues on this repo:
   **`63f33e6`** — see `eval/probes.md`; `standalone/mcp-isekai`'s `origin` is the live `cc-isekai`
   repo, so the pin is a checkout that stops tracking, not a fetchable tag.
   **Layer 0 of `docs/vault-search-convergence.md`**
-- **#30 — the ranking stage: the cross-encoder sorts, and graph reaches it by reserved quota.**
-  What survived #24. Graph stops being a fusion lane and becomes a candidate source keeping #29's
-  PPR as its reach function; **48 RRF anchors + 16 graph anchors of a 64-candidate pool, backfill
-  either way** — a routing guarantee, not a score bonus, answering the shut-out defect at the stage
-  where the shortlist is decided rather than at seeding. The cross-encoder sorts and nothing
-  reblends. Two caps split by job — bound one document's share of the **shortlist** (the model
-  cannot rank what it never saw), do **not** bound its share of the **results** (if a document holds
-  the ten best sections, ten sections is the right answer, and #6's vote-counting reason for capping
-  evaporates once there are no votes); this conflicts with §9.1 of the vault-search design, and #30
-  is the side being shipped. Control is a `ranking = "legacy" | "sorted"` switch reproducing current
-  output byte-for-byte; `LaneWeights::from_intent`'s graph arm is deleted rather than retuned.
-  Layer 1 of `docs/vault-search-convergence.md`
+- ~~**#30 — the ranking stage: the cross-encoder sorts, and graph reaches it by reserved quota**~~
+  — **DONE.** `src/ranking.rs`. Graph stops being a fusion lane and becomes a candidate source
+  keeping #29's PPR as its reach function; the shortlist is built by **reserved quota, backfilling
+  either way**, and the cross-encoder's probability is the final order with nothing reblended.
+  Two caps split by job — bound one document's share of the **shortlist**, not of the **results**;
+  this conflicts with §9.1 of the vault-search design and #30 is the side shipped.
+  **The control holds: `mode = "legacy"` is byte-identical to pre-#30 output on all five probes**,
+  through every subsequent edit. The tests were checked against two mutants — a sort that does
+  nothing fails three, a reserve that admits nothing fails six, including the end-to-end one.
+  **The probes overruled three of the ticket's four prescriptions.** §8.6's 64-candidate pool
+  doubles the assembled text for one rank *worse* on probe 2, so the pool stays at 30 and the change
+  is **cost-neutral** (55.7 s → 56.8 s of cross-encoder across five probes). The "loose shortlist
+  cap" moves nothing at 32. Pure ordering and the RRF tie-break are **byte-identical**, because a
+  softmax collides only on exact equality. And the 16-of-64 reserve is inert here: 8–19 graph-only
+  candidates enter the pool per query and **none survives the model** — `graph_reserve = 0` is
+  byte-identical. It ships as instrumentation rather than as a ranking effect.
+  **On rank the change loses three targets to one** (p1 temple 1 → 2 and lenne 2 → 5, p2 4, p3
+  holds at 1, **p4 5 → 1**), and that is recorded rather than explained away. What it buys is the
+  thing the rank table cannot show: **probe 5's confidence goes 100% → 0%** while every real probe's
+  answer scores 98–100%, which is the absolute score layer 2's abstention floor has to exist
+  against. Blocked on #32 — without it the same change puts probe 3's answer at rank 16.
+  **Layer 1 of `docs/vault-search-convergence.md`**
+- ~~**#32 — the cross-encoder is asked a question its model card does not document**~~ — **DONE.**
+  Found while measuring #30, and it inverted that measurement. Qwen3-Reranker's documented input is
+  a fixed system prompt, an `<Instruct>/<Query>/<Document>` body, an empty `<think></think>` block
+  before the answer, and lowercase `yes`/`no`; we matched none of it. **The reason it survived is
+  itself the sharpest measurement of #15 in the file**: as a voter, correcting the format changes
+  the top four results of no probe at all — two materially different score distributions, one
+  ranking. Under #30 it moves probe 3's answer 16 → 1, probe 1's 15 → 2, and the nonsense control's
+  best score 8% → 0%. `[rerank] document_title` ships on with it (probe 2's answer, 8 → 4).
 - ~~**#26 (defect 2 of #24, extracted)** — normalise each lane's scores before they leave the lane~~
   — **DONE.** Min-max into `[0.1, 1.0]` per `(lane × expansion)`, floor 0.1 because
   `seed.score * decay` feeds a sort that feeds `truncate`, `max == min` to the top of the range.

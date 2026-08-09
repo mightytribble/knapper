@@ -21,6 +21,7 @@ pub mod openapi;
 pub mod placement;
 pub mod prefix;
 pub mod profile;
+pub mod ranking;
 pub mod search;
 pub mod serve;
 pub mod store;

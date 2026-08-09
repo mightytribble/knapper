@@ -166,13 +166,20 @@ pub fn default_max_document_chars() -> usize {
 pub struct RerankConfig {
     /// Prepend the document's title to the chunk before scoring it.
     ///
-    /// Off, and unmeasured. This is not the experiment issue #2 lost: a prefix
-    /// added to every chunk of a file moves that file's *vectors* together and
-    /// costs within-document separation, whereas a cross-encoder scores each
-    /// pair on its own and shares no space to flatten. But "different failure
-    /// mode" is not "known to help", and the five seed probes cannot tell —
-    /// #12 changed 76 of 100 result slots without moving a single probe
-    /// verdict. So this waits on the probe battery in #3 and ships as a switch.
+    /// This is not the experiment issue #2 lost: a prefix added to every chunk
+    /// of a file moves that file's *vectors* together and costs within-document
+    /// separation, whereas a cross-encoder scores each pair on its own and
+    /// shares no space to flatten.
+    ///
+    /// It shipped off and unmeasured until the cross-encoder started deciding
+    /// the order (#30), at which point the probes could see it: **probe 2's
+    /// answer moves four ranks**, 8 to 4, and nothing else moves. The reason is
+    /// visible in the candidate — `## Evolution\n- Previous: Medium Dragon\n-
+    /// Next: Archdragon` is a section of `archdragon.md` that never says
+    /// "archdragon" outside a link, so without its title the model is judging
+    /// an unidentified fragment. The legacy stage is unmoved by it, which is
+    /// the same measurement #32 makes: a voter's input barely reaches the
+    /// output.
     ///
     /// The chunk's own heading is not included: the chunker already makes it
     /// the first line of the text.
@@ -205,8 +212,111 @@ pub struct RerankConfig {
 impl Default for RerankConfig {
     fn default() -> Self {
         Self {
-            document_title: false,
+            document_title: true,
             max_document_chars: default_max_document_chars(),
+        }
+    }
+}
+
+/// Which ranking stage runs (issue #30).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RankingMode {
+    /// Five lanes fused by weighted RRF, the cross-encoder among them as a
+    /// voter. What engraph did before #30.
+    ///
+    /// Kept as the control the change is measured against: a switch that
+    /// reproduces prior output byte-for-byte is what proves nothing incidental
+    /// leaked into the shared retrieval code. `OFF_CHUNK_LINK_WEIGHT = 1.0`
+    /// did the same job for #28 and stayed for the same reason.
+    Legacy,
+    /// Two content lanes fused, graph and temporal routed by reserved quota,
+    /// and the cross-encoder sorts what reaches it.
+    #[default]
+    Sorted,
+}
+
+/// What decides between candidates the cross-encoder scored identically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Tiebreak {
+    /// Fused rank first, then the chunk's identity.
+    ///
+    /// §8.6 says flatly not to reblend, and this is not reblending: a softmax
+    /// over two token logits collides only on exact equality, which is rare
+    /// enough to be measurable and is dominated by the degenerate case — a
+    /// reranker that returned the same number for everything. Falling back to
+    /// alphabetical order there would throw away the retrieval ordering for no
+    /// reason.
+    #[default]
+    Rrf,
+    /// The chunk's identity alone: pure cross-encoder ordering, with a
+    /// deterministic fallback and nothing of fusion in it.
+    Identity,
+}
+
+/// The ranking stage: what reaches the cross-encoder, and what it does there.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RankingConfig {
+    pub mode: RankingMode,
+    /// How many candidates the cross-encoder is shown.
+    ///
+    /// This is the knob that sets query cost: the cross-encoder is 85–96% of a
+    /// reranked query and its cost is very nearly linear in the text it reads,
+    /// so `candidates × max_document_chars` is the budget and the two trade
+    /// against each other.
+    ///
+    /// **§8.6 specifies 64 and it was measured and rejected.** At 64 the
+    /// assembled input doubles — 18k characters per query to 37k — and the
+    /// tracked targets do not move, except probe 2's answer which is *worse* by
+    /// two ranks. Thirty is what the legacy stage showed the model, so the
+    /// ranking change costs nothing at the stage that dominates the query.
+    pub candidates: usize,
+    /// Slots reserved for graph candidates in reach order.
+    ///
+    /// A routing guarantee, not a score bonus. The graph lane's fusion weight
+    /// is gone; this replaces it, one stage later, where the shortlist is
+    /// actually decided. Held at §8.6's ratio of the budget, 8 of 30.
+    ///
+    /// **Setting this to 0 leaves the five seed probes byte-identical.** The
+    /// reserve admits 8–19 candidates no content lane found, the model scores
+    /// every one of them below the content candidates, and none reaches the
+    /// output. It ships anyway, for the reason #9 measured: a lane that cannot
+    /// reach the model is a lane whose failures are invisible. What is bought
+    /// here is that the graph's contribution is now a number that can be read
+    /// off a log line rather than inferred from a ranking.
+    pub graph_reserve: usize,
+    /// Slots reserved for date-matching candidates the content order cut.
+    ///
+    /// **Unmeasured** — no probe covers the temporal lane. See
+    /// [`crate::ranking::Reserves::temporal`].
+    pub temporal_reserve: usize,
+    /// At most this many sections of one document may reach the model.
+    ///
+    /// Bound what the model is *shown*, because it cannot rank what it never
+    /// saw; do not bound what it returns, because ranking is its job. The
+    /// default of 3 comes from #6, where a 33-section document took 33 of the
+    /// ranks its lane handed to RRF — under sorting there is no vote mechanic
+    /// and that reason is gone.
+    ///
+    /// **Swept: 32 leaves every probe's ranking unchanged** while letting 9–108
+    /// more chunks into the fused order, so the loose cap #30 argued for buys
+    /// nothing measurable here. Three stays, as the cheaper of two settings the
+    /// probes cannot tell apart.
+    pub shortlist_cap: usize,
+    pub tiebreak: Tiebreak,
+}
+
+impl Default for RankingConfig {
+    fn default() -> Self {
+        Self {
+            mode: RankingMode::default(),
+            candidates: 30,
+            graph_reserve: 8,
+            temporal_reserve: 4,
+            shortlist_cap: default_max_chunks_per_file(),
+            tiebreak: Tiebreak::default(),
         }
     }
 }
@@ -254,6 +364,9 @@ pub struct Config {
     /// says which reranker to load.
     #[serde(default)]
     pub rerank: RerankConfig,
+    /// What reaches the cross-encoder, and what it does there (issue #30).
+    #[serde(default)]
+    pub ranking: RankingConfig,
     #[serde(default)]
     pub identity: IdentityConfig,
     #[serde(default)]
@@ -274,6 +387,7 @@ impl Default for Config {
             intelligence: None,
             models: ModelConfig::default(),
             rerank: RerankConfig::default(),
+            ranking: RankingConfig::default(),
             obsidian: ObsidianConfig::default(),
             agents: AgentsConfig::default(),
             http: HttpConfig::default(),
@@ -386,7 +500,11 @@ mod tests {
     fn the_rerank_character_cap_defaults_on_and_zero_means_unlimited() {
         let bare: Config = toml::from_str("").unwrap();
         assert_eq!(bare.rerank.max_document_chars, 1000);
-        assert!(!bare.rerank.document_title);
+        assert!(
+            bare.rerank.document_title,
+            "the candidate has to name the document it came from once the \
+             cross-encoder decides the order (#30)"
+        );
 
         let titled: Config = toml::from_str("[rerank]\ndocument_title = true\n").unwrap();
         assert_eq!(

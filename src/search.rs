@@ -4,10 +4,11 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde_json::json;
 
-use crate::config::GroupBy;
-use crate::fusion::{self, RankedResult};
+use crate::config::{GroupBy, RankingMode};
+use crate::fusion::{self, FusedResult, RankedResult};
 use crate::graph;
 use crate::llm::{self, EmbedModel, OrchestratorModel, RerankModel};
+use crate::ranking;
 use crate::store::{Store, StoreStats};
 
 /// Compute cache key for orchestration results (SHA256 of query).
@@ -47,6 +48,12 @@ pub struct InternalSearchResult {
 pub struct SearchOutput {
     pub results: Vec<InternalSearchResult>,
     pub fused: Vec<fusion::FusedResult>,
+    /// The cross-encoder was meant to sort this query and could not, so the
+    /// documented 3:1 interleave produced the order instead (#30).
+    ///
+    /// A fallback nobody is told about becomes the real ranking the moment the
+    /// model is slow or missing, and no number in the result distinguishes it.
+    pub degraded: bool,
     pub intent: Option<crate::llm::QueryIntent>,
     /// What each expanded query actually retrieved — the `--explain` record of
     /// the retrieval step, as opposed to the fusion step.
@@ -75,6 +82,8 @@ pub struct SearchConfig<'a> {
     pub orchestrator: Option<&'a mut dyn OrchestratorModel>,
     pub reranker: Option<&'a mut dyn RerankModel>,
     pub store: &'a Store,
+    /// How many candidates the legacy stage shows the cross-encoder. The sorted
+    /// stage reads `ranking.candidates` instead.
     pub rerank_candidates: usize,
     /// How candidates are presented to the reranker.
     pub rerank: crate::config::RerankConfig,
@@ -82,6 +91,8 @@ pub struct SearchConfig<'a> {
     pub max_chunks_per_file: usize,
     /// Whether results address sections or whole documents.
     pub group_by: GroupBy,
+    /// Which ranking stage runs, and what reaches it (issue #30).
+    pub ranking: crate::config::RankingConfig,
 }
 
 impl<'a> SearchConfig<'a> {
@@ -95,6 +106,7 @@ impl<'a> SearchConfig<'a> {
             rerank: config.rerank,
             max_chunks_per_file: config.max_chunks_per_file,
             group_by: config.group_by,
+            ranking: config.ranking,
         }
     }
 }
@@ -119,6 +131,7 @@ pub fn search_internal(
         rerank: crate::config::RerankConfig::default(),
         max_chunks_per_file: crate::config::default_max_chunks_per_file(),
         group_by,
+        ranking: crate::config::RankingConfig::default(),
     };
     search_with_intelligence(query, top_n, embedder, &mut config)
 }
@@ -136,9 +149,22 @@ pub fn search_internal(
 /// A candidate whose text cannot be found falls back to its snippet. That is
 /// the pre-#14 behaviour for that one candidate, which beats scoring it against
 /// nothing.
+/// One candidate as the rerank lane needs it: where its text lives, and what to
+/// fall back to if the lookup misses.
+///
+/// A borrowed view rather than a trait, because the two ranking stages hold
+/// their candidates in different types and neither should have to become the
+/// other to be scored.
+struct RerankTarget<'a> {
+    file_id: i64,
+    chunk_seq: i64,
+    file_path: &'a str,
+    snippet: &'a str,
+}
+
 fn rerank_documents(
     store: &Store,
-    candidates: &[&fusion::FusedResult],
+    candidates: &[RerankTarget<'_>],
     settings: crate::config::RerankConfig,
 ) -> Vec<String> {
     let keys: Vec<(i64, i64)> = candidates
@@ -154,12 +180,12 @@ fn rerank_documents(
         .iter()
         .zip(texts)
         .map(|(candidate, text)| {
-            let text = text.unwrap_or_else(|| candidate.snippet.clone());
+            let text = text.unwrap_or_else(|| candidate.snippet.to_string());
             // Truncate first, then prepend the title, so a title can never be
             // the thing the cap cuts off.
             let body = truncate_chars(text, settings.max_document_chars);
             if settings.document_title {
-                format!("{}\n\n{body}", document_title(&candidate.file_path))
+                format!("{}\n\n{body}", document_title(candidate.file_path))
             } else {
                 body
             }
@@ -356,7 +382,19 @@ pub fn search_with_intelligence(
     // Deduplicate across expanded queries, then bound each file's share of the
     // lane. Without the bound a 33-chunk document would take 33 of the ranks
     // this lane hands to RRF, pushing every other document down.
-    let cap = config.max_chunks_per_file;
+    //
+    // Under the sorted stage this is the *shortlist* cap and nothing else: what
+    // the model is shown is bounded, what it returns is not (#30).
+    //
+    // Which stage runs is decided once, here, because retrieval is shaped for
+    // it: the cap it applies and the size of the graph lane both belong to the
+    // stage that will consume them.
+    let sorts_by_model = config.ranking.mode == RankingMode::Sorted && config.reranker.is_some();
+    let cap = if sorts_by_model {
+        config.ranking.shortlist_cap
+    } else {
+        config.max_chunks_per_file
+    };
     let semantic_results = collapse_lane(all_semantic, cap);
     let fts_results = collapse_lane(all_fts, cap);
 
@@ -415,11 +453,20 @@ pub fn search_with_intelligence(
     // accumulates, so a structurally implicated chunk simply sorts where its
     // mass puts it.
     let graph_started = std::time::Instant::now();
+    let default_expansions = graph::PprParams::default().max_expansions;
     let graph_results = graph::graph_expand(
         config.store,
         &combined_seeds,
         &graph::PprParams {
             cap_per_file: cap,
+            // A reserve larger than the lane is allowed to produce would be a
+            // quota nothing can fill — starvation dressed as a routing
+            // guarantee. Below the default this changes nothing.
+            max_expansions: if sorts_by_model {
+                config.ranking.graph_reserve.max(default_expansions)
+            } else {
+                default_expansions
+            },
             ..graph::PprParams::default()
         },
     )
@@ -434,8 +481,73 @@ pub fn search_with_intelligence(
         "graph lane"
     );
 
-    // --- Step 3: RRF Pass 1 (3-lane) ---
     const RRF_K: usize = 60;
+
+    // --- Steps 3-5: the ranking stage ---
+    //
+    // Two of them, chosen by `[ranking] mode`. The sorted stage is #30; the
+    // legacy stage below is what it is measured against, and reproduces the
+    // pre-#30 order byte for byte.
+    //
+    // **A build with no cross-encoder configured takes the legacy stage.** The
+    // sorted stage's whole claim is that the model's absolute score is a better
+    // order than fused rank; with no model there is no such score, and what
+    // would remain is an interleave with nothing behind it standing in for a
+    // fusion that #9, #26, #28 and #29 each tuned against these probes.
+    // Measured with intelligence off, the interleave costs two tracked targets
+    // and gains one. So it is kept for what it is documented as — the fallback
+    // when a model that *should* be there is not (§7.3) — and a deliberate
+    // configuration is not that.
+    if sorts_by_model {
+        let (final_fused, degraded) = sorted_stage(
+            query,
+            config,
+            &semantic_results,
+            &fts_results,
+            &graph_results,
+            &weights,
+            orchestration.date_range,
+            RRF_K,
+        );
+
+        // No results cap. Bound what the model is shown, not what it returns:
+        // if one document holds the ten best sections then ten sections is the
+        // right answer, and #6's vote-counting reason for capping evaporates
+        // once the cross-encoder sorts instead of voting. `group_by = "file"`
+        // survives — it is a request about the shape of the answer rather than
+        // a guard against a lane mechanic.
+        let final_fused = match config.group_by {
+            GroupBy::File => fusion::cap_per_file(final_fused, 1),
+            GroupBy::Chunk => final_fused,
+        };
+
+        let results: Vec<InternalSearchResult> = final_fused
+            .iter()
+            .take(top_n)
+            .map(|f| InternalSearchResult {
+                file_path: f.file_path.clone(),
+                file_id: f.file_id,
+                chunk_seq: f.chunk_seq,
+                // The cross-encoder's own number, not a fused one. This is the
+                // absolute score layer 2 thresholds on for abstention.
+                score: model_score(f).unwrap_or(f.rrf_score),
+                confidence: f.confidence,
+                heading: f.heading.clone(),
+                snippet: f.snippet.clone(),
+                docid: f.docid.clone(),
+            })
+            .collect();
+
+        return Ok(SearchOutput {
+            results,
+            fused: final_fused,
+            degraded,
+            intent: Some(orchestration.intent),
+            expansions: traces,
+        });
+    }
+
+    // --- Step 3: RRF Pass 1 (3-lane) ---
     let fused_pass1 = fusion::rrf_fuse(
         &[
             ("semantic", &semantic_results, weights.semantic),
@@ -449,7 +561,8 @@ pub fn search_with_intelligence(
     let mut rerank_results: Vec<RankedResult> = Vec::new();
     let reranker_used = if let Some(reranker) = &mut config.reranker {
         let candidates: Vec<_> = fused_pass1.iter().take(config.rerank_candidates).collect();
-        let owned_documents = rerank_documents(config.store, &candidates, config.rerank);
+        let targets: Vec<RerankTarget<'_>> = candidates.iter().map(|c| target_of(c)).collect();
+        let owned_documents = rerank_documents(config.store, &targets, config.rerank);
         let documents: Vec<&str> = owned_documents.iter().map(String::as_str).collect();
 
         // One call for all thirty pairs, so the reranker sets up once instead of
@@ -457,12 +570,20 @@ pub fn search_with_intelligence(
         // rather than one candidate; the failures in reach are tokenizer and
         // decode errors, which would take every pair down anyway, and unlike the
         // old per-pair `unwrap_or(0.0)` this one says so.
+        // Timed the way the sorted stage times it, so a cost comparison
+        // between the two is a comparison and not two different measurements.
+        let started = std::time::Instant::now();
         let scores = reranker
             .rerank_batch(query, &documents)
             .unwrap_or_else(|e| {
                 tracing::warn!("rerank lane unavailable: {e:#}");
                 vec![0.0; documents.len()]
             });
+        tracing::debug!(
+            candidates = documents.len(),
+            elapsed_us = started.elapsed().as_micros() as u64,
+            "rerank lane voted"
+        );
 
         for (candidate, score) in candidates.iter().zip(scores) {
             let score = score as f64;
@@ -583,9 +704,214 @@ pub fn search_with_intelligence(
     Ok(SearchOutput {
         results,
         fused: final_fused,
+        degraded: false,
         intent: Some(orchestration.intent),
         expansions: traces,
     })
+}
+
+/// A `FusedResult` as the rerank lane needs it.
+fn target_of(result: &FusedResult) -> RerankTarget<'_> {
+    RerankTarget {
+        file_id: result.file_id,
+        chunk_seq: result.chunk_seq,
+        file_path: &result.file_path,
+        snippet: &result.snippet,
+    }
+}
+
+/// The cross-encoder's own score for a result, if it ran.
+fn model_score(result: &FusedResult) -> Option<f64> {
+    result
+        .lane_contributions
+        .iter()
+        .find(|l| l.lane_name == "rerank")
+        .map(|l| l.raw_score)
+}
+
+/// The ranking stage of issue #30: the graph reaches the cross-encoder by
+/// reserved quota, and the cross-encoder sorts what reaches it.
+///
+/// Returns the ranked results and whether the order is the degraded one.
+#[allow(clippy::too_many_arguments)]
+fn sorted_stage(
+    query: &str,
+    config: &mut SearchConfig<'_>,
+    semantic_results: &[RankedResult],
+    fts_results: &[RankedResult],
+    graph_results: &[RankedResult],
+    weights: &llm::LaneWeights,
+    date_range: Option<(i64, i64)>,
+    rrf_k: usize,
+) -> (Vec<FusedResult>, bool) {
+    // Two lanes, not three. The graph is a candidate generator and not a
+    // scorer (§3), so it no longer votes here — `weights.graph` is read by the
+    // legacy stage and by nothing else.
+    let content_fused = fusion::rrf_fuse(
+        &[
+            ("semantic", semantic_results, weights.semantic),
+            ("fts", fts_results, weights.fts),
+        ],
+        rrf_k,
+    );
+
+    let temporal_keys = match date_range {
+        Some(range) => temporal_promotions(config.store, range, &content_fused, graph_results),
+        None => Vec::new(),
+    };
+    let reserves = ranking::Reserves {
+        budget: config.ranking.candidates,
+        graph: config.ranking.graph_reserve,
+        // A reserve for a source with nothing to say is a slot taken from the
+        // content lanes for no reason.
+        temporal: if temporal_keys.is_empty() {
+            0
+        } else {
+            config.ranking.temporal_reserve
+        },
+    };
+
+    let (mut pool, shape) =
+        ranking::build_pool(content_fused, graph_results, &temporal_keys, reserves);
+    // Pool starvation, weak generation and model rejection all end in "the
+    // graph contributed nothing", and the result list cannot tell them apart
+    // (#30, §13.5). These are the first two of the three counts; the third is
+    // logged after the sort.
+    tracing::debug!(
+        budget = shape.budget,
+        admitted = shape.admitted,
+        rrf_available = shape.rrf_available,
+        graph_available = shape.graph_available,
+        from_rrf = shape.from_rrf,
+        from_graph = shape.from_graph,
+        from_temporal = shape.from_temporal,
+        backfilled = shape.backfilled,
+        graph_only = shape.graph_only,
+        "shortlist assembled"
+    );
+
+    // `Some` by construction — the caller checked, because a build with no
+    // cross-encoder configured never enters this stage at all.
+    let scored = if let Some(reranker) = &mut config.reranker {
+        let targets: Vec<RerankTarget<'_>> = pool
+            .iter()
+            .map(|c| RerankTarget {
+                file_id: c.file_id,
+                chunk_seq: c.chunk_seq,
+                file_path: &c.file_path,
+                snippet: &c.snippet,
+            })
+            .collect();
+        let owned_documents = rerank_documents(config.store, &targets, config.rerank);
+        let documents: Vec<&str> = owned_documents.iter().map(String::as_str).collect();
+        drop(targets);
+
+        let started = std::time::Instant::now();
+        let scores = reranker.rerank_batch(query, &documents);
+        let elapsed_us = started.elapsed().as_micros() as u64;
+        match scores {
+            Ok(scores) => {
+                for (candidate, score) in pool.iter_mut().zip(scores) {
+                    candidate.rerank_score = Some(score as f64);
+                }
+                tracing::debug!(
+                    candidates = documents.len(),
+                    elapsed_us,
+                    "cross-encoder sorted the shortlist"
+                );
+                true
+            }
+            Err(e) => {
+                // The whole ordering, not one candidate. Scoring everything 0.0
+                // would leave the tie-break deciding the entire ranking while
+                // the output claimed a model had judged it.
+                tracing::warn!("rerank lane unavailable, ordering degraded: {e:#}");
+                false
+            }
+        }
+    } else {
+        false
+    };
+
+    if !scored {
+        let ordered = ranking::degraded_interleave(pool);
+        let mut results = ranking::into_fused(ordered);
+        ranking::degraded_confidence(&mut results);
+        return (results, true);
+    }
+
+    ranking::sort_by_rerank(&mut pool, config.ranking.tiebreak);
+    // The third count: of the candidates only the graph found, how many the
+    // model kept near the top. Distinguishes "the reserve fed it junk" from
+    // "the reserve never got the chance".
+    tracing::debug!(
+        graph_only_admitted = shape.graph_only,
+        graph_only_in_top_10 = pool.iter().take(10).filter(|c| c.graph_only()).count(),
+        best_graph_only = pool
+            .iter()
+            .filter(|c| c.graph_only())
+            .filter_map(|c| c.rerank_score)
+            .fold(f64::NAN, f64::max),
+        best_overall = pool
+            .first()
+            .and_then(|c| c.rerank_score)
+            .unwrap_or(f64::NAN),
+        "graph reserve, after the sort"
+    );
+
+    (ranking::into_fused(pool), false)
+}
+
+/// Chunk keys whose note falls in the query's date range, best match first.
+///
+/// Drawn from the candidates retrieval already produced rather than generated:
+/// the temporal signal ranks *notes*, and choosing which passage of a note a
+/// date match implicates would be putting a number on a guess. Under the sorted
+/// stage temporal cannot stay a voter, and no probe covers it — so it becomes
+/// the source that promotes date-matching candidates the content order cut, and
+/// that choice is recorded as unmeasured rather than argued for.
+fn temporal_promotions(
+    store: &Store,
+    range: (i64, i64),
+    content: &[FusedResult],
+    graph: &[RankedResult],
+) -> Vec<ranking::ChunkKey> {
+    let candidates = content
+        .iter()
+        .map(|c| ((c.file_id, c.chunk_seq), c.file_path.as_str()))
+        .chain(
+            graph
+                .iter()
+                .map(|r| ((r.file_id, r.chunk_seq), r.file_path.as_str())),
+        );
+
+    let mut dates: HashMap<&str, Option<i64>> = HashMap::new();
+    let mut scored: Vec<(ranking::ChunkKey, f64)> = Vec::new();
+    let mut seen: std::collections::HashSet<ranking::ChunkKey> = std::collections::HashSet::new();
+    for (key, path) in candidates {
+        if !seen.insert(key) {
+            continue;
+        }
+        let note_date = *dates.entry(path).or_insert_with(|| {
+            store
+                .get_file(path)
+                .ok()
+                .flatten()
+                .and_then(|f| f.note_date)
+        });
+        if let Some(note_date) = note_date {
+            scored.push((
+                key,
+                crate::temporal::temporal_score(note_date, range.0, range.1),
+            ));
+        }
+    }
+    scored.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    scored.into_iter().map(|(key, _)| key).collect()
 }
 
 /// The bottom of the normalised seed range.
@@ -867,6 +1193,14 @@ pub fn run_search(
         .collect();
 
     let mut out = format_results(&results, json);
+
+    // The order came from the interleave, not from a model. Said on stdout
+    // beside the results rather than logged: stderr is where a warning goes to
+    // be discarded, and a degraded ranking that looks ranked is the failure.
+    // The structured contract carries this in layer 2 of the convergence plan.
+    if output.degraded && !json {
+        out.push_str("\n(degraded ordering: no cross-encoder available)\n");
+    }
 
     if explain && !json {
         let mut explain_out = String::new();
@@ -1229,6 +1563,7 @@ mod tests {
         let output = SearchOutput {
             results: vec![],
             fused: vec![],
+            degraded: false,
             intent: Some(crate::llm::QueryIntent::Conceptual),
             expansions: vec![],
         };
@@ -1240,6 +1575,7 @@ mod tests {
         let output = SearchOutput {
             results: vec![],
             fused: vec![],
+            degraded: false,
             intent: None,
             expansions: vec![],
         };
@@ -1444,6 +1780,7 @@ mod tests {
                 rerank: settings,
                 max_chunks_per_file: 3,
                 group_by: GroupBy::Chunk,
+                ranking: crate::config::RankingConfig::default(),
             };
             search_with_intelligence(query, 10, embedder, &mut config).unwrap();
         }
@@ -1501,17 +1838,24 @@ mod tests {
         );
     }
 
-    /// The document-identity switch is off by default and unmeasured, so what is
-    /// worth pinning is that it is genuinely off — not that it helps.
+    /// The candidate the cross-encoder reads names the document it came from,
+    /// and stops naming it when the switch is turned off.
+    ///
+    /// A chunk is a section, and a section of `archdragon.md` can go a thousand
+    /// characters without saying "archdragon" — which did not matter while the
+    /// score was a vote and decides the ranking now (#30).
     #[test]
-    fn the_document_title_is_prepended_only_when_asked_for() {
+    fn the_document_title_is_prepended_unless_it_is_switched_off() {
         let (_tmp, store, mut embedder) = vault_with_text_past_the_snippet_boundary();
 
         let without = documents_shown_to_reranker(
             "warding",
             &store,
             &mut embedder,
-            crate::config::RerankConfig::default(),
+            crate::config::RerankConfig {
+                document_title: false,
+                ..Default::default()
+            },
         );
         assert!(
             without
@@ -1525,10 +1869,7 @@ mod tests {
             "warding",
             &store,
             &mut embedder,
-            crate::config::RerankConfig {
-                document_title: true,
-                ..Default::default()
-            },
+            crate::config::RerankConfig::default(),
         );
         assert!(
             with.documents
@@ -1552,14 +1893,17 @@ mod tests {
         let (_tmp, store, mut embedder) = vault_with_text_past_the_snippet_boundary();
 
         // Explicitly unlimited rather than `default()`, which now carries a cap
-        // of its own — this arm has to be the thing the cap is measured against.
+        // of its own — this arm has to be the thing the cap is measured
+        // against. The title is off in both arms for the same reason: the cap
+        // bounds the chunk, and `the_character_cap_never_eats_the_document_title`
+        // is where that boundary is pinned.
         let uncapped = documents_shown_to_reranker(
             "warding",
             &store,
             &mut embedder,
             crate::config::RerankConfig {
                 max_document_chars: 0,
-                ..Default::default()
+                document_title: false,
             },
         );
         assert!(
@@ -1573,7 +1917,7 @@ mod tests {
             &mut embedder,
             crate::config::RerankConfig {
                 max_document_chars: 120,
-                ..Default::default()
+                document_title: false,
             },
         );
         assert!(!capped.documents.is_empty(), "the lane scored nothing");
@@ -1658,6 +2002,7 @@ mod tests {
                 rerank: crate::config::RerankConfig::default(),
                 max_chunks_per_file: 3,
                 group_by: GroupBy::Chunk,
+                ranking: crate::config::RankingConfig::default(),
             };
             let output =
                 search_with_intelligence("warding", 10, &mut embedder, &mut config).unwrap();
@@ -1688,6 +2033,13 @@ mod tests {
                 rerank: crate::config::RerankConfig::default(),
                 max_chunks_per_file: cap,
                 group_by: GroupBy::Chunk,
+                // The results cap is the legacy stage's; #30 caps the
+                // shortlist instead. See `the_sorted_stage_caps_the_shortlist_
+                // and_not_the_results`.
+                ranking: crate::config::RankingConfig {
+                    mode: crate::config::RankingMode::Legacy,
+                    ..Default::default()
+                },
             };
             let output =
                 search_with_intelligence("warding", 10, &mut embedder, &mut config).unwrap();
@@ -1698,6 +2050,279 @@ mod tests {
                 .filter(|r| r.file_path == "rules/abjuration-spells.md")
                 .count();
             assert!(count <= cap, "cap {cap} exceeded: {count} results");
+        }
+    }
+
+    /// A vault where one document answers the query in six sections, and a
+    /// second document is reachable only by a wikilink out of it.
+    fn vault_with_one_deep_document_and_a_linked_neighbour()
+    -> (tempfile::TempDir, Store, llm::MockLlm) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("rules")).unwrap();
+
+        let mut deep = String::from("# Wards\n\n");
+        for level in 1..=6 {
+            deep.push_str(&format!(
+                "## Level {level} Ward\n\nA warding effect at level {level}. \
+                 See [[quiet-neighbour|the neighbour]].\n\n"
+            ));
+        }
+        std::fs::write(root.join("rules/wards.md"), deep).unwrap();
+        // Nothing here matches the query lexically, and the mock embedder is a
+        // hash — so the only route to this file is the link above.
+        std::fs::write(
+            root.join("rules/quiet-neighbour.md"),
+            "# Quiet Neighbour\n\nUnrelated prose about pottery and rope.\n",
+        )
+        .unwrap();
+
+        let store = Store::open_memory().unwrap();
+        let mut embedder = llm::MockLlm::new(256);
+        let config = crate::config::Config::default();
+        crate::indexer::run_index_shared(root, &config, &store, &mut embedder, false, None)
+            .unwrap();
+        (tmp, store, embedder)
+    }
+
+    fn sorted_config(ranking: crate::config::RankingConfig) -> crate::config::RankingConfig {
+        crate::config::RankingConfig {
+            mode: crate::config::RankingMode::Sorted,
+            ..ranking
+        }
+    }
+
+    /// #30's two caps, split by job: bound what the model is shown, because it
+    /// cannot rank what it never saw; do not bound what it returns, because
+    /// ranking is its job. Under the legacy stage the same query is cut to
+    /// `max_chunks_per_file` on the way out.
+    #[test]
+    fn the_sorted_stage_caps_the_shortlist_and_not_the_results() {
+        let (_tmp, store, mut embedder) = vault_with_one_deep_document_and_a_linked_neighbour();
+
+        let count_for = |ranking, embedder: &mut llm::MockLlm| {
+            let mut reranker = CountingReranker::new();
+            let mut config = SearchConfig {
+                orchestrator: None,
+                reranker: Some(&mut reranker),
+                store: &store,
+                rerank_candidates: 30,
+                rerank: crate::config::RerankConfig::default(),
+                max_chunks_per_file: 3,
+                group_by: GroupBy::Chunk,
+                ranking,
+            };
+            let output = search_with_intelligence("warding", 20, embedder, &mut config).unwrap();
+            output
+                .results
+                .iter()
+                .filter(|r| r.file_path == "rules/wards.md")
+                .count()
+        };
+
+        let legacy = count_for(
+            crate::config::RankingConfig {
+                mode: crate::config::RankingMode::Legacy,
+                ..Default::default()
+            },
+            &mut embedder,
+        );
+        assert_eq!(legacy, 3, "the legacy stage caps the result set");
+
+        let sorted = count_for(
+            sorted_config(crate::config::RankingConfig {
+                shortlist_cap: 6,
+                ..Default::default()
+            }),
+            &mut embedder,
+        );
+        assert!(
+            sorted > 3,
+            "one document holding the best sections must be able to return them, got {sorted}"
+        );
+        assert!(
+            sorted <= 6,
+            "the shortlist cap still bounds what the model was shown, got {sorted}"
+        );
+    }
+
+    /// The defect the reserve answers. With a budget of four and two slots
+    /// spoken for by the content order, a candidate no content lane found still
+    /// reaches the model — which is the whole difference between a routing
+    /// guarantee and a fusion weight.
+    #[test]
+    fn a_graph_only_candidate_reaches_the_model_on_a_budget_that_would_have_cut_it() {
+        let (_tmp, store, mut embedder) = vault_with_one_deep_document_and_a_linked_neighbour();
+
+        let mut reranker = CountingReranker::new();
+        {
+            let mut config = SearchConfig {
+                orchestrator: None,
+                reranker: Some(&mut reranker),
+                store: &store,
+                rerank_candidates: 30,
+                rerank: crate::config::RerankConfig {
+                    max_document_chars: 0,
+                    ..Default::default()
+                },
+                max_chunks_per_file: 3,
+                group_by: GroupBy::Chunk,
+                ranking: sorted_config(crate::config::RankingConfig {
+                    candidates: 4,
+                    graph_reserve: 2,
+                    ..Default::default()
+                }),
+            };
+            search_with_intelligence("warding", 10, &mut embedder, &mut config).unwrap();
+        }
+
+        assert_eq!(reranker.batch_calls, 1);
+        assert!(
+            reranker.pairs_scored <= 4,
+            "the budget is the only number that binds, got {}",
+            reranker.pairs_scored
+        );
+        assert!(
+            reranker
+                .documents
+                .iter()
+                .any(|d| d.contains("pottery and rope")),
+            "the linked neighbour never reached the model: {:?}",
+            reranker.documents
+        );
+    }
+
+    /// A cross-encoder that is present and fails.
+    struct BrokenReranker;
+
+    impl RerankModel for BrokenReranker {
+        fn fingerprint(&self) -> String {
+            "broken".to_string()
+        }
+
+        fn rerank_score(&mut self, _query: &str, _document: &str) -> Result<f32> {
+            anyhow::bail!("decode failed")
+        }
+
+        fn rerank_batch(&mut self, _query: &str, _documents: &[&str]) -> Result<Vec<f32>> {
+            anyhow::bail!("decode failed")
+        }
+    }
+
+    /// When the model that should have sorted the shortlist cannot, the
+    /// fallback is the documented interleave and it says so.
+    ///
+    /// The failure mode this guards is not the missing order — it is a missing
+    /// order that looks exactly like a ranked answer. Scoring every candidate
+    /// 0.0 instead would leave the tie-break deciding the whole ranking while
+    /// the output claimed a model had judged it.
+    #[test]
+    fn a_failed_cross_encoder_degrades_the_order_and_labels_it() {
+        let (_tmp, store, mut embedder) = vault_with_one_deep_document_and_a_linked_neighbour();
+
+        let mut reranker = BrokenReranker;
+        let mut config = SearchConfig {
+            orchestrator: None,
+            reranker: Some(&mut reranker),
+            store: &store,
+            rerank_candidates: 30,
+            rerank: crate::config::RerankConfig::default(),
+            max_chunks_per_file: 3,
+            group_by: GroupBy::Chunk,
+            ranking: sorted_config(crate::config::RankingConfig::default()),
+        };
+        let output = search_with_intelligence("warding", 10, &mut embedder, &mut config).unwrap();
+
+        assert!(output.degraded, "the fallback did not label itself");
+        assert!(!output.results.is_empty(), "and it still answered");
+    }
+
+    /// No cross-encoder configured is not a degraded query — it is a different
+    /// configuration, and it keeps the fusion those probes were tuned against.
+    #[test]
+    fn a_build_without_a_cross_encoder_keeps_the_legacy_stage() {
+        let (_tmp, store, mut embedder) = vault_with_one_deep_document_and_a_linked_neighbour();
+
+        let mut config = SearchConfig {
+            orchestrator: None,
+            reranker: None,
+            store: &store,
+            rerank_candidates: 30,
+            rerank: crate::config::RerankConfig::default(),
+            max_chunks_per_file: 3,
+            group_by: GroupBy::Chunk,
+            ranking: sorted_config(crate::config::RankingConfig {
+                shortlist_cap: 6,
+                ..Default::default()
+            }),
+        };
+        let output = search_with_intelligence("warding", 20, &mut embedder, &mut config).unwrap();
+
+        assert!(!output.degraded);
+        assert_eq!(
+            output
+                .results
+                .iter()
+                .filter(|r| r.file_path == "rules/wards.md")
+                .count(),
+            3,
+            "the legacy stage caps the results at max_chunks_per_file"
+        );
+    }
+
+    /// The reranker runs, so the order is the model's and nothing claims to be
+    /// degraded.
+    #[test]
+    fn a_sorted_query_with_a_model_is_not_degraded() {
+        let (_tmp, store, mut embedder) = indexed_vault();
+
+        let mut reranker = CountingReranker::new();
+        let mut config = SearchConfig {
+            orchestrator: None,
+            reranker: Some(&mut reranker),
+            store: &store,
+            rerank_candidates: 30,
+            rerank: crate::config::RerankConfig::default(),
+            max_chunks_per_file: 3,
+            group_by: GroupBy::Chunk,
+            ranking: sorted_config(crate::config::RankingConfig::default()),
+        };
+        let output = search_with_intelligence("warding", 10, &mut embedder, &mut config).unwrap();
+
+        assert!(!output.degraded);
+        // Confidence is the model's probability, not a share of the best score,
+        // so the top result is only 100% if the model actually said so.
+        assert!(output.results.iter().all(|r| r.confidence <= 100.0));
+    }
+
+    /// `group_by = "file"` is a request about the shape of the answer, not a
+    /// vote-counting guard, so it survives the removal of the results cap.
+    #[test]
+    fn file_grouping_survives_the_sorted_stage() {
+        let (_tmp, store, mut embedder) = vault_with_one_deep_document_and_a_linked_neighbour();
+
+        let mut config = SearchConfig {
+            orchestrator: None,
+            reranker: None,
+            store: &store,
+            rerank_candidates: 30,
+            rerank: crate::config::RerankConfig::default(),
+            max_chunks_per_file: 3,
+            group_by: GroupBy::File,
+            ranking: sorted_config(crate::config::RankingConfig {
+                shortlist_cap: 6,
+                ..Default::default()
+            }),
+        };
+        let output = search_with_intelligence("warding", 10, &mut embedder, &mut config).unwrap();
+
+        let mut seen = std::collections::HashSet::new();
+        for r in &output.results {
+            assert!(
+                seen.insert(r.file_path.clone()),
+                "{} appeared twice",
+                r.file_path
+            );
         }
     }
 

@@ -49,6 +49,8 @@ pub struct ApiState {
     pub group_by: crate::config::GroupBy,
     /// Rerank-lane settings from `config.toml`.
     pub rerank: crate::config::RerankConfig,
+    /// Ranking-stage settings from `config.toml`.
+    pub ranking: crate::config::RankingConfig,
     /// Embedding-prefix settings from `config.toml`. Notes written over HTTP
     /// must be embedded the way `engraph index` embedded the rest of the vault.
     pub embedding_prefix: crate::prefix::PrefixConfig,
@@ -487,6 +489,7 @@ async fn handle_search(
         rerank: state.rerank,
         max_chunks_per_file: state.max_chunks_per_file,
         group_by: state.group_by,
+        ranking: state.ranking,
     };
 
     let output = search::search_with_intelligence(&body.query, top_n, &mut *embedder, &mut config)
@@ -1205,6 +1208,7 @@ mod tests {
             max_chunks_per_file: crate::config::default_max_chunks_per_file(),
             group_by: crate::config::GroupBy::default(),
             rerank: crate::config::RerankConfig::default(),
+            ranking: crate::config::RankingConfig::default(),
             embedding_prefix: crate::prefix::PrefixConfig::default(),
         }
     }
