@@ -661,20 +661,20 @@ See issues on this repo:
   `### Notes` at 99.73%** against 98.02%. The choice is vault-authoring against a chunker rule; the
   chunker version generalises to any Obsidian vault in this house style. Blocked by #43 — the first
   probe pass destroyed N10's abstention, and that was #43's bug
-- **#41** does the keyword lane's breadcrumb column still earn its default? — a third arm is worth
-  having beside on/off: **drop the note title from the heading path when it equals the leading
-  heading.** `prefix::breadcrumb` does not dedupe, and 64 of 1598 breadcrumbs (4%) read `X > X` —
-  memory files opening with a `##` that restates the note name. §5.4 writes the rule
-  `Note Title > H1 > H2 > H3`, but the corpus has **1303 `##`, 79 `###` and no H1 at all**: Obsidian
-  identifies a note by filename, so the H1 slot is unfilled by convention and the rule has only ever
-  run degenerate. A vault written H1-as-title would duplicate on every chunk. #37 shipped
-  `[fts] heading_path = true` on one reading: it returns `## Level 4 Silence` to probe 3, an answer
-  the embedding limb of the same rule dropped. #38 removed that embedding limb, and the answer is now
-  present without the column. Measured against the new default the column moves 80 of 360 slots and
-  nothing the instrument can read, except one result against it — probe 4 drops
-  `threads/the-archdragon-disguise.md > ## Objectives` at 97.43% and admits a demon-knight section.
-  One tail swap on one query is thinner than the pool can carry, so the column stays on and this is
-  the evidence owed. A flag flip is a 0.1 s keyword-index rebuild, so the arms are nearly free
+- **#41** does the keyword lane's breadcrumb column still earn its default? — **two arms, on against
+  off.** The column exists for one case: a chunk whose answering terms are in its heading and not in
+  its body. #37 shipped `[fts] heading_path = true` on one reading — it returns `## Level 4 Silence`
+  to probe 3, an answer the embedding limb of the same rule dropped. #38 removed that embedding limb,
+  and the answer is present without the column, so the recorded gain is gone. Measured against the
+  new default the column moves 80 of 360 slots and nothing the instrument can read, except one result
+  against it — probe 4 drops `threads/the-archdragon-disguise.md > ## Objectives` at 97.43% and admits
+  a demon-knight section. One tail swap on one query is thinner than the pool can carry, so the column
+  stays on and this is the evidence owed.
+  **#46 changed the string this measures.** The breadcrumb leads with the file path, so folder names
+  enter the keyword index on every chunk beneath them, and 0 of the 18 pool queries contain a folder
+  term. The pool needs two probes it does not have: one whose answer sits under a heading whose terms
+  are absent from the chunk body, and one naming a folder term. **#45 is the instrument that scores
+  them, so take it first.** A flag flip is a 0.1 s keyword-index rebuild, so the arms are nearly free
 - **#5** embedding model config — expose output dim, tie max chunk tokens to the model's context window
 - **#8** pick a better local embedder — >512 tokens, >768 dim (pairs with #5, which exposes the knobs)
 - ~~**#12** embed at the model's native dimension~~ — **done.** Every vector had been truncated to its
