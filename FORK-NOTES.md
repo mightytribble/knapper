@@ -182,6 +182,10 @@ has never executed on this box.
   `config.toml`, because the default no longer gives it.
   The four #38 arms are `.engraph-i38-*`, built from `.engraph-i37-shipped`. `-shipped` carries no
   `[embedding_prompt]` and no `[fts]` block at all, and it exists to check the defaults #38 changes.
+  The #42 arms are `.engraph-i42-*`; `-shipped` is the current baseline, defaults only, and it is what
+  a new arm should be copied from. `.engraph-i43*` are #44's heading probe and point at a **scratch
+  vault under `/tmp`** that will not survive the session — the promotion rule is written out in #44
+  and the arms are 15 s to rebuild.
   The eight #37 arms are `.engraph-i37-*`, built from `.engraph-i36x-breadcrumb`. `-control` is the
   copy the **pre-#37 binary** was run against; the other seven come from re-indexing one home with the
   #37 binary and copying its database, so they share a vector space exactly and differ only in the
@@ -595,6 +599,33 @@ See issues on this repo:
   limb is what pays that off. With the embedding limb off, the pair is there without it.
   **The defaults are verified end to end.** A home with no `[embedding_prompt]` block and no `[fts]`
   block, indexed from empty, reproduces the explicit arm on 360 of 360 result slots
+- **#45** score the positive queries against a ground-truth responsive set, not against churn — the
+  two metrics this file has used are both broken. *"Result slots that moved"* counts change and calls
+  it quality; *"read the swaps against the vault"* inspects only what differs between arms, so it
+  cannot see a responsive chunk absent from both or a noise chunk high in both.
+  `rules/developer-console.md > ## [3] SPELLS`, a console menu, has sat at **rank 2, 95.65%** on probe
+  3 in every arm of #36, #37 and #38 and no reading ever saw it. Per query: a tier-1 responsive set
+  and a tier-2 informative set drafted from the vault by the author, then coverage, the rank of each
+  tier-1 member, and inversions. **The instrument #41, #43 and #44 should be judged with, so do it
+  first.** The kept JSON for #36, #37, #38 and #42 is on disk, so re-scoring the record is a script
+  run
+- **#43** sections under the minimum size should not become chunks — design §5.4 specifies
+  `chunk_min_tokens_est = 30` and §14 lists it as "Later"; nothing implements it. **72 chunks in the
+  shipped corpus are under 60 characters**, mostly template scaffolding a later workflow will fill:
+  `## Threads\n_None yet._` ×6, `## Player Disposition\nHas not met the player.` ×7. BM25 normalises
+  by length, so a very short row carrying a query term scores enormously — #44's probe made it visible
+  by creating 49 rows reading `### Spells\nN/A`, which moved a *verified negative* from 1.61% to
+  **97.87%** on a file that was never edited. Needs a decision on where an under-minimum section
+  merges before any code. Blocks #44
+- **#44** a bold-only line is a heading the chunker cannot see — `**Skills**` is structure to a reader
+  and a paragraph to `emit_section`, so **33% of the bestiary's structure markers never reach a
+  breadcrumb**. Splitting cannot fix it: `Chunk::from_section` gives later pieces the parent's
+  `heading_path` unchanged, and 112 of 1598 continuation chunks carry no breadcrumb their parent did
+  not. Probed as a vault edit on a scratch copy: **P7's answer becomes a 363-char `### Spells` chunk
+  at rank 1** where it was buried at character 1038 of a 1061-char `## Stat Block`, and **P2's becomes
+  `### Notes` at 99.73%** against 98.02%. The choice is vault-authoring against a chunker rule; the
+  chunker version generalises to any Obsidian vault in this house style. Blocked by #43 — the first
+  probe pass destroyed N10's abstention, and that was #43's bug
 - **#41** does the keyword lane's breadcrumb column still earn its default? — #37 shipped
   `[fts] heading_path = true` on one reading: it returns `## Level 4 Silence` to probe 3, an answer
   the embedding limb of the same rule dropped. #38 removed that embedding limb, and the answer is now
