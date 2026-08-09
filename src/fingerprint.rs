@@ -579,7 +579,7 @@ mod tests {
         record(&store, &fps()).unwrap();
 
         let mut config = Config::default();
-        config.embedding_prompt.document_title = crate::llm::DocumentTitle::None;
+        config.embedding_prompt.document_title = crate::llm::DocumentTitle::Breadcrumb;
         let changed = Fingerprints::compute(&config, "embed-model-abc", Some("rerank-model-xyz"));
 
         let comparison = compare(&store, &changed).unwrap();

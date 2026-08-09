@@ -138,19 +138,42 @@ pub enum DocumentTemplate {
     Documented,
 }
 
-/// What fills the document template's `title:` field (issue #36).
+/// What fills the document template's `title:` field (issues #36, #38).
 ///
-/// The documented template has such a field, and before this key existed every
-/// stored vector carried the literal `none` in it. The vault knows what belongs
-/// there, and [`Self::Breadcrumb`] is what the design puts there.
+/// The documented template has such a field, and the model card fills it with
+/// the literal `none` when a document has no title. The vault knows what else
+/// could go there, and design §5.4's breadcrumb is what #36 put there.
+///
+/// **The breadcrumb ships in the lexical lane and not in this field.** The
+/// breadcrumb rule has three limbs that carry the same string. The keyword
+/// index (#37) and the cross-encoder's input (#30) are both measured gains.
+/// This limb is not: #38 ran it against `None` with the other two limbs on. No
+/// tracked answer separates them and the six positive queries read as a draw
+/// below the answers, so abstention decides it — the breadcrumb scores four of
+/// the eleven negatives higher. It is the closest call in `eval/probes.md`.
 ///
 /// Like [`DocumentTemplate`], the choice decides what a stored vector means, so
 /// it is a component of `embedding_fingerprint` and switching it re-indexes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DocumentTitle {
-    /// The literal `none`. What every store held before this key existed, and
-    /// the control the other two were measured against.
+    /// The literal `none` — the model card's own value for an untitled
+    /// document, and the default.
+    ///
+    /// It holds all seven tracked answers at the same rank and the same score
+    /// as [`Self::Breadcrumb`], so the choice between the two rests entirely on
+    /// the results below them, and there the two arms draw. `None` wins probe 6,
+    /// the right repair spell where the breadcrumb puts a healing spell above
+    /// the floor, and probe 7, the right species where the breadcrumb puts two
+    /// wrong ones. The breadcrumb wins probe 3, where it returns four answering
+    /// spells in the top seven against three, and probe 4, where it keeps three
+    /// archdemon sections out of an archdragon query.
+    ///
+    /// Abstention is what decides it. `None` scores four of the eleven verified
+    /// negatives lower — one of them at a quarter of the breadcrumb's score —
+    /// and it is the only difference in the pool that is not a manual judgment
+    /// about one passage.
+    #[default]
     None,
     /// The note's effective title: frontmatter `name`, else the filename stem.
     ///
@@ -159,19 +182,20 @@ pub enum DocumentTitle {
     /// probe's answer leaves the top 20 (`eval/probes.md`).
     Note,
     /// `Note Title > H1 > H2 > H3` — the note's title and the chunk's ancestor
-    /// headings. The design's breadcrumb, and the default.
+    /// headings. Design §5.4's breadcrumb.
     ///
     /// The one component of document identity that is **not** a per-file
-    /// constant, which is what separates this from issue #2: the heading path
+    /// constant, which is what separates it from issue #2: the heading path
     /// differs between the sections of one document, so it cannot flatten them
-    /// together the way #2's prefix did. Measured against `None` it holds every
-    /// tracked answer at its rank and reshuffles two thirds of the result slots
-    /// beneath them. Whether that reshuffle is an improvement is **open**: the
-    /// seed probes cannot see it, and the engine's own cross-encoder scores
-    /// cannot judge it, because they are the sort key that produced the window.
-    /// It ships because it is the design's rule and it costs no tracked answer —
-    /// see `eval/probes.md`, and #3 for the labels that would settle it.
-    #[default]
+    /// together the way #2's prefix did. That is why it holds the exact-name
+    /// answer that [`Self::Note`] loses.
+    ///
+    /// It costs no tracked answer either, so #36 shipped it on the design's
+    /// authority and left the reshuffle beneath the answers open. #38 closed it
+    /// against this value, and narrowly — see [`Self::None`] and
+    /// `eval/probes.md`. The setting stays because the reading is eighteen
+    /// queries and six manual judgments, and #3's relevance labels are the
+    /// evidence that would settle it properly.
     Breadcrumb,
 }
 

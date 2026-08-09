@@ -526,9 +526,11 @@ mod tests {
         );
     }
 
-    /// The shipped default, asserted where the composition is (§5.4).
+    /// The shipped default leaves the field empty, so the template writes the
+    /// model card's `none`. The breadcrumb rule reaches the index through the
+    /// keyword lane instead (#37, #38).
     #[test]
-    fn the_default_title_is_the_breadcrumb() {
+    fn the_default_title_is_empty() {
         let doc = DocContext::from_file("lore/bestiary/archdragon.md", ARCHDRAGON);
         let chunks = [chunk(
             &["Abilities", "Combat"],
@@ -536,7 +538,7 @@ mod tests {
         )];
         assert_eq!(
             titles(&doc, &chunks, DocumentTitle::default()),
-            vec!["Archdragon > Abilities > Combat".to_string()]
+            vec![String::new()]
         );
     }
 

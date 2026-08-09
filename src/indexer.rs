@@ -2121,11 +2121,12 @@ mod tests {
     // ── The title field (#36) ────────────────────────────────────
 
     /// The breadcrumb reaches the embedder as a *field*, chunk by chunk, with
-    /// the body untouched. Run against `Config::default()`, because the
-    /// breadcrumb is the shipped default and that is part of the contract.
+    /// the body untouched. The setting is off by default (#38), so the arm has
+    /// to be named.
     #[test]
     fn the_breadcrumb_reaches_the_embedder_as_the_title_field() {
-        let (_store, embedder) = index_prefixed_vault(&Config::default());
+        let (_store, embedder) =
+            index_prefixed_vault(&title_config(crate::llm::DocumentTitle::Breadcrumb));
         let (titles, seen) = (embedder.titles, embedder.seen);
         assert_eq!(titles.len(), 3, "one title per chunk: {titles:#?}");
 
@@ -2240,11 +2241,15 @@ mod tests {
     // ── The lexical limb of the breadcrumb rule (#37) ────────────
 
     /// The breadcrumb is stored on the chunk row, and it is the same string the
-    /// title field carries. One rule, one composition — the two limbs cannot
-    /// drift, because they call one function.
+    /// title field carries when that limb is on. One rule, one composition — the
+    /// two limbs cannot drift, because they call one function.
+    ///
+    /// The storage does not depend on the embedding limb. This runs the arm that
+    /// has both, because a comparison needs both.
     #[test]
     fn the_breadcrumb_is_stored_on_the_chunk_row() {
-        let (store, embedder) = index_prefixed_vault(&Config::default());
+        let (store, embedder) =
+            index_prefixed_vault(&title_config(crate::llm::DocumentTitle::Breadcrumb));
         let file = store
             .get_file("lore/bestiary/archdragon.md")
             .unwrap()
@@ -2270,6 +2275,23 @@ mod tests {
         titles.sort();
         lexical.sort();
         assert_eq!(titles, lexical, "the two limbs carry one string");
+
+        // And on the shipped default, where the embedding limb is off, the
+        // chunk row carries the breadcrumb just the same. This is the whole of
+        // the rule after #38, so it cannot depend on the other limb.
+        let (default_store, default_embedder) = index_prefixed_vault(&Config::default());
+        let file = default_store
+            .get_file("lore/bestiary/archdragon.md")
+            .unwrap()
+            .unwrap();
+        let default_stored: Vec<String> = default_store
+            .get_chunks_by_file(file.id)
+            .unwrap()
+            .iter()
+            .map(|c| c.heading_path.clone())
+            .collect();
+        assert_eq!(default_stored, stored);
+        assert!(default_embedder.titles.iter().all(String::is_empty));
     }
 
     /// The tags of the file, on every chunk of it, sorted. Frontmatter order is

@@ -788,12 +788,9 @@ batch_size = 128
     }
 
     #[test]
-    fn document_title_round_trips_and_defaults_to_the_breadcrumb() {
+    fn document_title_round_trips_and_defaults_to_none() {
         use crate::llm::DocumentTitle;
 
-        // `none` is the control, and the only value that has to be spelled out:
-        // it is what every store built before this key existed holds, so a
-        // measurement against that baseline must name it (issue #36).
         let cfg: Config =
             toml::from_str("[embedding_prompt]\ndocument_title = \"none\"\n").unwrap();
         assert_eq!(cfg.embedding_prompt.document_title, DocumentTitle::None);
@@ -804,12 +801,18 @@ batch_size = 128
             toml::from_str("[embedding_prompt]\ndocument_title = \"note\"\n").unwrap();
         assert_eq!(note.embedding_prompt.document_title, DocumentTitle::Note);
 
-        // The design's breadcrumb ships (§5.4).
-        let bare: Config = toml::from_str("").unwrap();
+        // The design's breadcrumb has to be spelled out (§5.4). It ships in the
+        // lexical lane instead — #37 indexes the same string, and #38 measured
+        // this limb as a loss beside it.
+        let breadcrumb: Config =
+            toml::from_str("[embedding_prompt]\ndocument_title = \"breadcrumb\"\n").unwrap();
         assert_eq!(
-            bare.embedding_prompt.document_title,
+            breadcrumb.embedding_prompt.document_title,
             DocumentTitle::Breadcrumb
         );
+
+        let bare: Config = toml::from_str("").unwrap();
+        assert_eq!(bare.embedding_prompt.document_title, DocumentTitle::None);
     }
 
     #[test]

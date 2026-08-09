@@ -44,7 +44,7 @@ git fetch upstream && git diff --stat upstream/main main
 | `llm::device_identity` | the compute device is read at load and fingerprinted | this fork, issue #33 |
 | `ranking::apply_answer_floor` | a query with no candidate above the floor returns no results | this fork, issue #34 |
 | `[embedding_prompt]` | EmbeddingGemma is fed the prompt format its model card documents | this fork, issue #10 |
-| `DocumentTitle` | the document template's `title:` field is filled by the vault, not by the literal `none` | this fork, issue #36 |
+| `DocumentTitle` | the document template's `title:` field is selectable; the vault's breadcrumb is one of its values | this fork, issues #36, #38 |
 | `chunks_fts` external content | the keyword index is derived from the chunk table, and indexes the breadcrumb beside the body | this fork, issue #37 |
 | `.github/workflows/ci.yml` | manual dispatch only — upstream runs it on push and PR | this fork, Actions minutes |
 
@@ -175,10 +175,13 @@ has never executed on this box.
   at the previous branch's store.
 - **The eval store lives at `standalone/mcp-isekai/.engraph-eval/`**, indexed by a CUDA build at the
   documented prompt templates (#10) and at `document_title = "breadcrumb"` (#36). Its
-  `embedding_fingerprint` is `d41cc349`, which is the same value as the #36 breadcrumb arm. The four
+  `embedding_fingerprint` is `d41cc349`, which is the same value as the #36 breadcrumb arm — and no
+  longer the default, so it re-indexes once when it is next opened (#38). The four
   #36 arm homes stay beside it as `.engraph-i36-*`, and the `.engraph-i36x-*` homes are the same four
   arms with #7's exclusion on. The two control arms name `document_title = "none"` in their own
   `config.toml`, because the default no longer gives it.
+  The four #38 arms are `.engraph-i38-*`, built from `.engraph-i37-shipped`. `-shipped` carries no
+  `[embedding_prompt]` and no `[fts]` block at all, and it exists to check the defaults #38 changes.
   The eight #37 arms are `.engraph-i37-*`, built from `.engraph-i36x-breadcrumb`. `-control` is the
   copy the **pre-#37 binary** was run against; the other seven come from re-indexing one home with the
   #37 binary and copying its database, so they share a vector space exactly and differ only in the
@@ -268,11 +271,14 @@ has never executed on this box.
     `documented` on `Conceptual` alone — two of the eighteen calibration queries, and no tracked
     target. `Archdragon` classifies as `Conceptual` (#19), so it asks the exact-name guard a
     question.
-  - **`document_title` decides what fills the `title:` field** (#36). `breadcrumb` ships, and it is
-    `Note Title > H1 > H2 > H3`. `none` is the literal the model card gives for a document with no
-    title, and it is the control. `note` is the note's title alone, and it breaks exact-name lookup.
-    The key is a fingerprint component, so a change to it re-indexes the vault. **A store built before
-    #36 re-indexes once on upgrade**, because the default is no longer what that store holds.
+  - **`document_title` decides what fills the `title:` field** (#36, #38). `none` ships, and it is
+    the literal the model card gives for a document with no title. `breadcrumb` is design §5.4's
+    `Note Title > H1 > H2 > H3`; #36 shipped it and #38 measured it out again — it costs no tracked
+    answer either way, below the answers the two arms are a draw on the six positive queries, and it
+    scores four of eleven negatives higher. `note` is the note's title alone, and it breaks
+    exact-name lookup. The key is a fingerprint component, so a change to it re-indexes the vault.
+    **A store built before #38 re-indexes once on upgrade**, because the default is no longer what
+    that store holds.
 - **The keyword index is derived from the chunk table, and indexes the breadcrumb** (this fork, issue
   #37). `chunks_fts` is an FTS5 **external-content** table over `chunks`, kept in step by three
   triggers, so it holds an index and no text of its own. #11's bug class — the keyword index holding a
@@ -408,6 +414,10 @@ has never executed on this box.
   got is read at load by `llm::device_identity` and folded into both model fingerprints, so
   **swapping between a CPU and a CUDA binary forces a re-embed each way.** On a derived store that
   is a wait, not a loss.
+  Mid-measurement this is a trap: a bare `cargo build --release` overwrites `target/release/engraph`
+  with a 27 MB CPU binary in about 20 s, and the next `index` run silently re-embeds the arm on the
+  other device. Two tells — the index takes about 158 s instead of 65 s, and a query against any
+  store the other binary built returns zero results.
 - **A hidden or unavailable GPU falls back to CPU silently, and the fingerprint is what catches it.**
   `CUDA_VISIBLE_DEVICES=""` against a GPU-built store loads `device=cpu` with no error and then the
   read path refuses on `embedding_fingerprint`. One binary can therefore produce either device's
@@ -563,12 +573,36 @@ See issues on this repo:
   *postings and scores* exactly, not its bytes: an incremental write leaves one segment per batch
   where a rebuild writes a single merged one. The test asserts `fts5vocab` rows and BM25 scores, which
   is what "the same index" can mean. #38 is the evidence still owed
-- **#38** re-measure the breadcrumb rule's embedding limb, now that the lexical limb is in — #36
-  shipped `document_title = "breadcrumb"` while making the secondary results worse on three of six
-  positive queries, and accepted that cost on the argument that the lexical limb would pay for it.
-  Probe 3 is that argument holding for one of the two answers it names (#37). Two arms, `none` against
-  `breadcrumb`, both carrying #37's columns; each is a full re-index, because `document_title` is an
-  `embedding_fingerprint` component
+- ~~**#38** re-measure the breadcrumb rule's embedding limb, now that the lexical limb is in~~ —
+  **DONE.** `document_title = "none"` ships. #36 shipped `breadcrumb` while making the secondary
+  results worse on two of six positive queries, and accepted that cost on the argument that the
+  lexical limb would pay for it. It did not.
+  **No tracked answer separates the arms** — same rank and same score on all seven, which #36 already
+  recorded for this pair. The decision is entirely the results below them.
+  **Read against the vault, the positive queries are a draw.** `none` wins probes 6 and 7: probe 6 gets
+  `## Level 9 Restore Object` at rank 2 where `breadcrumb` puts `## Level 3 Heal`, which does not touch
+  cloth, above the floor, and probe 7 keeps the right species. `breadcrumb` wins probes 3 and 4: it
+  returns four answering spells in probe 3's top seven against three, and `none` admits three archdemon
+  sections to an archdragon query. Probes 1 and 2 are noise.
+  **Abstention decides it.** `none` scores four of the eleven negatives lower, N10 at 1.61% against
+  6.77% and probe 5 at 0.02% against 0.23%, and it is the only difference in the pool that is not a
+  manual judgment about one passage. Above the floor it takes probe 6's wrong answer out and two of
+  N11's ten results with it, and gives back only probe 4. `answer_floor` needs no refit: 29.64%
+  midpoint again.
+  **The 2×2 says what each limb reaches.** Crossing the two limbs on probe 3: the embedding limb
+  decides which pair of answers the query reaches, and its cost is `breadcrumb` with a body-only
+  index, which reaches one answer beside Counterspell where every other cell reaches two. The lexical
+  limb is what pays that off. With the embedding limb off, the pair is there without it.
+  **The defaults are verified end to end.** A home with no `[embedding_prompt]` block and no `[fts]`
+  block, indexed from empty, reproduces the explicit arm on 360 of 360 result slots
+- **#41** does the keyword lane's breadcrumb column still earn its default? — #37 shipped
+  `[fts] heading_path = true` on one reading: it returns `## Level 4 Silence` to probe 3, an answer
+  the embedding limb of the same rule dropped. #38 removed that embedding limb, and the answer is now
+  present without the column. Measured against the new default the column moves 80 of 360 slots and
+  nothing the instrument can read, except one result against it — probe 4 drops
+  `threads/the-archdragon-disguise.md > ## Objectives` at 97.43% and admits a demon-knight section.
+  One tail swap on one query is thinner than the pool can carry, so the column stays on and this is
+  the evidence owed. A flag flip is a 0.1 s keyword-index rebuild, so the arms are nearly free
 - **#5** embedding model config — expose output dim, tie max chunk tokens to the model's context window
 - **#8** pick a better local embedder — >512 tokens, >768 dim (pairs with #5, which exposes the knobs)
 - ~~**#12** embed at the model's native dimension~~ — **done.** Every vector had been truncated to its
