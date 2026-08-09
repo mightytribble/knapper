@@ -621,6 +621,17 @@ See issues on this repo:
   H1 becomes an ordinary heading level with no consumption rule. `stem` is recorded as unusable — 14
   stems name more than one file. `writer::extract_title` is untouched; naming a file being created is
   a different job
+- **#47** *(low priority)* `writer::extract_title` guesses a filename, and since #46 that filename is
+  a breadcrumb root — it reads frontmatter `title` (neither Obsidian's key nor engraph's: the
+  community "Front Matter Title" plugin's, and no community plugins are installed here), else the
+  first `# heading`, else the first non-empty line, **truncated to 50 characters**. It produces a
+  filename rather than a label, so it is not a competing answer to `DocContext`'s job — but #46 made
+  the filename the first segment of every breadcrumb of every note the write pipeline creates.
+  `generate_filename` does not consult the store either, and the write path's only defence against a
+  collision is `final_path.exists()`, which refuses the write. **Nothing in `eval/pool.sh` reaches
+  this code** — the calibration corpus is authored, not written — so the evidence is unit tests over
+  a fixture and no arm can be run. It becomes urgent the first time a workflow writes notes into a
+  vault that is then searched
 - **#45** score the positive queries against a ground-truth responsive set, not against churn — the
   two metrics this file has used are both broken. *"Result slots that moved"* counts change and calls
   it quality; *"read the swaps against the vault"* inspects only what differs between arms, so it
