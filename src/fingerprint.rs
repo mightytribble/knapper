@@ -51,12 +51,17 @@ pub const CHUNKER_VERSION: u32 = 1;
 /// shortest-path ladder, or how an end that names no passage is stored.
 pub const LINK_RESOLVER_VERSION: u32 = 1;
 
-/// Bump when a [`crate::llm::PromptFormat`] variant's template text changes.
+/// Bump when the *text* of a [`crate::llm::PromptFormat`] template changes
+/// while the template keeps its name.
 ///
-/// #10 is the standing case: the `EmbeddingGemma` variant emits nomic's
-/// `search_document:` convention rather than EmbeddingGemma's documented one.
-/// Fixing that changes every stored vector, and this constant is what makes the
-/// store notice.
+/// *Which* template wrote a vector is data, not algorithm, and is hashed
+/// exactly from [`crate::llm::PromptFormat::template_id`] — so selecting
+/// EmbeddingGemma's documented document template over nomic's convention
+/// (issue #10) re-indexes with no bump here. Rewording one of them does need a
+/// bump, because the id would not move.
+///
+/// The query template is deliberately absent from both: a query is embedded and
+/// discarded, so changing it makes nothing in the store stale.
 pub const PROMPT_TEMPLATE_VERSION: u32 = 1;
 
 /// Bump when what happens to a vector after inference changes — currently L2

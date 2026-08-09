@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+use crate::llm::EmbeddingPromptConfig;
 use crate::prefix::PrefixConfig;
 
 /// Model override configuration.
@@ -394,6 +395,11 @@ pub struct Config {
     /// compares content hashes and will not notice.
     #[serde(default)]
     pub embedding_prefix: PrefixConfig,
+    /// Which prompt template each half of an asymmetric embedding model is fed
+    /// through (issue #10). `document` is a fingerprint component, so changing
+    /// it re-indexes on the next `engraph index`; `query` costs nothing.
+    #[serde(default)]
+    pub embedding_prompt: EmbeddingPromptConfig,
     /// Glob patterns to exclude from indexing.
     pub exclude: Vec<String>,
     /// Number of files to process per embedding batch.
@@ -435,6 +441,7 @@ impl Default for Config {
             max_chunks_per_file: default_max_chunks_per_file(),
             group_by: GroupBy::default(),
             embedding_prefix: PrefixConfig::default(),
+            embedding_prompt: EmbeddingPromptConfig::default(),
             exclude: vec![".obsidian/".to_string()],
             batch_size: 64,
             respect_gitignore: true,
@@ -537,6 +544,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::{DocumentTemplate, QueryTemplate};
 
     #[test]
     fn default_config_has_sane_values() {
@@ -645,6 +653,28 @@ batch_size = 128
         // Turning it on without naming components gives every component.
         let on: Config = toml::from_str("[embedding_prefix]\nenabled = true\n").unwrap();
         assert_eq!(on.embedding_prefix, PrefixConfig::full());
+    }
+
+    #[test]
+    fn embedding_prompt_round_trips_and_each_half_is_separate() {
+        let cfg: Config = toml::from_str(
+            "[embedding_prompt]\ndocument = \"documented\"\nquery = \"per_intent\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.embedding_prompt.document, DocumentTemplate::Documented);
+        assert_eq!(cfg.embedding_prompt.query, QueryTemplate::PerIntent);
+
+        // Naming one half leaves the other alone. The two carry very different
+        // costs — the document half re-indexes the vault (issue #10).
+        let half: Config = toml::from_str("[embedding_prompt]\ndocument = \"legacy\"\n").unwrap();
+        assert_eq!(half.embedding_prompt.document, DocumentTemplate::Legacy);
+        assert_eq!(half.embedding_prompt.query, QueryTemplate::Documented);
+
+        // A config that names neither gets the model card's own pair.
+        let bare: Config = toml::from_str("").unwrap();
+        assert_eq!(bare.embedding_prompt, EmbeddingPromptConfig::default());
+        assert_eq!(bare.embedding_prompt.document, DocumentTemplate::Documented);
+        assert_eq!(bare.embedding_prompt.query, QueryTemplate::Documented);
     }
 
     #[test]

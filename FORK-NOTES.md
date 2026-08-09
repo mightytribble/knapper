@@ -43,6 +43,7 @@ git fetch upstream && git diff --stat upstream/main main
 | `cuda` cargo feature | llama.cpp compiles its CUDA backend; off by default | this fork, issue #33 |
 | `llm::device_identity` | the compute device is read at load and fingerprinted | this fork, issue #33 |
 | `ranking::apply_answer_floor` | a query with no candidate above the floor returns no results | this fork, issue #34 |
+| `[embedding_prompt]` | EmbeddingGemma is fed the prompt format its model card documents | this fork, issue #10 |
 | `.github/workflows/ci.yml` | manual dispatch only — upstream runs it on push and PR | this fork, Actions minutes |
 
 Cherry-picked rather than merged: PR #41 branched before upstream's #40 graph fix, so merging the
@@ -170,7 +171,8 @@ has never executed on this box.
   re-downloads 300MB (1.6GB with intelligence enabled).
 - **MCP servers launch once per session**, so a mid-session `git checkout` leaves the server pointed
   at the previous branch's store.
-- **The eval store lives at `standalone/mcp-isekai/.engraph-eval/`** and the corpus it indexes is
+- **The eval store lives at `standalone/mcp-isekai/.engraph-eval/`**, indexed by a CUDA build at the
+  documented prompt templates (#10), and the corpus it indexes is
   not frozen. Every measurement from #26 to #29 was taken on a 247-file / 1598-chunk store; the
   pinned vault at `63f33e6` is 266 / 1863 / 1988 edges, because `standalone/mcp-isekai` tracks the
   live `cc-isekai` repo and it grew in between. Rank tables from either side of that are not
@@ -228,17 +230,29 @@ has never executed on this box.
   any model is loaded, so it cannot size the table and no longer guesses; a database that has never
   been indexed simply has no vec table, and the semantic lane returns nothing. The width comes from
   `ensure_embedding_dim` at index time, or from the first vector written.
-- **Every embedding is computed with the wrong model's prompt prefix** (issue #10).
-  `PromptFormat::EmbeddingGemma` emits `<bos>search_query:` / `<bos>search_document: {title} {text}`,
-  which is *nomic-embed-text*'s convention; EmbeddingGemma documents
-  `task: search result | query: …` and `title: {title | "none"} | text: …`. Affects queries and
-  documents alike, so it is a floor under every retrieval measurement in `eval/`.
-  Two traps when fixing it: the documented strings contain **no `<bos>`**, and `str_to_token` is
-  called with `AddBos::Never` because the current string supplies one literally
-  (`parse_special = true` in llama-cpp-2, so it does become the real BOS token) — swap the strings
-  without addressing that and every embedding loses its BOS. Changing the *document* side needs
-  `--reindex`; changing the *query* side needs nothing. Since #31 the reindex is no longer something
-  to remember: bump `fingerprint::PROMPT_TEMPLATE_VERSION` and the next `engraph index` does it.
+- **Each half of the embedding prompt is a config key** (`[embedding_prompt]`, this fork, issue #10).
+  `document` and `query` both ship `documented`, which is EmbeddingGemma's own format —
+  `<bos>task: search result | query: …` and `<bos>title: {title | none} | text: …`. `legacy` on
+  either side restores nomic-embed-text's `search_query:` / `search_document:` convention and is the
+  control each was measured against.
+  - **The `<bos>` is written into the template on purpose.** The documented strings contain none, and
+    `str_to_token` is called with `AddBos::Never` because the template supplies one literally
+    (`parse_special = true` in llama-cpp-2, so it becomes the real BOS token). Removing it from the
+    template and switching that call to `AddBos::Always` would also give `QwenEmbedding` and `Raw` a
+    BOS, which they have never had.
+  - **The two halves have very different costs.** `document` is a component of
+    `embedding_fingerprint`, so changing it re-indexes the vault — 68 s on the GPU store, and it
+    happens by itself on the next `engraph index`. `query` reaches no fingerprint, because a query is
+    embedded and discarded.
+  - **Which template built a store is hashed as data**, from `PromptFormat::template_id`. Nothing is
+    hand-bumped to switch templates; `fingerprint::PROMPT_TEMPLATE_VERSION` covers a reword of a
+    template that keeps its name.
+  - **`query = "per_intent"` picks the task from `QueryIntent` and ships off.** It differs from flat
+    `documented` on `Conceptual` alone — two of the eighteen calibration queries, and no tracked
+    target. `Archdragon` classifies as `Conceptual` (#19), so it asks the exact-name guard a
+    question.
+  - **`title:` holds the literal `none`.** Putting the document's own identity there is #36, and it
+    needs a per-text title through `EmbedModel::embed_batch`.
 - **The cross-encoder sorts the results; it used to vote on them** (this fork, issue #30). Two
   content lanes are fused by RRF, graph and temporal candidates are routed into the shortlist by
   **reserved quota** (`[ranking] candidates = 30`, `graph_reserve = 8`, `temporal_reserve = 4`), and
@@ -442,6 +456,11 @@ See issues on this repo:
   `status`, and provenance replacing `score`/`confidence` **on the MCP and HTTP payloads only** —
   §7.3's boundary is the consumer, not the field, and the CLI keeps the percentage `probe.sh` reads.
   Settled by ordering that must not move. **Layer 2, second half**
+- **#36** document identity in EmbeddingGemma's `title:` field, which holds the literal `none` today.
+  Needs a per-text title through `EmbedModel::embed_batch`, so the trait and both test embedders
+  move. Carries #2's failure mode — a per-file constant is still a per-file constant wherever it is
+  placed — and #2 is the reason to expect it can lose. Probe 2 is the guard, since its answer is one
+  section of a file whose other sections compete with it
 - **#5** embedding model config — expose output dim, tie max chunk tokens to the model's context window
 - **#8** pick a better local embedder — >512 tokens, >768 dim (pairs with #5, which exposes the knobs)
 - ~~**#12** embed at the model's native dimension~~ — **done.** Every vector had been truncated to its
@@ -450,10 +469,30 @@ See issues on this repo:
   reading, and the one #14 confirmed by moving them, is that the top of the ranking is robust to this
   change and the churn sat in the tail. Ruled out as the probe 1 explanation (#9). The migration ran
   itself; storage roughly doubles. Optional Matryoshka truncation is deliberately left unbuilt
-- **#10** the embedding prompt format is nomic-embed-text's, not EmbeddingGemma's — both query and
-  document sides are out-of-distribution. Query-side fix needs **no reindex** and is the cheapest
-  open experiment in the repo; document-side costs a reindex per configuration, which is the only
-  reason to do it second
+- ~~**#10** the embedding prompt format is nomic-embed-text's, not EmbeddingGemma's~~ — **DONE.**
+  `[embedding_prompt]`, both halves shipping `documented`. The control is the whole basis of the
+  reading: the pre-#10 build reproduces #34's tables exactly, and the #10 build at
+  `legacy`/`legacy` — after a forced 72.7 s re-embed, because the template is a fingerprint
+  component — is **byte-identical over all eighteen calibration queries**.
+  **P7 gains the section that answers it.** `lesser-dragon.md > ## Stat Block` holds *"Lesser
+  Dragons cannot take human form"*, and #34 recorded it as unreachable on the GPU store at any
+  floor. It was not ranked low: at `top_n = 50` the whole 30-candidate shortlist does not contain
+  it. Under the documented format it is **rank 1 at 97.6%**. That was filed against #3 and #8 and
+  belonged here.
+  **Correcting either half retrieves it**, which is the finding that stops this being a story about
+  matched pairs: the vector space moved, and that is all the probes can say. 261–292 of 360 result
+  slots moved against seven tracked targets — #12's and #14's shape.
+  The grid overruled the ticket twice. **The query half is where the rank table improves** (probe 1's
+  `archivist-lenne.md` 5 → 4, nothing lost) and the document half **costs probe 2 a rank**, inserting
+  an unrelated 91.0% candidate above `## Human Forms`. And **`per_intent` is inert** — two of
+  eighteen queries, no tracked target. Both halves ship documented anyway, because two ranks over
+  seven targets is inside what this instrument can resolve, the model card specifies a *pair*, and
+  #36 can only be measured from the documented document template.
+  **`answer_floor` needs no refit**: every cell gives the same 29.64% midpoint, from an unchanged
+  6.77% highest rejectable negative and 52.52% lowest correct answer.
+  Also fixed in passing: `placement::try_semantic_placement` embedded a note's content with the
+  **query** template and compared it against centroids built from **document** vectors. No probe
+  measures placement, so it is recorded rather than demonstrated
 - ~~**#13** reuse one llama.cpp context per phase instead of one per call~~ — **done, and the
   performance premise was wrong.** All three behaviour criteria held byte-for-byte: identical index
   content, identical probes with intelligence off, identical probes with intelligence *on*. But the

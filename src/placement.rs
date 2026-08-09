@@ -241,7 +241,14 @@ fn try_semantic_placement(
         return Ok(None);
     }
 
-    let embedding = embedder.embed_one(content)?;
+    // A note's content is a document, so it is embedded through the document
+    // half of the model's pair — the centroids it is compared against are means
+    // of vectors written by `embed_batch`. Embedding it as a *query* puts the
+    // two sides of an asymmetric model in one cosine (issue #10).
+    let embedding = embedder
+        .embed_batch(&[content])?
+        .pop()
+        .ok_or_else(|| anyhow::anyhow!("embedding returned no vector"))?;
 
     let mut best_folder = String::new();
     let mut best_sim = f64::NEG_INFINITY;

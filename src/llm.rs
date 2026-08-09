@@ -97,9 +97,9 @@ fn embed_fingerprint(
         &dim.to_string(),
         tokenizer_identity,
         &format!(
-            "{}:{:?}",
+            "{}:{}",
             crate::fingerprint::PROMPT_TEMPLATE_VERSION,
-            prompt_format
+            prompt_format.template_id()
         ),
         &crate::fingerprint::EMBEDDING_NORMALIZATION_VERSION.to_string(),
         device,
@@ -123,11 +123,94 @@ fn rerank_fingerprint(artifact: &str, yes_token_id: i32, no_token_id: i32, devic
 
 // ── Prompt format ────────────────────────────────────────────────────────────
 
+/// Which document template the `EmbeddingGemma` prompt format writes (issue #10).
+///
+/// The choice decides what a stored vector means, so it is a component of
+/// `embedding_fingerprint` and switching it re-indexes the vault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DocumentTemplate {
+    /// `<bos>search_document: {title} {text}` — nomic-embed-text's convention.
+    /// The control the documented template was measured against.
+    Legacy,
+    /// `<bos>title: {title | none} | text: {text}` — the model card's.
+    #[default]
+    Documented,
+}
+
+/// Which query template the `EmbeddingGemma` prompt format writes (issue #10).
+///
+/// A query is embedded and discarded, so this is **not** a fingerprint
+/// component: changing it needs no re-index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryTemplate {
+    /// `<bos>search_query: {query}` — nomic-embed-text's convention.
+    /// The control the documented template was measured against.
+    Legacy,
+    /// `<bos>task: search result | query: {query}`, whatever the intent is.
+    #[default]
+    Documented,
+    /// The documented template, with the task chosen from [`QueryIntent`].
+    ///
+    /// Off by default: it differs from [`Self::Documented`] on two of the
+    /// eighteen calibration queries and on no tracked target, and it hands the
+    /// choice of prompt to a classifier that calls the bare name `Archdragon`
+    /// conceptual (issue #19).
+    PerIntent,
+}
+
+/// The task an EmbeddingGemma query prompt names.
+///
+/// The model card documents eight of them. These are the ones a retrieval
+/// engine can reach: the others describe classification, clustering and
+/// similarity, which engraph never asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbedTask {
+    /// No task field at all — the legacy `search_query:` prefix.
+    Legacy,
+    /// `task: search result` — retrieval.
+    SearchResult,
+    /// `task: question answering` — a query written as a question.
+    QuestionAnswering,
+}
+
+impl EmbedTask {
+    /// Resolve the task from the configured template and the query's intent.
+    ///
+    /// `intent` is `None` where the caller has not classified the query — the
+    /// orchestrator runs after some embedding sites, and a task it did not
+    /// choose is `SearchResult` rather than a guess.
+    ///
+    /// The per-intent mapping differs from [`QueryTemplate::Documented`] on
+    /// `Conceptual` alone. `Exact`, `Relationship`, `Exploratory` and `Temporal`
+    /// all describe retrieval of a passage, which is what `search result` names.
+    pub fn resolve(template: QueryTemplate, intent: Option<&QueryIntent>) -> Self {
+        match template {
+            QueryTemplate::Legacy => Self::Legacy,
+            QueryTemplate::Documented => Self::SearchResult,
+            QueryTemplate::PerIntent => match intent {
+                Some(QueryIntent::Conceptual) => Self::QuestionAnswering,
+                _ => Self::SearchResult,
+            },
+        }
+    }
+
+    /// The task description the model card spells out.
+    fn description(self) -> &'static str {
+        match self {
+            Self::Legacy | Self::SearchResult => "search result",
+            Self::QuestionAnswering => "question answering",
+        }
+    }
+}
+
 /// Model-family-specific prompt templates for embedding models.
 #[derive(Debug, Clone)]
 pub enum PromptFormat {
-    /// Google embeddinggemma family: uses `<bos>search_query:` / `<bos>search_document:` prefixes.
-    EmbeddingGemma,
+    /// Google embeddinggemma family: an asymmetric query/document pair, whose
+    /// document half is selected by [`DocumentTemplate`].
+    EmbeddingGemma { document: DocumentTemplate },
     /// Qwen embedding family: uses `Instruct:` / `Query:` format.
     QwenEmbedding,
     /// No special formatting — pass text as-is.
@@ -136,10 +219,10 @@ pub enum PromptFormat {
 
 impl PromptFormat {
     /// Auto-detect prompt format from a GGUF filename.
-    pub fn detect(filename: &str) -> Self {
+    pub fn detect(filename: &str, document: DocumentTemplate) -> Self {
         let lower = filename.to_lowercase();
         if lower.contains("embeddinggemma") {
-            Self::EmbeddingGemma
+            Self::EmbeddingGemma { document }
         } else if lower.contains("qwen") && lower.contains("embed") {
             Self::QwenEmbedding
         } else {
@@ -147,10 +230,35 @@ impl PromptFormat {
         }
     }
 
-    /// Format text for a search query.
-    pub fn format_query(&self, query: &str) -> String {
+    /// What `embedding_fingerprint` hashes to know which template wrote a
+    /// vector (issue #31). The template choice is *data*, so it is hashed
+    /// exactly rather than carried by
+    /// [`crate::fingerprint::PROMPT_TEMPLATE_VERSION`], which covers edits to
+    /// the template text itself.
+    pub fn template_id(&self) -> String {
         match self {
-            Self::EmbeddingGemma => format!("<bos>search_query: {query}"),
+            Self::EmbeddingGemma { document } => {
+                format!("embeddinggemma/{}", document.id())
+            }
+            Self::QwenEmbedding => "qwen-embedding".to_string(),
+            Self::Raw => "raw".to_string(),
+        }
+    }
+
+    /// Format text for a search query.
+    ///
+    /// The documented strings carry no `<bos>`, and this one is written
+    /// literally because `str_to_token` is called with `AddBos::Never` — see
+    /// [`LlamaEmbed::embed_formatted`]. `parse_special` is on in llama-cpp-2, so
+    /// the literal becomes the real BOS token. Dropping it here and switching
+    /// that call to `AddBos::Always` would also add a BOS to `QwenEmbedding`
+    /// and `Raw`, which currently have none.
+    pub fn format_query(&self, query: &str, task: EmbedTask) -> String {
+        match self {
+            Self::EmbeddingGemma { .. } => match task {
+                EmbedTask::Legacy => format!("<bos>search_query: {query}"),
+                other => format!("<bos>task: {} | query: {query}", other.description()),
+            },
             Self::QwenEmbedding => {
                 format!("Instruct: Retrieve relevant passages\nQuery: {query}")
             }
@@ -159,12 +267,54 @@ impl PromptFormat {
     }
 
     /// Format text for a document to be indexed.
+    ///
+    /// An empty `title` is the documented literal `none` under
+    /// [`DocumentTemplate::Documented`] — a supported input rather than a
+    /// degenerate one. Issue #36 is whether the vault's own identity belongs in
+    /// that field.
     pub fn format_document(&self, title: &str, text: &str) -> String {
         match self {
-            Self::EmbeddingGemma => format!("<bos>search_document: {title} {text}"),
+            Self::EmbeddingGemma {
+                document: DocumentTemplate::Legacy,
+            } => format!("<bos>search_document: {title} {text}"),
+            Self::EmbeddingGemma {
+                document: DocumentTemplate::Documented,
+            } => {
+                let title = if title.trim().is_empty() {
+                    "none"
+                } else {
+                    title.trim()
+                };
+                format!("<bos>title: {title} | text: {text}")
+            }
             Self::QwenEmbedding | Self::Raw => format!("{title}\n{text}"),
         }
     }
+}
+
+impl DocumentTemplate {
+    fn id(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::Documented => "documented",
+        }
+    }
+}
+
+/// `[embedding_prompt]` — which EmbeddingGemma templates this instance writes
+/// (issue #10). Both sides default to the legacy convention, so a build that
+/// sets neither key is unchanged.
+///
+/// The two halves have very different costs. `document` is a fingerprint
+/// component and changing it re-indexes the vault; `query` is read per search
+/// and changing it costs nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct EmbeddingPromptConfig {
+    /// The template every stored vector is embedded through.
+    pub document: DocumentTemplate,
+    /// The template every query is embedded through.
+    pub query: QueryTemplate,
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -320,6 +470,19 @@ pub trait EmbedModel: Send {
         results
             .pop()
             .ok_or_else(|| anyhow::anyhow!("embed_batch returned empty results"))
+    }
+
+    /// Embed a search query — the other half of an asymmetric model's pair.
+    ///
+    /// `intent` is what the orchestrator classified the query as, where the
+    /// caller has one. Only `[embedding_prompt] query = "per_intent"` reads it
+    /// (issue #10); every other setting produces one template for every query.
+    ///
+    /// The default implementation ignores both the intent and the asymmetry,
+    /// which is correct for a symmetric model and for the test embedders.
+    fn embed_query(&mut self, text: &str, intent: Option<&QueryIntent>) -> Result<Vec<f32>> {
+        let _ = intent;
+        self.embed_one(text)
     }
 
     /// Approximate token count for `text` (used for chunk-size budgeting).
@@ -945,6 +1108,10 @@ pub struct LlamaEmbed {
     tokenizer: FlexTokenizer,
     dim: usize,
     prompt_format: PromptFormat,
+    /// Which query template to write (issue #10). Held apart from
+    /// `prompt_format` because the document half is a fingerprint component and
+    /// this half is not: a query is embedded and discarded.
+    query_template: QueryTemplate,
     /// Resolved once at load — see [`resolve_n_threads`].
     n_threads: i32,
     /// Computed once at load, because it hashes hundreds of megabytes of GGUF.
@@ -988,8 +1155,9 @@ impl LlamaEmbed {
         // Load tokenizer: try from the same HF repo, then from the non-GGUF variant.
         let (tokenizer, tokenizer_identity) = load_tokenizer_for_model(&uri, models_dir)?;
 
-        // Detect prompt format from filename.
-        let prompt_format = PromptFormat::detect(&uri.filename);
+        // Detect prompt format from filename; the document half of the
+        // EmbeddingGemma pair is a configured choice (issue #10).
+        let prompt_format = PromptFormat::detect(&uri.filename, config.embedding_prompt.document);
 
         // Get or initialize the global llama.cpp backend, then load model.
         let backend = llama_backend()?;
@@ -1029,6 +1197,7 @@ impl LlamaEmbed {
             tokenizer,
             dim,
             prompt_format,
+            query_template: config.embedding_prompt.query,
             n_threads,
             fingerprint,
         })
@@ -1175,8 +1344,13 @@ impl EmbedModel for LlamaEmbed {
     }
 
     fn embed_one(&mut self, text: &str) -> Result<Vec<f32>> {
+        self.embed_query(text, None)
+    }
+
+    fn embed_query(&mut self, text: &str, intent: Option<&QueryIntent>) -> Result<Vec<f32>> {
         // Apply query prompt format (asymmetric models like embeddinggemma need this).
-        let formatted = self.prompt_format.format_query(text);
+        let task = EmbedTask::resolve(self.query_template, intent);
+        let formatted = self.prompt_format.format_query(text, task);
         self.embed_text(&formatted)
     }
 
@@ -1996,18 +2170,22 @@ mod tests {
         // but the trait bound compiles.
     }
 
+    fn gemma(document: DocumentTemplate) -> PromptFormat {
+        PromptFormat::detect("embeddinggemma-300M-Q8_0.gguf", document)
+    }
+
     #[test]
     fn test_prompt_format_embeddinggemma_query() {
-        let fmt = PromptFormat::detect("embeddinggemma-300M-Q8_0.gguf");
-        let formatted = fmt.format_query("how does auth work");
+        let formatted =
+            gemma(DocumentTemplate::Legacy).format_query("how does auth work", EmbedTask::Legacy);
         assert!(formatted.contains("search_query"));
         assert!(formatted.contains("how does auth work"));
     }
 
     #[test]
     fn test_prompt_format_embeddinggemma_document() {
-        let fmt = PromptFormat::detect("embeddinggemma-300M-Q8_0.gguf");
-        let formatted = fmt.format_document("Note Title", "some content");
+        let formatted =
+            gemma(DocumentTemplate::Legacy).format_document("Note Title", "some content");
         assert!(formatted.contains("Note Title"));
         assert!(formatted.contains("some content"));
         assert!(formatted.contains("search_document"));
@@ -2015,15 +2193,15 @@ mod tests {
 
     #[test]
     fn test_prompt_format_unknown_model() {
-        let fmt = PromptFormat::detect("unknown-model.gguf");
-        let formatted = fmt.format_query("test query");
+        let fmt = PromptFormat::detect("unknown-model.gguf", DocumentTemplate::Documented);
+        let formatted = fmt.format_query("test query", EmbedTask::SearchResult);
         assert_eq!(formatted, "test query");
     }
 
     #[test]
     fn test_prompt_format_qwen_embedding() {
-        let fmt = PromptFormat::detect("qwen-embed-v2.gguf");
-        let formatted = fmt.format_query("find me something");
+        let fmt = PromptFormat::detect("qwen-embed-v2.gguf", DocumentTemplate::Documented);
+        let formatted = fmt.format_query("find me something", EmbedTask::SearchResult);
         assert!(formatted.contains("Instruct:"));
         assert!(formatted.contains("Query:"));
         assert!(formatted.contains("find me something"));
@@ -2031,16 +2209,133 @@ mod tests {
 
     #[test]
     fn test_prompt_format_qwen_document() {
-        let fmt = PromptFormat::detect("qwen-embed-v2.gguf");
+        let fmt = PromptFormat::detect("qwen-embed-v2.gguf", DocumentTemplate::Documented);
         let formatted = fmt.format_document("Title", "Body text");
         assert_eq!(formatted, "Title\nBody text");
     }
 
     #[test]
     fn test_prompt_format_raw_document() {
-        let fmt = PromptFormat::detect("random-model.gguf");
+        let fmt = PromptFormat::detect("random-model.gguf", DocumentTemplate::Documented);
         let formatted = fmt.format_document("Title", "Body");
         assert_eq!(formatted, "Title\nBody");
+    }
+
+    // ── The documented EmbeddingGemma templates (#10) ──────────────────────
+    //
+    // These assert the model card's strings exactly. A test that only checks
+    // for a substring is what let nomic-embed-text's convention live under
+    // this variant's name.
+
+    #[test]
+    fn documented_query_template_is_the_model_cards() {
+        assert_eq!(
+            gemma(DocumentTemplate::Documented)
+                .format_query("who guards the gate", EmbedTask::SearchResult),
+            "<bos>task: search result | query: who guards the gate"
+        );
+    }
+
+    #[test]
+    fn documented_document_template_is_the_model_cards() {
+        assert_eq!(
+            gemma(DocumentTemplate::Documented).format_document("Archdragon", "It flies."),
+            "<bos>title: Archdragon | text: It flies."
+        );
+    }
+
+    #[test]
+    fn an_untitled_document_is_the_literal_none() {
+        // The model card spells the empty case. The legacy template has no
+        // spelling for it and emits a double space instead.
+        assert_eq!(
+            gemma(DocumentTemplate::Documented).format_document("", "It flies."),
+            "<bos>title: none | text: It flies."
+        );
+        assert_eq!(
+            gemma(DocumentTemplate::Documented).format_document("   ", "It flies."),
+            "<bos>title: none | text: It flies."
+        );
+    }
+
+    #[test]
+    fn every_embeddinggemma_template_keeps_its_bos() {
+        // `str_to_token` is called with `AddBos::Never`, so the literal here is
+        // the only BOS the model gets. The documented strings do not carry one.
+        for document in [DocumentTemplate::Legacy, DocumentTemplate::Documented] {
+            let fmt = gemma(document);
+            assert!(fmt.format_document("t", "x").starts_with("<bos>"));
+            for task in [
+                EmbedTask::Legacy,
+                EmbedTask::SearchResult,
+                EmbedTask::QuestionAnswering,
+            ] {
+                assert!(fmt.format_query("q", task).starts_with("<bos>"));
+            }
+        }
+    }
+
+    #[test]
+    fn the_question_answering_task_reaches_the_query() {
+        assert_eq!(
+            gemma(DocumentTemplate::Documented)
+                .format_query("who guards the gate", EmbedTask::QuestionAnswering),
+            "<bos>task: question answering | query: who guards the gate"
+        );
+    }
+
+    #[test]
+    fn per_intent_differs_from_documented_on_conceptual_alone() {
+        use QueryIntent::*;
+        for intent in [Exact, Relationship, Exploratory, Temporal] {
+            assert_eq!(
+                EmbedTask::resolve(QueryTemplate::PerIntent, Some(&intent)),
+                EmbedTask::SearchResult,
+                "{intent:?}"
+            );
+        }
+        assert_eq!(
+            EmbedTask::resolve(QueryTemplate::PerIntent, Some(&Conceptual)),
+            EmbedTask::QuestionAnswering
+        );
+        // An unclassified query is not a guess.
+        assert_eq!(
+            EmbedTask::resolve(QueryTemplate::PerIntent, None),
+            EmbedTask::SearchResult
+        );
+    }
+
+    #[test]
+    fn the_legacy_template_ignores_the_intent() {
+        for intent in [QueryIntent::Conceptual, QueryIntent::Exact] {
+            assert_eq!(
+                EmbedTask::resolve(QueryTemplate::Legacy, Some(&intent)),
+                EmbedTask::Legacy
+            );
+        }
+    }
+
+    #[test]
+    fn the_document_template_is_a_fingerprint_component_and_the_query_one_is_not() {
+        // Which template wrote a vector decides what it means, so a store built
+        // one way must not be read the other. A query is embedded and
+        // discarded, so `QueryTemplate` reaches no fingerprint at all — it is
+        // not an input to `embed_fingerprint` and cannot be.
+        let legacy = embed_fingerprint(
+            "artifact",
+            768,
+            "tok",
+            &gemma(DocumentTemplate::Legacy),
+            "cpu",
+        );
+        let documented = embed_fingerprint(
+            "artifact",
+            768,
+            "tok",
+            &gemma(DocumentTemplate::Documented),
+            "cpu",
+        );
+        assert_ne!(legacy, documented);
     }
 
     // ── heuristic_orchestrate tests ──────────────────────────────────────────
@@ -2290,13 +2585,18 @@ mod tests {
     /// test belongs to the composition, not to the hardware.
     #[test]
     fn the_device_changes_the_embedding_fingerprint() {
-        let on_cpu =
-            embed_fingerprint("artifact", 768, "tok", &PromptFormat::EmbeddingGemma, "cpu");
+        let on_cpu = embed_fingerprint(
+            "artifact",
+            768,
+            "tok",
+            &gemma(DocumentTemplate::Legacy),
+            "cpu",
+        );
         let on_gpu = embed_fingerprint(
             "artifact",
             768,
             "tok",
-            &PromptFormat::EmbeddingGemma,
+            &gemma(DocumentTemplate::Legacy),
             "CUDA/NVIDIA GeForce RTX 4070 Ti",
         );
         assert_ne!(
@@ -2307,7 +2607,13 @@ mod tests {
         // And it is only the device that moved: the same one agrees with itself.
         assert_eq!(
             on_cpu,
-            embed_fingerprint("artifact", 768, "tok", &PromptFormat::EmbeddingGemma, "cpu"),
+            embed_fingerprint(
+                "artifact",
+                768,
+                "tok",
+                &gemma(DocumentTemplate::Legacy),
+                "cpu"
+            ),
             "the composition must be stable for a fixed device"
         );
     }

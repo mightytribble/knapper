@@ -298,8 +298,11 @@ pub fn search_with_intelligence(
         let mut fts_hits: Vec<RankedResult> = Vec::new();
 
         // Semantic lane
+        // The intent reaches the embedder because `[embedding_prompt] query =
+        // "per_intent"` names a task from it (issue #10). Every other setting
+        // ignores it.
         let query_vec = embedder
-            .embed_one(expanded_query)
+            .embed_query(expanded_query, Some(&orchestration.intent))
             .context("embedding query")?;
         let tombstones = std::collections::HashSet::new();
         let raw_results = config
