@@ -1433,10 +1433,12 @@ impl OrchestratorModel for LlamaOrchestrator {
 /// Format query+document for cross-encoder reranking.
 pub fn format_reranker_input(query: &str, document: &str) -> String {
     format!(
-        "<|im_start|>system\nJudge whether the document is relevant to the search query. \
-         Respond only with \"Yes\" or \"No\".<|im_end|>\n\
-         <|im_start|>user\nSearch query: {query}\nDocument: {document}<|im_end|>\n\
-         <|im_start|>assistant\n"
+        "<|im_start|>system\nJudge whether the Document meets the requirements based on the \
+         Query and the Instruct provided. Note that the answer can only be \"yes\" or \"no\".\
+         <|im_end|>\n\
+         <|im_start|>user\n<Instruct>: Given a web search query, retrieve relevant passages \
+         that answer the query\n<Query>: {query}\n<Document>: {document}<|im_end|>\n\
+         <|im_start|>assistant\n<think>\n\n</think>\n\n"
     )
 }
 
@@ -1500,7 +1502,7 @@ impl LlamaRerank {
         // Look up Yes/No token IDs via the model's built-in tokenizer.
         // str_to_token returns Vec<LlamaToken>; we take the first token ID (skip BOS).
         let yes_tokens = model
-            .str_to_token("Yes", AddBos::Never)
+            .str_to_token("yes", AddBos::Never)
             .map_err(|e| anyhow::anyhow!("tokenizing 'Yes': {e}"))?;
         let yes_token_id = yes_tokens
             .first()
@@ -1508,7 +1510,7 @@ impl LlamaRerank {
             .ok_or_else(|| anyhow::anyhow!("model tokenizer returned no tokens for 'Yes'"))?;
 
         let no_tokens = model
-            .str_to_token("No", AddBos::Never)
+            .str_to_token("no", AddBos::Never)
             .map_err(|e| anyhow::anyhow!("tokenizing 'No': {e}"))?;
         let no_token_id = no_tokens
             .first()
@@ -2116,12 +2118,28 @@ mod tests {
 
     // ── LlamaRerank tests ──────────────────────────────────────────────────
 
+    /// The four pieces Qwen3-Reranker's model card specifies, each of which we
+    /// got wrong until the ranking stage made the score matter (#30).
+    ///
+    /// The empty `<think></think>` block is the load-bearing one: without it
+    /// the next token the model produces is the start of its reasoning, so the
+    /// yes/no logits being read are from a distribution that was never about
+    /// yes or no.
     #[test]
-    fn test_format_reranker_input() {
+    fn the_reranker_is_asked_the_question_its_model_card_documents() {
         let formatted = format_reranker_input("auth system", "The auth module handles OAuth");
-        assert!(formatted.contains("auth system"));
-        assert!(formatted.contains("The auth module handles OAuth"));
-        assert!(formatted.contains("Respond only with"));
+
+        assert!(formatted.contains("<Query>: auth system"));
+        assert!(formatted.contains("<Document>: The auth module handles OAuth"));
+        assert!(formatted.contains("<Instruct>: "));
+        assert!(
+            formatted.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"),
+            "the answer is read from the token after this: {formatted:?}"
+        );
+        assert!(
+            formatted.contains("can only be \"yes\" or \"no\""),
+            "the scored tokens are lowercase and the system prompt has to say so"
+        );
     }
 
     #[test]
