@@ -42,7 +42,7 @@ git fetch upstream && git diff --stat upstream/main main
 | `format_reranker_input` | the cross-encoder is asked the question its model card documents | this fork, issue #32 |
 | `cuda` cargo feature | llama.cpp compiles its CUDA backend; off by default | this fork, issue #33 |
 | `llm::device_identity` | the compute device is read at load and fingerprinted | this fork, issue #33 |
-| `ranking::apply_answer_floor` | a query with no answer above the floor returns nothing and says so | this fork, issue #34 |
+| `ranking::apply_answer_floor` | a query with no candidate above the floor returns no results | this fork, issue #34 |
 | `.github/workflows/ci.yml` | manual dispatch only — upstream runs it on push and PR | this fork, Actions minutes |
 
 Cherry-picked rather than merged: PR #41 branched before upstream's #40 graph fix, so merging the
@@ -367,29 +367,28 @@ has never executed on this box.
   above is known, and it is clean.
 - **`engraph status` does not report the device.** The only place the resolved device is visible is
   the `loaded LlamaEmbed …` / `loaded LlamaRerank …` line at `RUST_LOG=engraph=info`.
-- **A search can now return nothing on purpose** (this fork, issue #34). `[ranking] answer_floor`
-  defaults to **0.30** and drops every candidate the cross-encoder scored below it; an empty result
-  set prints *"No relevant content found for this query in the vault."* `answer_floor = 0.0`
-  disables it and reproduces pre-#34 output byte for byte.
-  - **The floor is a claim about the pinned corpus and about the reranker**, fit against the 17-query
-    pool in `eval/probes.md`. Re-pinning the vault invalidates it along with the pool; changing the
-    reranker invalidates it too, which is what `reranker_fingerprint`'s `InvalidateThresholds`
-    action was reserved for.
-  - **The gate is per candidate, and that is what decides the value.** #34 specifies fitting on
-    best-score-per-query, which gives 89% — and 89% cuts probe 2's tracked answer, sitting at 81%
-    behind two better results from a different file. The ceiling is the weakest *answer* (52.5%,
-    probe 1's `archivist-lenne.md` at rank 5), not the weakest query's *best result*.
-  - **Two verified negatives score like positives and no floor separates them.** `In which city is
-    Tandi's brother a blacksmith?` scores **97.1%** on a passage naming Tandi, a brother, a
-    blacksmith and a city with the sibling bound to the wrong person, which is above both P6 and P7.
-    The reranker scores topical fit; one wrong entity-hop inside an otherwise perfect passage costs
-    it nothing. Nine of eleven negatives abstain; these two do not, and that is a reranker finding
-    rather than a tuning problem.
-  - **It truncates hard where the tail is junk and not at all where it is not.** Probe 5 goes 20 → 0,
-    P6 20 → 1, probes 1 and 2 20 → 5, and probe 4 — twenty sections of an exact-name query, all
-    above 89% — goes 20 → 20.
-  - **`[ranking] per_note_cap` ships at 0 (unbounded)**, the §9.1-versus-#30 conflict parked as a
-    one-key sweep rather than a code change.
+- **A search can return no results** (this fork, issue #34). `[ranking] answer_floor` is 0.30 by
+  default. The code removes every candidate that the cross-encoder scored below the floor. An empty
+  result set prints *"No relevant content found for this query in the vault."* A floor of 0.0
+  removes nothing and gives the same output as the build before #34.
+  - **The floor value is only correct for the pinned corpus and the current reranker.** It is fit
+    against the 17-query pool in `eval/probes.md`. A new pin makes the pool invalid, and the floor
+    with it. A new reranker also makes it invalid. This is what `reranker_fingerprint` and its
+    `InvalidateThresholds` action are for.
+  - **The floor applies to each candidate, and this decides the value.** #34 specifies a fit against
+    the best score of each query, which gives 89%. A floor of 89% removes probe 2's correct answer,
+    which scores 81% below two better results from a different file. The limit is the lowest correct
+    answer, 52.5% at probe 1's `archivist-lenne.md`, rank 5.
+  - **Two negatives score higher than two positives.** *In which city is Tandi's brother a
+    blacksmith?* scores 97.1%. The passage names Tandi, a brother, a blacksmith and a city, but the
+    brother is Mira's. That score is above P6 and P7, so no floor can reject it and keep them. The
+    reranker scores the topic of a passage, and one incorrect entity does not lower the score. Nine
+    of the eleven negatives return no results. These two do not, and the cause is the reranker.
+  - **How many results the floor removes depends on the query.** Probe 5 goes from 20 to 0. P6 goes
+    from 20 to 1. Probes 1 and 2 go from 20 to 5. Probe 4 stays at 20, because all 20 sections of
+    that exact-name query score above 89%.
+  - **`[ranking] per_note_cap` is 0, which means no limit.** The conflict between §9.1 and #30 stays
+    open, and the key makes a sweep possible without a code change.
 - **GPU numbers and CPU numbers are different baselines.** `eval/probes.md`'s CUDA section is a fresh
   baseline for exactly this reason: the kernels are not bitwise identical, the embeddings differ in
   the low bits, and the retrieved candidate set differs with them. Comparing a GPU rank table with a
@@ -416,24 +415,25 @@ See issues on this repo:
   one-up-one-down at n=5 (#14). Fix is sample count, plus negative controls and section-vs-file
   scoring recorded separately. Calibrates #4
 - **#4** relevance floor — §8.3's per-lane dense candidate floor. Deferred, and narrower than its
-  title: the "nonsense queries return nothing" half **shipped as #34**, which thresholds a calibrated
-  cross-encoder score rather than a per-lane one. The retrieval lanes have no calibrated score, which
-  is why that half waits for a probe
-- ~~**#34** abstention — a calibrated floor on the cross-encoder's score~~ — **DONE.**
-  `ranking::apply_answer_floor`, one gate at `[ranking] answer_floor = 0.30`, per candidate after
-  `sort_by_rerank`, skipped where `rerank_score` is `None`. **Probe 5 returns nothing for the first
-  time in the project's history**, with the literal message, and `answer_floor = 0.0` reproduces
-  pre-#34 output byte for byte across all five probes. Tests checked against both required
-  mutants — never-reject fails 4, always-reject fails 9.
-  **The pool overruled the ticket twice.** It predicted a clean gap and delivered an **overlap**:
-  N11 scores 97.1% and N4 86.2%, against 91.7% for the weakest positive, so no floor rejects them
-  while keeping P6 and P7. Both re-verified against the vault — the model scores topical fit and one
-  wrong entity-hop costs it nothing. And the prescribed fit, best-score-per-query, gives **89%**,
-  which cuts probe 2's tracked answer at 81%; a per-candidate gate has to clear the weakest *answer*,
-  not the strongest *result*. Refit at the midpoint of 6.77% (highest rejectable negative) and 52.5%
-  (probe 1's `archivist-lenne.md` @5), ~23 points of margin either side. Nine of eleven negatives
-  abstain, every tracked answer survives at its baseline rank, and the tail goes 20 → 1 on P6 and
-  20 → 20 on probe 4. Also ships `[ranking] per_note_cap` at 0.
+  title. #34 shipped the half that makes a query with no answer return nothing, and it uses the
+  calibrated cross-encoder score. The retrieval lanes have no calibrated score, so the per-lane half
+  waits for a probe
+- ~~**#34** the answer floor~~ — **DONE.** `ranking::apply_answer_floor`, at
+  `[ranking] answer_floor = 0.30`, applied to each candidate after `sort_by_rerank` and skipped when
+  `rerank_score` is `None`. Probe 5 returns no results, which it had never done before, and it
+  prints the message. A floor of 0.0 gives output identical to the build before #34 on all five
+  probes. Two mutants break the tests: a floor that rejects nothing fails 4, and a floor that
+  rejects everything fails 9.
+  The pool disagreed with the ticket twice. First, the ticket expected a clear gap and the pool has
+  an overlap: N11 scores 97.1% and N4 scores 86.2%, above the 91.7% of the weakest positive, so no
+  floor can reject them and keep P6 and P7. We checked both against the vault. The reranker scores
+  the topic of a passage, and one incorrect entity does not lower the score. Second, the fit the
+  ticket specifies gives 89%, and 89% removes probe 2's correct answer at 81%. A floor that applies
+  to each candidate must be below the lowest correct answer, not below the best result of each
+  query. The value is the midpoint of two scores: 6.77%, the highest negative a floor can reject,
+  and 52.5%, probe 1's `archivist-lenne.md` at rank 5. The margin is about 23 points on each side.
+  Nine of the eleven negatives return no results. Every correct answer keeps its rank. The result
+  count goes from 20 to 1 on P6, and stays at 20 on probe 4. `[ranking] per_note_cap` ships at 0.
   **Layer 2 of `docs/vault-search-convergence.md`, first half**
 - **#35** output contract — the scored window is the emitted window (today the model reads
   `chunks.text` capped at `max_document_chars` and the caller gets the 200-char `snippet`, so the

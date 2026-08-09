@@ -420,12 +420,12 @@ impl EngraphServer {
             search::search_with_intelligence(&params.0.query, top_n, &mut *embedder, &mut config)
                 .map_err(|e| mcp_err(&e))?;
 
-        // Abstention (#34). The empty array is the answer; the sentence is what
-        // stops a caller reading it as a transport failure and retrying. Added
-        // as a second content block rather than in place of the JSON, because
-        // substituting prose for the array would break a client that parses it —
-        // MCP's content model carries both without a schema change, and the
-        // schema itself belongs to #35.
+        // The answer floor (#34). The empty array is the answer, and the message
+        // stops a caller from reading it as a transport failure and sending the
+        // query again. The message is a second content block and does not
+        // replace the JSON, because text in place of the array would break a
+        // client that parses it. MCP holds both without a change to the schema,
+        // and #35 owns the schema.
         if output.results.is_empty() {
             let mut result = to_json_result(&output.results)?;
             result

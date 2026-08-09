@@ -306,48 +306,48 @@ pub struct RankingConfig {
     /// probes cannot tell apart.
     pub shortlist_cap: usize,
     pub tiebreak: Tiebreak,
-    /// The cross-encoder score below which a candidate is not an answer (#34).
+    /// The score below which a candidate is not an answer (#34).
     ///
-    /// Applied per candidate after the sort, and skipped wherever there is no
-    /// probability to threshold — see [`crate::ranking::apply_answer_floor`].
-    /// `0.0` disables it and is the inert control.
+    /// The code applies the floor to each candidate after the sort. It skips a
+    /// candidate that has no score — see
+    /// [`crate::ranking::apply_answer_floor`]. A value of `0.0` removes nothing
+    /// and is the control.
     ///
-    /// **Fit against the 17-query calibration pool in `eval/probes.md`**, not
-    /// chosen. On the GPU baseline store nine of the eleven verified negatives
-    /// score below **6.8%** on their best candidate, and the lowest score at
-    /// which any positive's tracked answer sits is **52.5%** — probe 1's
-    /// `archivist-lenne.md` at rank 5. The default is the midpoint of that gap,
-    /// with ~23 points of margin either side against ~1 point of CPU/GPU kernel
-    /// disagreement.
+    /// The value comes from the 17-query pool in `eval/probes.md`. On the GPU
+    /// baseline store, nine of the eleven negatives score below 6.8% on their
+    /// best candidate. The lowest score of a correct answer is 52.5%, at probe
+    /// 1's `archivist-lenne.md`, rank 5. The default is the midpoint of those
+    /// two values. The margin is about 23 points on each side, and CPU and GPU
+    /// scores differ by about 1 point.
     ///
-    /// **The ticket said to fit on best-score-per-query and the probes overruled
-    /// it.** That fit gives 89% — the midpoint of 86.2% (N4) to 91.7% (P6) — and
-    /// 89% cuts probe 2's tracked answer, which sits at 81% behind two better
-    /// results from a different file. A gate applied per candidate has to clear
-    /// the weakest *answer*, not the strongest *result*, and those are different
-    /// distributions; the ticket named the risk and the measurement found it.
+    /// #34 specifies a fit against the best score of each query, and the probes
+    /// show that this is wrong. That fit gives 89%, the midpoint of 86.2% (N4)
+    /// and 91.7% (P6). A floor of 89% removes probe 2's correct answer, which
+    /// scores 81% below two better results from a different file. A floor that
+    /// applies to each candidate must be below the lowest correct answer, and
+    /// not below the best result of each query.
     ///
-    /// **Two negatives sit above any usable floor and that is a finding about
-    /// the reranker, not about this number.** N11 asks which city Tandi's
-    /// brother smiths in and scores 97.1% on a passage naming Tandi, a brother,
-    /// a blacksmith and a city with the sibling bound to the wrong person; N4
-    /// asks after a Precept who does not exist and scores 86.2% on a section
-    /// saying who runs the place. Neither is separable from P6 and P7 by score.
-    /// The pool table records both.
+    /// Two negatives score above any usable floor, and the cause is the
+    /// reranker. N11 asks which city Tandi's brother works in as a blacksmith.
+    /// It scores 97.1% on a passage that names Tandi, a brother, a blacksmith
+    /// and a city, but the brother is Mira's. N4 asks for a Precept who does not
+    /// exist, and scores 86.2% on a section that gives the person who runs the
+    /// location. No floor can reject either one and keep P6 and P7. The pool
+    /// table records both.
     pub answer_floor: f64,
-    /// At most this many sections of one document may appear in the results.
-    /// `0` is unbounded.
+    /// How many sections of one document can appear in the results. `0` means no
+    /// limit.
     ///
-    /// **Ships unbounded, which is today's behaviour and #30's position:** bound
-    /// what the model is *shown* (`shortlist_cap`), not what it returns, because
-    /// if a document holds the ten best sections then ten sections is the right
-    /// answer. §9.1 of the vault-search design caps a note at three and the two
-    /// are not reconcilable by splitting the difference.
+    /// The default is no limit, which is the current behaviour and #30's
+    /// position. Limit what the model reads with `shortlist_cap`, but do not
+    /// limit what it returns: if one document holds the ten best sections, then
+    /// ten sections is the correct answer. §9.1 of the vault-search design
+    /// limits a note to three. The two positions do not combine.
     ///
-    /// The key exists so the deferred decision is a one-key sweep rather than a
-    /// code change. It waits on a probe where one document legitimately owns the
-    /// top of the ranking; probe 4 is the candidate, where `archdragon.md` holds
-    /// ranks 1, 3 and 5 and every one of its twenty results clears the floor.
+    /// This key makes the decision a sweep instead of a code change. It waits
+    /// for a probe where one document correctly holds the top of the results.
+    /// Probe 4 is the candidate: `archdragon.md` holds ranks 1, 3 and 5, and all
+    /// 20 of its results are above the floor.
     pub per_note_cap: usize,
 }
 
@@ -366,11 +366,11 @@ impl Default for RankingConfig {
     }
 }
 
-/// The fitted abstention floor: the midpoint of the pool's only constrained gap.
+/// The floor value from the pool fit: the midpoint of 6.77% and 52.52%.
 ///
-/// Kept as a function rather than a literal in `Default` so the number and the
-/// fit that produced it live in one place — the pool table in `eval/probes.md`
-/// is denominated in percent and this is the same number as a probability.
+/// This is a function and not a literal in `Default`, so the value and the fit
+/// stay together. The pool table in `eval/probes.md` gives percentages, and this
+/// is the same value as a probability.
 pub fn default_answer_floor() -> f64 {
     0.30
 }

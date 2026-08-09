@@ -263,38 +263,38 @@ fn rrf_position(candidate: &Candidate) -> usize {
     candidate.rrf_rank.unwrap_or(usize::MAX)
 }
 
-/// What a query with no supported answer says (issue #34).
+/// The message a query with no result above the floor returns (issue #34).
 ///
-/// One string, used by every channel that can carry prose, so "the engine found
-/// nothing" reads the same whether it came from the CLI or from a tool call.
+/// Every channel that can carry text uses this one string, so the CLI and a
+/// tool call report an empty result set the same way.
 pub const NO_RELEVANT_CONTENT: &str = "No relevant content found for this query in the vault.";
 
-/// Drop the candidates the cross-encoder did not support (issue #34).
+/// Remove the candidates that scored below the floor (issue #34).
 ///
-/// The gate #30 made possible: the sort key is a calibrated probability, so
-/// there is finally a quantity that means *this passage does not answer the
-/// question* rather than *this passage answered it less well than that one*.
-/// Before it, `confidence` was `rrf_score / max_score * 100` and the top hit was
-/// 100% by construction, whatever it was.
+/// #30 made this possible. The sort key is now a calibrated probability, so the
+/// engine has a number that means *this passage does not answer the question*
+/// and not *this passage is worse than that one*. Before #30, `confidence` was
+/// `rrf_score / max_score * 100`, so the first result always scored 100%.
 ///
-/// **Per candidate, not per response.** Gating the top score alone would deliver
-/// abstention and nothing else; gating every candidate also stops five
-/// confident-looking rows padding the bottom of an answer that has one real
-/// row — most of what #4 was filed for. It subsumes the response-level rule,
-/// since a pool with nothing above the floor empties, so there is one mechanism
-/// rather than two.
+/// The floor applies to each candidate and not to the best score alone. A test
+/// on the best score alone gives an empty response and nothing more. A test on
+/// each candidate also removes the low-scoring results below a correct one,
+/// which is most of what #4 asked for. It covers the response-level rule too: a
+/// pool with no candidate above the floor becomes empty. So there is one test
+/// and not two.
 ///
-/// **An unscored candidate is kept.** `rerank_score` is `None` under the legacy
+/// A candidate with no score stays. `rerank_score` is `None` under the legacy
 /// stage and under [`degraded_interleave`], where confidence is a *position*.
-/// Abstaining on a position is abstaining on nothing, and a consumer can discard
-/// a weak block it received where it cannot recover one that was withheld.
+/// A position is not a probability, so there is nothing to compare against the
+/// floor. A consumer can discard a weak result, but it cannot recover a result
+/// that the engine did not send.
 ///
-/// `floor <= 0.0` disables the gate and is the inert control the change is
+/// A floor of `0.0` or less removes nothing. That is the control the change was
 /// measured against.
 ///
-/// Returns how many candidates were dropped, which is the tail cost the fit is
-/// judged on: the floor is fit on best-score-per-query and applied to a whole
-/// list, and those are different distributions.
+/// Returns how many candidates the function removed. The fit uses the best score
+/// of each query, and the floor applies to a whole list, so this count is what
+/// shows the cost on a query that does have an answer.
 pub fn apply_answer_floor(pool: &mut Vec<Candidate>, floor: f64) -> usize {
     if floor <= 0.0 {
         return 0;
@@ -773,10 +773,9 @@ mod tests {
         }
     }
 
-    /// Probe 5's defect, as behaviour rather than as a number. `quantum banking
-    /// regulations` scores 0.29% on its best candidate against 91.7% for the
-    /// weakest positive in the pool; below the floor nothing is supported and
-    /// the engine has to be able to say so.
+    /// Probe 5, as behaviour and not as a number. `quantum banking regulations`
+    /// scores 0.29% on its best candidate. The weakest positive in the pool
+    /// scores 91.7%. Nothing is above the floor, so the engine returns nothing.
     #[test]
     fn a_query_with_nothing_above_the_floor_supports_nothing() {
         let mut pool = vec![
@@ -789,9 +788,9 @@ mod tests {
         assert!(pool.is_empty(), "the engine answered anyway");
     }
 
-    /// The gate is per candidate, so a query with one real answer keeps the
-    /// answer and loses the tail. P6 is the worked example: its answer scores
-    /// 91.7% and its second result scores 9.1%.
+    /// The floor applies to each candidate, so a query with one correct answer
+    /// keeps that answer and loses the rest. P6 is the example: its answer
+    /// scores 91.7% and its second result scores 9.1%.
     #[test]
     fn the_gate_truncates_the_tail_of_a_query_that_does_have_an_answer() {
         let mut pool = vec![
@@ -806,8 +805,8 @@ mod tests {
         assert_eq!(pool[0].file_path, "mend-object.md");
     }
 
-    /// The inert control. `answer_floor = 0.0` must leave the ranking exactly as
-    /// #30 left it — that is what makes the probe tables either side comparable.
+    /// The control. `answer_floor = 0.0` must leave the order exactly as #30
+    /// left it. This is what makes the probe tables on each side comparable.
     #[test]
     fn a_floor_of_zero_is_a_no_op() {
         let candidates = || {
@@ -825,9 +824,9 @@ mod tests {
         assert_eq!(paths, vec!["a.md", "b.md", "c.md"]);
     }
 
-    /// Confidence is a *position* under the degraded interleave and under the
-    /// legacy stage, and a position is not a probability. Thresholding one is
-    /// thresholding nothing, so the gate stands down rather than guessing.
+    /// Under the degraded interleave and the legacy stage, confidence is a
+    /// position. A position is not a probability, so there is nothing to compare
+    /// against the floor. The floor does not apply.
     #[test]
     fn an_unscored_candidate_is_not_gated() {
         let mut pool = vec![
@@ -840,10 +839,9 @@ mod tests {
         assert_eq!(pool.len(), 2, "abstained on an order nothing calibrated");
     }
 
-    /// The floor is a floor, not a strict bound: a candidate exactly at it is
-    /// supported. Fitting a threshold and then applying a different one is the
-    /// off-by-one that would make the pool table describe a build that does not
-    /// exist.
+    /// The comparison includes the floor value itself. If the fit gives one
+    /// value and the code applies a different one, the pool table describes a
+    /// build that does not exist.
     #[test]
     fn a_candidate_exactly_at_the_floor_survives() {
         let mut pool = vec![scored("exact.md", 1, Some(0.89))];
@@ -851,8 +849,8 @@ mod tests {
         assert_eq!(pool.len(), 1);
     }
 
-    /// Order is the model's, and the gate is a filter — it removes rows without
-    /// touching the arrangement of the ones it keeps.
+    /// The model sets the order. The floor only removes results, and it does not
+    /// change the order of the results that stay.
     #[test]
     fn the_gate_preserves_the_models_order() {
         let mut pool = vec![

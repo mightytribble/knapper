@@ -510,14 +510,14 @@ pub fn search_with_intelligence(
             RRF_K,
         );
 
-        // No results cap by default. Bound what the model is shown, not what it
-        // returns: if one document holds the ten best sections then ten sections
-        // is the right answer, and #6's vote-counting reason for capping
-        // evaporates once the cross-encoder sorts instead of voting.
-        // `group_by = "file"` survives — it is a request about the shape of the
-        // answer rather than a guard against a lane mechanic — and
-        // `per_note_cap` is §9.1's opposing position, shipped as a key set to
-        // unbounded so the deferred sweep is a config edit (#34).
+        // No limit on the results by default. Limit what the model reads, not
+        // what it returns: if one document holds the ten best sections, then ten
+        // sections is the correct answer. #6 limited the results because lanes
+        // voted, and the cross-encoder now sorts instead. `group_by = "file"`
+        // stays, because it asks for a shape of answer and does not guard
+        // against a lane mechanic. `per_note_cap` holds §9.1's opposite
+        // position, and it ships with no limit so that a sweep needs only a
+        // config edit (#34).
         let final_fused = match config.group_by {
             GroupBy::File => fusion::cap_per_file(final_fused, 1),
             GroupBy::Chunk => fusion::cap_per_file(final_fused, config.ranking.per_note_cap),
@@ -844,17 +844,16 @@ fn sorted_stage(
 
     ranking::sort_by_rerank(&mut pool, config.ranking.tiebreak);
 
-    // Abstention (#34). The gate is here rather than after `into_fused` because
-    // this is the last point at which `rerank_score` is still `Option` — the
-    // distinction between "the model scored this low" and "nothing scored this"
-    // is the whole reason the degraded order is not gated, and `confidence`
-    // collapses the two into one f64.
+    // The answer floor (#34). It runs here and not after `into_fused`, because
+    // this is the last point where `rerank_score` is still an `Option`. The
+    // floor must tell "the model gave this a low score" apart from "nothing
+    // scored this", and `confidence` reduces both to one f64.
     let supported = pool.len();
     let dropped = ranking::apply_answer_floor(&mut pool, config.ranking.answer_floor);
     if dropped > 0 {
-        // The tail cost, per query. The floor is fit on best-score-per-query and
-        // applied to a whole list, so how much of the list it eats is a separate
-        // measurement from whether it abstains correctly.
+        // The cost per query. The fit uses the best score of each query, and
+        // the floor applies to a whole list, so how much of the list it removes
+        // is a separate measurement from whether it returns nothing correctly.
         tracing::debug!(
             floor = config.ranking.answer_floor,
             scored = supported,
@@ -1276,14 +1275,14 @@ pub fn run_status(json: bool, data_dir: &Path) -> Result<()> {
 
 /// Format search results for display (pure function, no I/O).
 pub fn format_results(results: &[SearchResult], json: bool) -> String {
-    // An empty result set is abstention, however it got that way (#34): the
-    // answer floor rejected every candidate, or retrieval produced none. Both
-    // mean the same thing to whoever asked, which is why there is one message
-    // and not two — a "nothing was good enough" distinct from "nothing was
-    // found" would be reporting on the engine rather than on the vault.
+    // An empty result set means the same thing for both of its causes (#34):
+    // the floor removed every candidate, or retrieval found none. The reader
+    // asked about the vault, so one message covers both. A message that told
+    // "nothing scored high enough" apart from "nothing was found" would report
+    // on the engine instead.
     //
-    // The JSON channel keeps the empty array. The message is prose and the
-    // array has nowhere to put it; the machine-facing contract is #35's.
+    // The JSON channel keeps the empty array. The message is text, and an array
+    // has no field for it. #35 owns the machine-facing contract.
     if results.is_empty() {
         return if json {
             "[]\n".to_string()
@@ -1499,9 +1498,9 @@ mod tests {
         assert_eq!(parsed[0]["docid"], "ab12cd");
     }
 
-    /// An empty result set is abstention and says so (#34). One message covers
-    /// both routes to it — the floor rejected everything, or retrieval found
-    /// nothing — because the difference is about the engine and the sentence is
+    /// An empty result set reports that the vault has no answer (#34). One
+    /// message covers both causes: the floor removed everything, or retrieval
+    /// found nothing. The difference is about the engine, and the message is
     /// about the vault.
     #[test]
     fn test_no_results_message() {
@@ -2123,13 +2122,13 @@ mod tests {
         (tmp, store, embedder)
     }
 
-    /// The sorted stage with abstention switched off.
+    /// The sorted stage with the answer floor turned off.
     ///
-    /// `MockLlm::rerank_score` is a hash of the pair, not a calibrated
-    /// probability, so a floor fit against a real cross-encoder rejects
-    /// essentially all of it. Leaving the gate on would turn every test of
-    /// routing, capping and batching into a test of where the mock's hash
-    /// happens to land. Abstention has its own tests, with the floor stated.
+    /// `MockLlm::rerank_score` returns a hash of the pair and not a calibrated
+    /// probability. A floor fit against a real cross-encoder rejects nearly all
+    /// of those scores. With the floor on, every test of routing, limits and
+    /// batches becomes a test of where the hash lands. The floor has its own
+    /// tests, and they state the value they use.
     fn sorted_config(ranking: crate::config::RankingConfig) -> crate::config::RankingConfig {
         crate::config::RankingConfig {
             mode: crate::config::RankingMode::Sorted,
@@ -2192,13 +2191,13 @@ mod tests {
         );
     }
 
-    /// Abstention end to end (#34), and its own inert control beside it.
+    /// The answer floor end to end (#34), with its control.
     ///
-    /// A floor above every score the model can return must empty the response;
-    /// `0.0` must leave the same query exactly as #30 left it. The pair is what
-    /// makes the gate falsifiable in the pipeline rather than only in
-    /// `ranking::apply_answer_floor` — a gate wired up to nothing passes the
-    /// unit tests and changes no output.
+    /// A floor above every score the model can return must give an empty
+    /// response. A floor of `0.0` must leave the same query as #30 left it.
+    /// The two together test the floor in the pipeline and not only in
+    /// `ranking::apply_answer_floor`. A floor that no code calls passes the unit
+    /// tests and changes no output.
     #[test]
     fn the_answer_floor_empties_a_response_and_zero_is_inert() {
         let (_tmp, store, mut embedder) = vault_with_one_deep_document_and_a_linked_neighbour();
@@ -2224,12 +2223,12 @@ mod tests {
                 .results
         };
 
-        // Above 1.0, so it rejects on the gate rather than on the mock's hash
-        // landing somewhere convenient.
+        // Above 1.0, so the floor rejects every candidate whatever the mock's
+        // hash returns.
         let gated = results_at(1.01, &mut embedder);
         assert!(
             gated.is_empty(),
-            "nothing was supported and the engine answered anyway, with {} results",
+            "no candidate was above the floor, but the engine returned {} results",
             gated.len()
         );
         assert_eq!(
@@ -2238,12 +2237,12 @@ mod tests {
         );
 
         let ungated = results_at(0.0, &mut embedder);
-        assert!(!ungated.is_empty(), "the control gated something");
+        assert!(!ungated.is_empty(), "the control removed a result");
     }
 
-    /// The results cap §9.1 argues for and #30 argues against, shipped as a key
-    /// set to unbounded. The default must not bound one document's share; the
-    /// key must bound it when asked.
+    /// The results limit that §9.1 wants and #30 does not, shipped as a key with
+    /// no limit. The default must not limit one document's share, and the key
+    /// must limit it when it is set.
     #[test]
     fn per_note_cap_is_unbounded_by_default_and_binds_when_set() {
         let (_tmp, store, mut embedder) = vault_with_one_deep_document_and_a_linked_neighbour();
@@ -2275,9 +2274,9 @@ mod tests {
         let unbounded = count_for(0, &mut embedder);
         assert!(
             unbounded > 2,
-            "the default bounded the results, got {unbounded}"
+            "the default limited the results, got {unbounded}"
         );
-        assert_eq!(count_for(2, &mut embedder), 2, "the key did not bind");
+        assert_eq!(count_for(2, &mut embedder), 2, "the key did not limit them");
     }
 
     /// The defect the reserve answers. With a budget of four and two slots
