@@ -207,6 +207,12 @@ has never executed on this box.
   experiments — probe 2's tracked answer is absent at 5 and rank 1 at 20. `eval/probes.md`'s tables
   are at 20. The orchestration cache (`llm_cache`, keyed on the query) is what holds expansions
   constant across variants, so reusing one warm store is the control rather than a shortcut.
+  **The cost is not confined to the tail, and 20 → 25 is enough to pay it**: P3 returns
+  `## Level 4 Silence` at rank 3 and `## Level 6 Antimagic Shell` at rank 4 at `top_n = 20`, and
+  neither at any rank at 25. Those are the two most direct answers in the vault. #49 is the defect;
+  this entry is why no number may be read out of a home that raised the value. A home built to
+  propose candidate chunks for reading is not an arm — it names chunks, and every rank comes from
+  the shipped home at `top_n = 20`.
 - **Backlinks used to rot on every save** (#27, fixed). Any store last written by a pre-#27 build has
   edges missing — 24 of 1084 per three files edited, on the isekai vault — and the fix does not
   reconstruct them. `engraph index --rebuild` is the one-time repair, and any graph-lane number taken
@@ -641,7 +647,32 @@ See issues on this repo:
   and a tier-2 informative set drafted from the vault by the author, then coverage, the rank of each
   tier-1 member, and inversions. **The instrument #41, #43 and #44 should be judged with, so do it
   first.** The kept JSON for #36, #37, #38 and #42 is on disk, so re-scoring the record is a script
-  run
+  run.
+  **In progress, one query per comment on the issue, the author settling every reading.** P1 and P2
+  are agreed. Two boundary rules came out of them: a chunk that answers in the negative is tier 1
+  (*"No one investigates"*, *"Lesser Dragons cannot take human form"*), and a chunk about a character
+  who wears a form is tier 2 against a query about a species, which overturns #37's reading of
+  `the-archdragon-disguise.md > ### Summary` as "probe 2's most direct answer".
+  **The key is `file`, `heading` as the result JSON prints it, `section`, and the anchor sentence.**
+  Neither `path > heading` nor the stored breadcrumb is unique — 27 groups in the corpus collide,
+  because a split section gives every piece the same heading. The scorer resolves a member by anchor,
+  which survives a re-chunk, and reads `section` as a stamp taken at the pin; when the two disagree
+  it reports that the chunking moved rather than scoring a stale list.
+  Two findings the drafting has already produced: `[ranking] answer_floor = 0.30` removes a tier-1
+  member of P2 that scores 3.45%, against the 52.52% lowest correct answer #34 fit it on — the fit
+  needs re-reading once all six sets exist — and #49
+- **#49** `top_n` sets retrieval width, so asking for more results returns worse ones — both content
+  lanes fetch `top_n * 3` while `[ranking] candidates` stays at 30, so the value decides *which*
+  thirty candidates the cross-encoder is shown. P3 loses `## Level 4 Silence` (95.60%, rank 3) and
+  `## Level 6 Antimagic Shell` (94.82%, rank 4) between `top_n = 20` and 25, at any rank. A caller
+  who asks for more results gets other results. Every table in `eval/probes.md` is therefore valid
+  at 20 alone, and no test asserts it. The fix must decouple the lane width from the output limit,
+  and what the width should be is an arm, scored with #45; `top_n = 20` on the current binary is the
+  control. The value is query-time and reaches no fingerprint, so an arm is a re-run
+- ~~**#48** the per-document shortlist cap hides a responsive chunk from the cross-encoder~~ —
+  **closed, not reproducible.** Both of its arms ran in a home at `top_n = 100`, so neither was the
+  shipped configuration. The chunk it reported as hidden is rank 2 at 93.50% in the shipped arm, and
+  `shortlist_cap` is not binding on either query cited. Superseded by #49
 - **#43** sections under the minimum size should not become chunks — design §5.4 specifies
   `chunk_min_tokens_est = 30` and §14 lists it as "Later"; nothing implements it. **72 chunks in the
   shipped corpus are under 60 characters**, mostly template scaffolding a later workflow will fill:
