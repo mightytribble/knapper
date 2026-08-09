@@ -219,6 +219,112 @@ impl Default for RerankConfig {
     }
 }
 
+/// What the keyword lane indexes beside a chunk's body, and how each part is
+/// weighted (issue #37).
+///
+/// The breadcrumb rule of design §5.4 has three limbs that carry the same
+/// string. #36 shipped the embedding limb, where the breadcrumb is averaged
+/// into a vector. This is the lexical limb, where a heading term is *matched*.
+///
+/// Both flags are components of `fts_fingerprint`, because `chunks_fts` is
+/// declared with one column per enabled flag and the fingerprint hashes that
+/// declaration. A change to either therefore rebuilds the keyword index, which
+/// reads no files and runs no model. The weights are query-time and reach no
+/// fingerprint at all, so a weight sweep costs nothing.
+///
+/// `heading_path = false, tags = false` is the control: the declaration is then
+/// the single body column, and BM25 returns the same scores it returned before
+/// this issue. Measured: the whole eighteen-query pool is identical to the
+/// pre-#37 binary, to nine decimal places. A zero *weight* is not the same
+/// thing — BM25 normalises over the whole row's tokens, so a populated column
+/// at weight 0.0 still moves every score, which is why the flags exist and a
+/// weight of zero would not do.
+///
+/// The shipped values are measured rather than designed. `docs/vault-search-/// convergence.md` §6.2 asks for both columns at `bm25(chunks_fts, 1.0, 3.0,
+/// 4.0)`; the arms in `eval/probes.md` (#37) give the breadcrumb at equal
+/// weight and leave the tags out. See the two fields for what each one did.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FtsConfig {
+    /// Index each chunk's breadcrumb — `Note Title > H1 > H2 > H3`, the same
+    /// string `[embedding_prompt] document_title = "breadcrumb"` embeds.
+    ///
+    /// **On, and the reason this issue exists.** It returns `## Level 4
+    /// Silence` — *"the silenced target cannot cast spells of any school"* — to
+    /// probe 3 at rank 4, one of the two correct answers the embedding limb of
+    /// the same rule dropped in #36, and it drops a summoning spell that
+    /// answers nothing. It costs one swap below the answer on probe 4. No
+    /// tracked answer moves.
+    pub heading_path: bool,
+    /// Index the file's frontmatter tags, sorted and space separated.
+    ///
+    /// **Off, and measured off.** A tag records an attribute of a note rather
+    /// than something the note discusses, and the keyword lane cannot tell the
+    /// two apart. `npcs/tandi.md` is tagged `velthos`, a city, so the adjacent
+    /// negative N11 — *"in which city is Tandi's brother a blacksmith?"*, whose
+    /// correct answer is nothing — gains a 97.06% result at rank 2. On probe 2
+    /// it drops the one section that describes a dragon in human shape, at
+    /// 94.94%, and the tracked answer's rank 4 → 3 is that drop and not a gain.
+    ///
+    /// This is half of #17 attempted the cheap way, and the half that did not
+    /// work. Resolving a query against the tag *registry* is the other half and
+    /// is untouched by this result.
+    pub tags: bool,
+    /// BM25 weight on the chunk body.
+    pub body_weight: f64,
+    /// BM25 weight on the breadcrumb. Ignored when `heading_path` is false.
+    ///
+    /// 1.0, because 3.0 and 5.0 were measured and bought nothing: probe 3's
+    /// recovered answer arrives at rank 4 at all three, and the only other
+    /// difference is churn — 62 of 360 result slots move at 1.0, 117 at 3.0,
+    /// 123 at 5.0.
+    pub heading_path_weight: f64,
+    /// BM25 weight on the tags. Ignored when `tags` is false.
+    pub tags_weight: f64,
+}
+
+impl Default for FtsConfig {
+    fn default() -> Self {
+        Self {
+            heading_path: true,
+            tags: false,
+            body_weight: 1.0,
+            heading_path_weight: 1.0,
+            tags_weight: 1.0,
+        }
+    }
+}
+
+impl FtsConfig {
+    /// The control: body only, at the weight a one-column table has anyway.
+    pub const CONTROL: Self = Self {
+        heading_path: false,
+        tags: false,
+        body_weight: 1.0,
+        heading_path_weight: 1.0,
+        tags_weight: 1.0,
+    };
+
+    /// The declared columns and their BM25 weights, in the order `chunks_fts`
+    /// declares them. What `--explain` prints, so that a measurement cannot
+    /// silently be taken at weights nobody meant.
+    pub fn columns(&self) -> Vec<(&'static str, f64)> {
+        let mut cols = vec![("text", self.body_weight)];
+        if self.heading_path {
+            cols.push(("heading_path", self.heading_path_weight));
+        }
+        if self.tags {
+            cols.push(("tags_text", self.tags_weight));
+        }
+        cols
+    }
+
+    /// The BM25 weights alone, for the query.
+    pub fn weights(&self) -> Vec<f64> {
+        self.columns().iter().map(|(_, w)| *w).collect()
+    }
+}
+
 /// Which ranking stage runs (issue #30).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -427,6 +533,9 @@ pub struct Config {
     /// What reaches the cross-encoder, and what it does there (issue #30).
     #[serde(default)]
     pub ranking: RankingConfig,
+    /// What the keyword lane indexes beside the chunk body (issue #37).
+    #[serde(default)]
+    pub fts: FtsConfig,
     #[serde(default)]
     pub identity: IdentityConfig,
     #[serde(default)]
@@ -449,6 +558,7 @@ impl Default for Config {
             models: ModelConfig::default(),
             rerank: RerankConfig::default(),
             ranking: RankingConfig::default(),
+            fts: FtsConfig::default(),
             obsidian: ObsidianConfig::default(),
             agents: AgentsConfig::default(),
             http: HttpConfig::default(),

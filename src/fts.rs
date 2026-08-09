@@ -141,12 +141,29 @@ mod expr_tests {
 #[cfg(test)]
 mod tests {
     use crate::docid::generate_docid;
-    use crate::store::Store;
+    use crate::store::{NewChunk, Store};
 
     fn setup_store() -> Store {
         let store = Store::open_memory().unwrap();
         store.ensure_fts_table().unwrap();
         store
+    }
+
+    /// Index one chunk of `file_id`, the only way there is: `chunks_fts` is
+    /// external content over `chunks`, so a keyword index entry exists exactly
+    /// where a chunk row does (issue #37). `vector_id` is unique per store and
+    /// otherwise unused here.
+    fn index_chunk(store: &Store, file_id: i64, seq: i64, text: &str) {
+        store
+            .insert_chunk(&NewChunk {
+                file_id,
+                seq,
+                text,
+                vector_id: (file_id * 100 + seq) as u64,
+                token_count: text.split_whitespace().count() as i64,
+                ..Default::default()
+            })
+            .unwrap();
     }
 
     #[test]
@@ -164,9 +181,12 @@ mod tests {
             )
             .unwrap();
 
-        store
-            .insert_fts_chunk(file_id, 0, "BRE-2579 delivery date extension for checkout")
-            .unwrap();
+        index_chunk(
+            &store,
+            file_id,
+            0,
+            "BRE-2579 delivery date extension for checkout",
+        );
 
         let results = store.fts_search("BRE-2579", 10).unwrap();
         assert_eq!(results.len(), 1);
@@ -193,9 +213,7 @@ mod tests {
             )
             .unwrap();
 
-        store
-            .insert_fts_chunk(file_id, 0, "Rust programming language guide")
-            .unwrap();
+        index_chunk(&store, file_id, 0, "Rust programming language guide");
 
         let results = store.fts_search("kubernetes", 10).unwrap();
         assert_eq!(results.len(), 0);
@@ -220,28 +238,35 @@ mod tests {
             )
             .unwrap();
 
-        store
-            .insert_fts_chunk(file_id, 0, "Rust programming language guide")
-            .unwrap();
+        index_chunk(&store, file_id, 0, "Rust programming language guide");
 
         // The words are all present, but not contiguous and not in this order.
         assert!(store.fts_search("guide to Rust", 10).unwrap().is_empty());
-        assert_eq!(store.fts_search_any("guide to Rust", 10).unwrap().len(), 1);
+        assert_eq!(
+            store
+                .fts_search_any("guide to Rust", 10, &[])
+                .unwrap()
+                .len(),
+            1
+        );
 
         // Any one term is enough, which is what makes the lane a recall lane.
         assert_eq!(
-            store.fts_search_any("kubernetes Rust", 10).unwrap().len(),
+            store
+                .fts_search_any("kubernetes Rust", 10, &[])
+                .unwrap()
+                .len(),
             1
         );
         assert!(
             store
-                .fts_search_any("kubernetes helm", 10)
+                .fts_search_any("kubernetes helm", 10, &[])
                 .unwrap()
                 .is_empty()
         );
 
         // Nothing searchable: no rows, no error.
-        assert!(store.fts_search_any("-- ...", 10).unwrap().is_empty());
+        assert!(store.fts_search_any("-- ...", 10, &[]).unwrap().is_empty());
     }
 
     #[test]
@@ -283,19 +308,19 @@ mod tests {
             .unwrap();
 
         // Chunk with "delivery" appearing multiple times should rank higher.
-        store
-            .insert_fts_chunk(
-                file_id1,
-                0,
-                "delivery date delivery schedule delivery tracking",
-            )
-            .unwrap();
-        store
-            .insert_fts_chunk(file_id2, 0, "delivery date for the checkout page")
-            .unwrap();
-        store
-            .insert_fts_chunk(file_id3, 0, "unrelated content about Rust and WebAssembly")
-            .unwrap();
+        index_chunk(
+            &store,
+            file_id1,
+            0,
+            "delivery date delivery schedule delivery tracking",
+        );
+        index_chunk(&store, file_id2, 0, "delivery date for the checkout page");
+        index_chunk(
+            &store,
+            file_id3,
+            0,
+            "unrelated content about Rust and WebAssembly",
+        );
 
         let results = store.fts_search("delivery", 10).unwrap();
         assert_eq!(results.len(), 2, "only 2 chunks mention 'delivery'");
@@ -308,7 +333,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fts_delete_chunks_for_file() {
+    fn deleting_a_files_chunks_removes_its_keyword_index_entries() {
         let store = setup_store();
         let file_id = store
             .insert_file(
@@ -322,19 +347,16 @@ mod tests {
             )
             .unwrap();
 
-        store
-            .insert_fts_chunk(file_id, 0, "first chunk content")
-            .unwrap();
-        store
-            .insert_fts_chunk(file_id, 1, "second chunk content")
-            .unwrap();
+        index_chunk(&store, file_id, 0, "first chunk content");
+        index_chunk(&store, file_id, 1, "second chunk content");
 
         // Verify they exist.
         let results = store.fts_search("chunk", 10).unwrap();
         assert_eq!(results.len(), 2);
 
-        // Delete and verify gone.
-        store.delete_fts_chunks_for_file(file_id).unwrap();
+        // Deleting the chunks deletes the index entries: the triggers are the
+        // only writer, so there is no second delete to forget (issue #37).
+        store.delete_chunks_for_file(file_id).unwrap();
         let results = store.fts_search("chunk", 10).unwrap();
         assert_eq!(results.len(), 0);
     }

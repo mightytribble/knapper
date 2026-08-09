@@ -473,6 +473,10 @@ pub fn index_file(
         &chunks,
         crate::prefix::EmbedComposition::from_config(config),
     );
+    // What the keyword lane is shown, stored on the chunk row itself (issue
+    // #37). The same `doc`, so the breadcrumb here and the breadcrumb in the
+    // title field above are one string.
+    let lexical = crate::prefix::lexical_fields(&doc, &chunks);
     let docs: Vec<crate::llm::EmbedDoc<'_>> = inputs
         .iter()
         .map(crate::prefix::EmbedInput::as_doc)
@@ -511,7 +515,9 @@ pub fn index_file(
         for &vid in &vector_ids {
             store.delete_vec(vid)?;
         }
-        store.delete_fts_chunks_for_file(record.id)?;
+        // The keyword index goes with the chunks: `chunks_fts` is external
+        // content over `chunks`, and its delete trigger fires on every row this
+        // statement removes (issue #37).
         store.delete_chunks_for_file(record.id)?;
     }
 
@@ -535,21 +541,22 @@ pub fn index_file(
         let vector_id = start_vector_id + chunk_seq as u64;
 
         // The whole chunk goes to storage; the store derives the snippet from
-        // it (issue #14).
+        // it (issue #14). The keyword index needs no write of its own — the
+        // insert trigger indexes this row from the columns below (issue #37).
         store.insert_chunk_with_vector(
-            file_id,
-            chunk_seq as i64,
-            &heading,
-            &chunk.text,
-            vector_id,
-            token_counts[chunk_seq] as i64,
+            &crate::store::NewChunk {
+                file_id,
+                seq: chunk_seq as i64,
+                heading: &heading,
+                heading_path: &lexical[chunk_seq].heading_path,
+                tags_text: &lexical[chunk_seq].tags_text,
+                text: &chunk.text,
+                vector_id,
+                token_count: token_counts[chunk_seq] as i64,
+            },
             vector,
         )?;
         store.insert_vec(vector_id, vector)?;
-        // FTS gets the whole chunk, not the snippet (issue #11). `snippet` is
-        // the display field on the `chunks` row; keyword search needs the text,
-        // and this is the only place it is retained.
-        store.insert_fts_chunk(file_id, chunk_seq as i64, &chunk.text)?;
     }
 
     // 7. Register tags
@@ -587,7 +594,8 @@ pub fn remove_file(rel_path: &str, store: &Store) -> Result<()> {
     for &vid in &vector_ids {
         store.delete_vec(vid)?;
     }
-    store.delete_fts_chunks_for_file(file.id)?;
+    // No FTS delete: `chunks` CASCADEs off the `files` row below, and the
+    // keyword index follows the chunks (issue #37).
     // `unresolved_links` is keyed by path, not file id, so `delete_file` does not
     // reach it — the rows would outlive the file and keep reporting broken links
     // from a note that is no longer indexed.
@@ -698,8 +706,16 @@ fn run_index_inner(
     // Before the file loop, so anything indexed below lands in the new schema
     // rather than being written into the old one and then thrown away.
     if actions.contains(&crate::fingerprint::Action::RebuildFts) {
-        let rows = store.rebuild_fts()?;
+        let rows = store.rebuild_fts(&config.fts)?;
         info!(rows, "keyword index rebuilt from stored chunks");
+    }
+    // A store with no recorded fingerprints is adopted rather than rebuilt
+    // (issue #31), and a fresh one gets its keyword index from `Store::init`,
+    // which has read no config. Either way the declaration can still disagree
+    // with `[fts]`, and this is the path that holds the config, so it is the
+    // path that reconciles the two.
+    if let Some(rows) = store.sync_fts_objects(&config.fts)? {
+        info!(rows, "keyword index rebuilt to match [fts]");
     }
 
     let cleaned = crate::writer::cleanup_temp_files(vault_path)?;
@@ -1055,12 +1071,17 @@ mod tests {
             .unwrap()
             .expect("index file should be in the store");
         let file_id = indexed.id;
+        // The keyword index is external content over `chunks` (#37), so a
+        // file's entries are counted through the join and not through a column
+        // of the index.
         let fts_rows = |id: i64| -> i64 {
             store
                 .conn()
                 .query_row(
-                    "SELECT COUNT(*) FROM chunks_fts WHERE file_id = ?1",
-                    [id],
+                    "SELECT COUNT(*) FROM chunks_fts
+                     JOIN chunks c ON c.id = chunks_fts.rowid
+                     WHERE chunks_fts MATCH ?1 AND c.file_id = ?2",
+                    rusqlite::params![r#""the" OR "a" OR "of" OR "lore""#, id],
                     |row| row.get(0),
                 )
                 .unwrap()
@@ -1309,10 +1330,21 @@ mod tests {
         out
     }
 
+    /// How many rows the keyword index actually holds.
+    ///
+    /// A MATCH and not `count(*)`: since #37 `chunks_fts` is external content,
+    /// so `count(*)` counts the rows of the *content* table and reads the same
+    /// whether the index is populated or empty. Every fixture file contains
+    /// `#`, which the tokenizer drops, so the term below is one every chunk
+    /// carries.
     fn fts_row_count(store: &Store) -> i64 {
         store
             .conn()
-            .query_row("SELECT count(*) FROM chunks_fts", [], |row| row.get(0))
+            .query_row(
+                "SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH ?1",
+                [r#""a" OR "c" OR "hub""#],
+                |row| row.get(0),
+            )
             .unwrap()
     }
 
@@ -1951,7 +1983,6 @@ mod tests {
 
     /// Index one file whose body never names its own subject — the archdragon
     /// case from issue #2 — and report what the embedder saw.
-
     fn index_prefixed_vault(config: &Config) -> (Store, RecordingEmbed) {
         let tmp = TempDir::new().unwrap();
         write_file(
@@ -2204,6 +2235,218 @@ mod tests {
         .unwrap();
 
         assert_eq!(from_write, embedder.titles);
+    }
+
+    // ── The lexical limb of the breadcrumb rule (#37) ────────────
+
+    /// The breadcrumb is stored on the chunk row, and it is the same string the
+    /// title field carries. One rule, one composition — the two limbs cannot
+    /// drift, because they call one function.
+    #[test]
+    fn the_breadcrumb_is_stored_on_the_chunk_row() {
+        let (store, embedder) = index_prefixed_vault(&Config::default());
+        let file = store
+            .get_file("lore/bestiary/archdragon.md")
+            .unwrap()
+            .unwrap();
+
+        let stored: Vec<String> = store
+            .get_chunks_by_file(file.id)
+            .unwrap()
+            .iter()
+            .map(|c| c.heading_path.clone())
+            .collect();
+        assert_eq!(
+            stored,
+            vec![
+                "Archdragon > Definition",
+                "Archdragon > Abilities",
+                "Archdragon > Abilities > Combat",
+            ]
+        );
+
+        let mut titles = embedder.titles.clone();
+        let mut lexical = stored.clone();
+        titles.sort();
+        lexical.sort();
+        assert_eq!(titles, lexical, "the two limbs carry one string");
+    }
+
+    /// The tags of the file, on every chunk of it, sorted. Frontmatter order is
+    /// not information, and a stable string keeps two indexes of one file
+    /// byte-identical.
+    #[test]
+    fn the_files_tags_are_stored_on_every_chunk() {
+        let tmp = TempDir::new().unwrap();
+        write_file(
+            tmp.path(),
+            "n.md",
+            "---\ntags:\n  - zebra\n  - apex\n---\n\n## One\n\nBody.\n\n## Two\n\nMore.\n",
+        );
+        let store = Store::open_memory().unwrap();
+        let mut embedder = crate::llm::MockLlm::new(256);
+        run_index_shared(
+            tmp.path(),
+            &Config::default(),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let file = store.get_file("n.md").unwrap().unwrap();
+        for chunk in store.get_chunks_by_file(file.id).unwrap() {
+            assert_eq!(chunk.tags_text, "apex zebra");
+        }
+    }
+
+    /// The point of the issue: a term that appears **only** in a heading is
+    /// reachable through the keyword lane. The tag is not, under the shipped
+    /// default — `[fts] tags` is off and the column is not declared — and it
+    /// becomes reachable the moment it is turned on.
+    #[test]
+    fn a_heading_term_and_a_tag_are_matchable_without_appearing_in_a_body() {
+        let tmp = TempDir::new().unwrap();
+        write_file(
+            tmp.path(),
+            "rules/spells.md",
+            "---\ntags:\n  - grimoire\n---\n\n## Abjuration\n\nStops a caster.\n",
+        );
+        let store = Store::open_memory().unwrap();
+        let mut embedder = crate::llm::MockLlm::new(256);
+        run_index_shared(
+            tmp.path(),
+            &Config::default(),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let file = store.get_file("rules/spells.md").unwrap().unwrap();
+        let body = store.get_chunk_by_seq(file.id, 0).unwrap().unwrap().text;
+        assert!(
+            !body.contains("grimoire"),
+            "fixture puts the tag in the body"
+        );
+
+        let shipped = crate::config::FtsConfig::default();
+        for term in ["Abjuration", "spells"] {
+            let hits = store.fts_search_any(term, 10, &shipped.weights()).unwrap();
+            assert_eq!(hits.len(), 1, "no keyword hit for {term:?}");
+            assert_eq!(hits[0].file_id, file.id);
+        }
+        assert!(
+            store
+                .fts_search_any("grimoire", 10, &shipped.weights())
+                .unwrap()
+                .is_empty(),
+            "the tags column ships undeclared"
+        );
+
+        let with_tags = crate::config::FtsConfig {
+            tags: true,
+            ..shipped
+        };
+        store.rebuild_fts(&with_tags).unwrap();
+        assert_eq!(
+            store
+                .fts_search_any("grimoire", 10, &with_tags.weights())
+                .unwrap()
+                .len(),
+            1,
+            "turning the column on is a rebuild and nothing more"
+        );
+    }
+
+    /// The control. With both columns off the index is declared over the body
+    /// alone, and every score is the one the lane returned before this issue.
+    /// A weight of zero is not this: BM25 normalises over every token in the
+    /// row, so a populated column moves every score whatever its weight.
+    #[test]
+    fn the_control_scores_exactly_as_a_body_only_index_did() {
+        let files = [
+            (
+                "a.md",
+                "## Abjuration\n\nStops a caster from casting a spell.\n",
+            ),
+            ("b.md", "## Bread\n\nA short line about casting bread.\n"),
+        ];
+        let scores = |cfg: crate::config::FtsConfig| -> Vec<(String, f64)> {
+            let tmp = TempDir::new().unwrap();
+            let mut config = Config {
+                fts: cfg,
+                ..Config::default()
+            };
+            config.exclude.clear();
+            for (path, content) in &files {
+                write_file(tmp.path(), path, content);
+            }
+            let store = Store::open_memory().unwrap();
+            let mut embedder = crate::llm::MockLlm::new(256);
+            run_index_shared(tmp.path(), &config, &store, &mut embedder, false, None).unwrap();
+            store
+                .fts_search_any("casting", 10, &config.fts.weights())
+                .unwrap()
+                .iter()
+                .map(|r| {
+                    let path = store.get_file_by_id(r.file_id).unwrap().unwrap().path;
+                    (path, r.score)
+                })
+                .collect()
+        };
+
+        let control = scores(crate::config::FtsConfig::CONTROL);
+        let indexed = scores(crate::config::FtsConfig::default());
+        assert_eq!(control.len(), 2);
+        // Same rows, same order, and the control's scores are the pre-#37 ones.
+        assert_eq!(
+            control.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(),
+            indexed.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(),
+        );
+        assert!(
+            control
+                .iter()
+                .zip(&indexed)
+                .any(|((_, a), (_, b))| (a - b).abs() > f64::EPSILON),
+            "the declared columns changed nothing at all, which cannot be right: \
+             {control:?} {indexed:?}"
+        );
+    }
+
+    /// `[fts]` is a schema change and nothing more. It rebuilds the keyword
+    /// index, which reads no files and runs no model, and it leaves every
+    /// vector where it was.
+    #[test]
+    fn changing_the_declared_columns_rebuilds_the_keyword_index_only() {
+        let (tmp, store, mut embedder, _config) = fingerprint_fixture();
+        let before = chunk_snapshot(&store);
+        let vectors: Vec<(u64, Vec<f32>)> = store.get_all_vectors().unwrap();
+
+        let control = Config {
+            fts: crate::config::FtsConfig::CONTROL,
+            ..Config::default()
+        };
+        let result =
+            run_index_shared(tmp.path(), &control, &store, &mut embedder, false, None).unwrap();
+
+        assert_eq!(result.new_files, 0);
+        assert_eq!(result.updated_files, 0);
+        assert!(
+            embedder.seen.is_empty(),
+            "a column list is not an embedding input: {:?}",
+            embedder.seen
+        );
+        assert_eq!(before, chunk_snapshot(&store));
+        assert_eq!(vectors, store.get_all_vectors().unwrap());
+        assert_eq!(
+            store.fts_columns().unwrap(),
+            Some(vec!["text".to_string()]),
+            "the index should have been redeclared"
+        );
+        assert!(fts_row_count(&store) > 0, "and repopulated");
     }
 
     // ── Chunk-granular edges (#28) ───────────────────────────────

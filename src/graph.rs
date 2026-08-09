@@ -356,7 +356,7 @@ mod tests {
     use super::*;
     use crate::docid::generate_docid;
     use crate::fusion::RankedResult;
-    use crate::store::{DOC_LEVEL, Store};
+    use crate::store::{DOC_LEVEL, NewChunk, Store};
 
     #[test]
     fn test_extract_wikilink_targets() {
@@ -467,14 +467,15 @@ mod tests {
         for seq in 0..n {
             let text = format!("{path} passage {seq}");
             store
-                .insert_chunk(
-                    id,
+                .insert_chunk(&NewChunk {
+                    file_id: id,
                     seq,
-                    &format!("## S{seq}"),
-                    &text,
-                    (id * 100 + seq) as u64,
-                    20,
-                )
+                    heading: &format!("## S{seq}"),
+                    text: &text,
+                    vector_id: (id * 100 + seq) as u64,
+                    token_count: 20,
+                    ..Default::default()
+                })
                 .unwrap();
         }
         id

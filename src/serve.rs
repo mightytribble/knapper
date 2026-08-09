@@ -259,6 +259,10 @@ pub struct EngraphServer {
     rerank: crate::config::RerankConfig,
     /// Ranking-stage settings from `config.toml`.
     ranking: crate::config::RankingConfig,
+    /// Keyword-lane settings from `config.toml`. The BM25 weights are
+    /// positional over the columns the store's index is declared with, so this
+    /// has to be the config the store was built from (issue #37).
+    fts: crate::config::FtsConfig,
     /// Embedding-prefix settings, for the same reason: notes written by MCP
     /// tools share a vector space with the indexed vault.
     embed: crate::prefix::EmbedComposition,
@@ -414,6 +418,7 @@ impl EngraphServer {
             max_chunks_per_file: self.max_chunks_per_file,
             group_by: self.group_by,
             ranking: self.ranking,
+            fts: self.fts,
         };
 
         let output =
@@ -1144,6 +1149,7 @@ pub async fn run_serve(
     let group_by = config.group_by;
     let rerank = config.rerank;
     let ranking = config.ranking;
+    let fts = config.fts;
     let embed = crate::prefix::EmbedComposition::from_config(&config);
 
     let (watcher_handle, watcher_shutdown) = crate::watcher::start_watcher(
@@ -1174,6 +1180,7 @@ pub async fn run_serve(
         group_by,
         rerank,
         ranking,
+        fts,
         embed,
     };
 
@@ -1199,6 +1206,7 @@ pub async fn run_serve(
             group_by,
             rerank,
             ranking,
+            fts,
             embed,
         };
         let router = crate::http::build_router(api_state);

@@ -36,12 +36,19 @@ pub struct ChunkRecord {
     /// could not be found to backfill from. Nothing should read this without
     /// deciding what an empty one means.
     pub text: String,
+    /// The breadcrumb this chunk is indexed under, `Note Title > H1 > H2`
+    /// (issue #37). Empty on a database written before the column existed, and
+    /// on a chunk of a file with no headings.
+    pub heading_path: String,
+    /// The file's frontmatter tags, sorted and space separated (issue #37).
+    pub tags_text: String,
     pub vector_id: u64,
     pub token_count: i64,
 }
 
 /// Columns selected for every [`ChunkRecord`], in the order [`chunk_from_row`] expects.
-const CHUNK_COLUMNS: &str = "id, file_id, seq, heading, snippet, text, vector_id, token_count";
+const CHUNK_COLUMNS: &str =
+    "id, file_id, seq, heading, snippet, text, heading_path, tags_text, vector_id, token_count";
 
 /// The `chunk_seq` standing for "the document as a whole" on either end of an edge.
 ///
@@ -98,8 +105,10 @@ fn chunk_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChunkRecord> {
         heading: row.get(3)?,
         snippet: row.get(4)?,
         text: row.get(5)?,
-        vector_id: row.get::<_, i64>(6)? as u64,
-        token_count: row.get(7)?,
+        heading_path: row.get(6)?,
+        tags_text: row.get(7)?,
+        vector_id: row.get::<_, i64>(8)? as u64,
+        token_count: row.get(9)?,
     })
 }
 
@@ -110,6 +119,30 @@ pub struct FtsResult {
     pub chunk_seq: i64,
     pub score: f64,
     pub snippet: String,
+}
+
+/// One chunk row, as it is written.
+///
+/// A struct rather than nine positional arguments, and named after the thing
+/// `fingerprint::CHUNK_RECORD_VERSION` versions: what a chunk row records is now
+/// something a reader depends on, so it is worth having one place that says what
+/// that is. `Default` gives every text field the empty string, which is what a
+/// test that cares about two of them wants.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NewChunk<'a> {
+    pub file_id: i64,
+    /// The chunk's 0-based position in its file.
+    pub seq: i64,
+    /// The chunk's own heading line, as the chunker found it.
+    pub heading: &'a str,
+    /// The breadcrumb — `crate::prefix::breadcrumb` (issue #37).
+    pub heading_path: &'a str,
+    /// The file's frontmatter tags, sorted and space separated (issue #37).
+    pub tags_text: &'a str,
+    /// The whole chunk. `snippet` is derived from it.
+    pub text: &'a str,
+    pub vector_id: u64,
+    pub token_count: i64,
 }
 
 /// Statistics about edges in the graph.
@@ -178,18 +211,74 @@ pub struct StoreStats {
     pub mention_count: Option<usize>,
 }
 
-/// The keyword index's declaration, kept as one literal because
-/// `fts_fingerprint` hashes it (issue #31).
+/// The keyword index's declaration and its three sync triggers, as one batch of
+/// SQL, because `fts_fingerprint` hashes the text (issue #31).
 ///
 /// This is the one fingerprint input that needs no version constant beside it:
-/// the schema *is* the text, so any change to the column list, the tokenizer
-/// clause, or the `UNINDEXED` markers changes the digest exactly and nothing
-/// else does.
-pub const FTS_SCHEMA: &str = "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
-                content,
-                file_id UNINDEXED,
-                chunk_seq UNINDEXED
-            );";
+/// the schema *is* the text, so any change to the column list or to a trigger
+/// body changes the digest exactly and nothing else does. `[fts]` reaches the
+/// fingerprint through here too, since the flags decide the column list.
+///
+/// `chunks_fts` is **external content** over `chunks` (issue #37). It stores an
+/// index and no text of its own, and it reads every column value back out of
+/// the chunk row. Two consequences, both of them the point:
+///
+/// - the keyword index cannot hold a different string from `chunks.text`, which
+///   is the state issue #11 existed to repair. There is no second copy to
+///   disagree.
+/// - the triggers are the only writer. A chunk row inserted, updated or deleted
+///   by any path updates the index, including the delete SQLite performs itself
+///   when `files` cascades. Measured: after `DELETE FROM files`, the index is
+///   empty and `integrity-check` passes.
+///
+/// The column order is body, breadcrumb, tags, and `bm25()` takes its weights
+/// in that order. A disabled column is *absent* from the declaration rather
+/// than present at weight zero: BM25 normalises over every token in the row, so
+/// a populated column at weight 0.0 still moves every score, while a column the
+/// table does not declare is exactly inert.
+pub fn fts_objects_sql(cfg: &crate::config::FtsConfig) -> String {
+    let mut columns = vec!["text"];
+    if cfg.heading_path {
+        columns.push("heading_path");
+    }
+    if cfg.tags {
+        columns.push("tags_text");
+    }
+    let column_list = columns.join(", ");
+    // `new.`/`old.` qualified, for the trigger bodies.
+    let new_values = columns
+        .iter()
+        .map(|c| format!("new.{c}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let old_values = columns
+        .iter()
+        .map(|c| format!("old.{c}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    format!(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+                {column_list},
+                content='chunks',
+                content_rowid='id'
+            );
+            CREATE TRIGGER IF NOT EXISTS chunks_fts_insert AFTER INSERT ON chunks BEGIN
+                INSERT INTO chunks_fts(rowid, {column_list})
+                    VALUES (new.id, {new_values});
+            END;
+            CREATE TRIGGER IF NOT EXISTS chunks_fts_delete AFTER DELETE ON chunks BEGIN
+                INSERT INTO chunks_fts(chunks_fts, rowid, {column_list})
+                    VALUES ('delete', old.id, {old_values});
+            END;
+            CREATE TRIGGER IF NOT EXISTS chunks_fts_update AFTER UPDATE ON chunks BEGIN
+                INSERT INTO chunks_fts(chunks_fts, rowid, {column_list})
+                    VALUES ('delete', old.id, {old_values});
+                INSERT INTO chunks_fts(rowid, {column_list})
+                    VALUES (new.id, {new_values});
+            END;"
+    )
+}
 
 const SCHEMA: &str = r#"
 PRAGMA foreign_keys = ON;
@@ -216,9 +305,16 @@ CREATE TABLE IF NOT EXISTS chunks (
     heading     TEXT NOT NULL,
     snippet     TEXT NOT NULL,
     -- The whole chunk. Added by issue #14: the reranker has to read what it
-    -- scores, and `chunks_fts` — the only other copy — cannot be keyed into
-    -- without a MATCH, because its `file_id`/`chunk_seq` are UNINDEXED.
+    -- scores. Since issue #37 it is also what `chunks_fts` indexes: the keyword
+    -- index is external-content over this table and keeps no copy of its own.
     text        TEXT NOT NULL DEFAULT '',
+    -- The two columns the keyword index reads beside the body (issue #37).
+    -- `heading_path` is the breadcrumb, `Note Title > H1 > H2 > H3`; `tags_text`
+    -- is the file's frontmatter tags, sorted and space separated. Both are
+    -- written on every chunk whatever `[fts]` says, because the config decides
+    -- which columns the index is declared over and not what a chunk records.
+    heading_path TEXT NOT NULL DEFAULT '',
+    tags_text    TEXT NOT NULL DEFAULT '',
     vector_id   INTEGER UNIQUE NOT NULL,
     token_count INTEGER NOT NULL,
     vector      BLOB
@@ -469,6 +565,19 @@ impl Store {
             self.conn
                 .execute_batch("ALTER TABLE chunks ADD COLUMN text TEXT NOT NULL DEFAULT '';")?;
             self.backfill_chunk_text()?;
+        }
+
+        // Add the two lexical columns (issue #37). They stay empty here on
+        // purpose. `tags_text` could be derived from `files.tags`, but the
+        // breadcrumb cannot be derived from anything this table holds — only
+        // the leaf heading is stored, and the ancestors live in the vault. A
+        // half-populated pair would index one limb of the rule and not the
+        // other, so both wait for the re-index that `chunk_record` declares.
+        if !self.column_exists("chunks", "heading_path")? {
+            self.conn.execute_batch(
+                "ALTER TABLE chunks ADD COLUMN heading_path TEXT NOT NULL DEFAULT '';
+                 ALTER TABLE chunks ADD COLUMN tags_text TEXT NOT NULL DEFAULT '';",
+            )?;
         }
 
         // Check if edges table exists.
@@ -756,67 +865,54 @@ impl Store {
     }
 
     // ── Chunks ──────────────────────────────────────────────────
+    // See [`NewChunk`] for what one row holds and why it is one argument.
 
-    /// Insert a chunk. `seq` is its 0-based position in the file and must match
-    /// the `chunk_seq` given to [`insert_fts_chunk`](Self::insert_fts_chunk) for
-    /// the same chunk, or the two lanes will disagree about what they retrieved.
+    /// Insert a chunk.
     ///
     /// `text` is the **whole chunk**. The `snippet` column is derived from it
     /// here rather than passed in: a chunk row that holds a preview but not the
     /// text it previews is the state issue #14 exists to remove, and taking one
     /// argument makes it unreachable.
-    pub fn insert_chunk(
-        &self,
-        file_id: i64,
-        seq: i64,
-        heading: &str,
-        text: &str,
-        vector_id: u64,
-        token_count: i64,
-    ) -> Result<()> {
+    ///
+    /// The keyword index needs no separate write. `chunks_fts` is external
+    /// content over this table, so the insert trigger indexes the row (#37).
+    pub fn insert_chunk(&self, chunk: &NewChunk<'_>) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO chunks (file_id, seq, heading, snippet, text, vector_id, token_count)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO chunks
+                (file_id, seq, heading, heading_path, tags_text, snippet, text, vector_id, token_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
-                file_id,
-                seq,
-                heading,
-                crate::chunker::make_snippet(text),
-                text,
-                vector_id as i64,
-                token_count
+                chunk.file_id,
+                chunk.seq,
+                chunk.heading,
+                chunk.heading_path,
+                chunk.tags_text,
+                crate::chunker::make_snippet(chunk.text),
+                chunk.text,
+                chunk.vector_id as i64,
+                chunk.token_count
             ],
         )?;
         Ok(())
     }
 
     /// Insert a chunk with its embedding vector stored as a BLOB.
-    ///
-    /// `text` is the whole chunk, for the reason given on
-    /// [`insert_chunk`](Self::insert_chunk).
-    #[allow(clippy::too_many_arguments)]
-    pub fn insert_chunk_with_vector(
-        &self,
-        file_id: i64,
-        seq: i64,
-        heading: &str,
-        text: &str,
-        vector_id: u64,
-        token_count: i64,
-        vector: &[f32],
-    ) -> Result<()> {
+    pub fn insert_chunk_with_vector(&self, chunk: &NewChunk<'_>, vector: &[f32]) -> Result<()> {
         let vector_bytes: Vec<u8> = vector.iter().flat_map(|f| f.to_le_bytes()).collect();
         self.conn.execute(
-            "INSERT INTO chunks (file_id, seq, heading, snippet, text, vector_id, token_count, vector)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO chunks
+                (file_id, seq, heading, heading_path, tags_text, snippet, text, vector_id, token_count, vector)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
-                file_id,
-                seq,
-                heading,
-                crate::chunker::make_snippet(text),
-                text,
-                vector_id as i64,
-                token_count,
+                chunk.file_id,
+                chunk.seq,
+                chunk.heading,
+                chunk.heading_path,
+                chunk.tags_text,
+                crate::chunker::make_snippet(chunk.text),
+                chunk.text,
+                chunk.vector_id as i64,
+                chunk.token_count,
                 vector_bytes
             ],
         )?;
@@ -1214,56 +1310,110 @@ impl Store {
 
     // ── FTS5 ──────────────────────────────────────────────────
 
-    /// Ensure the FTS5 virtual table exists. Called during init.
+    /// The columns `chunks_fts` is declared over, or `None` if it does not
+    /// exist. The shape the store is *in*, as against the one `[fts]` asks for.
+    pub fn fts_columns(&self) -> Result<Option<Vec<String>>> {
+        let exists: bool = self
+            .conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'chunks_fts'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            > 0;
+        if !exists {
+            return Ok(None);
+        }
+        let mut stmt = self.conn.prepare("PRAGMA table_info(chunks_fts)")?;
+        let names = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(Some(names))
+    }
+
+    /// Whether the keyword index in the store is the one `cfg` describes.
+    fn fts_shape_matches(&self, cfg: &crate::config::FtsConfig) -> Result<bool> {
+        let mut wanted = vec!["text".to_string()];
+        if cfg.heading_path {
+            wanted.push("heading_path".to_string());
+        }
+        if cfg.tags {
+            wanted.push("tags_text".to_string());
+        }
+        Ok(self.fts_columns()? == Some(wanted))
+    }
+
+    /// Create the keyword index and its triggers if the store has none.
+    ///
+    /// Called during init, where no [`Config`](crate::config::Config) has been
+    /// read yet, so it builds the default shape. A store whose index is already
+    /// declared some other way is left exactly as it is: the triggers name the
+    /// table's own columns, so creating a set that disagrees with the table
+    /// would break the next chunk insert. Reconciling the two is a write-path
+    /// job — see [`sync_fts_objects`](Self::sync_fts_objects) — and until it
+    /// runs, `fts_fingerprint` blocks the read paths anyway.
     pub fn ensure_fts_table(&self) -> Result<()> {
-        self.conn
-            .execute_batch(FTS_SCHEMA)
-            .context("failed to create FTS5 virtual table")?;
+        let cfg = crate::config::FtsConfig::default();
+        match self.fts_columns()? {
+            None => self
+                .conn
+                .execute_batch(&fts_objects_sql(&cfg))
+                .context("failed to create FTS5 virtual table")?,
+            // `IF NOT EXISTS` throughout, so this only fills in a trigger that
+            // an interrupted earlier run left uncreated.
+            Some(_) if self.fts_shape_matches(&cfg)? => self
+                .conn
+                .execute_batch(&fts_objects_sql(&cfg))
+                .context("failed to create FTS5 triggers")?,
+            Some(_) => {}
+        }
         Ok(())
     }
 
-    /// Discard `chunks_fts` and rebuild it from `chunks.text`.
+    /// Make the keyword index the shape `cfg` describes, rebuilding it if it is
+    /// not. Returns the number of rows indexed, or `None` if nothing was done.
+    ///
+    /// A write path calls this, because it is the path that has a config in
+    /// hand. On a fresh store this is what turns the default shape built by
+    /// `init` into the configured one, at a cost of nothing, since there are no
+    /// chunks yet.
+    pub fn sync_fts_objects(&self, cfg: &crate::config::FtsConfig) -> Result<Option<usize>> {
+        if self.fts_shape_matches(cfg)? {
+            return Ok(None);
+        }
+        Ok(Some(self.rebuild_fts(cfg)?))
+    }
+
+    /// Discard `chunks_fts` and re-derive it from the `chunks` table.
     ///
     /// The action `fts_fingerprint` declares (issue #31). It reads no files and
-    /// runs no model: `chunks.text` is the whole chunk, so the keyword index is
-    /// derivable from what is already stored. That is the only reason an FTS
-    /// schema change is cheap rather than a reindex.
-    pub fn rebuild_fts(&self) -> Result<usize> {
-        self.conn
-            .execute_batch("DROP TABLE IF EXISTS chunks_fts;")?;
-        self.ensure_fts_table()?;
+    /// runs no model: every column the index is declared over is a column of
+    /// `chunks`, so the keyword index is derivable from what is already stored.
+    /// That is the only reason an FTS schema change is cheap rather than a
+    /// reindex.
+    ///
+    /// The triggers go with the table. They name the table's columns, so a set
+    /// left behind from an earlier declaration would fail on the next chunk
+    /// insert, and `DROP TABLE` does not take them with it.
+    pub fn rebuild_fts(&self, cfg: &crate::config::FtsConfig) -> Result<usize> {
         self.conn.execute_batch(
-            "INSERT INTO chunks_fts (content, file_id, chunk_seq)
-                 SELECT text, file_id, seq FROM chunks;",
+            "DROP TRIGGER IF EXISTS chunks_fts_insert;
+             DROP TRIGGER IF EXISTS chunks_fts_delete;
+             DROP TRIGGER IF EXISTS chunks_fts_update;
+             DROP TABLE IF EXISTS chunks_fts;",
         )?;
+        self.conn.execute_batch(&fts_objects_sql(cfg))?;
+        // The external-content rebuild command. It reads the content table
+        // directly, which is why it reproduces a trigger-built index exactly
+        // rather than approximately.
+        self.conn
+            .execute_batch("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild');")?;
         Ok(self
             .conn
             .query_row("SELECT count(*) FROM chunks_fts", [], |row| {
                 row.get::<_, i64>(0)
             })? as usize)
-    }
-
-    /// Insert a chunk's text into the FTS5 table.
-    ///
-    /// `text` is the **whole chunk**, not `chunks.snippet` — this table is the
-    /// only place a chunk's full text is retained, so anything not passed here
-    /// is unreachable by keyword search (issue #11). `chunks_fts` is a standalone
-    /// FTS5 table rather than external-content, so it keeps its own copy.
-    pub fn insert_fts_chunk(&self, file_id: i64, chunk_seq: i64, text: &str) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO chunks_fts (content, file_id, chunk_seq) VALUES (?1, ?2, ?3)",
-            params![text, file_id, chunk_seq],
-        )?;
-        Ok(())
-    }
-
-    /// Delete all FTS5 entries for a file.
-    pub fn delete_fts_chunks_for_file(&self, file_id: i64) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM chunks_fts WHERE file_id = ?1",
-            params![file_id],
-        )?;
-        Ok(())
     }
 
     /// Search the FTS5 index. Returns results ranked by BM25 score.
@@ -1272,8 +1422,13 @@ impl Store {
     ///
     /// The query is wrapped in double quotes so that FTS5 treats it as a
     /// phrase/literal rather than interpreting operators like `-`.
+    ///
+    /// Unweighted, and that is a decision rather than an omission: this is the
+    /// identity-resolution query, which asks whether a name appears verbatim.
+    /// Weighting a column changes the order among rows that already match, and
+    /// no caller of this function ranks by that order.
     pub fn fts_search(&self, query: &str, limit: usize) -> Result<Vec<FtsResult>> {
-        self.fts_search_expr(&crate::fts::phrase_expr(query), limit)
+        self.fts_search_expr(&crate::fts::phrase_expr(query), limit, &[])
     }
 
     /// Keyword search matching **any** token of `query`, each taken literally.
@@ -1283,24 +1438,68 @@ impl Store {
     /// wording. See [`crate::fts::any_term_expr`] for the measurements (#22).
     ///
     /// A query with no searchable token returns no rows rather than an error.
-    pub fn fts_search_any(&self, query: &str, limit: usize) -> Result<Vec<FtsResult>> {
+    ///
+    /// `weights` are the BM25 column weights, in the order `chunks_fts` declares
+    /// its columns — [`FtsConfig::weights`](crate::config::FtsConfig::weights)
+    /// builds them from the same config the declaration came from. An empty
+    /// slice is plain `bm25()`, every column at 1.0.
+    pub fn fts_search_any(
+        &self,
+        query: &str,
+        limit: usize,
+        weights: &[f64],
+    ) -> Result<Vec<FtsResult>> {
         match crate::fts::any_term_expr(query) {
-            Some(expr) => self.fts_search_expr(&expr, limit),
+            Some(expr) => self.fts_search_expr(&expr, limit, weights),
             None => Ok(Vec::new()),
         }
     }
 
     /// Run a prepared FTS5 MATCH expression. Callers build the expression with
     /// `crate::fts`, which is where the quoting rules and their reasons live.
-    fn fts_search_expr(&self, fts_query: &str, limit: usize) -> Result<Vec<FtsResult>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT file_id, chunk_seq, bm25(chunks_fts) as score,
+    ///
+    /// `file_id` and `chunk_seq` come from a join and not from the index: since
+    /// issue #37 `chunks_fts` is external content over `chunks`, and it is
+    /// keyed on the chunk's rowid rather than carrying a copy of the pair.
+    fn fts_search_expr(
+        &self,
+        fts_query: &str,
+        limit: usize,
+        weights: &[f64],
+    ) -> Result<Vec<FtsResult>> {
+        // More weights than the table has columns is an error in SQLite, and a
+        // caller that holds a different `[fts]` from the one the store was built
+        // with would hit it. `fingerprint::verify` already refuses that state on
+        // the paths that read a config, so the ones that reach here with a
+        // mismatch are the ones carrying defaults; they get a weight per column
+        // rather than a failed query that reads as an empty keyword lane.
+        let declared = self.fts_columns()?.map(|c| c.len()).unwrap_or(0);
+        let weights = &weights[..weights.len().min(declared)];
+
+        // Interpolated rather than bound: `bm25()`'s weights are arguments to a
+        // function in the select list, and SQLite has no way to bind a variadic
+        // argument list. They are `f64` and formatted here, so no caller can put
+        // anything else in the string.
+        let bm25 = match weights.is_empty() {
+            true => "bm25(chunks_fts)".to_string(),
+            false => format!(
+                "bm25(chunks_fts, {})",
+                weights
+                    .iter()
+                    .map(|w| format!("{w:.6}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT c.file_id, c.seq, {bm25} as score,
                     snippet(chunks_fts, 0, '<b>', '</b>', '...', 64)
              FROM chunks_fts
+             JOIN chunks c ON c.id = chunks_fts.rowid
              WHERE chunks_fts MATCH ?1
              ORDER BY score
              LIMIT ?2",
-        )?;
+        ))?;
 
         let rows = stmt.query_map(params![fts_query, limit as i64], |row| {
             Ok(FtsResult {
@@ -1446,7 +1645,9 @@ impl Store {
         let escaped = term.replace('"', "\"\"");
         let query = format!("\"{}\"", escaped);
         let result: Result<i64, _> = self.conn.query_row(
-            "SELECT 1 FROM chunks_fts WHERE chunks_fts MATCH ?1 AND file_id = ?2 LIMIT 1",
+            "SELECT 1 FROM chunks_fts
+             JOIN chunks c ON c.id = chunks_fts.rowid
+             WHERE chunks_fts MATCH ?1 AND c.file_id = ?2 LIMIT 1",
             params![query, file_id],
             |row| row.get(0),
         );
@@ -1474,8 +1675,9 @@ impl Store {
             .join(" OR ");
 
         let result: rusqlite::Result<i64> = self.conn.query_row(
-            "SELECT chunk_seq FROM chunks_fts
-             WHERE chunks_fts MATCH ?1 AND file_id = ?2
+            "SELECT c.seq FROM chunks_fts
+             JOIN chunks c ON c.id = chunks_fts.rowid
+             WHERE chunks_fts MATCH ?1 AND c.file_id = ?2
              ORDER BY bm25(chunks_fts) LIMIT 1",
             params![disjunction, file_id],
             |row| row.get(0),
@@ -1913,8 +2115,8 @@ impl Store {
     pub fn reset_for_reindex(&self, new_dim: usize) -> Result<()> {
         self.conn.execute("DROP TABLE IF EXISTS chunks_vec", [])?;
         crate::vecstore::init_vec_table(&self.conn, new_dim)?;
+        // The keyword index follows the chunks (issue #37).
         self.conn.execute("DELETE FROM chunks", [])?;
-        self.conn.execute("DELETE FROM chunks_fts", [])?;
         Ok(())
     }
 
@@ -2410,9 +2612,9 @@ impl Store {
     /// Deletion order:
     /// 1. Collect chunk vector_ids for the file
     /// 2. Delete from `chunks_vec` (virtual table, no CASCADE)
-    /// 3. Delete from `chunks_fts` (virtual table, no CASCADE)
-    /// 4. Delete from `edges` where from_file or to_file matches
-    /// 5. Delete from `files` (CASCADE handles chunks table)
+    /// 3. Delete from `edges` where from_file or to_file matches
+    /// 4. Delete from `files` (CASCADE handles chunks, and the chunks carry
+    ///    the keyword index with them — see [`fts_objects_sql`])
     pub fn delete_file_hard(&self, path: &str) -> Result<()> {
         let file = self
             .get_file(path)?
@@ -2427,13 +2629,10 @@ impl Store {
             self.delete_vec(*vid)?;
         }
 
-        // 3. Delete from chunks_fts (virtual table — no CASCADE)
-        self.delete_fts_chunks_for_file(file_id)?;
-
-        // 4. Delete from edges (both directions)
+        // 3. Delete from edges (both directions)
         self.delete_edges_for_file(file_id)?;
 
-        // 5. Delete from files (CASCADE handles chunks table)
+        // 4. Delete from files (CASCADE handles chunks table)
         self.delete_file(file_id)?;
 
         Ok(())
@@ -2528,6 +2727,201 @@ mod tests {
     use super::*;
     use crate::docid::generate_docid;
 
+    // ── The keyword index as external content (#37) ──────────────
+
+    /// A file with `n` chunks, each carrying a breadcrumb and the file's tags.
+    fn indexed_file(store: &Store, path: &str, sections: &[(&str, &str)]) -> i64 {
+        let file_id = store
+            .insert_file(
+                path,
+                "h",
+                0,
+                &["grimoire".into()],
+                &generate_docid(path),
+                None,
+                None,
+            )
+            .unwrap();
+        for (seq, (heading, text)) in sections.iter().enumerate() {
+            store
+                .insert_chunk(&NewChunk {
+                    file_id,
+                    seq: seq as i64,
+                    heading,
+                    heading_path: &format!("Doc > {heading}"),
+                    tags_text: "grimoire",
+                    text,
+                    vector_id: (file_id * 100 + seq as i64) as u64,
+                    token_count: 10,
+                })
+                .unwrap();
+        }
+        file_id
+    }
+
+    /// Every posting in the index: which term, in which row, in which column,
+    /// at which offset. This is the index's content, read through `fts5vocab`.
+    ///
+    /// Not the bytes of `chunks_fts_data`. Those differ, and legitimately: an
+    /// incremental write leaves one segment per batch where a rebuild writes a
+    /// single merged one. Segmentation is a storage layout that every query
+    /// reads through, so the postings are what "the same index" has to mean.
+    fn fts_postings(store: &Store) -> Vec<(String, i64, String, i64)> {
+        store
+            .conn
+            .execute_batch(
+                "DROP TABLE IF EXISTS fts_vocab;
+                 CREATE VIRTUAL TABLE fts_vocab USING fts5vocab(chunks_fts, 'instance');",
+            )
+            .unwrap();
+        let mut stmt = store
+            .conn
+            .prepare("SELECT term, doc, col, offset FROM fts_vocab ORDER BY 1, 2, 3, 4")
+            .unwrap();
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    }
+
+    /// The invariant the issue names: `'rebuild'` reproduces what the triggers
+    /// built. If it did not, `rebuild_fts` — the action `fts_fingerprint`
+    /// declares — would return a *different* index from an incremental write,
+    /// and a store's keyword results would depend on how it got there.
+    #[test]
+    fn a_rebuild_reproduces_the_trigger_built_index_exactly() {
+        let store = Store::open_memory().unwrap();
+        indexed_file(
+            &store,
+            "rules/spells.md",
+            &[
+                ("Abjuration", "Counterspell stops a caster."),
+                ("Restoration", "Mend Object repairs torn cloth."),
+            ],
+        );
+        indexed_file(&store, "lore/dragon.md", &[("Definition", "Rank SS.")]);
+
+        let scores = |store: &Store| -> Vec<(i64, i64, String)> {
+            store
+                .fts_search_any(
+                    "counterspell cloth grimoire Abjuration",
+                    10,
+                    &[1.0, 3.0, 4.0],
+                )
+                .unwrap()
+                .iter()
+                .map(|r| (r.file_id, r.chunk_seq, format!("{:.9}", r.score)))
+                .collect()
+        };
+        let by_trigger = fts_postings(&store);
+        let by_trigger_scores = scores(&store);
+        assert!(!by_trigger.is_empty() && !by_trigger_scores.is_empty());
+
+        let rows = store
+            .rebuild_fts(&crate::config::FtsConfig::default())
+            .unwrap();
+
+        assert_eq!(rows, 3, "one indexed row per chunk");
+        assert_eq!(by_trigger, fts_postings(&store), "postings differ");
+        assert_eq!(by_trigger_scores, scores(&store), "BM25 differs");
+    }
+
+    /// Insert, update and delete round-trips agree between the two tables. The
+    /// triggers are the only writer, so this is the whole contract — and it is
+    /// what makes #11's bug class, a keyword index holding a different string
+    /// from the chunk, unreachable rather than fixed.
+    #[test]
+    fn every_write_to_chunks_reaches_the_keyword_index() {
+        let store = Store::open_memory().unwrap();
+        let file_id = indexed_file(&store, "n.md", &[("One", "alpha bravo")]);
+        let hit = |term: &str| store.fts_search(term, 10).unwrap().len();
+
+        assert_eq!(hit("alpha"), 1);
+        assert_eq!(hit("One"), 1, "the breadcrumb column is indexed");
+
+        store
+            .conn
+            .execute(
+                "UPDATE chunks SET text = 'charlie delta' WHERE file_id = ?1",
+                params![file_id],
+            )
+            .unwrap();
+        assert_eq!(hit("alpha"), 0, "the old text is still indexed");
+        assert_eq!(hit("charlie"), 1);
+
+        store.delete_chunks_for_file(file_id).unwrap();
+        assert_eq!(hit("charlie"), 0);
+        assert_eq!(hit("One"), 0);
+    }
+
+    /// The delete SQLite performs itself, on the cascade from `files`, fires
+    /// the trigger too. Nothing in the write paths has to remember the keyword
+    /// index, which is the reason the explicit deletes could be removed.
+    #[test]
+    fn a_cascade_from_files_takes_the_keyword_index_with_it() {
+        let store = Store::open_memory().unwrap();
+        let file_id = indexed_file(&store, "n.md", &[("One", "alpha bravo")]);
+
+        store.delete_file(file_id).unwrap();
+
+        assert_eq!(store.fts_search("alpha", 10).unwrap().len(), 0);
+        // A desynced external-content index is exactly what this reports.
+        store
+            .conn
+            .execute_batch("INSERT INTO chunks_fts(chunks_fts, rank) VALUES('integrity-check', 1);")
+            .unwrap();
+    }
+
+    /// The control is declared over the body alone, so a heading term and a tag
+    /// stop being reachable. That is what makes it a control and not a setting
+    /// with a smaller weight.
+    #[test]
+    fn the_control_declares_the_body_column_only() {
+        let store = Store::open_memory().unwrap();
+        indexed_file(&store, "n.md", &[("Abjuration", "alpha bravo")]);
+        store
+            .rebuild_fts(&crate::config::FtsConfig::CONTROL)
+            .unwrap();
+
+        assert_eq!(store.fts_columns().unwrap(), Some(vec!["text".to_string()]));
+        assert_eq!(store.fts_search("alpha", 10).unwrap().len(), 1);
+        assert_eq!(store.fts_search("Abjuration", 10).unwrap().len(), 0);
+        assert_eq!(store.fts_search("grimoire", 10).unwrap().len(), 0);
+    }
+
+    /// A store whose index is declared some other way is left alone until a
+    /// path holding a config reconciles it. Creating triggers that name columns
+    /// the table does not have would break the next chunk insert, and the store
+    /// has no config to know better with.
+    #[test]
+    fn init_leaves_an_index_it_did_not_declare_alone() {
+        let store = Store::open_memory().unwrap();
+        store
+            .rebuild_fts(&crate::config::FtsConfig::CONTROL)
+            .unwrap();
+        store.ensure_fts_table().unwrap();
+        assert_eq!(store.fts_columns().unwrap(), Some(vec!["text".to_string()]));
+
+        // And the write path is what fixes it.
+        let rebuilt = store
+            .sync_fts_objects(&crate::config::FtsConfig::default())
+            .unwrap();
+        assert_eq!(rebuilt, Some(0), "an empty store, rebuilt");
+        assert_eq!(
+            store.fts_columns().unwrap(),
+            Some(vec!["text".to_string(), "heading_path".to_string()])
+        );
+        assert_eq!(
+            store
+                .sync_fts_objects(&crate::config::FtsConfig::default())
+                .unwrap(),
+            None,
+            "a matching declaration is not rebuilt"
+        );
+    }
+
     #[test]
     fn test_create_schema() {
         let store = Store::open_memory().unwrap();
@@ -2588,10 +2982,26 @@ mod tests {
             .unwrap();
 
         store
-            .insert_chunk(file_id, 0, "Heading 1", "Some text here", 1, 42)
+            .insert_chunk(&NewChunk {
+                file_id,
+                seq: 0,
+                heading: "Heading 1",
+                text: "Some text here",
+                vector_id: 1,
+                token_count: 42,
+                ..Default::default()
+            })
             .unwrap();
         store
-            .insert_chunk(file_id, 1, "Heading 2", "More text", 2, 30)
+            .insert_chunk(&NewChunk {
+                file_id,
+                seq: 1,
+                heading: "Heading 2",
+                text: "More text",
+                vector_id: 2,
+                token_count: 30,
+                ..Default::default()
+            })
             .unwrap();
 
         let chunks = store.get_chunks_by_file(file_id).unwrap();
@@ -2620,10 +3030,26 @@ mod tests {
             )
             .unwrap();
         store
-            .insert_chunk(file_id, 0, "H", "snippet", 10, 5)
+            .insert_chunk(&NewChunk {
+                file_id,
+                seq: 0,
+                heading: "H",
+                text: "snippet",
+                vector_id: 10,
+                token_count: 5,
+                ..Default::default()
+            })
             .unwrap();
         store
-            .insert_chunk(file_id, 1, "H2", "snippet2", 11, 6)
+            .insert_chunk(&NewChunk {
+                file_id,
+                seq: 1,
+                heading: "H2",
+                text: "snippet2",
+                vector_id: 11,
+                token_count: 6,
+                ..Default::default()
+            })
             .unwrap();
 
         assert_eq!(store.get_chunks_by_file(file_id).unwrap().len(), 2);
@@ -2672,9 +3098,27 @@ mod tests {
                 None,
             )
             .unwrap();
-        store.insert_chunk(file_id, 0, "H", "text", 50, 10).unwrap();
         store
-            .insert_chunk(file_id, 1, "H2", "text2", 51, 12)
+            .insert_chunk(&NewChunk {
+                file_id,
+                seq: 0,
+                heading: "H",
+                text: "text",
+                vector_id: 50,
+                token_count: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .insert_chunk(&NewChunk {
+                file_id,
+                seq: 1,
+                heading: "H2",
+                text: "text2",
+                vector_id: 51,
+                token_count: 12,
+                ..Default::default()
+            })
             .unwrap();
 
         // Simulate detecting hash change: collect old vector_ids for tombstoning.
@@ -2699,7 +3143,15 @@ mod tests {
             )
             .unwrap();
         store
-            .insert_chunk(new_file_id, 0, "H", "new text", 60, 15)
+            .insert_chunk(&NewChunk {
+                file_id: new_file_id,
+                seq: 0,
+                heading: "H",
+                text: "new text",
+                vector_id: 60,
+                token_count: 15,
+                ..Default::default()
+            })
             .unwrap();
 
         let rec = store.get_file("notes/change.md").unwrap().unwrap();
@@ -3174,7 +3626,14 @@ mod tests {
             .unwrap();
 
         store
-            .insert_fts_chunk(f1, 0, "BRE-2579 delivery date extension")
+            .insert_chunk(&NewChunk {
+                file_id: f1,
+                seq: 0,
+                text: "BRE-2579 delivery date extension",
+                vector_id: 1,
+                token_count: 4,
+                ..Default::default()
+            })
             .unwrap();
 
         assert!(store.file_contains_term(f1, "delivery").unwrap());
@@ -3191,16 +3650,16 @@ mod tests {
         let file_id = store.get_file(path).unwrap().unwrap().id;
         for (seq, (heading, text)) in sections.iter().enumerate() {
             store
-                .insert_chunk(
+                .insert_chunk(&NewChunk {
                     file_id,
-                    seq as i64,
+                    seq: seq as i64,
                     heading,
                     text,
-                    (file_id * 100 + seq as i64) as u64,
-                    10,
-                )
+                    vector_id: (file_id * 100 + seq as i64) as u64,
+                    token_count: 10,
+                    ..Default::default()
+                })
                 .unwrap();
-            store.insert_fts_chunk(file_id, seq as i64, text).unwrap();
         }
         file_id
     }
@@ -3416,7 +3875,17 @@ mod tests {
             .insert_file("a.md", "h", 0, &[], "d", None, None)
             .unwrap();
         let long = "x".repeat(500);
-        store.insert_chunk(file_id, 0, "H", &long, 1, 10).unwrap();
+        store
+            .insert_chunk(&NewChunk {
+                file_id,
+                seq: 0,
+                heading: "H",
+                text: &long,
+                vector_id: 1,
+                token_count: 10,
+                ..Default::default()
+            })
+            .unwrap();
 
         let texts = store
             .get_chunk_texts(&[(file_id, 0), (file_id, 9), (999, 0)])
@@ -3797,7 +4266,18 @@ mod tests {
             .unwrap();
         let vector: Vec<f32> = (0..256).map(|i| (i as f32) / 256.0).collect();
         store
-            .insert_chunk_with_vector(file_id, 0, "heading", "snippet", 0, 100, &vector)
+            .insert_chunk_with_vector(
+                &NewChunk {
+                    file_id,
+                    seq: 0,
+                    heading: "heading",
+                    text: "snippet",
+                    vector_id: 0,
+                    token_count: 100,
+                    ..Default::default()
+                },
+                &vector,
+            )
             .unwrap();
 
         // Clear vec0 to simulate a pre-migration state, then re-run the migration.
@@ -4042,10 +4522,32 @@ mod tests {
         let v1: Vec<f32> = vec![1.0, 2.0, 3.0];
         let v2: Vec<f32> = vec![4.0, 5.0, 6.0];
         store
-            .insert_chunk_with_vector(file_id, 0, "H1", "text1", 100, 10, &v1)
+            .insert_chunk_with_vector(
+                &NewChunk {
+                    file_id,
+                    seq: 0,
+                    heading: "H1",
+                    text: "text1",
+                    vector_id: 100,
+                    token_count: 10,
+                    ..Default::default()
+                },
+                &v1,
+            )
             .unwrap();
         store
-            .insert_chunk_with_vector(file_id, 0, "H2", "text2", 101, 10, &v2)
+            .insert_chunk_with_vector(
+                &NewChunk {
+                    file_id,
+                    seq: 0,
+                    heading: "H2",
+                    text: "text2",
+                    vector_id: 101,
+                    token_count: 10,
+                    ..Default::default()
+                },
+                &v2,
+            )
             .unwrap();
 
         let vectors = store.get_chunk_vectors_for_file(file_id).unwrap();
@@ -4188,10 +4690,20 @@ mod tests {
             .unwrap();
         let vid = store.next_vector_id().unwrap();
         store
-            .insert_chunk_with_vector(file_id, 0, "H", "snippet", vid, 10, &[0.1_f32; 256])
+            .insert_chunk_with_vector(
+                &NewChunk {
+                    file_id,
+                    seq: 0,
+                    heading: "H",
+                    text: "snippet",
+                    vector_id: vid,
+                    token_count: 10,
+                    ..Default::default()
+                },
+                &[0.1_f32; 256],
+            )
             .unwrap();
         store.insert_vec(vid, &[0.1_f32; 256]).unwrap();
-        store.insert_fts_chunk(file_id, 0, "chunk text").unwrap();
 
         assert_eq!(store.ensure_embedding_dim(768).unwrap(), Some(256));
 
@@ -4340,12 +4852,20 @@ mod tests {
             .insert_file("delete-me.md", "hash", 100, &tags, "del123", None, None)
             .unwrap();
 
-        // Insert a chunk + FTS entry + vec entry for the file
+        // Insert a chunk + vec entry for the file. The keyword index follows
+        // the chunk row (issue #37), so there is no third insert.
         let vid = store.next_vector_id().unwrap();
         store
-            .insert_chunk(file_id, 0, "## Heading", "chunk text", vid, 10)
+            .insert_chunk(&NewChunk {
+                file_id,
+                seq: 0,
+                heading: "## Heading",
+                text: "chunk text",
+                vector_id: vid,
+                token_count: 10,
+                ..Default::default()
+            })
             .unwrap();
-        store.insert_fts_chunk(file_id, 0, "chunk text").unwrap();
 
         // Insert an embedding vector into chunks_vec
         let embedding = vec![0.1_f32; 256];
@@ -4647,10 +5167,28 @@ mod tests {
         let b = file(&store, "b.md");
         for seq in [0, 1, 2] {
             store
-                .insert_chunk(a, seq, "## H", "text", seq as u64, 10)
+                .insert_chunk(&NewChunk {
+                    file_id: a,
+                    seq,
+                    heading: "## H",
+                    text: "text",
+                    vector_id: seq as u64,
+                    token_count: 10,
+                    ..Default::default()
+                })
                 .unwrap();
         }
-        store.insert_chunk(b, 0, "## H", "text", 9, 10).unwrap();
+        store
+            .insert_chunk(&NewChunk {
+                file_id: b,
+                seq: 0,
+                heading: "## H",
+                text: "text",
+                vector_id: 9,
+                token_count: 10,
+                ..Default::default()
+            })
+            .unwrap();
 
         let seqs = store.chunk_seqs_for_files(&[a, b]).unwrap();
         assert_eq!(seqs[&a], vec![0, 1, 2]);
@@ -4704,7 +5242,18 @@ mod tests {
             (2, "## Events (cont.)"),
         ] {
             store
-                .insert_chunk_with_vector(f, seq, heading, "text", seq as u64, 1, &[0.0])
+                .insert_chunk_with_vector(
+                    &NewChunk {
+                        file_id: f,
+                        seq,
+                        heading,
+                        text: "text",
+                        vector_id: seq as u64,
+                        token_count: 1,
+                        ..Default::default()
+                    },
+                    &[0.0],
+                )
                 .unwrap();
         }
         assert_eq!(

@@ -440,10 +440,29 @@ fn file_mtime(path: &Path) -> Result<i64> {
 /// text, so there is only one to pass and nothing to transpose.
 struct ChunkData {
     heading: String,
-    /// The whole chunk, for both `chunks.text` and the FTS index.
+    /// The whole chunk, for `chunks.text` — which is also what the keyword
+    /// index reads, since it is external content over that table (issue #37).
     text: String,
+    /// What the keyword lane indexes beside the body (issue #37).
+    lexical: crate::prefix::LexicalFields,
     vector: Vec<f32>,
     token_count: i64,
+}
+
+impl ChunkData {
+    /// The row to write, less the vector id the store assigns.
+    fn record<'a>(&'a self, file_id: i64, seq: i64, vector_id: u64) -> crate::store::NewChunk<'a> {
+        crate::store::NewChunk {
+            file_id,
+            seq,
+            heading: &self.heading,
+            heading_path: &self.lexical.heading_path,
+            tags_text: &self.lexical.tags_text,
+            text: &self.text,
+            vector_id,
+            token_count: self.token_count,
+        }
+    }
 }
 
 /// Chunk content, embed, and return pre-computed data ready for store insertion.
@@ -468,13 +487,17 @@ fn precompute_chunks(
         .map(crate::prefix::EmbedInput::as_doc)
         .collect();
     let embeddings = embedder.embed_batch(&docs)?;
+    // Composed from the same `doc` as the embed inputs, so a note written here
+    // and the same note indexed by `index_file` carry one breadcrumb (issue #37).
+    let lexical = crate::prefix::lexical_fields(&doc, &chunks);
 
     let mut results = Vec::with_capacity(chunks.len());
-    for (chunk, embedding) in chunks.into_iter().zip(embeddings) {
+    for ((chunk, embedding), lexical) in chunks.into_iter().zip(embeddings).zip(lexical) {
         results.push(ChunkData {
             heading: chunk.heading.unwrap_or_default(),
             token_count: chunk.text.split_whitespace().count() as i64,
             text: chunk.text,
+            lexical,
             vector: embedding,
         });
     }
@@ -674,18 +697,8 @@ pub fn create_note(
         let start_vid = store.next_vector_id()?;
         for (chunk_seq, c) in chunk_data.iter().enumerate() {
             let vid = start_vid + chunk_seq as u64;
-            store.insert_chunk_with_vector(
-                file_id,
-                chunk_seq as i64,
-                &c.heading,
-                &c.text,
-                vid,
-                c.token_count,
-                &c.vector,
-            )?;
+            store.insert_chunk_with_vector(&c.record(file_id, chunk_seq as i64, vid), &c.vector)?;
             store.insert_vec(vid, &c.vector)?;
-            // FTS gets the whole chunk, not the snippet (issue #11).
-            store.insert_fts_chunk(file_id, chunk_seq as i64, &c.text)?;
         }
 
         build_edges_for_file(store, file_id, &full_content)?;
@@ -811,10 +824,10 @@ pub fn append_to_note(
             store.delete_vec(*vid)?;
         }
 
-        // Delete old chunks, FTS, and the edges this file's own content owns.
-        // The `files` row stays so the id — and every backlink keyed on it —
-        // survives the rewrite; `insert_file` below upserts on `path` (#27).
-        store.delete_fts_chunks_for_file(file_record.id)?;
+        // Delete old chunks — the keyword index follows them (issue #37) —
+        // and the edges this file's own content owns. The `files` row stays so
+        // the id, and every backlink keyed on it, survives the rewrite;
+        // `insert_file` below upserts on `path` (#27).
         store.delete_outgoing_edges_for_file(file_record.id)?;
         store.delete_chunks_for_file(file_record.id)?;
 
@@ -833,18 +846,8 @@ pub fn append_to_note(
         let start_vid = store.next_vector_id()?;
         for (chunk_seq, c) in chunk_data.iter().enumerate() {
             let vid = start_vid + chunk_seq as u64;
-            store.insert_chunk_with_vector(
-                file_id,
-                chunk_seq as i64,
-                &c.heading,
-                &c.text,
-                vid,
-                c.token_count,
-                &c.vector,
-            )?;
+            store.insert_chunk_with_vector(&c.record(file_id, chunk_seq as i64, vid), &c.vector)?;
             store.insert_vec(vid, &c.vector)?;
-            // FTS gets the whole chunk, not the snippet (issue #11).
-            store.insert_fts_chunk(file_id, chunk_seq as i64, &c.text)?;
         }
 
         build_edges_for_file(store, file_id, &new_content)?;
@@ -1492,7 +1495,6 @@ pub fn archive_note(
     for vid in &old_vids {
         store.delete_vec(*vid)?;
     }
-    store.delete_fts_chunks_for_file(file_record.id)?;
     store.delete_edges_for_file(file_record.id)?;
     store.delete_file(file_record.id)?;
 
@@ -1606,18 +1608,8 @@ pub fn unarchive_note(
         let start_vid = store.next_vector_id()?;
         for (seq, c) in chunk_data.iter().enumerate() {
             let vid = start_vid + seq as u64;
-            store.insert_chunk_with_vector(
-                file_id,
-                seq as i64,
-                &c.heading,
-                &c.text,
-                vid,
-                c.token_count,
-                &c.vector,
-            )?;
+            store.insert_chunk_with_vector(&c.record(file_id, seq as i64, vid), &c.vector)?;
             store.insert_vec(vid, &c.vector)?;
-            // FTS gets the whole chunk, not the snippet (issue #11).
-            store.insert_fts_chunk(file_id, seq as i64, &c.text)?;
         }
 
         build_edges_for_file(store, file_id, &restored_content)?;
@@ -1669,12 +1661,12 @@ pub fn verify_index_integrity(store: &Store, vault_path: &Path) -> Result<usize>
     for file in &all_files {
         let full_path = vault_path.join(&file.path);
         if !full_path.exists() {
-            // Clean up orphan: vectors, FTS, edges, file record
+            // Clean up orphan: vectors, edges, file record. The chunks and
+            // their keyword index go with the `files` row (issue #37).
             let vids = store.get_vector_ids_for_file(file.id)?;
             for vid in &vids {
                 store.delete_vec(*vid)?;
             }
-            store.delete_fts_chunks_for_file(file.id)?;
             store.delete_edges_for_file(file.id)?;
             store.delete_file(file.id)?;
             orphans += 1;
@@ -2476,9 +2468,7 @@ mod tests {
         let file_id = store
             .insert_file("places/coast.md", "h", 0, &[], "d", None, None)
             .unwrap();
-        store
-            .insert_chunk(file_id, 0, &c.heading, &c.text, 1, c.token_count)
-            .unwrap();
+        store.insert_chunk(&c.record(file_id, 0, 1)).unwrap();
 
         let stored = store.get_chunk_by_seq(file_id, 0).unwrap().unwrap();
         assert!(

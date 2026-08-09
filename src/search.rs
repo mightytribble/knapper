@@ -58,6 +58,10 @@ pub struct SearchOutput {
     /// What each expanded query actually retrieved — the `--explain` record of
     /// the retrieval step, as opposed to the fusion step.
     pub expansions: Vec<ExpansionTrace>,
+    /// The keyword index's declared columns and their BM25 weights (#37).
+    /// Printed by `--explain` because the weights are a measurement input that
+    /// leaves no other trace in the output.
+    pub fts_columns: Vec<(&'static str, f64)>,
 }
 
 /// One expanded query and what it brought back, per lane.
@@ -93,6 +97,11 @@ pub struct SearchConfig<'a> {
     pub group_by: GroupBy,
     /// Which ranking stage runs, and what reaches it (issue #30).
     pub ranking: crate::config::RankingConfig,
+    /// What the keyword lane indexes, and how each column is weighted (#37).
+    /// The flags have to be the ones the store was built with — the BM25
+    /// weights are positional over the declared columns — and `fingerprint`
+    /// blocks this path when they are not.
+    pub fts: crate::config::FtsConfig,
 }
 
 impl<'a> SearchConfig<'a> {
@@ -107,6 +116,7 @@ impl<'a> SearchConfig<'a> {
             max_chunks_per_file: config.max_chunks_per_file,
             group_by: config.group_by,
             ranking: config.ranking,
+            fts: config.fts,
         }
     }
 }
@@ -131,6 +141,10 @@ pub fn search_internal(
         rerank: crate::config::RerankConfig::default(),
         max_chunks_per_file: crate::config::default_max_chunks_per_file(),
         group_by,
+        // Defaults, like every other setting on this path. The weights are
+        // truncated to the store's declared columns, so a store built at some
+        // other `[fts]` gives this lane fewer weights rather than an error.
+        fts: crate::config::FtsConfig::default(),
         ranking: crate::config::RankingConfig::default(),
     };
     search_with_intelligence(query, top_n, embedder, &mut config)
@@ -338,7 +352,7 @@ pub fn search_with_intelligence(
         // seed probes and left this lane empty for every multi-word query (#22).
         let fts_raw = config
             .store
-            .fts_search_any(expanded_query, top_n * 3)
+            .fts_search_any(expanded_query, top_n * 3, &config.fts.weights())
             .unwrap_or_default();
 
         for fr in fts_raw {
@@ -549,6 +563,7 @@ pub fn search_with_intelligence(
             degraded,
             intent: Some(orchestration.intent),
             expansions: traces,
+            fts_columns: config.fts.columns(),
         });
     }
 
@@ -712,6 +727,7 @@ pub fn search_with_intelligence(
         degraded: false,
         intent: Some(orchestration.intent),
         expansions: traces,
+        fts_columns: config.fts.columns(),
     })
 }
 
@@ -1062,11 +1078,19 @@ fn collapse_lane(results: Vec<RankedResult>, cap: usize) -> Vec<RankedResult> {
 /// expansions and before the per-file cap. That is the number that answers
 /// "was anything retrieved at all", which is the question these three tickets
 /// kept turning out to hinge on.
-fn format_expansions(traces: &[ExpansionTrace]) -> String {
+fn format_expansions(traces: &[ExpansionTrace], columns: &[(&str, f64)]) -> String {
     if traces.is_empty() {
         return String::new();
     }
-    let mut out = format!("--- Queries run ({}) ---\n", traces.len());
+    let declared = columns
+        .iter()
+        .map(|(name, weight)| format!("{name}·{weight}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut out = format!(
+        "--- Queries run ({}) ---\nkeyword index: {declared}\n",
+        traces.len()
+    );
     for (i, t) in traces.iter().enumerate() {
         out.push_str(&format!(
             "{}. {:?}\n   semantic {} · fts {}",
@@ -1232,7 +1256,7 @@ pub fn run_search(
         if let Some(ref intent) = output.intent {
             explain_out.push_str(&format!("Intent: {:?}\n\n", intent));
         }
-        explain_out.push_str(&format_expansions(&output.expansions));
+        explain_out.push_str(&format_expansions(&output.expansions, &output.fts_columns));
         explain_out.push_str("--- Explain ---\n");
         for f in output.fused.iter().take(top_n) {
             explain_out.push_str(&format!("{}\n", f.file_path));
@@ -1601,6 +1625,7 @@ mod tests {
     #[test]
     fn test_search_output_has_intent() {
         let output = SearchOutput {
+            fts_columns: crate::config::FtsConfig::default().columns(),
             results: vec![],
             fused: vec![],
             degraded: false,
@@ -1613,6 +1638,7 @@ mod tests {
     #[test]
     fn test_search_output_intent_none() {
         let output = SearchOutput {
+            fts_columns: crate::config::FtsConfig::default().columns(),
             results: vec![],
             fused: vec![],
             degraded: false,
@@ -1813,6 +1839,7 @@ mod tests {
         let mut reranker = CountingReranker::new();
         {
             let mut config = SearchConfig {
+                fts: crate::config::FtsConfig::default(),
                 orchestrator: None,
                 reranker: Some(&mut reranker),
                 store,
@@ -2035,6 +2062,7 @@ mod tests {
 
         {
             let mut config = SearchConfig {
+                fts: crate::config::FtsConfig::default(),
                 orchestrator: None,
                 reranker: Some(&mut reranker),
                 store: &store,
@@ -2066,6 +2094,7 @@ mod tests {
 
         for cap in [1, 2] {
             let mut config = SearchConfig {
+                fts: crate::config::FtsConfig::default(),
                 orchestrator: None,
                 reranker: None,
                 store: &store,
@@ -2151,6 +2180,7 @@ mod tests {
         let count_for = |ranking, embedder: &mut llm::MockLlm| {
             let mut reranker = CountingReranker::new();
             let mut config = SearchConfig {
+                fts: crate::config::FtsConfig::default(),
                 orchestrator: None,
                 reranker: Some(&mut reranker),
                 store: &store,
@@ -2208,6 +2238,7 @@ mod tests {
         let results_at = |floor: f64, embedder: &mut llm::MockLlm| {
             let mut reranker = CountingReranker::new();
             let mut config = SearchConfig {
+                fts: crate::config::FtsConfig::default(),
                 orchestrator: None,
                 reranker: Some(&mut reranker),
                 store: &store,
@@ -2253,6 +2284,7 @@ mod tests {
         let count_for = |per_note_cap, embedder: &mut llm::MockLlm| {
             let mut reranker = CountingReranker::new();
             let mut config = SearchConfig {
+                fts: crate::config::FtsConfig::default(),
                 orchestrator: None,
                 reranker: Some(&mut reranker),
                 store: &store,
@@ -2293,6 +2325,7 @@ mod tests {
         let mut reranker = CountingReranker::new();
         {
             let mut config = SearchConfig {
+                fts: crate::config::FtsConfig::default(),
                 orchestrator: None,
                 reranker: Some(&mut reranker),
                 store: &store,
@@ -2358,6 +2391,7 @@ mod tests {
 
         let mut reranker = BrokenReranker;
         let mut config = SearchConfig {
+            fts: crate::config::FtsConfig::default(),
             orchestrator: None,
             reranker: Some(&mut reranker),
             store: &store,
@@ -2380,6 +2414,7 @@ mod tests {
         let (_tmp, store, mut embedder) = vault_with_one_deep_document_and_a_linked_neighbour();
 
         let mut config = SearchConfig {
+            fts: crate::config::FtsConfig::default(),
             orchestrator: None,
             reranker: None,
             store: &store,
@@ -2414,6 +2449,7 @@ mod tests {
 
         let mut reranker = CountingReranker::new();
         let mut config = SearchConfig {
+            fts: crate::config::FtsConfig::default(),
             orchestrator: None,
             reranker: Some(&mut reranker),
             store: &store,
@@ -2438,6 +2474,7 @@ mod tests {
         let (_tmp, store, mut embedder) = vault_with_one_deep_document_and_a_linked_neighbour();
 
         let mut config = SearchConfig {
+            fts: crate::config::FtsConfig::default(),
             orchestrator: None,
             reranker: None,
             store: &store,

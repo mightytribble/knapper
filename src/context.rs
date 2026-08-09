@@ -748,7 +748,7 @@ pub fn context_topic_with_search(
 mod tests {
     use super::*;
     use crate::docid::generate_docid;
-    use crate::store::{DOC_LEVEL, Store};
+    use crate::store::{DOC_LEVEL, NewChunk, Store};
     use tempfile::TempDir;
 
     fn setup_vault() -> (TempDir, Store, std::path::PathBuf) {
@@ -928,10 +928,15 @@ mod tests {
             .insert_edge(f2, DOC_LEVEL, f1, DOC_LEVEL, "mention")
             .unwrap();
         store
-            .insert_chunk(f2, 0, "# Daily", "Talked to John about Rust.", 10, 20)
-            .unwrap();
-        store
-            .insert_fts_chunk(f2, 0, "Talked to John about Rust.")
+            .insert_chunk(&NewChunk {
+                file_id: f2,
+                seq: 0,
+                heading: "# Daily",
+                text: "Talked to John about Rust.",
+                vector_id: 10,
+                token_count: 20,
+                ..Default::default()
+            })
             .unwrap();
 
         let params = ContextParams {

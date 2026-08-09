@@ -47,6 +47,22 @@ pub const PARSER_VERSION: u32 = 1;
 /// and need no bump.
 pub const CHUNKER_VERSION: u32 = 1;
 
+/// Bump when what a chunk **row** holds changes, even though the chunk
+/// boundaries do not.
+///
+/// Separate from [`CHUNKER_VERSION`] because the two answer different
+/// questions: that one asks whether the chunks would come out in the same
+/// places, this one asks whether the row written for a chunk still holds
+/// everything a reader now needs. Both declare `Reindex`, since the row is
+/// written by the same pass that embeds it.
+///
+/// Version 2 is issue #37: `heading_path` and `tags_text`. Neither can be
+/// derived from the columns already stored — the breadcrumb's ancestors are in
+/// the vault, not in `chunks.heading` — so a store built before them has to be
+/// read again, and a keyword index declared over empty columns would look
+/// healthy while matching nothing.
+pub const CHUNK_RECORD_VERSION: u32 = 2;
+
 /// Bump when wikilink resolution changes: extraction, the exact → basename →
 /// shortest-path ladder, or how an end that names no passage is stored.
 pub const LINK_RESOLVER_VERSION: u32 = 1;
@@ -172,6 +188,7 @@ impl Fingerprints {
             parser: digest(&[&PARSER_VERSION.to_string()]),
             chunker: digest(&[
                 &CHUNKER_VERSION.to_string(),
+                &CHUNK_RECORD_VERSION.to_string(),
                 &limits::TARGET_TOKENS.to_string(),
                 &limits::OVERLAP_PCT.to_string(),
                 &limits::MAX_TOKENS.to_string(),
@@ -181,7 +198,7 @@ impl Fingerprints {
                 &LINK_RESOLVER_VERSION.to_string(),
                 &crate::store::DOC_LEVEL.to_string(),
             ]),
-            fts: digest(&[crate::store::FTS_SCHEMA]),
+            fts: digest(&[&crate::store::fts_objects_sql(&config.fts)]),
             // The prefix and the title field are embedding input, not chunk
             // content: they change the vector and leave `chunks.text`, the
             // snippet and FTS untouched (issues #2 and #36). So they belong here
@@ -710,9 +727,50 @@ mod tests {
         // digest moves exactly when the declaration does.
         assert_eq!(
             fps().fts,
-            digest(&[crate::store::FTS_SCHEMA]),
+            digest(&[&crate::store::fts_objects_sql(
+                &crate::config::FtsConfig::default()
+            )]),
             "fts_fingerprint must be a digest of the declaration itself"
         );
+    }
+
+    /// `[fts]` decides the column list, the column list is the declaration, and
+    /// the declaration is the digest. So turning a column off rebuilds the
+    /// keyword index and re-embeds nothing (issue #37).
+    #[test]
+    fn the_declared_fts_columns_reach_the_fts_fingerprint() {
+        let control = Config {
+            fts: crate::config::FtsConfig::CONTROL,
+            ..Config::default()
+        };
+        let shipped = fps();
+        let other = Fingerprints::compute(&control, "embed-model-abc", None);
+
+        assert_ne!(shipped.fts, other.fts);
+        assert_eq!(
+            (shipped.chunker, shipped.embedding),
+            (other.chunker, other.embedding),
+            "a column list is neither a chunk boundary nor an embedding input"
+        );
+    }
+
+    /// The columns a chunk *row* holds are a reindex, and they are the chunker's
+    /// key: nothing else declares `Reindex` for a change the vault has to be
+    /// read again to satisfy (issue #37).
+    #[test]
+    fn the_chunk_record_version_is_part_of_the_chunker_fingerprint() {
+        assert!(
+            fps().chunker
+                != digest(&[
+                    &CHUNKER_VERSION.to_string(),
+                    &(CHUNK_RECORD_VERSION + 1).to_string(),
+                    &crate::chunker::limits::TARGET_TOKENS.to_string(),
+                    &crate::chunker::limits::OVERLAP_PCT.to_string(),
+                    &crate::chunker::limits::MAX_TOKENS.to_string(),
+                    &crate::chunker::limits::OVERLAP_TOKENS.to_string(),
+                ]),
+        );
+        assert_eq!(CHUNKER.action, Action::Reindex);
     }
 
     #[test]

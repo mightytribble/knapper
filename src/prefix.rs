@@ -231,15 +231,67 @@ fn title_for(doc: &DocContext, chunk: &Chunk, cfg: DocumentTitle) -> String {
     match cfg {
         DocumentTitle::None => String::new(),
         DocumentTitle::Note => doc.name.clone(),
-        DocumentTitle::Breadcrumb => {
-            let mut parts: Vec<&str> = Vec::with_capacity(1 + chunk.heading_path.len());
-            if !doc.name.is_empty() {
-                parts.push(&doc.name);
-            }
-            parts.extend(chunk.heading_path.iter().map(String::as_str));
-            parts.join(" > ")
-        }
+        DocumentTitle::Breadcrumb => breadcrumb(doc, chunk),
     }
+}
+
+/// `Note Title > H1 > H2 > H3` — design §5.4's rule, and the one string all
+/// three limbs of it carry.
+///
+/// Two limbs read this function. The embedding limb fills the document
+/// template's `title:` field with it (issue #36); the lexical limb stores it in
+/// `chunks.heading_path`, which is the column the keyword index is declared
+/// over (issue #37). One function, because two compositions of the same rule
+/// eventually disagree, and the disagreement would be invisible: each limb
+/// looks correct on its own.
+pub fn breadcrumb(doc: &DocContext, chunk: &Chunk) -> String {
+    let mut parts: Vec<&str> = Vec::with_capacity(1 + chunk.heading_path.len());
+    if !doc.name.is_empty() {
+        parts.push(&doc.name);
+    }
+    parts.extend(chunk.heading_path.iter().map(String::as_str));
+    parts.join(" > ")
+}
+
+/// What the keyword lane indexes beside a chunk's body (issue #37).
+///
+/// Stored on the `chunks` row rather than written into the FTS index directly:
+/// `chunks_fts` is an external-content table over `chunks`, so these columns
+/// *are* what it indexes, and `'rebuild'` re-derives the index from them. That
+/// is what makes #11's bug class — the keyword index holding a different string
+/// from the chunk table — unreachable rather than fixed.
+///
+/// Both fields are stored whatever `[fts]` says. The config decides which
+/// columns the index is *declared* over, so turning one off costs a rebuild of
+/// the keyword index and never a re-index of the vault.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LexicalFields {
+    /// The breadcrumb. See [`breadcrumb`].
+    pub heading_path: String,
+    /// The file's frontmatter tags, sorted and space separated. Sorted because
+    /// the order frontmatter happens to list them in is not information, and a
+    /// stable string keeps two indexes of the same file byte-identical.
+    pub tags_text: String,
+}
+
+/// The lexical fields for each chunk of a file, in chunk order.
+///
+/// The counterpart of [`embed_inputs`], and shared by the same two callers for
+/// the same reason: `indexer::index_file` and `writer::precompute_chunks` write
+/// rows into one table.
+pub fn lexical_fields(doc: &DocContext, chunks: &[Chunk]) -> Vec<LexicalFields> {
+    let mut tags: Vec<&str> = doc.tags.iter().map(String::as_str).collect();
+    tags.sort_unstable();
+    tags.dedup();
+    let tags_text = tags.join(" ");
+
+    chunks
+        .iter()
+        .map(|chunk| LexicalFields {
+            heading_path: breadcrumb(doc, chunk),
+            tags_text: tags_text.clone(),
+        })
+        .collect()
 }
 
 /// `lore/bestiary/archdragon.md` → `archdragon`.
@@ -253,6 +305,49 @@ fn filename_stem(rel_path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The lexical fields of a file: a breadcrumb per chunk, one tag string for
+    /// all of them, sorted (issue #37).
+    #[test]
+    fn the_lexical_fields_are_a_breadcrumb_and_the_sorted_tags() {
+        let doc = DocContext {
+            name: "Archdragon".into(),
+            rel_path: "lore/archdragon.md".into(),
+            aliases: vec![],
+            tags: vec!["zebra".into(), "apex".into(), "apex".into()],
+        };
+        let chunks = [
+            chunk(&["Abilities", "Combat"], "Opens at range."),
+            chunk(&[], "No heading here."),
+        ];
+
+        let fields = lexical_fields(&doc, &chunks);
+        assert_eq!(fields[0].heading_path, "Archdragon > Abilities > Combat");
+        assert_eq!(fields[1].heading_path, "Archdragon");
+        assert!(fields.iter().all(|f| f.tags_text == "apex zebra"));
+    }
+
+    /// One rule, one composition: the string the keyword index stores is the
+    /// string the embedder is given as a title.
+    #[test]
+    fn both_limbs_of_the_rule_carry_one_string() {
+        let doc = DocContext {
+            name: "Archdragon".into(),
+            rel_path: "lore/archdragon.md".into(),
+            aliases: vec![],
+            tags: vec![],
+        };
+        let chunks = [chunk(&["Abilities"], "Flight.")];
+        let composition = EmbedComposition {
+            prefix: PrefixConfig::default(),
+            title: DocumentTitle::Breadcrumb,
+        };
+
+        assert_eq!(
+            embed_inputs(&doc, &chunks, composition)[0].title,
+            lexical_fields(&doc, &chunks)[0].heading_path
+        );
+    }
 
     fn chunk(heading_path: &[&str], text: &str) -> Chunk {
         Chunk {

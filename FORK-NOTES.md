@@ -45,6 +45,7 @@ git fetch upstream && git diff --stat upstream/main main
 | `ranking::apply_answer_floor` | a query with no candidate above the floor returns no results | this fork, issue #34 |
 | `[embedding_prompt]` | EmbeddingGemma is fed the prompt format its model card documents | this fork, issue #10 |
 | `DocumentTitle` | the document template's `title:` field is filled by the vault, not by the literal `none` | this fork, issue #36 |
+| `chunks_fts` external content | the keyword index is derived from the chunk table, and indexes the breadcrumb beside the body | this fork, issue #37 |
 | `.github/workflows/ci.yml` | manual dispatch only — upstream runs it on push and PR | this fork, Actions minutes |
 
 Cherry-picked rather than merged: PR #41 branched before upstream's #40 graph fix, so merging the
@@ -178,6 +179,11 @@ has never executed on this box.
   #36 arm homes stay beside it as `.engraph-i36-*`, and the `.engraph-i36x-*` homes are the same four
   arms with #7's exclusion on. The two control arms name `document_title = "none"` in their own
   `config.toml`, because the default no longer gives it.
+  The eight #37 arms are `.engraph-i37-*`, built from `.engraph-i36x-breadcrumb`. `-control` is the
+  copy the **pre-#37 binary** was run against; the other seven come from re-indexing one home with the
+  #37 binary and copying its database, so they share a vector space exactly and differ only in the
+  keyword index's declaration. `-off` is the inert control and reproduces `-control` to nine decimal
+  places.
   **The store itself does not exclude derived files.** Its `exclude` is `[".obsidian/"]`, so
   `*-index.md` and `templates/` are in the corpus. Issue #7 measured that exclusion as a clear gain and
   the baseline never adopted it. Every table in `eval/probes.md` from #26 to #10 therefore holds about
@@ -267,6 +273,25 @@ has never executed on this box.
     title, and it is the control. `note` is the note's title alone, and it breaks exact-name lookup.
     The key is a fingerprint component, so a change to it re-indexes the vault. **A store built before
     #36 re-indexes once on upgrade**, because the default is no longer what that store holds.
+- **The keyword index is derived from the chunk table, and indexes the breadcrumb** (this fork, issue
+  #37). `chunks_fts` is an FTS5 **external-content** table over `chunks`, kept in step by three
+  triggers, so it holds an index and no text of its own. #11's bug class — the keyword index holding a
+  different string from the chunk — stops being a bug that was fixed and becomes a state that cannot
+  be reached, and the four hand-written FTS writes and four hand-written FTS deletes are gone with it.
+  A delete SQLite performs itself, on the cascade from `files`, reaches the index too.
+  - **`[fts]` decides which columns the index is declared over**, and the fingerprint hashes the
+    declaration, so a change to a flag is a keyword-index rebuild: 1598 rows in 0.1 s, no vault read
+    and no model. The BM25 weights are query-time and reach no fingerprint at all, so a weight sweep
+    costs nothing. `engraph search --explain` prints the declaration and the weights.
+  - **`heading_path = true` at weight 1.0, `tags = false`** — measured, not designed. §6.2 of the
+    convergence document asks for both columns at `1.0, 3.0, 4.0`.
+  - **`heading_path = false, tags = false` is the control, and it is exact.** The new binary with both
+    columns undeclared reproduces the pre-#37 binary on all eighteen calibration queries, to nine
+    decimal places. A zero *weight* is not the same thing: BM25 normalises over every token in the
+    row, so a populated column at weight 0.0 still moves every score.
+  - **A store built before #37 re-indexes once**, declared by `fingerprint::CHUNK_RECORD_VERSION` in
+    the chunker's key. The breadcrumb cannot be derived from anything `chunks` already holds — only
+    the leaf heading is stored, and its ancestors are in the vault.
 - **The cross-encoder sorts the results; it used to vote on them** (this fork, issue #30). Two
   content lanes are fused by RRF, graph and temporal candidates are routed into the shortlist by
   **reserved quota** (`[ranking] candidates = 30`, `graph_reserve = 8`, `temporal_reserve = 4`), and
@@ -506,12 +531,44 @@ See issues on this repo:
   rule's three limbs carry the same string. #37 puts the breadcrumb in the lexical lane, where a heading
   term is matched and not averaged into a vector, so the embedding limb is measured again after #37 and
   is not closed now. #3 is the evidence still owed
-- **#37** the breadcrumb rule's lexical limb — `content='chunks'` with sync triggers, `heading_path`
-  and `tags_text` as indexed FTS columns, `bm25(chunks_fts, 1.0, 3.0, 4.0)`. Makes #11's bug class
-  structurally impossible and is the cheap form of what #2 attempted in the embedding. The schema and
-  the weights are two measurements. It **owns** the stored `heading_path` column: #36 shipped
-  without it, because the embedding limb reads the chunker's in-process value and nothing else did.
-  Layer 3; closes half of #17
+- ~~**#37** the breadcrumb rule's lexical limb~~ — **DONE.**
+  `chunks_fts` is external content over `chunks` with three sync triggers, and `[fts]` declares it
+  over `text` plus whichever of `heading_path` / `tags_text` is on. Both columns are stored on every
+  chunk row whatever the config says; the config decides what is *declared*, so switching one is a
+  0.1 s rebuild and never a re-index. `prefix::breadcrumb` is the one composition both limbs of the
+  rule call. `NewChunk` is the chunk row as it is written, and `CHUNK_RECORD_VERSION` is the
+  fingerprint input that asks whether the row still holds what a reader needs — separate from
+  `CHUNKER_VERSION`, which asks whether the chunks would fall in the same places.
+  **The control is exact.** The new binary with both columns undeclared reproduces the pre-#37 binary
+  on all eighteen calibration queries, to nine decimal places, 0 of 360 result slots moved — after a
+  schema change, a full re-index and a rebuilt index. A zero weight would not have shown this, because
+  BM25 normalises over every token in the row.
+  **The breadcrumb returns an answer #36 dropped.** `rules/abjuration-spells.md > ## Level 4 Silence`
+  — *"the silenced target cannot cast spells of any school"* — enters probe 3 at rank 4, 94.04%, and a
+  summoning spell that answers nothing leaves. It is one of the two correct answers #36's arm B lost,
+  and recovering it is the argument that issue made for accepting its own cost. It costs one swap
+  below the answer on probe 4, and no tracked target moves.
+  **The tags cost two things and gain nothing, so they ship off.** They drop probe 2's most direct
+  answer, `the-archdragon-disguise.md > ### Summary` at 94.94%, out of the window entirely, and they
+  give the adjacent negative N11 a 97.06% result at rank 2. The tracked answer's 4 → 3 in the tags
+  arms is that drop and not a gain. The mechanism is in the vault: `npcs/tandi.md` is tagged
+  `velthos`, a city, so a tag records an attribute of a note rather than something the note discusses
+  and the keyword lane cannot tell the two apart. That is half of #17 tried the cheap way; the tag
+  *registry* half is untouched.
+  **The weights buy nothing.** Probe 3's recovered answer arrives at rank 4 at heading weights 1, 3
+  and 5 alike, and the only difference is churn — 62, 117 and 123 of 360 slots. §6.2's `1.0, 3.0, 4.0`
+  is not supported. `answer_floor` needs no refit: same 6.77% highest rejectable negative, same 52.52%
+  lowest correct answer, same 29.64% midpoint.
+  **One invariant reads differently from the issue.** `'rebuild'` reproduces the trigger-built index's
+  *postings and scores* exactly, not its bytes: an incremental write leaves one segment per batch
+  where a rebuild writes a single merged one. The test asserts `fts5vocab` rows and BM25 scores, which
+  is what "the same index" can mean. #38 is the evidence still owed
+- **#38** re-measure the breadcrumb rule's embedding limb, now that the lexical limb is in — #36
+  shipped `document_title = "breadcrumb"` while making the secondary results worse on three of six
+  positive queries, and accepted that cost on the argument that the lexical limb would pay for it.
+  Probe 3 is that argument holding for one of the two answers it names (#37). Two arms, `none` against
+  `breadcrumb`, both carrying #37's columns; each is a full re-index, because `document_title` is an
+  `embedding_fingerprint` component
 - **#5** embedding model config — expose output dim, tie max chunk tokens to the model's context window
 - **#8** pick a better local embedder — >512 tokens, >768 dim (pairs with #5, which exposes the knobs)
 - ~~**#12** embed at the model's native dimension~~ — **done.** Every vector had been truncated to its
