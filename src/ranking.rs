@@ -263,6 +263,47 @@ fn rrf_position(candidate: &Candidate) -> usize {
     candidate.rrf_rank.unwrap_or(usize::MAX)
 }
 
+/// What a query with no supported answer says (issue #34).
+///
+/// One string, used by every channel that can carry prose, so "the engine found
+/// nothing" reads the same whether it came from the CLI or from a tool call.
+pub const NO_RELEVANT_CONTENT: &str = "No relevant content found for this query in the vault.";
+
+/// Drop the candidates the cross-encoder did not support (issue #34).
+///
+/// The gate #30 made possible: the sort key is a calibrated probability, so
+/// there is finally a quantity that means *this passage does not answer the
+/// question* rather than *this passage answered it less well than that one*.
+/// Before it, `confidence` was `rrf_score / max_score * 100` and the top hit was
+/// 100% by construction, whatever it was.
+///
+/// **Per candidate, not per response.** Gating the top score alone would deliver
+/// abstention and nothing else; gating every candidate also stops five
+/// confident-looking rows padding the bottom of an answer that has one real
+/// row — most of what #4 was filed for. It subsumes the response-level rule,
+/// since a pool with nothing above the floor empties, so there is one mechanism
+/// rather than two.
+///
+/// **An unscored candidate is kept.** `rerank_score` is `None` under the legacy
+/// stage and under [`degraded_interleave`], where confidence is a *position*.
+/// Abstaining on a position is abstaining on nothing, and a consumer can discard
+/// a weak block it received where it cannot recover one that was withheld.
+///
+/// `floor <= 0.0` disables the gate and is the inert control the change is
+/// measured against.
+///
+/// Returns how many candidates were dropped, which is the tail cost the fit is
+/// judged on: the floor is fit on best-score-per-query and applied to a whole
+/// list, and those are different distributions.
+pub fn apply_answer_floor(pool: &mut Vec<Candidate>, floor: f64) -> usize {
+    if floor <= 0.0 {
+        return 0;
+    }
+    let before = pool.len();
+    pool.retain(|c| c.rerank_score.is_none_or(|score| score >= floor));
+    before - pool.len()
+}
+
 /// The documented fallback when no cross-encoder is available: three content
 /// candidates, then one from the other sources, repeating.
 ///
@@ -723,6 +764,107 @@ mod tests {
         assert_eq!(pool.len(), 4);
         assert_eq!(shape.from_graph, 4, "the graph takes the whole budget");
         assert_eq!(shape.from_rrf, 0);
+    }
+
+    fn scored(path: &str, rank: usize, score: Option<f64>) -> Candidate {
+        Candidate {
+            rerank_score: score,
+            ..from_fused(fused(path, 0, 1.0), rank)
+        }
+    }
+
+    /// Probe 5's defect, as behaviour rather than as a number. `quantum banking
+    /// regulations` scores 0.29% on its best candidate against 91.7% for the
+    /// weakest positive in the pool; below the floor nothing is supported and
+    /// the engine has to be able to say so.
+    #[test]
+    fn a_query_with_nothing_above_the_floor_supports_nothing() {
+        let mut pool = vec![
+            scored("nothing-relevant.md", 1, Some(0.0029)),
+            scored("also-nothing.md", 2, Some(0.0010)),
+        ];
+        let dropped = apply_answer_floor(&mut pool, 0.89);
+
+        assert_eq!(dropped, 2);
+        assert!(pool.is_empty(), "the engine answered anyway");
+    }
+
+    /// The gate is per candidate, so a query with one real answer keeps the
+    /// answer and loses the tail. P6 is the worked example: its answer scores
+    /// 91.7% and its second result scores 9.1%.
+    #[test]
+    fn the_gate_truncates_the_tail_of_a_query_that_does_have_an_answer() {
+        let mut pool = vec![
+            scored("mend-object.md", 1, Some(0.9174)),
+            scored("waterproof.md", 2, Some(0.0905)),
+            scored("harden.md", 3, Some(0.0803)),
+        ];
+        let dropped = apply_answer_floor(&mut pool, 0.89);
+
+        assert_eq!(dropped, 2);
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool[0].file_path, "mend-object.md");
+    }
+
+    /// The inert control. `answer_floor = 0.0` must leave the ranking exactly as
+    /// #30 left it — that is what makes the probe tables either side comparable.
+    #[test]
+    fn a_floor_of_zero_is_a_no_op() {
+        let candidates = || {
+            vec![
+                scored("a.md", 1, Some(0.99)),
+                scored("b.md", 2, Some(0.0001)),
+                scored("c.md", 3, Some(0.0)),
+            ]
+        };
+        let mut pool = candidates();
+        let dropped = apply_answer_floor(&mut pool, 0.0);
+
+        assert_eq!(dropped, 0);
+        let paths: Vec<&str> = pool.iter().map(|c| c.file_path.as_str()).collect();
+        assert_eq!(paths, vec!["a.md", "b.md", "c.md"]);
+    }
+
+    /// Confidence is a *position* under the degraded interleave and under the
+    /// legacy stage, and a position is not a probability. Thresholding one is
+    /// thresholding nothing, so the gate stands down rather than guessing.
+    #[test]
+    fn an_unscored_candidate_is_not_gated() {
+        let mut pool = vec![
+            scored("degraded-1.md", 1, None),
+            scored("degraded-2.md", 2, None),
+        ];
+        let dropped = apply_answer_floor(&mut pool, 0.89);
+
+        assert_eq!(dropped, 0);
+        assert_eq!(pool.len(), 2, "abstained on an order nothing calibrated");
+    }
+
+    /// The floor is a floor, not a strict bound: a candidate exactly at it is
+    /// supported. Fitting a threshold and then applying a different one is the
+    /// off-by-one that would make the pool table describe a build that does not
+    /// exist.
+    #[test]
+    fn a_candidate_exactly_at_the_floor_survives() {
+        let mut pool = vec![scored("exact.md", 1, Some(0.89))];
+        assert_eq!(apply_answer_floor(&mut pool, 0.89), 0);
+        assert_eq!(pool.len(), 1);
+    }
+
+    /// Order is the model's, and the gate is a filter — it removes rows without
+    /// touching the arrangement of the ones it keeps.
+    #[test]
+    fn the_gate_preserves_the_models_order() {
+        let mut pool = vec![
+            scored("first.md", 9, Some(0.99)),
+            scored("cut.md", 1, Some(0.10)),
+            scored("second.md", 4, Some(0.95)),
+        ];
+        sort_by_rerank(&mut pool, Tiebreak::Rrf);
+        apply_answer_floor(&mut pool, 0.89);
+
+        let paths: Vec<&str> = pool.iter().map(|c| c.file_path.as_str()).collect();
+        assert_eq!(paths, vec!["first.md", "second.md"]);
     }
 
     #[test]

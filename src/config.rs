@@ -306,6 +306,49 @@ pub struct RankingConfig {
     /// probes cannot tell apart.
     pub shortlist_cap: usize,
     pub tiebreak: Tiebreak,
+    /// The cross-encoder score below which a candidate is not an answer (#34).
+    ///
+    /// Applied per candidate after the sort, and skipped wherever there is no
+    /// probability to threshold — see [`crate::ranking::apply_answer_floor`].
+    /// `0.0` disables it and is the inert control.
+    ///
+    /// **Fit against the 17-query calibration pool in `eval/probes.md`**, not
+    /// chosen. On the GPU baseline store nine of the eleven verified negatives
+    /// score below **6.8%** on their best candidate, and the lowest score at
+    /// which any positive's tracked answer sits is **52.5%** — probe 1's
+    /// `archivist-lenne.md` at rank 5. The default is the midpoint of that gap,
+    /// with ~23 points of margin either side against ~1 point of CPU/GPU kernel
+    /// disagreement.
+    ///
+    /// **The ticket said to fit on best-score-per-query and the probes overruled
+    /// it.** That fit gives 89% — the midpoint of 86.2% (N4) to 91.7% (P6) — and
+    /// 89% cuts probe 2's tracked answer, which sits at 81% behind two better
+    /// results from a different file. A gate applied per candidate has to clear
+    /// the weakest *answer*, not the strongest *result*, and those are different
+    /// distributions; the ticket named the risk and the measurement found it.
+    ///
+    /// **Two negatives sit above any usable floor and that is a finding about
+    /// the reranker, not about this number.** N11 asks which city Tandi's
+    /// brother smiths in and scores 97.1% on a passage naming Tandi, a brother,
+    /// a blacksmith and a city with the sibling bound to the wrong person; N4
+    /// asks after a Precept who does not exist and scores 86.2% on a section
+    /// saying who runs the place. Neither is separable from P6 and P7 by score.
+    /// The pool table records both.
+    pub answer_floor: f64,
+    /// At most this many sections of one document may appear in the results.
+    /// `0` is unbounded.
+    ///
+    /// **Ships unbounded, which is today's behaviour and #30's position:** bound
+    /// what the model is *shown* (`shortlist_cap`), not what it returns, because
+    /// if a document holds the ten best sections then ten sections is the right
+    /// answer. §9.1 of the vault-search design caps a note at three and the two
+    /// are not reconcilable by splitting the difference.
+    ///
+    /// The key exists so the deferred decision is a one-key sweep rather than a
+    /// code change. It waits on a probe where one document legitimately owns the
+    /// top of the ranking; probe 4 is the candidate, where `archdragon.md` holds
+    /// ranks 1, 3 and 5 and every one of its twenty results clears the floor.
+    pub per_note_cap: usize,
 }
 
 impl Default for RankingConfig {
@@ -317,8 +360,19 @@ impl Default for RankingConfig {
             temporal_reserve: 4,
             shortlist_cap: default_max_chunks_per_file(),
             tiebreak: Tiebreak::default(),
+            answer_floor: default_answer_floor(),
+            per_note_cap: 0,
         }
     }
+}
+
+/// The fitted abstention floor: the midpoint of the pool's only constrained gap.
+///
+/// Kept as a function rather than a literal in `Default` so the number and the
+/// fit that produced it live in one place — the pool table in `eval/probes.md`
+/// is denominated in percent and this is the same number as a probability.
+pub fn default_answer_floor() -> f64 {
+    0.30
 }
 
 /// Application configuration, loaded from `~/.engraph/config.toml` with CLI overrides.

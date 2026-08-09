@@ -42,6 +42,7 @@ git fetch upstream && git diff --stat upstream/main main
 | `format_reranker_input` | the cross-encoder is asked the question its model card documents | this fork, issue #32 |
 | `cuda` cargo feature | llama.cpp compiles its CUDA backend; off by default | this fork, issue #33 |
 | `llm::device_identity` | the compute device is read at load and fingerprinted | this fork, issue #33 |
+| `ranking::apply_answer_floor` | a query with no answer above the floor returns nothing and says so | this fork, issue #34 |
 | `.github/workflows/ci.yml` | manual dispatch only — upstream runs it on push and PR | this fork, Actions minutes |
 
 Cherry-picked rather than merged: PR #41 branched before upstream's #40 graph fix, so merging the
@@ -366,6 +367,29 @@ has never executed on this box.
   above is known, and it is clean.
 - **`engraph status` does not report the device.** The only place the resolved device is visible is
   the `loaded LlamaEmbed …` / `loaded LlamaRerank …` line at `RUST_LOG=engraph=info`.
+- **A search can now return nothing on purpose** (this fork, issue #34). `[ranking] answer_floor`
+  defaults to **0.30** and drops every candidate the cross-encoder scored below it; an empty result
+  set prints *"No relevant content found for this query in the vault."* `answer_floor = 0.0`
+  disables it and reproduces pre-#34 output byte for byte.
+  - **The floor is a claim about the pinned corpus and about the reranker**, fit against the 17-query
+    pool in `eval/probes.md`. Re-pinning the vault invalidates it along with the pool; changing the
+    reranker invalidates it too, which is what `reranker_fingerprint`'s `InvalidateThresholds`
+    action was reserved for.
+  - **The gate is per candidate, and that is what decides the value.** #34 specifies fitting on
+    best-score-per-query, which gives 89% — and 89% cuts probe 2's tracked answer, sitting at 81%
+    behind two better results from a different file. The ceiling is the weakest *answer* (52.5%,
+    probe 1's `archivist-lenne.md` at rank 5), not the weakest query's *best result*.
+  - **Two verified negatives score like positives and no floor separates them.** `In which city is
+    Tandi's brother a blacksmith?` scores **97.1%** on a passage naming Tandi, a brother, a
+    blacksmith and a city with the sibling bound to the wrong person, which is above both P6 and P7.
+    The reranker scores topical fit; one wrong entity-hop inside an otherwise perfect passage costs
+    it nothing. Nine of eleven negatives abstain; these two do not, and that is a reranker finding
+    rather than a tuning problem.
+  - **It truncates hard where the tail is junk and not at all where it is not.** Probe 5 goes 20 → 0,
+    P6 20 → 1, probes 1 and 2 20 → 5, and probe 4 — twenty sections of an exact-name query, all
+    above 89% — goes 20 → 20.
+  - **`[ranking] per_note_cap` ships at 0 (unbounded)**, the §9.1-versus-#30 conflict parked as a
+    one-key sweep rather than a code change.
 - **GPU numbers and CPU numbers are different baselines.** `eval/probes.md`'s CUDA section is a fresh
   baseline for exactly this reason: the kernels are not bitwise identical, the embeddings differ in
   the low bits, and the retrieved candidate set differs with them. Comparing a GPU rank table with a
@@ -392,19 +416,25 @@ See issues on this repo:
   one-up-one-down at n=5 (#14). Fix is sample count, plus negative controls and section-vs-file
   scoring recorded separately. Calibrates #4
 - **#4** relevance floor — §8.3's per-lane dense candidate floor. Deferred, and narrower than its
-  title: the "nonsense queries return nothing" half is **#34**, which thresholds a calibrated
+  title: the "nonsense queries return nothing" half **shipped as #34**, which thresholds a calibrated
   cross-encoder score rather than a per-lane one. The retrieval lanes have no calibrated score, which
   is why that half waits for a probe
-- **#34** abstention — one gate, `[ranking] answer_floor`, applied **per candidate** after
-  `sort_by_rerank` and skipped where `rerank_score` is `None` (the legacy stage and the degraded
-  interleave, where confidence is a position). Below it, nothing is supported and the answer is
-  *"No relevant content found for this query in the vault."* The floor is fit against the verified
-  negative pool in `eval/probes.md` — 11 negatives, 6 positives, and it must fall between the
-  matched pair N10/P6 — on the GPU baseline store, then confirmed on CPU, since one floor may not
-  sit inside both devices' gaps. **The fit is on best-score-per-query and the gate is per
-  candidate**, so the surviving count on each probe is an acceptance criterion and response-level
-  gating is the named fallback. Also ships `[ranking] per_note_cap`, defaulting to unbounded.
-  **Layer 2 of `docs/vault-search-convergence.md`**
+- ~~**#34** abstention — a calibrated floor on the cross-encoder's score~~ — **DONE.**
+  `ranking::apply_answer_floor`, one gate at `[ranking] answer_floor = 0.30`, per candidate after
+  `sort_by_rerank`, skipped where `rerank_score` is `None`. **Probe 5 returns nothing for the first
+  time in the project's history**, with the literal message, and `answer_floor = 0.0` reproduces
+  pre-#34 output byte for byte across all five probes. Tests checked against both required
+  mutants — never-reject fails 4, always-reject fails 9.
+  **The pool overruled the ticket twice.** It predicted a clean gap and delivered an **overlap**:
+  N11 scores 97.1% and N4 86.2%, against 91.7% for the weakest positive, so no floor rejects them
+  while keeping P6 and P7. Both re-verified against the vault — the model scores topical fit and one
+  wrong entity-hop costs it nothing. And the prescribed fit, best-score-per-query, gives **89%**,
+  which cuts probe 2's tracked answer at 81%; a per-candidate gate has to clear the weakest *answer*,
+  not the strongest *result*. Refit at the midpoint of 6.77% (highest rejectable negative) and 52.5%
+  (probe 1's `archivist-lenne.md` @5), ~23 points of margin either side. Nine of eleven negatives
+  abstain, every tracked answer survives at its baseline rank, and the tail goes 20 → 1 on P6 and
+  20 → 20 on probe 4. Also ships `[ranking] per_note_cap` at 0.
+  **Layer 2 of `docs/vault-search-convergence.md`, first half**
 - **#35** output contract — the scored window is the emitted window (today the model reads
   `chunks.text` capped at `max_document_chars` and the caller gets the 200-char `snippet`, so the
   passage that earned the rank is not the passage that comes back), `budget_tokens` with a greedy

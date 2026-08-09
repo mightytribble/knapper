@@ -419,6 +419,20 @@ impl EngraphServer {
         let output =
             search::search_with_intelligence(&params.0.query, top_n, &mut *embedder, &mut config)
                 .map_err(|e| mcp_err(&e))?;
+
+        // Abstention (#34). The empty array is the answer; the sentence is what
+        // stops a caller reading it as a transport failure and retrying. Added
+        // as a second content block rather than in place of the JSON, because
+        // substituting prose for the array would break a client that parses it —
+        // MCP's content model carries both without a schema change, and the
+        // schema itself belongs to #35.
+        if output.results.is_empty() {
+            let mut result = to_json_result(&output.results)?;
+            result
+                .content
+                .push(Content::text(crate::ranking::NO_RELEVANT_CONTENT));
+            return Ok(result);
+        }
         to_json_result(&output.results)
     }
 
