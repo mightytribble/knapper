@@ -391,7 +391,27 @@ See issues on this repo:
   The five seed probes catch regressions and resolve large effects; what they cannot do is settle a
   one-up-one-down at n=5 (#14). Fix is sample count, plus negative controls and section-vs-file
   scoring recorded separately. Calibrates #4
-- **#4** relevance floor — configurable per-lane min scores so nonsense queries return nothing
+- **#4** relevance floor — §8.3's per-lane dense candidate floor. Deferred, and narrower than its
+  title: the "nonsense queries return nothing" half is **#34**, which thresholds a calibrated
+  cross-encoder score rather than a per-lane one. The retrieval lanes have no calibrated score, which
+  is why that half waits for a probe
+- **#34** abstention — one gate, `[ranking] answer_floor`, applied **per candidate** after
+  `sort_by_rerank` and skipped where `rerank_score` is `None` (the legacy stage and the degraded
+  interleave, where confidence is a position). Below it, nothing is supported and the answer is
+  *"No relevant content found for this query in the vault."* The floor is fit against the verified
+  negative pool in `eval/probes.md` — 11 negatives, 6 positives, and it must fall between the
+  matched pair N10/P6 — on the GPU baseline store, then confirmed on CPU, since one floor may not
+  sit inside both devices' gaps. **The fit is on best-score-per-query and the gate is per
+  candidate**, so the surviving count on each probe is an acceptance criterion and response-level
+  gating is the named fallback. Also ships `[ranking] per_note_cap`, defaulting to unbounded.
+  **Layer 2 of `docs/vault-search-convergence.md`**
+- **#35** output contract — the scored window is the emitted window (today the model reads
+  `chunks.text` capped at `max_document_chars` and the caller gets the 200-char `snippet`, so the
+  passage that earned the rank is not the passage that comes back), `budget_tokens` with a greedy
+  fill and an 8-item overflow list, structured content with `untrusted_content`, `truncated`,
+  `status`, and provenance replacing `score`/`confidence` **on the MCP and HTTP payloads only** —
+  §7.3's boundary is the consumer, not the field, and the CLI keeps the percentage `probe.sh` reads.
+  Settled by ordering that must not move. **Layer 2, second half**
 - **#5** embedding model config — expose output dim, tie max chunk tokens to the model's context window
 - **#8** pick a better local embedder — >512 tokens, >768 dim (pairs with #5, which exposes the knobs)
 - ~~**#12** embed at the model's native dimension~~ — **done.** Every vector had been truncated to its
