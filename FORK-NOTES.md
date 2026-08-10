@@ -177,6 +177,14 @@ has never executed on this box.
   re-downloads 300MB (1.6GB with intelligence enabled).
 - **MCP servers launch once per session**, so a mid-session `git checkout` leaves the server pointed
   at the previous branch's store.
+- **A promoted heading is not addressable by `read_section` or `write edit`.** Promotion (#44) puts a
+  bold-only line in `chunks.heading`, so a search result prints
+  `lore/bestiary/archdragon.md > **Spells**` — 107 of the shipped arm's 1559 chunks are labelled this
+  way, `**Abilities**` 67 times and `**Spells**` 22. `markdown::find_section` reads ATX headings only,
+  which is deliberate and is what the section editor writes against, so `read_section` with
+  `**Spells**` and with `Spells` both answer "Section not found", and `writer::edit` cannot target the
+  passage either. Read the whole note instead, or name the enclosing `#` heading. The breadcrumb the
+  result prints is the way back: the ancestor before the bold line is an ATX heading and does resolve.
 - **Do not add a top-level config key with `>>`.** Every arm home's `config.toml` ends in a
   `[section]` table, so a line appended to the end of the file lands **inside that table**. TOML
   parses `promote_bold_headings = true` after `[memory]` as `memory.promote_bold_headings`, serde
@@ -290,6 +298,11 @@ has never executed on this box.
   every vector to its first 256 of 768 — silently, with no config key and no relationship to the
   model loaded. **Every measurement in `eval/` recorded before this was taken at a third of the
   model's dimensionality.**
+- **`CHUNKER_VERSION` is 2, so every store built by an earlier binary re-indexes once on its next
+  open.** The version is the chunker's *algorithm* input to `chunker_fingerprint`, hand-bumped
+  because there is no runtime view of what a function does, and #44's carry rule changed the rules
+  while every hashed number stayed the same. It applies to every arm home, whatever its settings, and
+  it is on top of any key-driven mismatch an arm already has.
 - **Upgrading past #12 re-indexes the vault on the first `engraph index`.** `run_index_inner` calls
   `store.ensure_embedding_dim`, which rebuilds `chunks_vec` at the model's width and discards every
   chunk indexed at the old one. It is automatic and prints what it is doing, but it is a full
