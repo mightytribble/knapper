@@ -1067,7 +1067,13 @@ async fn handle_reindex_file(
         format!("{:x}", hasher.finalize())
     };
 
-    let config = crate::config::Config::load().unwrap_or_default();
+    let mut config = crate::config::Config::load().unwrap_or_default();
+    // The chunker settings come from the session, not from this load: a load
+    // that fails falls back to the defaults, and one file re-chunked at
+    // settings the rest of the store was not built at is a set of rows nothing
+    // downstream can tell apart. Carrying the captured value is what
+    // `ChunkOptions` exists to give.
+    config.set_chunk_options(state.chunk_opts);
 
     let result = crate::indexer::index_file(
         &body.file,

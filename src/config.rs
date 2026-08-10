@@ -753,6 +753,18 @@ impl Config {
         }
     }
 
+    /// Put the chunker settings of `opts` back on this config.
+    ///
+    /// The inverse of [`Config::chunk_options`], and it lives beside it so that
+    /// a third chunker key cannot be added to one and forgotten in the other. A
+    /// long-running session captures `chunk_options()` once at startup, and a
+    /// path that has to hand a whole `Config` to the indexer uses this to carry
+    /// the session's settings rather than a fresh load's.
+    pub fn set_chunk_options(&mut self, opts: crate::chunker::ChunkOptions) {
+        self.chunk_min_chars = opts.min_chars;
+        self.promote_bold_headings = opts.promote_bold;
+    }
+
     /// Merge CLI-provided top_n over the loaded config.
     pub fn merge_top_n(&mut self, n: Option<usize>) {
         if let Some(n) = n {
@@ -995,6 +1007,21 @@ batch_size = 128
         let control: Config = toml::from_str("promote_bold_headings = false\n").unwrap();
         assert!(!control.promote_bold_headings);
         assert!(!control.chunk_options().promote_bold);
+    }
+
+    #[test]
+    fn the_chunker_settings_travel_back_onto_a_config_whole() {
+        // A session captures `chunk_options()` once and puts it back on a
+        // freshly loaded config before it hands it to the indexer, so a load
+        // that failed cannot re-chunk one file at the defaults.
+        let session = crate::chunker::ChunkOptions {
+            min_chars: 0,
+            promote_bold: false,
+        };
+        let mut fresh = Config::default();
+        assert_ne!(fresh.chunk_options(), session);
+        fresh.set_chunk_options(session);
+        assert_eq!(fresh.chunk_options(), session);
     }
 
     #[test]
