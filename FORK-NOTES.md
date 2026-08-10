@@ -48,6 +48,7 @@ git fetch upstream && git diff --stat upstream/main main
 | `BreadcrumbRoot` | a breadcrumb leads with the file path, so its first segment resolves to a file on disk | this fork, issue #46 |
 | `chunks_fts` external content | the keyword index is derived from the chunk table, and indexes the breadcrumb beside the body | this fork, issue #37 |
 | `ranking::retrieval_width` | how deep the content lanes dig is a setting; `top_n` truncates the output and nothing else | this fork, issue #49 |
+| `chunk_min_chars` | a section too short to stand on its own merges into the preceding chunk rather than becoming a row. Ships at 120 — see #43 | this fork, issue #43 |
 | `.github/workflows/ci.yml` | manual dispatch only — upstream runs it on push and PR | this fork, Actions minutes |
 
 Cherry-picked rather than merged: PR #41 branched before upstream's #40 graph fix, so merging the
@@ -184,10 +185,15 @@ has never executed on this box.
   `config.toml`, because the default no longer gives it.
   The four #38 arms are `.engraph-i38-*`, built from `.engraph-i37-shipped`. `-shipped` carries no
   `[embedding_prompt]` and no `[fts]` block at all, and it exists to check the defaults #38 changes.
-  The #42 arms are `.engraph-i42-*`; `-shipped` is the current baseline, defaults only, and it is what
-  a new arm should be copied from. `.engraph-i43*` are #44's heading probe and point at a **scratch
-  vault under `/tmp`** that will not survive the session — the promotion rule is written out in #44
-  and the arms are 15 s to rebuild.
+  The #42 arms are `.engraph-i42-*`; `-shipped` was the baseline of its day, defaults only.
+  **`.engraph-i43-min120` is the current baseline** — the shipped defaults, the arm
+  `eval/ground-truth.json` is stamped against, and what a new arm should be copied from.
+  `.engraph-i43-min0` is #43's control, and `.engraph-i46-path` is the same configuration under its
+  old name — both now name `chunk_min_chars = 0` in their own `config.toml`, because the default no
+  longer gives it and an open without the key would quietly convert them to the shipped arm.
+  `.engraph-i43-headings` and `.engraph-i43b` are **not #43's**: they are #44's
+  heading probe under its old number, and they point at a **scratch vault under `/tmp`** that did not
+  survive the session — the promotion rule is written out in #44 and the arms are 15 s to rebuild.
   The eight #37 arms are `.engraph-i37-*`, built from `.engraph-i36x-breadcrumb`. `-control` is the
   copy the **pre-#37 binary** was run against; the other seven come from re-indexing one home with the
   #37 binary and copying its database, so they share a vector space exactly and differ only in the
@@ -739,14 +745,28 @@ See issues on this repo:
   **closed, not reproducible.** Both of its arms ran in a home at `top_n = 100`, so neither was the
   shipped configuration. The chunk it reported as hidden is rank 2 at 93.50% in the shipped arm, and
   `shortlist_cap` is not binding on either query cited. Superseded by #49
-- **#43** sections under the minimum size should not become chunks — design §5.4 specifies
-  `chunk_min_tokens_est = 30` and §14 lists it as "Later"; nothing implements it. **72 chunks in the
-  shipped corpus are under 60 characters**, mostly template scaffolding a later workflow will fill:
-  `## Threads\n_None yet._` ×6, `## Player Disposition\nHas not met the player.` ×7. BM25 normalises
-  by length, so a very short row carrying a query term scores enormously — #44's probe made it visible
-  by creating 49 rows reading `### Spells\nN/A`, which moved a *verified negative* from 1.61% to
-  **97.87%** on a file that was never edited. Needs a decision on where an under-minimum section
-  merges before any code. Blocks #44
+- ~~**#43** sections under the minimum size should not become chunks~~ — **DONE.**
+  `chunk_min_chars` is the shortest section body that becomes a chunk of its own; a shorter section
+  merges into the **preceding chunk of the same file**, keeping its own heading line inside the
+  merged body so its terms stay in `chunks.text` and the keyword index over it. The host keeps its
+  `heading` and `heading_path`, the merge stops at `TARGET_TOKENS` — these sections run in streaks —
+  and a section with no preceding chunk stays a chunk. The unit is characters because the chunker
+  estimates `chars / 4`, so §5.4's 30 tokens is 120. It is a chunker-digest component, so a change
+  re-indexes, and **the digest moves at 0 too**: every store re-indexes once on the upgrade.
+  **The default is 120.** The corpus goes 1598 → 1461 chunks and the 72 sub-60-character rows go to
+  zero, and the pool reads nothing against it: every negative holds or falls, every set holds its
+  coverage, and P2's window shortens two ranks. The control is exact — at 0 the new binary reproduces
+  the previous default's 1598 chunks with an identical SHA over every row, and its scores.
+  **The pin moves**: `.engraph-i43-min120` is the shipped arm at 247 files and 1461 chunks,
+  `.engraph-i43-min0` is the control, and `eval/ground-truth.json` is re-stamped against the shipped
+  arm — P1 7/7 inv 0, P2 5/5 inv 4, P3 4/5 inv 7, **P4 5/8** inv 1, P6 1/1 inv 0, P7 1/1 inv 0, where
+  P4's denominator is 8 because two of its members are now one chunk and nothing it returns changed.
+  `eval/probes.md` holds the tables. Two limits found: a short **piece** of a split section is not a
+  section, so the rule does not see it (one row in the corpus, `summaries/session-013.md` seq 5), and
+  `eval/build-ground-truth.py` had to learn a re-chunk — a tier-1 member now falls back to its anchor,
+  and a noise stamp, which carries none, is dropped and reported. Four of the five that dropped are
+  the same row an ordinal lower and are re-stamped; `hell-moth.md > ## Resources` merged into
+  `## Stat Block` and wants a ruling if it ever surfaces. Noise by anchor is instrument work beside #50
 - **#44** a bold-only line is a heading the chunker cannot see — `**Skills**` is structure to a reader
   and a paragraph to `emit_section`, so **33% of the bestiary's structure markers never reach a
   breadcrumb**. The vault cannot separate two candidate guards: all 219 bold-only lines are inside a
@@ -756,8 +776,9 @@ See issues on this repo:
   not. Probed as a vault edit on a scratch copy: **P7's answer becomes a 363-char `### Spells` chunk
   at rank 1** where it was buried at character 1038 of a 1061-char `## Stat Block`, and **P2's becomes
   `### Notes` at 99.73%** against 98.02%. The choice is vault-authoring against a chunker rule; the
-  chunker version generalises to any Obsidian vault in this house style. Blocked by #43 — the first
-  probe pass destroyed N10's abstention, and that was #43's bug
+  chunker version generalises to any Obsidian vault in this house style. **#43 unblocked it**: the
+  first probe pass destroyed N10's abstention, that was #43's bug, and `chunk_min_chars = 120` put all
+  eleven negatives back to the baseline. It is the default now, so #44's arm inherits it
 - **#41** does the keyword lane's breadcrumb column still earn its default? — **two arms, on against
   off.** The column exists for one case: a chunk whose answering terms are in its heading and not in
   its body. #37 shipped `[fts] heading_path = true` on one reading — it returns `## Level 4 Silence`
