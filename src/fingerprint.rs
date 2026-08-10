@@ -196,6 +196,10 @@ impl Fingerprints {
                 // so it sits with the limits it belongs among rather than with
                 // the embedding inputs.
                 &config.chunk_min_chars.to_string(),
+                // #44: promotion decides where a section starts, so it decides
+                // which rows exist at all — the same class of change as the
+                // minimum, and the same action.
+                &config.promote_bold_headings.to_string(),
                 &limits::TARGET_TOKENS.to_string(),
                 &limits::OVERLAP_PCT.to_string(),
                 &limits::MAX_TOKENS.to_string(),
@@ -607,6 +611,23 @@ mod tests {
         // 0 is the control arm, and it is a different index from the default.
         let mut config = Config::default();
         config.chunk_min_chars = 0;
+        let changed = Fingerprints::compute(&config, "embed-model-abc", Some("rerank-model-xyz"));
+
+        let comparison = compare(&store, &changed).unwrap();
+        assert_eq!(comparison.mismatches[0].key, CHUNKER.name);
+        assert_eq!(comparison.actions(), BTreeSet::from([Action::Reindex]));
+    }
+
+    /// Promotion decides where a section starts, so it decides which rows exist
+    /// at all — the same class of change as the minimum (issue #44).
+    #[test]
+    fn a_changed_promotion_setting_demands_a_reindex() {
+        let store = Store::open_memory().unwrap();
+        record(&store, &fps()).unwrap();
+
+        // `false` is the control arm, so `true` is a different index.
+        let mut config = Config::default();
+        config.promote_bold_headings = true;
         let changed = Fingerprints::compute(&config, "embed-model-abc", Some("rerank-model-xyz"));
 
         let comparison = compare(&store, &changed).unwrap();

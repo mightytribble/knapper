@@ -188,6 +188,13 @@ pub fn default_chunk_min_chars() -> usize {
     120
 }
 
+/// Whether a bold-only line opens a section (issue #44).
+///
+/// `false` is the control and reproduces the pre-#44 chunking exactly.
+pub fn default_promote_bold_headings() -> bool {
+    false
+}
+
 /// How the rerank lane presents a candidate to the cross-encoder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -654,6 +661,11 @@ pub struct Config {
     /// the pre-#43 chunking exactly.
     #[serde(default = "default_chunk_min_chars")]
     pub chunk_min_chars: usize,
+    /// A line that is one bold span and nothing else opens a section, one level
+    /// below the enclosing `#` heading (issue #44). Like [`Config::chunk_min_chars`]
+    /// it reaches the chunker digest, so a change to it re-indexes the vault.
+    #[serde(default = "default_promote_bold_headings")]
+    pub promote_bold_headings: bool,
     #[serde(default)]
     pub identity: IdentityConfig,
     #[serde(default)]
@@ -669,6 +681,7 @@ impl Default for Config {
             group_by: GroupBy::default(),
             breadcrumb_root: BreadcrumbRoot::default(),
             chunk_min_chars: default_chunk_min_chars(),
+            promote_bold_headings: default_promote_bold_headings(),
             embedding_prefix: PrefixConfig::default(),
             embedding_prompt: EmbeddingPromptConfig::default(),
             exclude: vec![".obsidian/".to_string()],
@@ -725,6 +738,17 @@ impl Config {
     pub fn merge_vault_path(&mut self, path: Option<PathBuf>) {
         if path.is_some() {
             self.vault_path = path;
+        }
+    }
+
+    /// The two chunker settings that are config keys, as one value.
+    ///
+    /// Every path that chunks a file takes this rather than the settings
+    /// separately, so no path can carry one and forget the other.
+    pub fn chunk_options(&self) -> crate::chunker::ChunkOptions {
+        crate::chunker::ChunkOptions {
+            min_chars: self.chunk_min_chars,
+            promote_bold: self.promote_bold_headings,
         }
     }
 
@@ -956,6 +980,17 @@ batch_size = 128
 
         let control: Config = toml::from_str("chunk_min_chars = 0\n").unwrap();
         assert_eq!(control.chunk_min_chars, 0);
+    }
+
+    #[test]
+    fn promote_bold_headings_defaults_off_and_travels_with_the_minimum() {
+        let bare: Config = toml::from_str("").unwrap();
+        assert!(!bare.promote_bold_headings);
+        assert_eq!(bare.chunk_options().min_chars, 120);
+        assert!(!bare.chunk_options().promote_bold);
+
+        let on: Config = toml::from_str("promote_bold_headings = true\n").unwrap();
+        assert!(on.chunk_options().promote_bold);
     }
 
     #[test]

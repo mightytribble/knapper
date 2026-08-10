@@ -267,10 +267,11 @@ pub struct EngraphServer {
     /// Embedding-prefix settings, for the same reason: notes written by MCP
     /// tools share a vector space with the indexed vault.
     embed: crate::prefix::EmbedComposition,
-    /// The chunk minimum, one step earlier than `embed` for the same reason: a
+    /// The chunker settings, one step earlier than `embed` for the same reason: a
     /// note written by an MCP tool has to be cut into the rows a re-index of it
-    /// would produce (issue #43).
-    chunk_min_chars: usize,
+    /// would produce (issue #43), and the same now holds for where a section
+    /// starts (issue #44).
+    chunk_opts: crate::chunker::ChunkOptions,
 }
 
 fn read_only_err() -> McpError {
@@ -576,7 +577,7 @@ impl EngraphServer {
             &store,
             &mut *embedder,
             self.embed,
-            self.chunk_min_chars,
+            self.chunk_opts,
             &self.vault_path,
             self.profile.as_ref().as_ref(),
         )
@@ -604,7 +605,7 @@ impl EngraphServer {
             &store,
             &mut *embedder,
             self.embed,
-            self.chunk_min_chars,
+            self.chunk_opts,
             &self.vault_path,
         )
         .map_err(|e| mcp_err(&e))?;
@@ -693,7 +694,7 @@ impl EngraphServer {
             &store,
             &mut *embedder,
             self.embed,
-            self.chunk_min_chars,
+            self.chunk_opts,
             &self.vault_path,
         )
         .map_err(|e| mcp_err(&e))?;
@@ -1159,7 +1160,7 @@ pub async fn run_serve(
     let ranking = config.ranking;
     let fts = config.fts;
     let embed = crate::prefix::EmbedComposition::from_config(&config);
-    let chunk_min_chars = config.chunk_min_chars;
+    let chunk_opts = config.chunk_options();
 
     let (watcher_handle, watcher_shutdown) = crate::watcher::start_watcher(
         store_arc.clone(),
@@ -1191,7 +1192,7 @@ pub async fn run_serve(
         ranking,
         fts,
         embed,
-        chunk_min_chars,
+        chunk_opts,
     };
 
     // Cancellation token for coordinated shutdown of HTTP + MCP
@@ -1218,7 +1219,7 @@ pub async fn run_serve(
             ranking,
             fts,
             embed,
-            chunk_min_chars,
+            chunk_opts,
         };
         let router = crate::http::build_router(api_state);
         let addr = format!("{}:{}", opts.host, opts.port);

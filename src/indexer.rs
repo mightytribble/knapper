@@ -435,7 +435,7 @@ pub fn index_file(
     let overlap_tokens = crate::chunker::OVERLAP_TOKENS;
 
     // 1. Parse frontmatter for tags and created_by
-    let parsed = chunk_markdown(content, config.chunk_min_chars);
+    let parsed = chunk_markdown(content, config.chunk_options());
     let tags = parsed.tags;
     let chunks = {
         let tc = |s: &str| embedder.token_count(s);
@@ -2218,7 +2218,7 @@ mod tests {
             &store,
             &mut embedder,
             crate::prefix::EmbedComposition::from_config(&config),
-            config.chunk_min_chars,
+            config.chunk_options(),
             root,
             None,
         )

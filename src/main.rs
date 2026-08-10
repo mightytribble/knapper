@@ -1288,7 +1288,7 @@ async fn main() -> Result<()> {
                         &store,
                         &mut embedder,
                         engraph::prefix::EmbedComposition::from_config(&cfg),
-                        cfg.chunk_min_chars,
+                        cfg.chunk_options(),
                         &vault_path,
                         profile.as_ref(),
                     )?;
@@ -1326,7 +1326,7 @@ async fn main() -> Result<()> {
                         &store,
                         &mut embedder,
                         engraph::prefix::EmbedComposition::from_config(&cfg),
-                        cfg.chunk_min_chars,
+                        cfg.chunk_options(),
                         &vault_path,
                     )?;
                     if cli.json {
@@ -1354,7 +1354,7 @@ async fn main() -> Result<()> {
                         &store,
                         &mut embedder,
                         engraph::prefix::EmbedComposition::from_config(&cfg),
-                        cfg.chunk_min_chars,
+                        cfg.chunk_options(),
                         &vault_path,
                     )?;
                     if cli.json {

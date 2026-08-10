@@ -387,6 +387,24 @@ fn line_offsets(content: &str) -> Vec<usize> {
     offsets
 }
 
+/// The settings that decide where a chunk boundary falls and are config keys
+/// rather than [`limits`] constants.
+///
+/// They travel together because every path that chunks a file must use the same
+/// pair. A note written through the write pipeline at one setting and
+/// re-indexed at another is cut into two different sets of rows, and nothing
+/// downstream can tell. This is what [`crate::prefix::EmbedComposition`] does
+/// for the embedding inputs, applied to the chunker's own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkOptions {
+    /// The shortest section body that becomes a chunk of its own (issue #43).
+    /// A shorter section merges into the preceding chunk of the same file.
+    pub min_chars: usize,
+    /// Whether a line that is one bold span and nothing else opens a section
+    /// (issue #44).
+    pub promote_bold: bool,
+}
+
 /// Structure-first chunking: a chunk boundary is placed at every ATX heading,
 /// and size only decides how an *oversized* section is subdivided.
 ///
@@ -409,7 +427,7 @@ pub fn structure_chunk(
     content: &str,
     target_tokens: usize,
     overlap_pct: usize,
-    min_chars: usize,
+    opts: ChunkOptions,
 ) -> Vec<Chunk> {
     if content.trim().is_empty() {
         return Vec::new();
@@ -432,7 +450,7 @@ pub fn structure_chunk(
         &[],
         target_tokens,
         overlap_pct,
-        min_chars,
+        opts.min_chars,
         &mut chunks,
     );
 
@@ -474,7 +492,7 @@ pub fn structure_chunk(
             &path,
             target_tokens,
             overlap_pct,
-            min_chars,
+            opts.min_chars,
             &mut chunks,
         );
     }
@@ -617,14 +635,15 @@ pub use limits::{MAX_TOKENS, OVERLAP_PCT, OVERLAP_TOKENS, TARGET_TOKENS};
 /// 2. Run `structure_chunk` on the body at [`TARGET_TOKENS`] / [`OVERLAP_PCT`].
 /// 3. Return `ParsedMarkdown { tags, chunks }`.
 ///
-/// `min_chars` is `[chunk_min_chars]`, the shortest section body that becomes a
-/// chunk of its own (issue #43). It is a parameter rather than a constant
-/// because it is a config key, and every caller must pass the same one: two
-/// paths chunking a file differently write two sets of rows for it.
-pub fn chunk_markdown(content: &str, min_chars: usize) -> ParsedMarkdown {
+/// `opts` carries `[chunk_min_chars]` and `[promote_bold_headings]`, the config
+/// keys that decide where a chunk boundary falls (see [`ChunkOptions`]). It is
+/// a parameter rather than constants because they are config keys, and every
+/// caller must pass the same pair: two paths chunking a file at different
+/// settings write two different sets of rows.
+pub fn chunk_markdown(content: &str, opts: ChunkOptions) -> ParsedMarkdown {
     let (tags, body) = parse_frontmatter(content);
 
-    let chunks = structure_chunk(body, TARGET_TOKENS, OVERLAP_PCT, min_chars);
+    let chunks = structure_chunk(body, TARGET_TOKENS, OVERLAP_PCT, opts);
 
     ParsedMarkdown { tags, chunks }
 }
@@ -1081,10 +1100,19 @@ mod tests {
 
     // ── Structure-first chunking tests ───────────────────────────────────
 
+    /// `ChunkOptions` at a given minimum, with promotion off — the settings
+    /// every test written before #44 was written against.
+    fn opts(min_chars: usize) -> ChunkOptions {
+        ChunkOptions {
+            min_chars,
+            promote_bold: false,
+        }
+    }
+
     #[test]
     fn test_structure_chunk_one_chunk_per_section() {
         let md = "## Alpha\nA body.\n\n## Beta\nB body.\n\n## Gamma\nG body.\n";
-        let chunks = structure_chunk(md, 512, 15, 0);
+        let chunks = structure_chunk(md, 512, 15, opts(0));
         assert_eq!(chunks.len(), 3);
         for (chunk, expected) in chunks.iter().zip(["Alpha", "Beta", "Gamma"]) {
             assert_eq!(chunk.heading.as_deref(), Some(&*format!("## {expected}")));
@@ -1098,7 +1126,7 @@ mod tests {
         let md: String = (0..6)
             .map(|i| format!("## Section {i}\nBody of section {i}.\n\n"))
             .collect();
-        let chunks = structure_chunk(&md, 512, 15, 0);
+        let chunks = structure_chunk(&md, 512, 15, opts(0));
 
         assert_eq!(chunks.len(), 6);
         for chunk in &chunks {
@@ -1116,7 +1144,7 @@ mod tests {
         // Long enough to force a split inside a section.
         let filler = "Sentence of prose padding this section out. ".repeat(60);
         let md = format!("## First\n{filler}\n\n{filler}\n\n## Second\nShort.\n");
-        let chunks = structure_chunk(&md, 128, 15, 0);
+        let chunks = structure_chunk(&md, 128, 15, opts(0));
 
         assert!(chunks.len() > 2, "expected the first section to split");
         for chunk in &chunks {
@@ -1142,7 +1170,7 @@ mod tests {
         // them one per chunk rather than cutting a paragraph in half.
         let para = |n: usize| format!("Paragraph {n} {}", "word ".repeat(30));
         let md = format!("## Body\n{}\n\n{}\n\n{}\n", para(1), para(2), para(3));
-        let chunks = structure_chunk(&md, 64, 15, 0);
+        let chunks = structure_chunk(&md, 64, 15, opts(0));
 
         assert_eq!(chunks.len(), 3);
         for (i, chunk) in chunks.iter().enumerate() {
@@ -1159,7 +1187,7 @@ mod tests {
         // A single paragraph — no blank lines to split on — well over budget.
         let giant = "This is one very long unbroken paragraph. ".repeat(80);
         let md = format!("## Wall\n{giant}");
-        let chunks = structure_chunk(&md, 64, 15, 0);
+        let chunks = structure_chunk(&md, 64, 15, opts(0));
 
         assert!(
             chunks.len() > 3,
@@ -1186,7 +1214,7 @@ mod tests {
     #[test]
     fn test_structure_chunk_subsections_are_siblings_with_ancestor_path() {
         let md = "## Abilities\nOverview text.\n\n### Combat\nSword work.\n\n### Magic\nSpell work.\n\n## Gear\nA sword.\n";
-        let chunks = structure_chunk(md, 512, 15, 0);
+        let chunks = structure_chunk(md, 512, 15, opts(0));
 
         assert_eq!(chunks.len(), 4);
         // A parent does not swallow its subsections...
@@ -1207,7 +1235,7 @@ mod tests {
     #[test]
     fn test_structure_chunk_skips_bodyless_heading() {
         let md = "## Parent\n### Child\nOnly real content.\n";
-        let chunks = structure_chunk(md, 512, 15, 0);
+        let chunks = structure_chunk(md, 512, 15, opts(0));
 
         // `## Parent` has no body of its own, so it produces no title-only chunk.
         assert_eq!(chunks.len(), 1);
@@ -1221,7 +1249,7 @@ mod tests {
     #[test]
     fn test_structure_chunk_preamble_before_first_heading() {
         let md = "Intro prose with no heading.\n\n## Section\nBody.\n";
-        let chunks = structure_chunk(md, 512, 15, 0);
+        let chunks = structure_chunk(md, 512, 15, opts(0));
 
         assert_eq!(chunks.len(), 2);
         assert!(chunks[0].heading.is_none());
@@ -1242,7 +1270,7 @@ mod tests {
             "## Stat Block\n{}\n\n## Threads\n_None yet._\n",
             host_body()
         );
-        let chunks = structure_chunk(&md, 512, 15, 120);
+        let chunks = structure_chunk(&md, 512, 15, opts(120));
 
         assert_eq!(chunks.len(), 1);
         // The host's own label and breadcrumb: no breadcrumb is invented.
@@ -1265,7 +1293,7 @@ mod tests {
             "## Stat Block\n{}\n\n## Threads\n_None yet._\n",
             host_body()
         );
-        let chunks = structure_chunk(&md, 512, 15, 120);
+        let chunks = structure_chunk(&md, 512, 15, opts(120));
 
         assert_eq!(chunks[0].snippet, make_snippet(&chunks[0].text));
     }
@@ -1275,7 +1303,7 @@ mod tests {
         // A file that is one short section is one chunk. Dropping it would make
         // the file unfindable, which is not the case a minimum is for.
         let md = "## Threads\n_None yet._\n";
-        let chunks = structure_chunk(md, 512, 15, 120);
+        let chunks = structure_chunk(md, 512, 15, opts(120));
 
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].text, "## Threads\n_None yet._");
@@ -1286,7 +1314,7 @@ mod tests {
     fn test_structure_chunk_body_at_the_minimum_is_not_a_stub() {
         let exact = "x".repeat(120);
         let md = format!("## Host\n{}\n\n## Exact\n{exact}\n", host_body());
-        let chunks = structure_chunk(&md, 512, 15, 120);
+        let chunks = structure_chunk(&md, 512, 15, opts(120));
 
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[1].heading.as_deref(), Some("## Exact"));
@@ -1300,7 +1328,7 @@ mod tests {
             .map(|i| format!("\n\n## Stub {i}\nNone yet.\n"))
             .collect();
         let md = format!("## Host\n{}{stubs}", host_body());
-        let chunks = structure_chunk(&md, 64, 15, 120);
+        let chunks = structure_chunk(&md, 64, 15, opts(120));
 
         assert!(
             chunks.len() > 1 && chunks.len() < 13,
@@ -1319,7 +1347,7 @@ mod tests {
     #[test]
     fn test_structure_chunk_minimum_of_zero_keeps_every_section() {
         let md = "## Alpha\nA body.\n\n## Threads\n_None yet._\n";
-        let chunks = structure_chunk(md, 512, 15, 0);
+        let chunks = structure_chunk(md, 512, 15, opts(0));
 
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[1].text, "## Threads\n_None yet._");
@@ -1331,7 +1359,7 @@ mod tests {
             "---\ntags: [beast]\n---\n\n## Stat Block\n{}\n\n## Threads\n_None yet._\n",
             host_body()
         );
-        let parsed = chunk_markdown(&md, 120);
+        let parsed = chunk_markdown(&md, opts(120));
 
         assert_eq!(parsed.tags, vec!["beast".to_string()]);
         assert_eq!(parsed.chunks.len(), 1);
@@ -1341,7 +1369,7 @@ mod tests {
     #[test]
     fn test_structure_chunk_ignores_headings_in_code_fences() {
         let md = "## Real\nSee below:\n\n```md\n## Not A Heading\n```\n\n## Also Real\nBody.\n";
-        let chunks = structure_chunk(md, 512, 15, 0);
+        let chunks = structure_chunk(md, 512, 15, opts(0));
 
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].heading.as_deref(), Some("## Real"));
@@ -1353,7 +1381,7 @@ mod tests {
     fn test_structure_chunk_handles_multibyte_headings() {
         // Byte offsets, not char counts: a mis-slice here would panic.
         let md = "## Ríoghán's Résumé\nBody — with an em dash.\n\n## 日本語\n本文です。\n";
-        let chunks = structure_chunk(md, 512, 15, 0);
+        let chunks = structure_chunk(md, 512, 15, opts(0));
 
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].heading.as_deref(), Some("## Ríoghán's Résumé"));
@@ -1384,7 +1412,7 @@ mod tests {
     #[test]
     fn test_chunk_by_headings() {
         let md = "## A\nContent A\n\n## B\nContent B\n";
-        let parsed = chunk_markdown(md, 0);
+        let parsed = chunk_markdown(md, opts(0));
         // One chunk per section, regardless of how far under the size target
         // they are. Merging them would put two topics in one vector.
         assert_eq!(parsed.chunks.len(), 2);
@@ -1397,7 +1425,7 @@ mod tests {
     #[test]
     fn test_no_headings_single_chunk() {
         let md = "Just some plain text\nwith multiple lines.";
-        let parsed = chunk_markdown(md, 0);
+        let parsed = chunk_markdown(md, opts(0));
         assert_eq!(parsed.chunks.len(), 1);
         assert!(parsed.chunks[0].heading.is_none());
         assert!(parsed.chunks[0].text.contains("Just some plain text"));
@@ -1406,7 +1434,7 @@ mod tests {
     #[test]
     fn test_frontmatter_excluded() {
         let md = "---\ntags: [a]\n---\n# Title\nBody";
-        let parsed = chunk_markdown(md, 0);
+        let parsed = chunk_markdown(md, opts(0));
         assert_eq!(parsed.chunks.len(), 1);
         assert!(!parsed.chunks[0].text.contains("tags"));
         assert!(!parsed.chunks[0].text.contains("---\ntags"));
@@ -1417,7 +1445,7 @@ mod tests {
     fn test_snippet_truncation() {
         let long_text = "a".repeat(300);
         let md = format!("## Heading\n{long_text}");
-        let parsed = chunk_markdown(&md, 0);
+        let parsed = chunk_markdown(&md, opts(0));
         assert!(!parsed.chunks.is_empty());
         // At least one chunk should have a truncated snippet
         let has_truncated = parsed.chunks.iter().any(|c| c.snippet.ends_with("..."));
@@ -1435,14 +1463,14 @@ mod tests {
 
     #[test]
     fn test_empty_file() {
-        let parsed = chunk_markdown("", 0);
+        let parsed = chunk_markdown("", opts(0));
         assert!(parsed.chunks.is_empty());
     }
 
     #[test]
     fn test_parse_frontmatter_tags() {
         let md = "---\ntags: [rust, cli, search]\n---\n# Hello\nWorld";
-        let parsed = chunk_markdown(md, 0);
+        let parsed = chunk_markdown(md, opts(0));
         assert_eq!(parsed.tags, vec!["rust", "cli", "search"]);
     }
 

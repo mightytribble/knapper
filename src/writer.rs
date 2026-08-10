@@ -6,7 +6,7 @@ use ignore::WalkBuilder;
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
-use crate::chunker::{chunk_markdown, split_oversized_chunks};
+use crate::chunker::{ChunkOptions, chunk_markdown, split_oversized_chunks};
 use crate::docid::generate_docid;
 use crate::indexer::build_edges_for_file;
 use crate::links;
@@ -472,17 +472,18 @@ impl ChunkData {
 /// while having been embedded a different way. That is why both settings travel
 /// as one [`EmbedComposition`] and share one composition function.
 ///
-/// `chunk_min_chars` is `[chunk_min_chars]` and it has to match for the same
-/// reason, one step earlier: at a different minimum this path writes different
-/// *rows* for the file than a re-index of it would (issue #43).
+/// `chunk_opts` is `[chunk_min_chars]` and `[promote_bold_headings]` and it has
+/// to match for the same reason, one step earlier: at a different pair this
+/// path writes different *rows* for the file than a re-index of it would
+/// (issue #43).
 fn precompute_chunks(
     rel_path: &str,
     content: &str,
     embedder: &mut impl EmbedModel,
     embed: EmbedComposition,
-    chunk_min_chars: usize,
+    chunk_opts: ChunkOptions,
 ) -> Result<Vec<ChunkData>> {
-    let parsed = chunk_markdown(content, chunk_min_chars);
+    let parsed = chunk_markdown(content, chunk_opts);
     let chunks = split_oversized_chunks(parsed.chunks, &|s| s.split_whitespace().count(), 512, 50);
 
     let doc = DocContext::from_file(rel_path, content);
@@ -556,7 +557,7 @@ pub fn create_note(
     store: &Store,
     embedder: &mut impl EmbedModel,
     embed: EmbedComposition,
-    chunk_min_chars: usize,
+    chunk_opts: ChunkOptions,
     vault_path: &Path,
     profile: Option<&VaultProfile>,
 ) -> Result<WriteResult> {
@@ -674,7 +675,7 @@ pub fn create_note(
     }
 
     // Step 6: Pre-compute chunks + embeddings BEFORE transaction
-    let chunk_data = precompute_chunks(&rel_path, &full_content, embedder, embed, chunk_min_chars)?;
+    let chunk_data = precompute_chunks(&rel_path, &full_content, embedder, embed, chunk_opts)?;
 
     let content_hash = compute_content_hash(&full_content);
     let docid = generate_docid(&rel_path);
@@ -783,7 +784,7 @@ pub fn append_to_note(
     store: &Store,
     embedder: &mut impl EmbedModel,
     embed: EmbedComposition,
-    chunk_min_chars: usize,
+    chunk_opts: ChunkOptions,
     vault_path: &Path,
 ) -> Result<WriteResult> {
     // Step 1: Resolve file
@@ -809,13 +810,8 @@ pub fn append_to_note(
     let new_content = format!("{}\n{}", existing_content.trim_end(), input.content);
 
     // Step 4: Pre-compute new chunks + embeddings
-    let chunk_data = precompute_chunks(
-        &file_record.path,
-        &new_content,
-        embedder,
-        embed,
-        chunk_min_chars,
-    )?;
+    let chunk_data =
+        precompute_chunks(&file_record.path, &new_content, embedder, embed, chunk_opts)?;
 
     let content_hash = compute_content_hash(&new_content);
     let docid = file_record
@@ -1534,7 +1530,7 @@ pub fn unarchive_note(
     store: &Store,
     embedder: &mut impl EmbedModel,
     embed: EmbedComposition,
-    chunk_min_chars: usize,
+    chunk_opts: ChunkOptions,
     vault_path: &Path,
 ) -> Result<WriteResult> {
     // Resolve — the file may not be in the index (archived notes are excluded).
@@ -1607,7 +1603,7 @@ pub fn unarchive_note(
         &restored_content,
         embedder,
         embed,
-        chunk_min_chars,
+        chunk_opts,
     )?;
     let content_hash = compute_content_hash(&restored_content);
     let docid = generate_docid(&original_path);
@@ -2476,7 +2472,10 @@ mod tests {
             &content,
             &mut embedder,
             EmbedComposition::default(),
-            0,
+            ChunkOptions {
+                min_chars: 0,
+                promote_bold: false,
+            },
         )
         .unwrap();
 
@@ -2529,7 +2528,10 @@ mod tests {
             &store,
             &mut embedder,
             EmbedComposition::default(),
-            0,
+            ChunkOptions {
+                min_chars: 0,
+                promote_bold: false,
+            },
             &root,
         )
         .unwrap();
@@ -2583,7 +2585,10 @@ mod tests {
             &store,
             &mut embedder,
             EmbedComposition::default(),
-            0,
+            ChunkOptions {
+                min_chars: 0,
+                promote_bold: false,
+            },
             &root,
         );
         assert!(
@@ -2644,7 +2649,10 @@ mod tests {
             &store,
             &mut embedder,
             EmbedComposition::default(),
-            0,
+            ChunkOptions {
+                min_chars: 0,
+                promote_bold: false,
+            },
             &root,
         );
         assert!(
@@ -2703,7 +2711,10 @@ mod tests {
             &store,
             &mut embedder,
             EmbedComposition::default(),
-            0,
+            ChunkOptions {
+                min_chars: 0,
+                promote_bold: false,
+            },
             &root,
         );
         assert!(
