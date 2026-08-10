@@ -741,6 +741,19 @@ See issues on this repo:
   reconstructions in #45 step 4 and false for that pair. Two candidate fixes are on the issue: print
   the whole-window noise count beside the inversion count, or report the anchor rank and refuse the
   comparison when it moves
+- **#52** a noise stamp cannot survive a re-chunk, because it carries no anchor — `(file, seq)` is a
+  position and a merge moves positions. Tier 1 falls back to its anchor sentence since #43; noise has
+  none, so five stamps dropped on #43's arm and P2 read `inversions 3` where the truth was 4, the
+  missing row being its own noise row an ordinal lower. Nothing is miscounted silently — the builder
+  reports each drop and the scorer reports the row unclassified — but every re-chunk costs a hand pass
+  over the lists. **Take it before #44**, which re-chunks again. About sixty pairs, and the anchors can
+  be generated from the pinned store and read over, so no ruling is re-opened
+- **#51** a short **piece** of a split section escapes the chunk minimum — `emit_section` flushes
+  whatever it has packed when the next paragraph alone busts the budget, so a section over the minimum
+  can still emit a short row. `summaries/session-013.md > ## NPC Activity` is 68 characters at seq 5,
+  and it is the only row under 120 characters in the shipped corpus that is not its file's first
+  chunk. One row of 1461, so it is a paper cut, and #43's own mechanism is the fix: merge the flushed
+  piece into the preceding chunk on the same terms
 - ~~**#48** the per-document shortlist cap hides a responsive chunk from the cross-encoder~~ —
   **closed, not reproducible.** Both of its arms ran in a home at `top_n = 100`, so neither was the
   shipped configuration. The chunk it reported as hidden is rank 2 at 93.50% in the shipped arm, and
@@ -761,12 +774,12 @@ See issues on this repo:
   `.engraph-i43-min0` is the control, and `eval/ground-truth.json` is re-stamped against the shipped
   arm — P1 7/7 inv 0, P2 5/5 inv 4, P3 4/5 inv 7, **P4 5/8** inv 1, P6 1/1 inv 0, P7 1/1 inv 0, where
   P4's denominator is 8 because two of its members are now one chunk and nothing it returns changed.
-  `eval/probes.md` holds the tables. Two limits found: a short **piece** of a split section is not a
-  section, so the rule does not see it (one row in the corpus, `summaries/session-013.md` seq 5), and
+  `eval/probes.md` holds the tables. Two limits found and filed: a short **piece** of a split section
+  is not a section, so the rule does not see it (**#51**, one row in the corpus), and
   `eval/build-ground-truth.py` had to learn a re-chunk — a tier-1 member now falls back to its anchor,
-  and a noise stamp, which carries none, is dropped and reported. Four of the five that dropped are
-  the same row an ordinal lower and are re-stamped; `hell-moth.md > ## Resources` merged into
-  `## Stat Block` and wants a ruling if it ever surfaces. Noise by anchor is instrument work beside #50
+  and a noise stamp, which carries none, is dropped and reported (**#52**). Four of the five that
+  dropped are the same row an ordinal lower and are re-stamped; `hell-moth.md > ## Resources` merged
+  into `## Stat Block` and wants a ruling if it ever surfaces
 - **#44** a bold-only line is a heading the chunker cannot see — `**Skills**` is structure to a reader
   and a paragraph to `emit_section`, so **33% of the bestiary's structure markers never reach a
   breadcrumb**. The vault cannot separate two candidate guards: all 219 bold-only lines are inside a
