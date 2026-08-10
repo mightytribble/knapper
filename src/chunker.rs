@@ -49,6 +49,19 @@ impl Chunk {
             snippet,
         }
     }
+
+    /// Put a carried heading line at the head of this chunk's text (issue #44).
+    ///
+    /// The chunk's own `heading` and `heading_path` do not change: the carried
+    /// line labels no chunk, it is only kept in the corpus. `text` is what the
+    /// keyword index reads, so the line stays searchable there.
+    fn prepend_carried(&mut self, carried: Option<&str>) {
+        let Some(line) = carried else {
+            return;
+        };
+        self.text = format!("{line}\n{}", self.text);
+        self.snippet = make_snippet(&self.text);
+    }
 }
 
 /// Result of parsing a markdown file.
@@ -568,8 +581,11 @@ pub fn structure_chunk(
         .unwrap_or(content.len());
     emit_section(
         &content[..first_heading],
-        None,
-        &[],
+        SectionHeading {
+            line: None,
+            path: &[],
+            carried: None,
+        },
         target_tokens,
         overlap_pct,
         opts.min_chars,
@@ -578,6 +594,9 @@ pub fn structure_chunk(
 
     // Ancestor stack of (level, heading text) for the heading path.
     let mut ancestors: Vec<(u8, String)> = Vec::new();
+    // A heading line skipped for an empty body, waiting for the promoted
+    // section that follows it. See the skip below.
+    let mut carried: Option<String> = None;
 
     for (i, heading) in headings.iter().enumerate() {
         while ancestors
@@ -604,22 +623,51 @@ pub fn structure_chunk(
         // A heading with no body of its own (immediately followed by a
         // subheading) would produce a chunk that is nothing but its own title.
         // Skip it — the text survives in its descendants' heading_path.
+        //
+        // A promoted line is an ancestor of nothing, so it carries no such
+        // path, and a promoted section under `min_chars` merges into a chunk
+        // that keeps the host's breadcrumb. The skipped heading would then
+        // reach the corpus nowhere. Carry the line into the next section
+        // instead, and only when that section is a promoted one: a heading
+        // with `#` descendants keeps the behaviour above (issue #44).
         if body.trim().is_empty() {
+            if headings
+                .get(i + 1)
+                .is_some_and(|next| next.level == PROMOTED_LEVEL)
+            {
+                carried = Some(heading_line.to_string());
+            }
             continue;
         }
 
         emit_section(
             body,
-            Some(heading_line),
-            &path,
+            SectionHeading {
+                line: Some(heading_line),
+                path: &path,
+                carried: carried.as_deref(),
+            },
             target_tokens,
             overlap_pct,
             opts.min_chars,
             &mut chunks,
         );
+        carried = None;
     }
 
     chunks
+}
+
+/// What labels a section when it becomes a chunk.
+struct SectionHeading<'a> {
+    /// The section's own heading line, re-emitted at the head of every piece.
+    line: Option<&'a str>,
+    /// The ancestor breadcrumb, this section's own heading last.
+    path: &'a [String],
+    /// A heading line skipped for an empty body, carried here so that it stays
+    /// in the corpus. It is emitted once, above `line`, at the head of the
+    /// first piece only (issue #44).
+    carried: Option<&'a str>,
 }
 
 /// Emit one or more chunks for a single section body, splitting on paragraph
@@ -632,13 +680,17 @@ pub fn structure_chunk(
 /// `## Threads`, `## Player Disposition` — is full of them.
 fn emit_section(
     body: &str,
-    heading_line: Option<&str>,
-    heading_path: &[String],
+    heading: SectionHeading<'_>,
     target_tokens: usize,
     overlap_pct: usize,
     min_chars: usize,
     out: &mut Vec<Chunk>,
 ) {
+    let SectionHeading {
+        line: heading_line,
+        path: heading_path,
+        carried,
+    } = heading;
     let body = body.trim();
     if body.is_empty() {
         return;
@@ -651,10 +703,13 @@ fn emit_section(
     {
         // The section's heading line travels with its body, so its terms stay
         // in `chunks.text` and therefore in the keyword index, which derives
-        // from `chunks` (#37). Dropping them would be #11's bug class.
-        let addition = match heading_line {
-            Some(h) => format!("{h}\n{body}"),
-            None => body.to_string(),
+        // from `chunks` (#37). Dropping them would be #11's bug class. A
+        // carried line travels the same way, and for the same reason.
+        let addition = match (carried, heading_line) {
+            (Some(c), Some(h)) => format!("{c}\n{h}\n{body}"),
+            (Some(c), None) => format!("{c}\n{body}"),
+            (None, Some(h)) => format!("{h}\n{body}"),
+            (None, None) => body.to_string(),
         };
         // These sections run in streaks, so the host is not grown past the
         // target: at the budget the stub becomes a chunk and hosts the rest.
@@ -669,11 +724,16 @@ fn emit_section(
     }
 
     // The heading is re-emitted on every piece, so it spends budget every time.
-    let heading_tokens = heading_line.map(approx_tokens).unwrap_or(0);
+    // A carried line is emitted once and counted here too, so that no piece can
+    // bust the budget.
+    let heading_tokens =
+        heading_line.map(approx_tokens).unwrap_or(0) + carried.map(approx_tokens).unwrap_or(0);
     let budget = target_tokens.saturating_sub(heading_tokens).max(1);
 
     if approx_tokens(body) <= budget {
-        out.push(Chunk::from_section(heading_line, heading_path, body, false));
+        let mut chunk = Chunk::from_section(heading_line, heading_path, body, false);
+        chunk.prepend_carried(carried);
+        out.push(chunk);
         return;
     }
 
@@ -714,12 +774,11 @@ fn emit_section(
     }
 
     for (i, piece) in pieces.into_iter().enumerate() {
-        out.push(Chunk::from_section(
-            heading_line,
-            heading_path,
-            &piece,
-            i > 0,
-        ));
+        let mut chunk = Chunk::from_section(heading_line, heading_path, &piece, i > 0);
+        if i == 0 {
+            chunk.prepend_carried(carried);
+        }
+        out.push(chunk);
     }
 }
 
@@ -1659,6 +1718,60 @@ mod tests {
         // The under-minimum `**Spells**` section merged into the chunk before it.
         assert_eq!(chunks[0].heading_path, vec!["Stat Block"]);
         assert!(chunks[0].text.contains("**Spells**\nN/A"));
+    }
+
+    #[test]
+    fn a_heading_promotion_empties_survives_in_the_merged_chunk() {
+        // `## Spells` has no body of its own once `**Spells**` opens a section,
+        // and that section is under the minimum, so it merges into the chunk
+        // before it and the host's breadcrumb wins. Without the carry the
+        // heading would be in no chunk's text and in no chunk's heading_path.
+        let md = format!(
+            "## Abilities\n{}\n\n## Spells\n**Spells**\nN/A\n",
+            body(350)
+        );
+        let chunks = structure_chunk(&md, 512, 15, promoting(120));
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].heading_path, vec!["Abilities"]);
+        assert!(chunks[0].text.contains("## Spells\n**Spells**\nN/A"));
+
+        // The control merges the whole `## Spells` section into the chunk
+        // before it, heading line included, so the corpus holds the heading at
+        // both settings.
+        let control = structure_chunk(&md, 512, 15, opts(120));
+        assert_eq!(control.len(), 1);
+        assert!(control[0].text.contains("## Spells\n**Spells**\nN/A"));
+    }
+
+    #[test]
+    fn a_heading_promotion_empties_survives_in_a_standalone_chunk() {
+        // The same shape, with a promoted body big enough to be its own chunk.
+        let md = format!(
+            "## Abilities\n{}\n\n## Spells\n**Spells**\n{}\n",
+            body(350),
+            body(350)
+        );
+        let chunks = structure_chunk(&md, 512, 15, promoting(120));
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks[1].text.starts_with("## Spells\n**Spells**"));
+        // The carried line labels nothing: the chunk is still the promoted one.
+        assert_eq!(chunks[1].heading.as_deref(), Some("**Spells**"));
+        assert_eq!(chunks[1].heading_path, vec!["Spells", "Spells"]);
+        assert!(chunks[1].snippet.starts_with("## Spells"));
+    }
+
+    #[test]
+    fn a_bodyless_heading_with_hash_descendants_is_still_skipped() {
+        // Its text survives in the descendants' heading_path, so it must keep
+        // behaving as it did before the carry — at both settings.
+        let md = format!("## Spells\n### Level 1\n{}\n", body(350));
+        for options in [promoting(120), opts(120)] {
+            let chunks = structure_chunk(&md, 512, 15, options);
+            assert_eq!(chunks.len(), 1);
+            assert_eq!(chunks[0].heading_path, vec!["Spells", "Level 1"]);
+            assert!(chunks[0].text.starts_with("### Level 1"));
+            assert!(!chunks[0].text.contains("## Spells"));
+        }
     }
 
     #[test]

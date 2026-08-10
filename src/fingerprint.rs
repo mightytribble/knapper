@@ -45,7 +45,13 @@ pub const PARSER_VERSION: u32 = 1;
 ///
 /// The chunker's *numbers* are hashed directly from [`crate::chunker::limits`]
 /// and need no bump.
-pub const CHUNKER_VERSION: u32 = 1;
+///
+/// Version 2 is issue #44: a heading line skipped for an empty body is carried
+/// into the promoted section that follows it. A promoted line is an ancestor of
+/// nothing, so the skipped heading has no descendant breadcrumb to survive in,
+/// and a promoted section under `chunk_min_chars` merges into a chunk that keeps
+/// the host's breadcrumb. Without the carry the heading is in no row at all.
+pub const CHUNKER_VERSION: u32 = 2;
 
 /// Bump when what a chunk **row** holds changes, even though the chunk
 /// boundaries do not.
