@@ -56,6 +56,10 @@ pub struct ApiState {
     /// Embedding-prefix settings from `config.toml`. Notes written over HTTP
     /// must be embedded the way `engraph index` embedded the rest of the vault.
     pub embed: crate::prefix::EmbedComposition,
+    /// The chunk minimum, one step earlier than `embed` for the same reason: a
+    /// note written over HTTP has to be cut into the rows a re-index of it
+    /// would produce (issue #43).
+    pub chunk_min_chars: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -733,6 +737,7 @@ async fn handle_create(
         &store,
         &mut *embedder,
         state.embed,
+        state.chunk_min_chars,
         &state.vault_path,
         state.profile.as_ref().as_ref(),
     )
@@ -765,6 +770,7 @@ async fn handle_append(
         &store,
         &mut *embedder,
         state.embed,
+        state.chunk_min_chars,
         &state.vault_path,
     )
     .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
@@ -915,6 +921,7 @@ async fn handle_unarchive(
         &store,
         &mut *embedder,
         state.embed,
+        state.chunk_min_chars,
         &state.vault_path,
     )
     .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
@@ -1217,6 +1224,7 @@ mod tests {
             ranking: crate::config::RankingConfig::default(),
             fts: crate::config::FtsConfig::default(),
             embed: crate::prefix::EmbedComposition::default(),
+            chunk_min_chars: 0,
         }
     }
 

@@ -1744,9 +1744,14 @@ mod tests {
         std::fs::write(
             root.join("rules/abjuration-spells.md"),
             "# Abjuration\n\n\
-             ## Level 3 Counterspell\n\nA warding effect that stops a spell mid-cast.\n\n\
-             ## Level 5 Dispel Magic\n\nA warding effect that ends an ongoing spell.\n\n\
-             ## Level 9 Dimensional Anchor\n\nA warding effect that pins a creature.\n",
+             ## Level 3 Counterspell\n\nA warding effect that stops a spell mid-cast. \
+             It interrupts the casting itself and does nothing to a spell already in effect.\n\n\
+             ## Level 5 Dispel Magic\n\nA warding effect that ends an ongoing spell. \
+             It reaches an effect already in place and cannot interrupt one \
+             that is still being cast, which is the whole of the difference.\n\n\
+             ## Level 9 Dimensional Anchor\n\nA warding effect that pins a creature. \
+             It closes every route out of the space the creature \
+             currently stands in, and it does not care how that route was opened.\n",
         )
         .unwrap();
         std::fs::write(
@@ -2227,7 +2232,8 @@ mod tests {
         for level in 1..=6 {
             deep.push_str(&format!(
                 "## Level {level} Ward\n\nA warding effect at level {level}. \
-                 See [[quiet-neighbour|the neighbour]].\n\n"
+                 See [[quiet-neighbour|the neighbour]]. The ward holds for as long as \
+                 its caster keeps channelling, and it fails the moment they stop.\n\n"
             ));
         }
         std::fs::write(root.join("rules/wards.md"), deep).unwrap();

@@ -192,6 +192,10 @@ impl Fingerprints {
                 // #46: the breadcrumb root is written into `chunks.heading_path`,
                 // a stored column, so changing it rewrites every chunk row.
                 &format!("{:?}", config.breadcrumb_root),
+                // #43: the minimum decides which sections become rows at all,
+                // so it sits with the limits it belongs among rather than with
+                // the embedding inputs.
+                &config.chunk_min_chars.to_string(),
                 &limits::TARGET_TOKENS.to_string(),
                 &limits::OVERLAP_PCT.to_string(),
                 &limits::MAX_TOKENS.to_string(),
@@ -585,6 +589,24 @@ mod tests {
 
         let mut config = Config::default();
         config.breadcrumb_root = crate::config::BreadcrumbRoot::Name;
+        let changed = Fingerprints::compute(&config, "embed-model-abc", Some("rerank-model-xyz"));
+
+        let comparison = compare(&store, &changed).unwrap();
+        assert_eq!(comparison.mismatches[0].key, CHUNKER.name);
+        assert_eq!(comparison.actions(), BTreeSet::from([Action::Reindex]));
+    }
+
+    /// The minimum decides which sections become rows of their own, so it
+    /// changes `chunks.text`, every vector derived from it and the keyword
+    /// index over it (issue #43).
+    #[test]
+    fn a_changed_chunk_minimum_demands_a_reindex() {
+        let store = Store::open_memory().unwrap();
+        record(&store, &fps()).unwrap();
+
+        // 0 is the control arm, and it is a different index from the default.
+        let mut config = Config::default();
+        config.chunk_min_chars = 0;
         let changed = Fingerprints::compute(&config, "embed-model-abc", Some("rerank-model-xyz"));
 
         let comparison = compare(&store, &changed).unwrap();

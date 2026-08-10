@@ -435,7 +435,7 @@ pub fn index_file(
     let overlap_tokens = crate::chunker::OVERLAP_TOKENS;
 
     // 1. Parse frontmatter for tags and created_by
-    let parsed = chunk_markdown(content);
+    let parsed = chunk_markdown(content, config.chunk_min_chars);
     let tags = parsed.tags;
     let chunks = {
         let tc = |s: &str| embedder.token_count(s);
@@ -1989,9 +1989,15 @@ mod tests {
             tmp.path(),
             "lore/bestiary/archdragon.md",
             "---\nname: Archdragon\naliases:\n  - Elder Wyrm\ntags:\n  - apex\n---\n\n\
-             ## Definition\n\nRank SS, levels 150-511.\n\n\
-             ## Abilities\n\nFlight and breath.\n\n\
-             ### Combat\n\nOpens at range.\n",
+             ## Definition\n\nRank SS, levels 150-511. The apex of the ladder, and the \
+             only rank whose stat cap needs an eleven-bit field to hold it, and the ladder \
+             has no rung above it.\n\n\
+             ## Abilities\n\nFlight and breath. Both are innate rather than learned, and \
+             neither costs the mana a spell of the same reach would, which is most of \
+             what makes the rank what it is.\n\n\
+             ### Combat\n\nOpens at range. Closes only against something that survived the \
+             opening, which in the whole of the recorded history of the continent is very \
+             little indeed.\n",
         );
 
         let store = Store::open_memory().unwrap();
@@ -2212,6 +2218,7 @@ mod tests {
             &store,
             &mut embedder,
             crate::prefix::EmbedComposition::from_config(&config),
+            config.chunk_min_chars,
             root,
             None,
         )
@@ -2497,7 +2504,12 @@ mod tests {
             &[
                 (
                     "hub.md",
-                    "# Hub\n## Role\nIt does the thing, with [[near]].\n\n## Session History\nLong ago, [[far]] happened.\n",
+                    "# Hub\n## Role\nIt does the thing, with [[near]]. That is the whole of \
+                     what it is for, and the role reaches no further than that in any direction \
+                     that anyone has yet found.\n\n\
+                     ## Session History\nLong ago, [[far]] happened. Nobody who was there \
+                     has told the story the same way twice since, so the record of it is thin and \
+                     the parts that agree are thinner.\n",
                 ),
                 ("near.md", "# Near\nnothing here"),
                 ("far.md", "# Far\nnothing here"),
@@ -2534,7 +2546,12 @@ mod tests {
             &[
                 (
                     "hub.md",
-                    "# Hub\n## Role\nSee [[near]] and [[far]].\n\n## History\nStill [[near]], plus [[far]].\n",
+                    "# Hub\n## Role\nSee [[near]] and [[far]]. Between them they cover every \
+                     part of what this hub is answerable for, and no other section of the file \
+                     covers any of it.\n\n\
+                     ## History\nStill [[near]], plus [[far]]. The pair have been named \
+                     together in this section for as long as the section has existed, and neither \
+                     has ever been named here alone.\n",
                 ),
                 ("near.md", "# Near\nBack to [[hub]]."),
                 ("far.md", "# Far\nnothing here"),
@@ -2578,7 +2595,12 @@ mod tests {
                 ("hub.md", "# Hub\nSee [[dragon#Human Forms]] for detail."),
                 (
                     "dragon.md",
-                    "# Dragon\n## Origin\nBorn of fire.\n\n## Human Forms\nIt walks as a man.\n",
+                    "# Dragon\n## Origin\nBorn of fire, in the age before the first cities, \
+                     older than any record that survives to name it, and older than the language \
+                     those records were written in.\n\n\
+                     ## Human Forms\nIt walks as a man, and holds the shape for decades at \
+                     a time, long enough to be born, to marry and to be buried under a human name \
+                     that nobody thinks to question.\n",
                 ),
             ],
         );
@@ -2609,7 +2631,12 @@ mod tests {
                 ("hub.md", "# Hub\nSee [[dragon#Alternate Form]]."),
                 (
                     "dragon.md",
-                    "# Dragon\n## Origin\nBorn of fire.\n\n## Human Forms\nIt walks as a man.\n",
+                    "# Dragon\n## Origin\nBorn of fire, in the age before the first cities, \
+                     older than any record that survives to name it, and older than the language \
+                     those records were written in.\n\n\
+                     ## Human Forms\nIt walks as a man, and holds the shape for decades at \
+                     a time, long enough to be born, to marry and to be buried under a human name \
+                     that nobody thinks to question.\n",
                 ),
             ],
         );
@@ -2661,7 +2688,12 @@ mod tests {
                 ("far.md", "# Far\nnothing here"),
                 (
                     "dragon.md",
-                    "# Dragon\n## Origin\nBorn of fire.\n\n## Human Forms\nIt walks as a man.\n",
+                    "# Dragon\n## Origin\nBorn of fire, in the age before the first cities, \
+                     older than any record that survives to name it, and older than the language \
+                     those records were written in.\n\n\
+                     ## Human Forms\nIt walks as a man, and holds the shape for decades at \
+                     a time, long enough to be born, to marry and to be buried under a human name \
+                     that nobody thinks to question.\n",
                 ),
             ],
         );

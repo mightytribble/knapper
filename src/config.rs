@@ -170,6 +170,24 @@ pub fn default_max_document_chars() -> usize {
     0
 }
 
+/// Default shortest section body that becomes a chunk of its own.
+///
+/// **120 characters**, which is design §5.4's `chunk_min_tokens_est = 30` at the
+/// chunker's own `chars / 4` estimate. It takes the eval corpus from 1598 chunks
+/// to 1461 and its 72 rows under 60 characters to none — `## Threads\n_None
+/// yet._` and the rest of the scaffolding a later workflow will fill. BM25
+/// normalises by row length, so each of those rows scores enormously on any
+/// query term it happens to carry.
+///
+/// Measured over the eighteen calibration queries the value costs nothing: every
+/// negative holds or falls, every responsive set holds its coverage, and P2's
+/// window shortens by two ranks (`eval/probes.md`, #43).
+///
+/// `0` is the control and reproduces the pre-#43 chunking exactly.
+pub fn default_chunk_min_chars() -> usize {
+    120
+}
+
 /// How the rerank lane presents a candidate to the cross-encoder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -622,6 +640,20 @@ pub struct Config {
     /// A chunker-digest component, so changing it re-indexes the vault.
     #[serde(default)]
     pub breadcrumb_root: BreadcrumbRoot,
+    /// The shortest section body that becomes a chunk of its own (issue #43).
+    /// A shorter one merges into the preceding chunk of the same file.
+    ///
+    /// The unit is characters, because the chunker's own size estimate is
+    /// `chars / 4` — design §5.4's `chunk_min_tokens_est = 30` is 120 here. It
+    /// is a key rather than a `chunker::limits` constant so that finding the
+    /// right value is a config edit and not a recompile; like
+    /// [`Config::breadcrumb_root`] it reaches the chunker digest, so changing
+    /// it re-indexes the vault.
+    ///
+    /// The default is [`default_chunk_min_chars`]; `0` is no minimum, which is
+    /// the pre-#43 chunking exactly.
+    #[serde(default = "default_chunk_min_chars")]
+    pub chunk_min_chars: usize,
     #[serde(default)]
     pub identity: IdentityConfig,
     #[serde(default)]
@@ -636,6 +668,7 @@ impl Default for Config {
             max_chunks_per_file: default_max_chunks_per_file(),
             group_by: GroupBy::default(),
             breadcrumb_root: BreadcrumbRoot::default(),
+            chunk_min_chars: default_chunk_min_chars(),
             embedding_prefix: PrefixConfig::default(),
             embedding_prompt: EmbeddingPromptConfig::default(),
             exclude: vec![".obsidian/".to_string()],
@@ -912,6 +945,17 @@ batch_size = 128
         let swept: Config = toml::from_str("[ranking]\nretrieval_width = 120\n").unwrap();
         assert_eq!(swept.ranking.retrieval_width, 120);
         assert_eq!(swept.ranking.candidates, 30, "the other keys keep defaults");
+    }
+
+    #[test]
+    fn the_chunk_minimum_ships_at_the_measured_value_and_zero_is_the_control() {
+        // 120 characters is design §5.4's 30 tokens at the chunker's own
+        // `chars / 4`. 0 is the control: it reproduces the pre-#43 index.
+        let bare: Config = toml::from_str("").unwrap();
+        assert_eq!(bare.chunk_min_chars, 120);
+
+        let control: Config = toml::from_str("chunk_min_chars = 0\n").unwrap();
+        assert_eq!(control.chunk_min_chars, 0);
     }
 
     #[test]
