@@ -1645,9 +1645,18 @@ mod tests {
 
     #[test]
     fn a_promoted_section_under_the_minimum_merges_into_the_preceding_chunk() {
-        let md = format!("## Stat Block\n{}\n\n**Spells**\nN/A\n", body(200));
+        let md = format!(
+            "## Stat Block\n{}\n\n**Spells**\nN/A\n\n**Notes**\n{}\n",
+            body(200),
+            body(200)
+        );
         let chunks = structure_chunk(&md, 512, 15, promoting(120));
-        assert_eq!(chunks.len(), 1);
+        // The well-bodied `**Notes**` section proves promotion ran at all; if
+        // it did not, the whole document would still be one `## Stat Block`
+        // chunk and this assertion would fail.
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[1].heading_path, vec!["Stat Block", "Notes"]);
+        // The under-minimum `**Spells**` section merged into the chunk before it.
         assert_eq!(chunks[0].heading_path, vec!["Stat Block"]);
         assert!(chunks[0].text.contains("**Spells**\nN/A"));
     }
@@ -1655,12 +1664,16 @@ mod tests {
     #[test]
     fn a_bold_line_in_a_code_fence_is_not_promoted() {
         let md = format!(
-            "## Stat Block\n{}\n\n```\n**Spells**\n```\n{}\n",
+            "## Stat Block\n{}\n\n```\n**Spells**\n```\n{}\n\n**Notes**\n{}\n",
+            body(200),
             body(200),
             body(200)
         );
         let chunks = structure_chunk(&md, 512, 15, promoting(120));
-        assert_eq!(chunks.len(), 1);
+        // The trailing `**Notes**` section proves promotion was active; the
+        // fenced `**Spells**` line still did not open a section of its own.
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[1].heading_path, vec!["Stat Block", "Notes"]);
         assert_eq!(chunks[0].heading_path, vec!["Stat Block"]);
     }
 
