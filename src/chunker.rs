@@ -1,3 +1,5 @@
+use crate::markdown::HeadingInfo;
+
 /// Represents a single semantic chunk extracted from a markdown file.
 pub struct Chunk {
     /// The heading line (any `#` level), if any.
@@ -405,6 +407,126 @@ pub struct ChunkOptions {
     pub promote_bold: bool,
 }
 
+/// The text of a bold-only line, or `None` when the line is not one.
+///
+/// A promoted heading is one bold span and nothing else: `**Text**`,
+/// `__Text__`, or either with a single colon directly after the closing marker
+/// (issue #44). A table row, a list item and the bestiary's
+/// `**Rank**: S • **Levels**: …` preamble all carry text outside the span, so
+/// the content test rejects them. So does a bold span wrapping an italic one,
+/// which is emphasis rather than a label.
+fn bold_heading_text(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    let body = trimmed.strip_suffix(':').unwrap_or(trimmed).trim_end();
+    let inner = body
+        .strip_prefix("**")
+        .and_then(|rest| rest.strip_suffix("**"))
+        .or_else(|| {
+            body.strip_prefix("__")
+                .and_then(|rest| rest.strip_suffix("__"))
+        })?;
+    let inner = inner.trim();
+    if inner.is_empty()
+        || inner.contains("**")
+        || inner.contains("__")
+        || inner.starts_with('*')
+        || inner.ends_with('*')
+        || inner.starts_with('_')
+        || inner.ends_with('_')
+    {
+        return None;
+    }
+    Some(inner)
+}
+
+/// The level a promoted line takes (issue #44).
+///
+/// It is deeper than every `#` level, so `structure_chunk`'s ancestor stack pops
+/// it for the next heading of any depth and for the next promoted line, and it
+/// is an ancestor of nothing. The value never leaves the chunker: it decides the
+/// breadcrumb and is not written to a row or rendered as markdown.
+const PROMOTED_LEVEL: u8 = u8::MAX;
+
+/// Drop a promoted line whose section body is empty.
+///
+/// `structure_chunk` skips a `#` heading with no body of its own, because its
+/// text survives in the `heading_path` of its descendants. A promoted line is
+/// flat and has no descendants — the next one pops it off the ancestor stack —
+/// so the same skip would delete the line from the corpus. It stays in the
+/// enclosing section's body instead (issue #44).
+fn drop_bodyless_promotions(content: &str, entries: Vec<(HeadingInfo, bool)>) -> Vec<HeadingInfo> {
+    let offsets = line_offsets(content);
+    let line_start = |line: usize| offsets.get(line).copied().unwrap_or(content.len());
+
+    let mut out = Vec::with_capacity(entries.len());
+    for (i, (info, promoted)) in entries.iter().enumerate() {
+        if *promoted {
+            let body_start = line_start(info.line + 1);
+            let body_end = entries
+                .get(i + 1)
+                .map(|(next, _)| line_start(next.line))
+                .unwrap_or(content.len());
+            if content[body_start..body_end.max(body_start)]
+                .trim()
+                .is_empty()
+            {
+                continue;
+            }
+        }
+        out.push(info.clone());
+    }
+    out
+}
+
+/// The structure lines of `content`: every `#` heading, and — when promotion is
+/// on — every bold-only line, in line order (issue #44).
+///
+/// A promoted line is **deeper than any `#` heading and an ancestor of
+/// nothing**, which is what flat means for a construct that carries no level of
+/// its own. `structure_chunk` pops an ancestor of equal or greater level, so
+/// [`PROMOTED_LEVEL`] gives all three properties the rule needs at once: the
+/// enclosing heading stays in the breadcrumb, the next promoted line ends this
+/// one, and any later `#` heading of any depth ends it too.
+fn structure_headings(content: &str, promote_bold: bool) -> Vec<HeadingInfo> {
+    let headings = crate::markdown::parse_headings(content);
+    if !promote_bold {
+        return headings;
+    }
+
+    // `true` marks a promoted entry, which is what the bodyless rule reads.
+    let mut merged: Vec<(HeadingInfo, bool)> = Vec::with_capacity(headings.len());
+    let mut next = 0usize;
+    let mut in_fence = false;
+
+    for (i, line) in content.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if next < headings.len() && headings[next].line == i {
+            merged.push((headings[next].clone(), false));
+            next += 1;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        if let Some(text) = bold_heading_text(line) {
+            merged.push((
+                HeadingInfo {
+                    line: i,
+                    level: PROMOTED_LEVEL,
+                    text: text.to_string(),
+                },
+                true,
+            ));
+        }
+    }
+
+    drop_bodyless_promotions(content, merged)
+}
+
 /// Structure-first chunking: a chunk boundary is placed at every ATX heading,
 /// and size only decides how an *oversized* section is subdivided.
 ///
@@ -434,7 +556,7 @@ pub fn structure_chunk(
     }
 
     let offsets = line_offsets(content);
-    let headings = crate::markdown::parse_headings(content);
+    let headings = structure_headings(content, opts.promote_bold);
     let line_start = |line: usize| offsets.get(line).copied().unwrap_or(content.len());
 
     let mut chunks = Vec::new();
@@ -1110,6 +1232,35 @@ mod tests {
     }
 
     #[test]
+    fn bold_only_lines_are_recognised() {
+        assert_eq!(bold_heading_text("**Spells**"), Some("Spells"));
+        assert_eq!(bold_heading_text("__Spells__"), Some("Spells"));
+        assert_eq!(bold_heading_text("**Spells**:"), Some("Spells"));
+        assert_eq!(bold_heading_text("  **Spells**  "), Some("Spells"));
+        assert_eq!(bold_heading_text("**Human Forms**"), Some("Human Forms"));
+    }
+
+    #[test]
+    fn a_line_with_anything_outside_the_bold_span_is_not_a_heading() {
+        // The bestiary preamble: one per file, and it is data, not structure.
+        assert_eq!(
+            bold_heading_text(
+                "**Rank**: S • **Levels**: 110-255 • **Threat**: peer of a Demon Lord"
+            ),
+            None
+        );
+        assert_eq!(bold_heading_text("- **Spells**"), None);
+        assert_eq!(bold_heading_text("| **Spells** |"), None);
+        assert_eq!(bold_heading_text("**Spells** and more"), None);
+        assert_eq!(bold_heading_text("Spells"), None);
+        assert_eq!(bold_heading_text(""), None);
+        assert_eq!(bold_heading_text("**"), None);
+        assert_eq!(bold_heading_text("****"), None);
+        // Bold wrapping an italic span is emphasis, not a label.
+        assert_eq!(bold_heading_text("***Spells***"), None);
+    }
+
+    #[test]
     fn test_structure_chunk_one_chunk_per_section() {
         let md = "## Alpha\nA body.\n\n## Beta\nB body.\n\n## Gamma\nG body.\n";
         let chunks = structure_chunk(md, 512, 15, opts(0));
@@ -1387,6 +1538,143 @@ mod tests {
         assert_eq!(chunks[0].heading.as_deref(), Some("## Ríoghán's Résumé"));
         assert_eq!(chunks[1].heading.as_deref(), Some("## 日本語"));
         assert!(chunks[1].text.contains("本文です。"));
+    }
+
+    /// A section body of `n` characters, so a test states its own size against
+    /// `min_chars` rather than depending on a fixture's length.
+    fn body(n: usize) -> String {
+        let mut s = String::new();
+        while s.len() < n {
+            s.push_str("The dragon hoards gold in the deep places of the world. ");
+        }
+        s.truncate(n);
+        s
+    }
+
+    fn promoting(min_chars: usize) -> ChunkOptions {
+        ChunkOptions {
+            min_chars,
+            promote_bold: true,
+        }
+    }
+
+    #[test]
+    fn a_bold_only_line_opens_a_section() {
+        let md = format!(
+            "## Stat Block\n{}\n\n**Spells**\n{}\n",
+            body(200),
+            body(200)
+        );
+        let chunks = structure_chunk(&md, 512, 15, promoting(120));
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].heading_path, vec!["Stat Block"]);
+        assert_eq!(chunks[1].heading_path, vec!["Stat Block", "Spells"]);
+    }
+
+    #[test]
+    fn a_promoted_line_keeps_its_own_text_in_the_chunk() {
+        let md = format!(
+            "## Stat Block\n{}\n\n**Spells**\n{}\n",
+            body(200),
+            body(200)
+        );
+        let chunks = structure_chunk(&md, 512, 15, promoting(120));
+        assert!(chunks[1].text.starts_with("**Spells**"));
+        assert_eq!(chunks[1].heading.as_deref(), Some("**Spells**"));
+    }
+
+    #[test]
+    fn promoted_lines_are_siblings_and_do_not_nest() {
+        let md = format!(
+            "## Stat Block\n{}\n\n**Spells**\n{}\n\n**Notes**\n{}\n",
+            body(200),
+            body(200),
+            body(200)
+        );
+        let chunks = structure_chunk(&md, 512, 15, promoting(120));
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[1].heading_path, vec!["Stat Block", "Spells"]);
+        assert_eq!(chunks[2].heading_path, vec!["Stat Block", "Notes"]);
+    }
+
+    #[test]
+    fn a_promoted_line_before_any_heading_is_a_top_level_section() {
+        let md = format!(
+            "{}\n\n**Summary**\n{}\n\n## Stat Block\n{}\n",
+            body(200),
+            body(200),
+            body(200)
+        );
+        let chunks = structure_chunk(&md, 512, 15, promoting(120));
+        assert_eq!(chunks.len(), 3);
+        assert!(chunks[0].heading_path.is_empty());
+        assert_eq!(chunks[1].heading_path, vec!["Summary"]);
+        assert_eq!(chunks[2].heading_path, vec!["Stat Block"]);
+    }
+
+    #[test]
+    fn a_later_heading_of_any_depth_ends_a_promoted_section() {
+        let md = format!(
+            "## Stat Block\n{}\n\n**Spells**\n{}\n\n### Notes\n{}\n",
+            body(200),
+            body(200),
+            body(200)
+        );
+        let chunks = structure_chunk(&md, 512, 15, promoting(120));
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[1].heading_path, vec!["Stat Block", "Spells"]);
+        // A promoted line is an ancestor of nothing, so the deeper heading
+        // hangs off the enclosing `##` and not off the bold line above it.
+        assert_eq!(chunks[2].heading_path, vec!["Stat Block", "Notes"]);
+    }
+
+    #[test]
+    fn a_promoted_line_with_no_body_stays_in_the_enclosing_section() {
+        let md = format!(
+            "## Stat Block\n{}\n\n**Spells**\n\n**Notes**\n{}\n",
+            body(200),
+            body(200)
+        );
+        let chunks = structure_chunk(&md, 512, 15, promoting(120));
+        assert_eq!(chunks.len(), 2);
+        // The line is not a section, and it is not lost either: a flat promoted
+        // line has no descendant to carry it in a heading_path.
+        assert!(chunks[0].text.contains("**Spells**"));
+        assert_eq!(chunks[1].heading_path, vec!["Stat Block", "Notes"]);
+    }
+
+    #[test]
+    fn a_promoted_section_under_the_minimum_merges_into_the_preceding_chunk() {
+        let md = format!("## Stat Block\n{}\n\n**Spells**\nN/A\n", body(200));
+        let chunks = structure_chunk(&md, 512, 15, promoting(120));
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].heading_path, vec!["Stat Block"]);
+        assert!(chunks[0].text.contains("**Spells**\nN/A"));
+    }
+
+    #[test]
+    fn a_bold_line_in_a_code_fence_is_not_promoted() {
+        let md = format!(
+            "## Stat Block\n{}\n\n```\n**Spells**\n```\n{}\n",
+            body(200),
+            body(200)
+        );
+        let chunks = structure_chunk(&md, 512, 15, promoting(120));
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].heading_path, vec!["Stat Block"]);
+    }
+
+    #[test]
+    fn promotion_off_reproduces_the_previous_chunking() {
+        let md = format!(
+            "## Stat Block\n{}\n\n**Spells**\n{}\n\n**Notes**\n{}\n",
+            body(200),
+            body(200),
+            body(200)
+        );
+        let off = structure_chunk(&md, 512, 15, opts(120));
+        assert_eq!(off.len(), 1);
+        assert_eq!(off[0].heading_path, vec!["Stat Block"]);
     }
 
     #[test]
