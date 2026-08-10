@@ -625,9 +625,9 @@ mod tests {
         let store = Store::open_memory().unwrap();
         record(&store, &fps()).unwrap();
 
-        // `false` is the control arm, so `true` is a different index.
+        // `true` ships, so the control arm `false` is a different index.
         let mut config = Config::default();
-        config.promote_bold_headings = true;
+        config.promote_bold_headings = false;
         let changed = Fingerprints::compute(&config, "embed-model-abc", Some("rerank-model-xyz"));
 
         let comparison = compare(&store, &changed).unwrap();

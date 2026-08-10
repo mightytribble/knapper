@@ -49,6 +49,7 @@ git fetch upstream && git diff --stat upstream/main main
 | `chunks_fts` external content | the keyword index is derived from the chunk table, and indexes the breadcrumb beside the body | this fork, issue #37 |
 | `ranking::retrieval_width` | how deep the content lanes dig is a setting; `top_n` truncates the output and nothing else | this fork, issue #49 |
 | `chunk_min_chars` | a section too short to stand on its own merges into the preceding chunk rather than becoming a row. Ships at 120 — see #43 | this fork, issue #43 |
+| `structure_headings` | a bold-only line opens a section, deeper than any `#` heading and an ancestor of nothing. Ships on — see #44 | this fork, issue #44 |
 | `.github/workflows/ci.yml` | manual dispatch only — upstream runs it on push and PR | this fork, Actions minutes |
 
 Cherry-picked rather than merged: PR #41 branched before upstream's #40 graph fix, so merging the
@@ -176,6 +177,13 @@ has never executed on this box.
   re-downloads 300MB (1.6GB with intelligence enabled).
 - **MCP servers launch once per session**, so a mid-session `git checkout` leaves the server pointed
   at the previous branch's store.
+- **Do not add a top-level config key with `>>`.** Every arm home's `config.toml` ends in a
+  `[section]` table, so a line appended to the end of the file lands **inside that table**. TOML
+  parses `promote_bold_headings = true` after `[memory]` as `memory.promote_bold_headings`, serde
+  ignores the unknown field, and the top-level key keeps its default. The store then re-indexes,
+  reports success, and is a second copy of the arm the key was supposed to change. #44 built one
+  wrong arm this way and it was caught only by a fingerprint check against the control. Insert the
+  key above the first line that starts with `[`, and read the file back.
 - **The eval store lives at `standalone/mcp-isekai/.engraph-eval/`**, indexed by a CUDA build at the
   documented prompt templates (#10) and at `document_title = "breadcrumb"` (#36). Its
   `embedding_fingerprint` is `d41cc349`, which is the same value as the #36 breadcrumb arm — and no
@@ -186,11 +194,18 @@ has never executed on this box.
   The four #38 arms are `.engraph-i38-*`, built from `.engraph-i37-shipped`. `-shipped` carries no
   `[embedding_prompt]` and no `[fts]` block at all, and it exists to check the defaults #38 changes.
   The #42 arms are `.engraph-i42-*`; `-shipped` was the baseline of its day, defaults only.
-  **`.engraph-i43-min120` is the current baseline** — the shipped defaults, the arm
+  The two #44 arms are `.engraph-i44-off` and `.engraph-i44-on`, both copied from
+  `.engraph-i43-min120` and fully re-indexed. `-off` is #44's control and reproduces
+  `.engraph-i43-min120` row for row, over one SHA-256 of every
+  `(path, seq, heading, heading_path, text)`.
+  **`.engraph-i44-on` is the current baseline** — the shipped defaults, the arm
   `eval/ground-truth.json` is stamped against, and what a new arm should be copied from.
-  `.engraph-i43-min0` is #43's control, and `.engraph-i46-path` is the same configuration under its
-  old name — both now name `chunk_min_chars = 0` in their own `config.toml`, because the default no
-  longer gives it and an open without the key would quietly convert them to the shipped arm.
+  `.engraph-i43-min120` is a record of the previous default, `.engraph-i43-min0` is #43's control,
+  and `.engraph-i46-path` is the same configuration as `-min0` under its old name — the last two
+  name `chunk_min_chars = 0` in their own `config.toml`, because the default no longer gives it.
+  **Every arm home built before #44 names `promote_bold_headings = false` in its own
+  `config.toml`** for the same reason: the key is a chunker-digest component, so an open without it
+  quietly converts the home to the shipped arm and re-indexes it.
   `.engraph-i43-headings` and `.engraph-i43b` are **not #43's**: they are #44's
   heading probe under its old number, and they point at a **scratch vault under `/tmp`** that did not
   survive the session — the promotion rule is written out in #44 and the arms are 15 s to rebuild.
@@ -203,13 +218,15 @@ has never executed on this box.
   configuration.** #46 made `breadcrumb_root` a chunker-digest component, because the value is written
   into `chunks.heading_path`, so nine homes fail `chunker_fingerprint`: `.engraph-i36x-control`,
   `-breadcrumb`, `.engraph-i37-shipped`, `-off`, `.engraph-i38-shipped`, `-none`, `-nolex`,
-  `.engraph-i42-shipped` and `-cap1000`. The route back is the arm's own settings plus **two** keys,
-  and an omission of either is silent:
+  `.engraph-i42-shipped` and `-cap1000`. The route back is the arm's own settings plus **three** keys,
+  and an omission of any of them is silent:
   - `breadcrumb_root = "name"`, which #46 measured as reproducing the pre-#46 binary on 360 of 360
     result slots.
   - `[rerank] max_document_chars = 1000` for every arm before #42, because #25 shipped that cap as
     the default. The key is a `reranker_fingerprint` component, whose action is
     `InvalidateThresholds`, so it rebuilds nothing and warns about nothing at index time.
+  - `promote_bold_headings = false` for every arm before #44, because #44 ships that rule on. The
+    key is a chunker-digest component, so an open without it re-chunks the whole home.
 
   The nine homes hold **four** configurations, because each experiment was copied to a new home
   rather than run again, and the fifth is `.engraph-i46-name`. Copy a home to keep the `llm_cache`

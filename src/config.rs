@@ -190,9 +190,10 @@ pub fn default_chunk_min_chars() -> usize {
 
 /// Whether a bold-only line opens a section (issue #44).
 ///
-/// `false` is the control and reproduces the pre-#44 chunking exactly.
+/// `true` ships. `false` is the control and reproduces the pre-#44 chunking
+/// exactly.
 pub fn default_promote_bold_headings() -> bool {
-    false
+    true
 }
 
 /// How the rerank lane presents a candidate to the cross-encoder.
@@ -983,14 +984,17 @@ batch_size = 128
     }
 
     #[test]
-    fn promote_bold_headings_defaults_off_and_travels_with_the_minimum() {
+    fn promotion_ships_on_and_false_is_the_control_and_it_travels_with_the_minimum() {
+        // `true` ships. `false` is the control: it reproduces the pre-#44
+        // index.
         let bare: Config = toml::from_str("").unwrap();
-        assert!(!bare.promote_bold_headings);
+        assert!(bare.promote_bold_headings);
         assert_eq!(bare.chunk_options().min_chars, 120);
-        assert!(!bare.chunk_options().promote_bold);
+        assert!(bare.chunk_options().promote_bold);
 
-        let on: Config = toml::from_str("promote_bold_headings = true\n").unwrap();
-        assert!(on.chunk_options().promote_bold);
+        let control: Config = toml::from_str("promote_bold_headings = false\n").unwrap();
+        assert!(!control.promote_bold_headings);
+        assert!(!control.chunk_options().promote_bold);
     }
 
     #[test]
