@@ -299,6 +299,12 @@ pub fn search_with_intelligence(
     // `all_*` keeps the lane's own scores and feeds fusion, `*_seeds` is
     // normalised and feeds graph expansion. See `normalise_lane_scores` for why
     // one pool cannot serve both (#26).
+    //
+    // How deep each content lane digs is `[ranking] retrieval_width` and not
+    // `top_n`. The two were one number until #49, so asking for five more
+    // results changed which candidates reached the model and rewrote the top of
+    // the ranking. `top_n` now truncates the output and nothing else.
+    let lane_width = config.ranking.retrieval_width;
     let mut all_semantic: Vec<RankedResult> = Vec::new();
     let mut all_fts: Vec<RankedResult> = Vec::new();
     let mut semantic_seeds: Vec<RankedResult> = Vec::new();
@@ -321,7 +327,7 @@ pub fn search_with_intelligence(
         let tombstones = std::collections::HashSet::new();
         let raw_results = config
             .store
-            .search_vec(&query_vec, top_n * 3, &tombstones)?;
+            .search_vec(&query_vec, lane_width, &tombstones)?;
 
         for (vector_id, distance) in raw_results {
             if let Some(chunk) = config.store.get_chunk_by_vector_id(vector_id)? {
@@ -352,7 +358,7 @@ pub fn search_with_intelligence(
         // seed probes and left this lane empty for every multi-word query (#22).
         let fts_raw = config
             .store
-            .fts_search_any(expanded_query, top_n * 3, &config.fts.weights())
+            .fts_search_any(expanded_query, lane_width, &config.fts.weights())
             .unwrap_or_default();
 
         for fr in fts_raw {
@@ -1782,6 +1788,93 @@ mod tests {
 
         // Every result names the section it came from.
         assert!(hits.iter().all(|r| r.heading.is_some()));
+    }
+
+    /// A vault of one-section files, all carrying the same term, so a lane has
+    /// more rows to fetch than any width under test and the per-file collapse
+    /// cap never binds.
+    fn vault_of_many_files(count: usize) -> (tempfile::TempDir, Store, llm::MockLlm) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        for i in 0..count {
+            std::fs::write(
+                root.join(format!("ward-{i:02}.md")),
+                format!("# Ward {i}\n\n## Level {i} Ward\n\nA warding effect, number {i}.\n"),
+            )
+            .unwrap();
+        }
+
+        let store = Store::open_memory().unwrap();
+        let mut embedder = llm::MockLlm::new(256);
+        let config = crate::config::Config::default();
+        crate::indexer::run_index_shared(root, &config, &store, &mut embedder, false, None)
+            .unwrap();
+        (tmp, store, embedder)
+    }
+
+    /// Run a search at one `top_n` and one lane width.
+    fn search_at(
+        query: &str,
+        top_n: usize,
+        retrieval_width: usize,
+        store: &Store,
+        embedder: &mut llm::MockLlm,
+    ) -> SearchOutput {
+        let mut config = SearchConfig {
+            fts: crate::config::FtsConfig::default(),
+            orchestrator: None,
+            reranker: None,
+            store,
+            rerank_candidates: 30,
+            rerank: crate::config::RerankConfig::default(),
+            max_chunks_per_file: crate::config::default_max_chunks_per_file(),
+            group_by: GroupBy::Chunk,
+            ranking: crate::config::RankingConfig {
+                retrieval_width,
+                ..crate::config::RankingConfig::default()
+            },
+        };
+        search_with_intelligence(query, top_n, embedder, &mut config).unwrap()
+    }
+
+    #[test]
+    fn lane_width_is_the_setting_and_not_top_n() {
+        // #49. Each content lane fetched `top_n * 3`, so the size of the
+        // candidate pool moved with the length of the answer.
+        let (_tmp, store, mut embedder) = vault_of_many_files(12);
+
+        let narrow = search_at("warding", 1, 4, &store, &mut embedder);
+        let wide = search_at("warding", 20, 4, &store, &mut embedder);
+
+        for output in [&narrow, &wide] {
+            let trace = &output.expansions[0];
+            assert_eq!(trace.fts_hits, 4, "the keyword lane fetches the width");
+            assert_eq!(
+                trace.semantic_hits, 4,
+                "the semantic lane fetches the width"
+            );
+        }
+    }
+
+    #[test]
+    fn a_longer_request_extends_the_ranking_rather_than_replacing_it() {
+        // The output contract #49 is about: more results means more results,
+        // and not other results.
+        // More files than the pre-#49 widths for either `top_n` below, so the
+        // two runs are not both saturated by a small corpus.
+        let (_tmp, store, mut embedder) = vault_of_many_files(40);
+        let width = crate::config::default_retrieval_width();
+
+        let short = search_at("warding", 3, width, &store, &mut embedder);
+        let long = search_at("warding", 10, width, &store, &mut embedder);
+
+        assert_eq!(short.results.len(), 3);
+        assert!(long.results.len() > short.results.len());
+
+        let identity = |r: &InternalSearchResult| (r.file_path.clone(), r.chunk_seq);
+        let short_ids: Vec<_> = short.results.iter().map(identity).collect();
+        let long_prefix: Vec<_> = long.results.iter().take(3).map(identity).collect();
+        assert_eq!(short_ids, long_prefix, "the shorter answer is a prefix");
     }
 
     /// Records how the rerank lane is driven. Whether an implementation can

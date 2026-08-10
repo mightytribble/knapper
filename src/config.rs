@@ -421,6 +421,24 @@ pub enum Tiebreak {
 #[serde(default)]
 pub struct RankingConfig {
     pub mode: RankingMode,
+    /// How many rows each content lane retrieves, per expanded query.
+    ///
+    /// The semantic and keyword lanes each fetch this many rows for every
+    /// expansion, and what they bring back is what `candidates` selects from.
+    /// So this value decides *which* chunks the cross-encoder can ever see, and
+    /// `top_n` decides only how many of the sorted results are returned.
+    ///
+    /// **The two were one number, and that was issue #49.** Each lane fetched
+    /// `top_n * 3`, so a caller who asked for more results got a different pile
+    /// of candidates and a different ranking: probe 3 held
+    /// `## Level 4 Silence` at rank 3 and `## Level 6 Antimagic Shell` at rank
+    /// 4 at `top_n = 20`, and neither at any rank at 25. The default of 60 is
+    /// `20 * 3`, which is the width every table in `eval/probes.md` was
+    /// measured at.
+    ///
+    /// The value is query-time and reaches no fingerprint, so a sweep is a
+    /// config edit with no index work, no vault read and no model reload.
+    pub retrieval_width: usize,
     /// How many candidates the cross-encoder is shown.
     ///
     /// This is the knob that sets query cost: the cross-encoder is 85–96% of a
@@ -516,6 +534,7 @@ impl Default for RankingConfig {
     fn default() -> Self {
         Self {
             mode: RankingMode::default(),
+            retrieval_width: default_retrieval_width(),
             candidates: 30,
             graph_reserve: 8,
             temporal_reserve: 4,
@@ -525,6 +544,15 @@ impl Default for RankingConfig {
             per_note_cap: 0,
         }
     }
+}
+
+/// The lane width every table in `eval/probes.md` was measured at.
+///
+/// A function and not a literal in `Default`, so the number and the run that
+/// produced it stay together: `top_n = 20` on the pre-#49 binary, where each
+/// lane fetched `top_n * 3`.
+pub fn default_retrieval_width() -> usize {
+    60
 }
 
 /// The floor value from the pool fit: the midpoint of 6.77% and 52.52%.
@@ -873,6 +901,17 @@ batch_size = 128
 
         let bare: Config = toml::from_str("").unwrap();
         assert_eq!(bare.embedding_prompt.document_title, DocumentTitle::None);
+    }
+
+    #[test]
+    fn retrieval_width_is_settable_and_defaults_to_the_measured_value() {
+        // 60 is the width every table in `eval/probes.md` was taken at (#49).
+        let bare: Config = toml::from_str("").unwrap();
+        assert_eq!(bare.ranking.retrieval_width, 60);
+
+        let swept: Config = toml::from_str("[ranking]\nretrieval_width = 120\n").unwrap();
+        assert_eq!(swept.ranking.retrieval_width, 120);
+        assert_eq!(swept.ranking.candidates, 30, "the other keys keep defaults");
     }
 
     #[test]

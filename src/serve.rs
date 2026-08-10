@@ -47,7 +47,8 @@ pub struct ListParams {
     pub tags: Option<Vec<String>>,
     /// Filter to notes created by a specific agent.
     pub created_by: Option<String>,
-    /// Maximum results (default 20).
+    /// Maximum results (default 20). Raising it adds results below the same
+    /// ranking; it does not change what the top of the ranking holds.
     pub limit: Option<usize>,
 }
 

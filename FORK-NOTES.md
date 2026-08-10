@@ -47,6 +47,7 @@ git fetch upstream && git diff --stat upstream/main main
 | `DocumentTitle` | the document template's `title:` field is selectable; the vault's breadcrumb is one of its values | this fork, issues #36, #38 |
 | `BreadcrumbRoot` | a breadcrumb leads with the file path, so its first segment resolves to a file on disk | this fork, issue #46 |
 | `chunks_fts` external content | the keyword index is derived from the chunk table, and indexes the breadcrumb beside the body | this fork, issue #37 |
+| `ranking::retrieval_width` | how deep the content lanes dig is a setting; `top_n` truncates the output and nothing else | this fork, issue #49 |
 | `.github/workflows/ci.yml` | manual dispatch only — upstream runs it on push and PR | this fork, Actions minutes |
 
 Cherry-picked rather than merged: PR #41 branched before upstream's #40 graph fix, so merging the
@@ -218,17 +219,15 @@ has never executed on this box.
   pinned vault at `63f33e6` is 266 / 1863 / 1988 edges, because `standalone/mcp-isekai` tracks the
   live `cc-isekai` repo and it grew in between. Rank tables from either side of that are not
   comparable. Earlier stores lived in session scratchpads and expired with the sessions.
-- **`top_n` is part of the measurement, not a display setting.** Both content lanes retrieve
-  `top_n * 3` per expansion, so a probe table taken at 5 and one taken at 20 are different
-  experiments — probe 2's tracked answer is absent at 5 and rank 1 at 20. `eval/probes.md`'s tables
-  are at 20. The orchestration cache (`llm_cache`, keyed on the query) is what holds expansions
-  constant across variants, so reusing one warm store is the control rather than a shortcut.
-  **The cost is not confined to the tail, and 20 → 25 is enough to pay it**: P3 returns
-  `## Level 4 Silence` at rank 3 and `## Level 6 Antimagic Shell` at rank 4 at `top_n = 20`, and
-  neither at any rank at 25. Those are the two most direct answers in the vault. #49 is the defect;
-  this entry is why no number may be read out of a home that raised the value. A home built to
-  propose candidate chunks for reading is not an arm — it names chunks, and every rank comes from
-  the shipped home at `top_n = 20`.
+- **`[ranking] retrieval_width` is part of the measurement, not a display setting** (#49). Both
+  content lanes retrieve this many rows per expansion, so a probe table taken at 15 and one taken at
+  60 are different experiments — probe 2's tracked answer is absent at 15 and rank 1 at 60.
+  `eval/probes.md`'s tables are at 60, which is the default. The orchestration cache (`llm_cache`,
+  keyed on the query) is what holds expansions constant across variants, so reusing one warm store is
+  the control rather than a shortcut. **`top_n` is a display setting**: it truncates the result list,
+  and the eighteen pool queries are prefix-stable from 20 to 25 and to 100. A table taken before #49
+  names `top_n = 20` in place of the width, on a binary whose width was `top_n * 3`, and that is the
+  same 60.
 - **Backlinks used to rot on every save** (#27, fixed). Any store last written by a pre-#27 build has
   edges missing — 24 of 1084 per three files edited, on the isekai vault — and the fix does not
   reconstruct them. `engraph index --rebuild` is the one-time repair, and any graph-lane number taken
@@ -716,14 +715,17 @@ See issues on this repo:
   tier-1 member, so an arm that loses coverage is judged over a smaller window and its inversion count
   falls. Two arms compare on inversions only when that member holds the same rank.
   `eval/probes.md` (#45) holds the tables
-- **#49** `top_n` sets retrieval width, so asking for more results returns worse ones — both content
-  lanes fetch `top_n * 3` while `[ranking] candidates` stays at 30, so the value decides *which*
-  thirty candidates the cross-encoder is shown. P3 loses `## Level 4 Silence` (95.60%, rank 3) and
-  `## Level 6 Antimagic Shell` (94.82%, rank 4) between `top_n = 20` and 25, at any rank. A caller
-  who asks for more results gets other results. Every table in `eval/probes.md` is therefore valid
-  at 20 alone, and no test asserts it. The fix must decouple the lane width from the output limit,
-  and what the width should be is an arm, scored with #45; `top_n = 20` on the current binary is the
-  control. The value is query-time and reaches no fingerprint, so an arm is a re-run
+- ~~**#49** `top_n` sets retrieval width, so asking for more results returns worse ones~~ — **DONE.**
+  `[ranking] retrieval_width` is the lane width, default 60, and `top_n` truncates the output and
+  nothing else. Both content lanes had fetched `top_n * 3` while `[ranking] candidates` stayed at 30,
+  so the output limit decided *which* thirty candidates the cross-encoder was shown: **twelve of the
+  eighteen pool queries changed their ranking between `top_n = 20` and 25**, P3 losing
+  `## Level 4 Silence` (95.60%, rank 3) and `## Level 6 Antimagic Shell` (94.82%, rank 4) at any
+  rank, and N10 gaining a new best result, which is an input to the `answer_floor` fit. The default
+  reproduces the shipped arm on **360 of 360 result slots**, and all eighteen queries are now
+  prefix-stable from 20 to 25 and to 100. `candidates` is the ceiling on a result list, so
+  `top_n = 100` returns 30. The width is query-time and reaches no fingerprint, so an arm is a re-run.
+  `eval/probes.md` holds the tables
 - **#50** the inversion count falls when an arm loses coverage — `eval/score-ground-truth.py` counts
   noise above the **lowest-ranked tier-1 member present**, so the window an arm is judged over is one
   the arm itself sets. On P3 the shipped arm holds that member at rank 15 and reports 7 inversions;
