@@ -192,6 +192,22 @@ has never executed on this box.
   #37 binary and copying its database, so they share a vector space exactly and differ only in the
   keyword index's declaration. `-off` is the inert control and reproduces `-control` to nine decimal
   places.
+- **Every arm home built before #46 refuses to answer, and each arm is reproducible as a
+  configuration.** #46 made `breadcrumb_root` a chunker-digest component, because the value is written
+  into `chunks.heading_path`, so nine homes fail `chunker_fingerprint`: `.engraph-i36x-control`,
+  `-breadcrumb`, `.engraph-i37-shipped`, `-off`, `.engraph-i38-shipped`, `-none`, `-nolex`,
+  `.engraph-i42-shipped` and `-cap1000`. The route back is the arm's own settings plus **two** keys,
+  and an omission of either is silent:
+  - `breadcrumb_root = "name"`, which #46 measured as reproducing the pre-#46 binary on 360 of 360
+    result slots.
+  - `[rerank] max_document_chars = 1000` for every arm before #42, because #25 shipped that cap as
+    the default. The key is a `reranker_fingerprint` component, whose action is
+    `InvalidateThresholds`, so it rebuilds nothing and warns about nothing at index time.
+
+  The nine homes hold **four** configurations, because each experiment was copied to a new home
+  rather than run again, and the fifth is `.engraph-i46-name`. Copy a home to keep the `llm_cache`
+  and the query expansions with it. See `eval/probes.md` (#45), which holds the four configurations,
+  the control check for each and the scores.
   **The store itself does not exclude derived files.** Its `exclude` is `[".obsidian/"]`, so
   `*-index.md` and `templates/` are in the corpus. Issue #7 measured that exclusion as a clear gain and
   the baseline never adopted it. Every table in `eval/probes.md` from #26 to #10 therefore holds about
@@ -605,7 +621,14 @@ See issues on this repo:
   index, which reaches one answer beside Counterspell where every other cell reaches two. The lexical
   limb is what pays that off. With the embedding limb off, the pair is there without it.
   **The defaults are verified end to end.** A home with no `[embedding_prompt]` block and no `[fts]`
-  block, indexed from empty, reproduces the explicit arm on 360 of 360 result slots
+  block, indexed from empty, reproduces the explicit arm on 360 of 360 result slots.
+  **#45 scored both arms against the responsive sets and confirmed the default on today's binary.**
+  The arm that would ship now is `document_title = "breadcrumb"` at `breadcrumb_root = "path"`, and it
+  holds 3 of 5 on P3 where the default holds 4 of 5. Two readings above are corrected. The `name`-rooted
+  breadcrumb returned `rules/dark-spells.md > ## Level 3 Curse of Tongues` at rank 7, 90.44%, which is a
+  tier-1 member no other arm returns and which this issue removed without counting it; #46 then made
+  that result unreachable. And the 2×2's `## Level 3 Invisibility` is tier 2, so the cell it separates
+  reaches one tier-1 member fewer and not one answer fewer
 - ~~**#46** the breadcrumb root should be the file path, not a frontmatter key engraph does not own~~
   — **DONE.** `breadcrumb_root = "path"` ships: `lore/bestiary/lesser-dragon.md > Stat Block`.
   **`name:` was never engraph's key.** The engine read it and never wrote it, it is a cc-isekai
@@ -679,14 +702,20 @@ See issues on this repo:
   withdrawn; `[ranking] answer_floor = 0.30` cuts a tier-1 member of P2 that scores 3.45%, against the
   52.52% lowest correct answer #34 fit it on, and the fit is re-read once, at the end, against all six
   sets.
-  **What is left is step 4, and it is a re-measurement rather than the script run the ticket assumed.**
-  No kept JSON exists anywhere on the box, and **every arm home built before #46 refuses to answer**:
-  #46 made `breadcrumb_root` a chunker-digest component, so all nine fail `chunker_fingerprint` and
-  the read path refuses, which is what `fingerprint::verify` documents. Each historical arm is
-  reproducible as a *configuration* on today's binary — its own settings plus
-  `breadcrumb_root = "name"`, which #46 measured as reproducing the pre-#46 binary on 360 of 360
-  slots — at a re-index (~65 s) and a pool run (~2 min) each, and each arm must be checked against its
-  recorded control before anything is scored
+  **Step 4 re-measured the arms on record, and every control held.** No kept JSON existed and all nine
+  pre-#46 homes fail `chunker_fingerprint`, so each arm was rebuilt as a configuration — see the entry
+  above on the two keys a reconstruction sets. The nine homes are four configurations plus
+  `.engraph-i46-name`. **#42's uncapping is the largest gain on record**: three of P2's five tier-1
+  members go from about 1.5% to between 78% and 98%, and coverage cannot see it because every arm
+  holds 5 of 5. **#37's lexical limb is +1 coverage on P3 and costs nothing**, and #36's embedding limb
+  is the −1 it pays back. **P4 holds 6 of 9 in every configuration since #36**, so that loss belongs to
+  no arm and goes to #41. **P1, P6 and P7 give the same score in every arm on record**, so the pool
+  discriminates on P3 and P4. `document_title = "none"` is confirmed on today's binary: at
+  `breadcrumb_root = "path"` the `breadcrumb` arm holds 3 of 5 on P3 against the default's 4 of 5.
+  **One defect in the instrument is filed as #50** — the scorer counts inversions above the *lowest*
+  tier-1 member, so an arm that loses coverage is judged over a smaller window and its inversion count
+  falls. Two arms compare on inversions only when that member holds the same rank.
+  `eval/probes.md` (#45) holds the tables
 - **#49** `top_n` sets retrieval width, so asking for more results returns worse ones — both content
   lanes fetch `top_n * 3` while `[ranking] candidates` stays at 30, so the value decides *which*
   thirty candidates the cross-encoder is shown. P3 loses `## Level 4 Silence` (95.60%, rank 3) and
@@ -695,6 +724,15 @@ See issues on this repo:
   at 20 alone, and no test asserts it. The fix must decouple the lane width from the output limit,
   and what the width should be is an arm, scored with #45; `top_n = 20` on the current binary is the
   control. The value is query-time and reaches no fingerprint, so an arm is a re-run
+- **#50** the inversion count falls when an arm loses coverage — `eval/score-ground-truth.py` counts
+  noise above the **lowest-ranked tier-1 member present**, so the window an arm is judged over is one
+  the arm itself sets. On P3 the shipped arm holds that member at rank 15 and reports 7 inversions;
+  the `breadcrumb` arm at `breadcrumb_root = "path"` loses it, holds the next member at rank 4, and
+  reports **1** — while carrying 10 noise chunks in the top 20 against the shipped arm's 12. Two arms
+  compare on inversions only when that member holds the same rank, which is true of all four
+  reconstructions in #45 step 4 and false for that pair. Two candidate fixes are on the issue: print
+  the whole-window noise count beside the inversion count, or report the anchor rank and refuse the
+  comparison when it moves
 - ~~**#48** the per-document shortlist cap hides a responsive chunk from the cross-encoder~~ —
   **closed, not reproducible.** Both of its arms ran in a home at `top_n = 100`, so neither was the
   shipped configuration. The chunk it reported as hidden is rank 2 at 93.50% in the shipped arm, and
@@ -1036,7 +1074,11 @@ See issues on this repo:
   slot. `answer_floor` needs no refit: the same 29.64% midpoint.
   The key stays settable, because #25's trade is still real on a CPU build. **Every table in
   `eval/probes.md` above the #42 section was measured at cap 1000**, so rank tables from either side
-  of it are not comparable
+  of it are not comparable.
+  **#45 measured this as the largest gain on record.** P2 holds five responsive chunks and every arm
+  returns all five, so coverage does not separate the arms and the ranks do. Three of the five score
+  **1.36% to 1.83% under the cap and 78.76% to 98.02% without it**. At the shipped floor the capped
+  arms answer P2 with one of the five and the uncapped arm answers with four
 - ~~**#6** section-level retrieval granularity — fuse on `(file_id, seq)` so a document can
   contribute more than one section~~ — **done**, probe 3 now returns the correct section and every
   result names its heading. It did not fix probe 1, but #9 has: nothing about the section-per-file
