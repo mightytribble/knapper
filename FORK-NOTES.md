@@ -638,7 +638,7 @@ See issues on this repo:
   this code** — the calibration corpus is authored, not written — so the evidence is unit tests over
   a fixture and no arm can be run. It becomes urgent the first time a workflow writes notes into a
   vault that is then searched
-- **#45** score the positive queries against a ground-truth responsive set, not against churn — the
+- **#45** score the pool's queries against a ground-truth responsive set, not against churn — the
   two metrics this file has used are both broken. *"Result slots that moved"* counts change and calls
   it quality; *"read the swaps against the vault"* inspects only what differs between arms, so it
   cannot see a responsive chunk absent from both or a noise chunk high in both.
@@ -646,21 +646,47 @@ See issues on this repo:
   3 in every arm of #36, #37 and #38 and no reading ever saw it. Per query: a tier-1 responsive set
   and a tier-2 informative set drafted from the vault by the author, then coverage, the rank of each
   tier-1 member, and inversions. **The instrument #41, #43 and #44 should be judged with, so do it
-  first.** The kept JSON for #36, #37, #38 and #42 is on disk, so re-scoring the record is a script
-  run.
-  **In progress, one query per comment on the issue, the author settling every reading.** P1 and P2
-  are agreed. Two boundary rules came out of them: a chunk that answers in the negative is tier 1
-  (*"No one investigates"*, *"Lesser Dragons cannot take human form"*), and a chunk about a character
-  who wears a form is tier 2 against a query about a species, which overturns #37's reading of
-  `the-archdragon-disguise.md > ### Summary` as "probe 2's most direct answer".
+  first.**
+  **The sets are agreed and shipped as data**, one query per comment on the issue with the author
+  ruling every reading. `eval/ground-truth.json`, built by `eval/build-ground-truth.py` and read by
+  `eval/score-ground-truth.py`. At the pin: P1 **7/7**, inversions 0; P2 **5/5**, 4; P3 **4/5**, 7;
+  P4 **6/9**, 1; P6 **1/1**, 0; P7 **1/1**, 0.
+  **The pool holds five positives and one false premise.** P7 asks which form Lesser Dragons adopt and
+  the vault says they adopt none, so it is neither a positive nor one of the eleven negatives —
+  abstention would score it as a failure for returning the refutation, which is the right answer.
+  **A responsive set is not a property of the query string**, so each query records the intent it was
+  drafted against: P3's `## Level 3 Invisibility` is responsive to *"which spells limit a caster"* and
+  not to *"which spells stop a caster casting"*, and the query says neither.
+  Five boundary rules: a negative answer is tier 1; tier 1 needs the text to *state* the effect asked
+  for, or a piano dropped on a mage qualifies; right topic and wrong entity is tier 2; a bare entity
+  name is a keyword search, so tier 1 is the canonical entry in full and nothing else; overkill is
+  tier 2.
   **The key is `file`, `heading` as the result JSON prints it, `section`, and the anchor sentence.**
   Neither `path > heading` nor the stored breadcrumb is unique — 27 groups in the corpus collide,
   because a split section gives every piece the same heading. The scorer resolves a member by anchor,
-  which survives a re-chunk, and reads `section` as a stamp taken at the pin; when the two disagree
-  it reports that the chunking moved rather than scoring a stale list.
-  Two findings the drafting has already produced: `[ranking] answer_floor = 0.30` removes a tier-1
-  member of P2 that scores 3.45%, against the 52.52% lowest correct answer #34 fit it on — the fit
-  needs re-reading once all six sets exist — and #49
+  which survives a re-chunk, and reads `section` as a stamp taken at the pin; when the two disagree it
+  reports that the chunking moved rather than scoring a stale list. An anchor that does not occur in
+  its chunk fails the build. A result above the lowest tier-1 member that is in no list is reported
+  **unclassified** rather than counted as noise, so an incomplete list asks for a ruling instead of
+  reading as a clean run.
+  **What it has already overturned:** P3 is missing a correct answer and carries seven noise chunks
+  above another, while Counterspell holds rank 1 and every older metric reads the query as healthy;
+  P4 returns two thirds of its own entity's file, and the keyword index matches all nine, so the loss
+  is after the lane; the pool discriminates arms on **four** queries, because P6 and P7 hold one
+  member each at rank 1 and their inversion count is inert; #37's reading of
+  `the-archdragon-disguise.md > ### Summary` as "probe 2's most direct answer" is wrong; #38's probe-6
+  limb compared a tier-2 chunk with a noise chunk, both below the single correct answer, and is
+  withdrawn; `[ranking] answer_floor = 0.30` cuts a tier-1 member of P2 that scores 3.45%, against the
+  52.52% lowest correct answer #34 fit it on, and the fit is re-read once, at the end, against all six
+  sets.
+  **What is left is step 4, and it is a re-measurement rather than the script run the ticket assumed.**
+  No kept JSON exists anywhere on the box, and **every arm home built before #46 refuses to answer**:
+  #46 made `breadcrumb_root` a chunker-digest component, so all nine fail `chunker_fingerprint` and
+  the read path refuses, which is what `fingerprint::verify` documents. Each historical arm is
+  reproducible as a *configuration* on today's binary — its own settings plus
+  `breadcrumb_root = "name"`, which #46 measured as reproducing the pre-#46 binary on 360 of 360
+  slots — at a re-index (~65 s) and a pool run (~2 min) each, and each arm must be checked against its
+  recorded control before anything is scored
 - **#49** `top_n` sets retrieval width, so asking for more results returns worse ones — both content
   lanes fetch `top_n * 3` while `[ranking] candidates` stays at 30, so the value decides *which*
   thirty candidates the cross-encoder is shown. P3 loses `## Level 4 Silence` (95.60%, rank 3) and
