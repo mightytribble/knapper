@@ -710,10 +710,11 @@ pub fn create_note(
 
         build_edges_for_file(store, file_id, &full_content)?;
 
-        // Register new tags
-        for tag in &resolved_tags {
-            store.register_tag(tag, &input.created_by)?;
-        }
+        // The writer is not an author of the vocabulary (#60). It writes the
+        // file; the reconciler owns the rows, and reads the tags back out of
+        // the content that was written, so the property and the body are peers
+        // here exactly as they are on the index path.
+        store.reconcile_file_tags(file_id, &crate::tags::extract(&full_content))?;
 
         Ok(file_id)
     })();
@@ -859,6 +860,8 @@ pub fn append_to_note(
             store.insert_vec(vid, &c.vector)?;
         }
 
+        store.reconcile_file_tags(file_id, &crate::tags::extract(&new_content))?;
+
         build_edges_for_file(store, file_id, &new_content)?;
         Ok(file_id)
     })();
@@ -955,7 +958,7 @@ pub fn update_metadata(
 
     // Step 5: Update store record (metadata-only, no re-chunking)
     let mtime = file_mtime(&full_path)?;
-    store.insert_file(
+    let file_id = store.insert_file(
         &file_record.path,
         &content_hash,
         mtime,
@@ -965,10 +968,9 @@ pub fn update_metadata(
         None,
     )?;
 
-    // Register tags
-    for tag in &tags {
-        store.register_tag(tag, &input.modified_by)?;
-    }
+    // A frontmatter edit changes a note's tags and no chunk boundary, so it
+    // reconciles the rows and does not re-index (#60).
+    store.reconcile_file_tags(file_id, &crate::tags::extract(&new_content))?;
 
     let folder = file_record
         .path
@@ -1213,7 +1215,7 @@ pub fn edit_frontmatter(
         vec![]
     };
 
-    store.insert_file(
+    let file_id = store.insert_file(
         &file_record.path,
         &content_hash,
         mtime,
@@ -1222,6 +1224,7 @@ pub fn edit_frontmatter(
         file_record.created_by.as_deref(),
         None,
     )?;
+    store.reconcile_file_tags(file_id, &crate::tags::extract(&new_content))?;
 
     Ok(EditResult {
         path: file_record.path,
@@ -1417,8 +1420,11 @@ pub fn delete_note(
             let content = std::fs::read_to_string(&new_full_path)?;
             let content_hash = compute_content_hash(&content);
 
+            // The row is replaced, so the new id holds no links: read the ids
+            // the old row releases, write the new row's rows, then prune (#60).
+            let released_tags = store.file_tag_ids(file_record.id)?;
             store.delete_file(file_record.id)?;
-            store.insert_file(
+            let file_id = store.insert_file(
                 &new_rel_path,
                 &content_hash,
                 mtime,
@@ -1427,13 +1433,17 @@ pub fn delete_note(
                 created_by.as_deref(),
                 None,
             )?;
+            store.reconcile_file_tags(file_id, &crate::tags::extract(&content))?;
+            store.prune_unused_tags(&released_tags)?;
 
             Ok(())
         }
         DeleteMode::Hard => {
             // Delete disk file first, then purge store
+            let released_tags = store.file_tag_ids(file_record.id)?;
             std::fs::remove_file(&old_path)?;
             store.delete_file_hard(&file_record.path)?;
+            store.prune_unused_tags(&released_tags)?;
             Ok(())
         }
     }
@@ -1504,8 +1514,10 @@ pub fn archive_note(
     for vid in &old_vids {
         store.delete_vec(*vid)?;
     }
+    let released_tags = store.file_tag_ids(file_record.id)?;
     store.delete_edges_for_file(file_record.id)?;
     store.delete_file(file_record.id)?;
+    store.prune_unused_tags(&released_tags)?;
 
     // Remove original file
     std::fs::remove_file(&old_path)?;
@@ -1630,9 +1642,7 @@ pub fn unarchive_note(
 
         build_edges_for_file(store, file_id, &restored_content)?;
 
-        for tag in &tags {
-            store.register_tag(tag, "unarchive")?;
-        }
+        store.reconcile_file_tags(file_id, &crate::tags::extract(&restored_content))?;
 
         Ok(())
     })();
@@ -2722,5 +2732,121 @@ mod tests {
             "append after edit_frontmatter should not fail with mtime conflict, got: {:?}",
             result.err()
         );
+    }
+
+    // ── The tag store (#60) ──────────────────────────────────────
+
+    fn stored_tags(store: &Store, path: &str) -> Vec<String> {
+        let file = store.get_file(path).unwrap().unwrap();
+        store.file_tags(file.id).unwrap()
+    }
+
+    fn test_chunk_opts() -> ChunkOptions {
+        ChunkOptions {
+            min_chars: 0,
+            promote_bold: false,
+        }
+    }
+
+    #[test]
+    fn a_created_note_writes_its_tag_rows() {
+        use crate::llm::MockLlm;
+
+        let (_tmp, store, root) = setup_vault();
+        let mut embedder = MockLlm::new(256);
+        let result = create_note(
+            CreateNoteInput {
+                content: "# Swamp\n\nA #type/undead lives here.\n".to_string(),
+                filename: Some("swamp.md".to_string()),
+                type_hint: None,
+                tags: vec!["habitat/swamp".to_string()],
+                folder: None,
+                created_by: "test".to_string(),
+                auto_link: Some(false),
+            },
+            &store,
+            &mut embedder,
+            EmbedComposition::default(),
+            test_chunk_opts(),
+            &root,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            stored_tags(&store, &result.path),
+            vec!["habitat/swamp", "type/undead"],
+            "the property and the body are peers"
+        );
+    }
+
+    #[test]
+    fn editing_frontmatter_moves_the_tag_rows_with_it() {
+        let (_tmp, store, root) = setup_vault();
+        let content = "---\ntags:\n  - habitat/swamp\n---\n\nBody.\n";
+        let file_path = root.join("n.md");
+        std::fs::write(&file_path, content).unwrap();
+        let mtime = file_mtime(&file_path).unwrap();
+        let id = store
+            .insert_file(
+                "n.md",
+                "hash",
+                mtime,
+                &["habitat/swamp".to_string()],
+                "fmtag1",
+                None,
+                None,
+            )
+            .unwrap();
+        store
+            .reconcile_file_tags(id, &crate::tags::extract(content))
+            .unwrap();
+
+        edit_frontmatter(
+            &store,
+            &root,
+            &EditFrontmatterInput {
+                file: "n.md".to_string(),
+                operations: vec![FrontmatterOp::AddTag("type/undead".to_string())],
+                modified_by: "test".to_string(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            stored_tags(&store, "n.md"),
+            vec!["habitat/swamp", "type/undead"]
+        );
+    }
+
+    #[test]
+    fn archiving_a_note_takes_the_tags_that_go_unused_with_it() {
+        let (_tmp, store, root) = setup_vault();
+        let content = "---\ntags:\n  - solo\n---\n\nBody.\n";
+        let file_path = root.join("n.md");
+        std::fs::write(&file_path, content).unwrap();
+        let mtime = file_mtime(&file_path).unwrap();
+        let id = store
+            .insert_file(
+                "n.md",
+                "hash",
+                mtime,
+                &["solo".to_string()],
+                "arctag",
+                None,
+                None,
+            )
+            .unwrap();
+        store
+            .reconcile_file_tags(id, &crate::tags::extract(content))
+            .unwrap();
+
+        archive_note("n.md", &store, &root, None).unwrap();
+
+        let remaining: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM tags", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, 0, "the note was the tag's only carrier");
     }
 }
