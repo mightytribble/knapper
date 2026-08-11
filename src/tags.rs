@@ -69,39 +69,45 @@ fn push_tag(out: &mut Vec<Tag>, seen: &mut HashSet<String>, written: &str) {
 /// The `tags` property, in the three forms Obsidian accepts.
 ///
 /// `tags: [a, b]`, a block sequence of `- a` lines, and a single scalar
-/// `tags: a`. A value may carry one leading `#`, which is stripped. The key is
-/// read at column 0 only, because Obsidian's properties are top level and an
-/// indented `tags:` belongs to some other mapping. The singular `tag` property
-/// is not read: Obsidian dropped support for it at 1.9.
+/// `tags: a`. A value may carry one leading `#`, which is stripped. A value
+/// runs through the same token test as a body tag: the character set of
+/// `is_tag_char` and at least one non-numeric character. A value that fails
+/// the test is dropped, and dropping it does not drop the other values on the
+/// line. A `#` that opens the trailing part of the line, after whitespace, is
+/// a YAML comment and is cut before the value split; a `#` that opens a value
+/// itself is not preceded by whitespace and stays. The key is read at column
+/// 0 only, because Obsidian's properties are top level and an indented
+/// `tags:` belongs to some other mapping. The singular `tag` property is not
+/// read: Obsidian dropped support for it at 1.9.
 fn property_tags(frontmatter: &str) -> Vec<String> {
     let lines: Vec<&str> = frontmatter.lines().collect();
     for (i, line) in lines.iter().enumerate() {
         let Some(after) = line.strip_prefix("tags:") else {
             continue;
         };
-        let after = after.trim();
+        let after = strip_trailing_comment(after.trim());
         if let Some(inner) = after.strip_prefix('[') {
             return inner
                 .trim_end_matches(']')
                 .split(',')
                 .map(clean_property_value)
-                .filter(|s| !s.is_empty())
+                .filter(|s| is_valid_tag_token(s))
                 .collect();
         }
         if !after.is_empty() {
             let value = clean_property_value(after);
-            return if value.is_empty() {
-                Vec::new()
-            } else {
+            return if is_valid_tag_token(&value) {
                 vec![value]
+            } else {
+                Vec::new()
             };
         }
         let mut out = Vec::new();
         for subsequent in &lines[i + 1..] {
             let trimmed = subsequent.trim();
             if let Some(item) = trimmed.strip_prefix("- ") {
-                let value = clean_property_value(item);
-                if !value.is_empty() {
+                let value = clean_property_value(strip_trailing_comment(item));
+                if is_valid_tag_token(&value) {
                     out.push(value);
                 }
             } else if trimmed.is_empty() {
@@ -115,9 +121,44 @@ fn property_tags(frontmatter: &str) -> Vec<String> {
     Vec::new()
 }
 
+/// Cut a trailing YAML comment from the rest of a `tags:` line.
+///
+/// A `#` is a comment mark when it follows a space. A `#` at the very start
+/// of the text, or right after `[` or `,`, opens a value instead and is kept:
+/// this is what lets `tags: [#undead]` keep its tag and lets a bare
+/// `tags: #undead` keep its tag too, while still cutting `tags: alpha  # todo`.
+fn strip_trailing_comment(s: &str) -> &str {
+    let mut prev_is_space = false;
+    for (idx, c) in s.char_indices() {
+        if c == '#' && prev_is_space {
+            return s[..idx].trim_end();
+        }
+        prev_is_space = c.is_whitespace();
+    }
+    s
+}
+
+/// Trim quotes and one leading `#` from a raw property value.
+///
+/// This only cleans the text. It does not check whether the result is a
+/// valid tag; call `is_valid_tag_token` on the result for that.
 fn clean_property_value(raw: &str) -> String {
     let trimmed = raw.trim().trim_matches('"').trim_matches('\'').trim();
     trimmed.strip_prefix('#').unwrap_or(trimmed).to_string()
+}
+
+/// The token test a tag must pass, from either source.
+///
+/// A tag holds only `is_tag_char` characters and at least one non-numeric
+/// character. A body token already meets the character-set half by
+/// construction, because `line_tags` stops reading at the first character
+/// outside the set; a property value is free text and must be checked in
+/// full, so a value such as `"my tag"` is dropped rather than cut at the
+/// space.
+fn is_valid_tag_token(token: &str) -> bool {
+    !token.is_empty()
+        && token.chars().all(is_tag_char)
+        && token.chars().any(|c| !c.is_ascii_digit())
 }
 
 /// Every `#tag` token the body holds, with the five rejections applied.
@@ -170,7 +211,8 @@ fn line_tags(line: &str) -> Vec<String> {
         let token: String = chars[start..end].iter().collect();
         // An ATX heading is `#` followed by a space, which leaves the token
         // empty. `#1984` holds no non-numeric character and is not a tag.
-        if !token.is_empty() && token.chars().any(|c| !c.is_ascii_digit()) {
+        // This is the same token test a property value must pass.
+        if is_valid_tag_token(&token) {
             out.push(token);
         }
         i = end.max(start);
@@ -392,6 +434,21 @@ mod tests {
         let tags = extract("---\ntags: [Type/Undead]\n---\nbody #type/undead\n");
         assert_eq!(tags.len(), 1);
         assert_eq!(tags[0].display, "Type/Undead");
+    }
+
+    #[test]
+    fn a_property_value_holds_the_same_token_test_as_the_body() {
+        assert!(paths("---\ntags: [1984]\n---\nbody\n").is_empty());
+        assert!(paths("---\ntags: [my tag]\n---\nbody\n").is_empty());
+    }
+
+    #[test]
+    fn a_trailing_comment_on_the_tags_line_is_not_a_tag() {
+        assert_eq!(
+            paths("---\ntags: [alpha, beta]  # todo\n---\nbody\n"),
+            ["alpha", "beta"]
+        );
+        assert_eq!(paths("---\ntags: alpha  # todo\n---\nbody\n"), ["alpha"]);
     }
 
     fn setup_store() -> Store {
