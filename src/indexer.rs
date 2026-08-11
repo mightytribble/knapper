@@ -559,10 +559,12 @@ pub fn index_file(
         store.insert_vec(vector_id, vector)?;
     }
 
-    // 7. Register tags
-    for tag in &tags {
-        store.register_tag(tag, "indexer")?;
-    }
+    // 7. Reconcile the file's tags (#60)
+    //
+    // The extractor reads the property and the body, and the store owns this
+    // file's rows the way step 5 owns its chunks. The watcher calls this
+    // function, so the warm path needs no second implementation.
+    store.reconcile_file_tags(file_id, &crate::tags::extract(content))?;
 
     // 8. Commit (only if we own the transaction)
     if owns_transaction {
@@ -594,6 +596,10 @@ pub fn remove_file(rel_path: &str, store: &Store) -> Result<()> {
     for &vid in &vector_ids {
         store.delete_vec(vid)?;
     }
+    // The ids this file is about to release. `file_tags` cascades off the
+    // `files` row below, so steps 1 and 2 of reconciliation need no code here;
+    // step 3 does, and it needs the ids read before the cascade (#60).
+    let released_tags = store.file_tag_ids(file.id)?;
     // No FTS delete: `chunks` CASCADEs off the `files` row below, and the
     // keyword index follows the chunks (issue #37).
     // `unresolved_links` is keyed by path, not file id, so `delete_file` does not
@@ -601,6 +607,7 @@ pub fn remove_file(rel_path: &str, store: &Store) -> Result<()> {
     // from a note that is no longer indexed.
     store.clear_unresolved_links_for_file(&file.path)?;
     store.delete_file(file.id)?;
+    store.prune_unused_tags(&released_tags)?;
 
     if owns_transaction {
         store.commit()?;
@@ -2783,5 +2790,158 @@ mod tests {
         );
         assert_eq!(edge_snapshot(&store), expected);
         assert!(!store.needs_edge_backfill().unwrap());
+    }
+
+    // ── The tag store (#60) ──────────────────────────────────────
+
+    fn tag_counts(store: &Store) -> (i64, i64) {
+        let tags = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM tags", [], |row| row.get(0))
+            .unwrap();
+        let links = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM file_tags", [], |row| row.get(0))
+            .unwrap();
+        (tags, links)
+    }
+
+    fn index_once(dir: &std::path::Path, store: &Store) {
+        let mut embedder = crate::llm::MockLlm::new(256);
+        run_index_shared(dir, &Config::default(), store, &mut embedder, false, None).unwrap();
+    }
+
+    #[test]
+    fn a_property_tag_and_a_body_tag_both_reach_the_store() {
+        let tmp = TempDir::new().unwrap();
+        write_file(
+            tmp.path(),
+            "n.md",
+            "---\ntags:\n  - habitat/swamp\n---\n\n## One\n\nA #type/undead lives here.\n",
+        );
+        let store = Store::open_memory().unwrap();
+        index_once(tmp.path(), &store);
+
+        let file = store.get_file("n.md").unwrap().unwrap();
+        assert_eq!(
+            store.file_tags(file.id).unwrap(),
+            vec!["habitat/swamp", "type/undead"]
+        );
+    }
+
+    #[test]
+    fn a_file_indexed_twice_holds_the_rows_it_held_once() {
+        let tmp = TempDir::new().unwrap();
+        write_file(
+            tmp.path(),
+            "n.md",
+            "---\ntags: [alpha, beta]\n---\n\n## One\n\nBody.\n",
+        );
+        let store = Store::open_memory().unwrap();
+        index_once(tmp.path(), &store);
+        let first = tag_counts(&store);
+
+        // A second full pass over an unchanged vault.
+        index_once(tmp.path(), &store);
+        assert_eq!(tag_counts(&store), first);
+        assert_eq!(first, (2, 2));
+    }
+
+    #[test]
+    fn a_vault_indexed_twice_reports_the_usage_of_one_index() {
+        let tmp = TempDir::new().unwrap();
+        write_file(
+            tmp.path(),
+            "a.md",
+            "---\ntags: [shared]\n---\n\n## A\n\nBody.\n",
+        );
+        write_file(
+            tmp.path(),
+            "b.md",
+            "---\ntags: [shared]\n---\n\n## B\n\nBody.\n",
+        );
+        let store = Store::open_memory().unwrap();
+        index_once(tmp.path(), &store);
+        index_once(tmp.path(), &store);
+
+        let usage: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM file_tags ft JOIN tags t ON t.id = ft.tag_id
+                  WHERE t.path = 'shared'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(usage, 2, "usage counts notes, not index events");
+    }
+
+    #[test]
+    fn editing_a_note_to_drop_its_last_tag_deletes_the_tag_row() {
+        let tmp = TempDir::new().unwrap();
+        write_file(
+            tmp.path(),
+            "n.md",
+            "---\ntags: [habitat/swamp]\n---\n\n## One\n\nBody.\n",
+        );
+        let store = Store::open_memory().unwrap();
+        index_once(tmp.path(), &store);
+        assert_eq!(tag_counts(&store), (1, 1));
+
+        write_file(
+            tmp.path(),
+            "n.md",
+            "---\ntags: []\n---\n\n## One\n\nBody.\n",
+        );
+        index_once(tmp.path(), &store);
+        assert_eq!(tag_counts(&store), (0, 0));
+    }
+
+    #[test]
+    fn a_tag_a_second_note_carries_survives_the_first_dropping_it() {
+        let tmp = TempDir::new().unwrap();
+        write_file(
+            tmp.path(),
+            "a.md",
+            "---\ntags: [habitat/swamp]\n---\n\n## A\n\nBody.\n",
+        );
+        write_file(
+            tmp.path(),
+            "b.md",
+            "---\ntags: [habitat/swamp]\n---\n\n## B\n\nBody.\n",
+        );
+        let store = Store::open_memory().unwrap();
+        index_once(tmp.path(), &store);
+        assert_eq!(tag_counts(&store), (1, 2));
+
+        write_file(tmp.path(), "a.md", "---\ntags: []\n---\n\n## A\n\nBody.\n");
+        index_once(tmp.path(), &store);
+        assert_eq!(tag_counts(&store), (1, 1));
+    }
+
+    #[test]
+    fn removing_a_file_takes_its_links_and_the_tags_that_go_unused_with_it() {
+        let tmp = TempDir::new().unwrap();
+        write_file(
+            tmp.path(),
+            "a.md",
+            "---\ntags: [solo, shared]\n---\n\n## A\n\nBody.\n",
+        );
+        write_file(
+            tmp.path(),
+            "b.md",
+            "---\ntags: [shared]\n---\n\n## B\n\nBody.\n",
+        );
+        let store = Store::open_memory().unwrap();
+        index_once(tmp.path(), &store);
+        assert_eq!(tag_counts(&store), (2, 3));
+
+        remove_file("a.md", &store).unwrap();
+        assert_eq!(tag_counts(&store), (1, 1));
+        let left: String = store
+            .conn()
+            .query_row("SELECT path FROM tags", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(left, "shared");
     }
 }
