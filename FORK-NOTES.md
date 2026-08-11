@@ -237,11 +237,11 @@ has never executed on this box.
     key is a chunker-digest component, so an open without it re-chunks the whole home.
 
   The nine homes hold **four** configurations, because each experiment was copied to a new home
-  rather than run again, and the fifth is `.engraph-i46-name`. See `eval/probes.md` (#45), which
-  holds the four configurations, the control check for each and the scores.
+  rather than run again, and the fifth is `.engraph-i46-name`. `eval/probes.md` §8 lists the homes;
+  the four configurations, the control check for each and the scores are in #45 and its commit.
   **The store itself does not exclude derived files.** Its `exclude` is `[".obsidian/"]`, so
   `*-index.md` and `templates/` are in the corpus. Issue #7 measured that exclusion as a clear gain and
-  the baseline never adopted it. Every table in `eval/probes.md` from #26 to #10 therefore holds about
+  the baseline never adopted it. Every table recorded for #26 through #10 therefore holds about
   29% derived rows in the window, and the graph lane in each of them runs over six hub files that have
   no incoming edges. #36's tables use the exclusion. The other tables need a re-run before they can be
   compared with them.
@@ -252,7 +252,8 @@ has never executed on this box.
 - **`[ranking] retrieval_width` is part of the measurement, not a display setting** (#49). Both
   content lanes retrieve this many rows, so a probe table taken at 15 and one taken at 60 are
   different experiments — probe 2's tracked answer is absent at 15 and rank 1 at 60.
-  `eval/probes.md`'s tables are at 60, which is the default. **`top_n` is a display setting**: it
+  `eval/probes.md`'s readings are taken at 60, which is the default. **`top_n` is a display
+  setting**: it
   truncates the result list,
   and the eighteen pool queries are prefix-stable from 20 to 25 and to 100. A table taken before #49
   names `top_n = 20` in place of the width, on a binary whose width was `top_n * 3`, and that is the
@@ -512,11 +513,11 @@ has never executed on this box.
   - **What counts as a correct answer is #34's reading, and it is open.** The 52.52% anchor is the
     lowest result #34 judged an answer; the responsive sets of #45 put two more P1 members below it,
     at 23.50% and 1.33%. Read against tier 1 no floor both keeps every responsive chunk and rejects
-    anything. `eval/probes.md`'s re-taken pool section holds both readings.
+    anything. `eval/probes.md` §6 states both readings.
   - **`[ranking] per_note_cap` is 0, which means no limit.** The conflict between §9.1 and #30 stays
     open, and the key makes a sweep possible without a code change.
-- **GPU numbers and CPU numbers are different baselines.** `eval/probes.md`'s CUDA section is a fresh
-  baseline for exactly this reason: the kernels are not bitwise identical, the embeddings differ in
+- **GPU numbers and CPU numbers are different baselines**, which is a standing rule in
+  `eval/probes.md` §7: the kernels are not bitwise identical, the embeddings differ in
   the low bits, and the retrieved candidate set differs with them. Comparing a GPU rank table with a
   CPU one measures the backend, not the change under test.
 
@@ -585,7 +586,7 @@ See issues on this repo:
   28.6% to 30.0% of the result slots. Two findings were artifacts of that corpus. `note` appeared to
   gain a rank on probe 2, through `lore-index.md`, and the gain is absent from the clean corpus. `note`
   and the body control appeared to lose probe 4 to a list of links in `lore-index.md`. Every table in
-  `eval/probes.md` for #36 now uses `exclude = ["*-index.md", "templates/"]`, which is #7's setting, and
+  #36 uses `exclude = ["*-index.md", "templates/"]`, which is #7's setting, and
   0 of 1440 result slots hold a derived file.
   `note` and the body control lose the exact-name answer and gain nothing.
   `archdragon.md > ## Definition` has rank 1 at 99.97% in the control, and it is absent from the top 20
@@ -756,7 +757,7 @@ See issues on this repo:
   **One defect in the instrument is filed as #50** — the scorer counts inversions above the *lowest*
   tier-1 member, so an arm that loses coverage is judged over a smaller window and its inversion count
   falls. Two arms compare on inversions only when that member holds the same rank.
-  `eval/probes.md` (#45) holds the tables
+  #45's tables are in its commit; `eval/probes.md` §4 holds the rule the scorer now applies
 - ~~**#49** `top_n` sets retrieval width, so asking for more results returns worse ones~~ — **DONE.**
   `[ranking] retrieval_width` is the lane width, default 60, and `top_n` truncates the output and
   nothing else. Both content lanes had fetched `top_n * 3` while `[ranking] candidates` stayed at 30,
@@ -767,7 +768,7 @@ See issues on this repo:
   reproduces the shipped arm on **360 of 360 result slots**, and all eighteen queries are now
   prefix-stable from 20 to 25 and to 100. `candidates` is the ceiling on a result list, so
   `top_n = 100` returns 30. The width is query-time and reaches no fingerprint, so an arm is a re-run.
-  `eval/probes.md` holds the tables
+  The tables are in this issue's commit; `eval/probes.md` §2 holds the shipped width
 - ~~**#50** the inversion count falls when an arm loses coverage~~ — **DONE.**
   `eval/score-ground-truth.py` counts noise above the **lowest-ranked tier-1 member present**, so an
   inversion count is taken over a window the arm itself sets: an arm that loses that member shortens
@@ -792,8 +793,8 @@ See issues on this repo:
   chunk and said nothing.
   **`eval/chunk-rows-sha.py` had the same class of defect.** Its `0x1f` separator sat between the
   fields of a row and not at the end of one, so one row's `text` abutted the next row's `path` — the
-  run the separator exists to stop. The separator terminates the row as well, and the hashes in
-  `eval/probes.md` move with it
+  run the separator exists to stop. The separator terminates the row as well, and the row hash
+  `eval/probes.md` §1 records moves with it
 - **#51** a short **piece** of a split section escapes the chunk minimum — `emit_section` flushes
   whatever it has packed when the next paragraph alone busts the budget, so a section over the minimum
   can still emit a short row. `summaries/session-013.md > ## NPC Activity` is 68 characters at seq 5,
@@ -830,7 +831,7 @@ See issues on this repo:
   `.engraph-i43-min0` is the control, and `eval/ground-truth.json` is re-stamped against the shipped
   arm — P1 7/7 inv 0, P2 5/5 inv 4, P3 4/5 inv 7, **P4 5/8** inv 1, P6 1/1 inv 0, P7 1/1 inv 0, where
   P4's denominator is 8 because two of its members are now one chunk and nothing it returns changed.
-  `eval/probes.md` holds the tables. Two limits found and filed: a short **piece** of a split section
+  The tables are in this issue's commit. Two limits found and filed: a short **piece** of a split section
   is not a section, so the rule does not see it (**#51**, one row in the corpus), and
   `eval/build-ground-truth.py` had to learn a re-chunk — a tier-1 member now falls back to its anchor,
   and a noise stamp, which carries none, is dropped and reported (**#52**). Four of the five that
@@ -894,8 +895,9 @@ See issues on this repo:
   involved. #44 fixed the neighbouring case and deliberately did not widen the carry, because
   widening it changes the control arm's rows and #44's result rests on that control being exact. **The
   pinned vault does not hold this shape**, so no measurement is affected, and the fix is
-  `Action::Reindex`, a `CHUNKER_VERSION` bump and a new chunk-boundary baseline for every table in
-  `eval/probes.md`. What decides it is whether an empty heading is worth a row of text at all
+  `Action::Reindex`, a `CHUNKER_VERSION` bump and a new chunk-boundary baseline for `eval/probes.md`'s
+  corpus counts, its row hash and every reading taken at the pin. What decides it is whether an empty
+  heading is worth a row of text at all
 - **#55** the setup and apply reindex path chunks at settings the session did not choose —
   `EngraphServer::setup` and `handle_setup` each load a fresh `Config::load().unwrap_or_default()` and
   hand it to `onboarding::run_apply_json`, which runs a full vault index. Neither applies the
@@ -1242,8 +1244,7 @@ See issues on this repo:
   now runs over **chunks**, so the lane returns the passage it reached instead of guessing one.
   Deleted: the decay table, the `max` merge, `get_best_chunk_for_file`, `get_shared_tags_files` and
   its unordered `LIMIT 100`, the disjointness skip, and **the whole admission filter**.
-  **Three tracked targets up, one down, two hold — the best single move in `eval/probes.md` since
-  #6.** Probe 2's exact-answer section goes 6 → 1; probe 1, the acceptance criterion, improves 5 → 2;
+  **Three tracked targets up, one down, two hold — the best single move on record since #6.** Probe 2's exact-answer section goes 6 → 1; probe 1, the acceptance criterion, improves 5 → 2;
   probe 4 slips 3 → 4, one rank *inside* the top five, which is not the drop-out that probe guards.
   **The lane's own cost fell from 0.76–2.08 s to 0.83–1.64 ms** — three interleaved rounds, both
   binaries instrumented identically; the ticket's 536–1548 ms estimate was low because #23 and #26
@@ -1286,9 +1287,8 @@ See issues on this repo:
   **The cost is the two negatives #34 already records as unrejectable**, N4 and N11, which gain two
   above-floor results each. Every other negative and probe 5 are identical, best score and every
   slot. `answer_floor` needs no refit: the same 29.64% midpoint.
-  The key stays settable, because #25's trade is still real on a CPU build. **Every table in
-  `eval/probes.md` above the #42 section was measured at cap 1000**, so rank tables from either side
-  of it are not comparable.
+  The key stays settable, because #25's trade is still real on a CPU build. **Every table recorded
+  before #42 was measured at cap 1000**, so rank tables from either side of it are not comparable.
   **#45 measured this as the largest gain on record.** P2 holds five responsive chunks and every arm
   returns all five, so coverage does not separate the arms and the ranks do. Three of the five score
   **1.36% to 1.83% under the cap and 78.76% to 98.02% without it**. At the shipped floor the capped
@@ -1464,7 +1464,7 @@ weight table in charge — so this was the baseline configuration's behaviour, n
 models-loaded-only bug. (#59 deleted the orchestrator and the weight table both.) And graph's
 contribution at 0.8 is not quite "invisible": it is two tail
 slots on probe 1 and two on probe 5, *the nonsense control*, which is what a disjoint set does when
-the content lanes have nothing to say. Full audit in `eval/probes.md`.
+the content lanes have nothing to say. The full audit is in #9 and its commit.
 
 The section-per-file transform's win is no longer mysterious either: its sections are their own
 files, dense enough in "temple" for **both** content lanes to find them, which is the one
