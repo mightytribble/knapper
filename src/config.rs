@@ -489,6 +489,13 @@ pub struct RankingConfig {
     /// reach the model is a lane whose failures are invisible. What is bought
     /// here is that the graph's contribution is now a number that can be read
     /// off a log line rather than inferred from a ranking.
+    ///
+    /// **It is not free, because the slots come out of the content lanes'
+    /// share.** At 8 they get 22, and 22 is a gate: the cross-encoder scores
+    /// `rules/restoration-spells.md > ## Level 5 Purify Body` 0.98 against N10
+    /// whenever it is shown it, so whether that negative abstains is decided by
+    /// what competes for those 22 slots and not by the ranking (#58). Read a
+    /// changed abstention here before reading it as a quality result.
     pub graph_reserve: usize,
     /// Slots reserved for date-matching candidates the content order cut.
     ///
@@ -516,12 +523,20 @@ pub struct RankingConfig {
     /// [`crate::ranking::apply_answer_floor`]. A value of `0.0` removes nothing
     /// and is the control.
     ///
-    /// The value comes from the 17-query pool in `eval/probes.md`. On the GPU
-    /// baseline store, nine of the eleven negatives score below 6.8% on their
-    /// best candidate. The lowest score of a correct answer is 52.5%, at probe
-    /// 1's `archivist-lenne.md`, rank 5. The default is the midpoint of those
-    /// two values. The margin is about 23 points on each side, and CPU and GPU
+    /// The value comes from the pool in `eval/probes.md`. On the GPU baseline
+    /// store the rejectable negatives score below 6.8% on their best candidate.
+    /// The lowest score of a correct answer is 52.5%, at probe 1's
+    /// `archivist-lenne.md`, rank 5. The default is the midpoint of those two
+    /// values. The margin is about 23 points on each side, and CPU and GPU
     /// scores differ by about 1 point.
+    ///
+    /// **The count of negatives the floor rejects is owed a pool run.** N10 was
+    /// the highest rejectable one at 6.77%, and it is not rejectable: the
+    /// shortlist gate that held it there is described on
+    /// [`RankingConfig::graph_reserve`], and #59 removed the query expansion
+    /// that made the gate bind, so N10 scores 97.87%. The lower anchor is then
+    /// N6 at 6.76% and the midpoint is unmoved, which is why the value stands
+    /// while the per-query counts do not.
     ///
     /// #34 specifies a fit against the best score of each query, and the probes
     /// show that this is wrong. That fit gives 89%, the midpoint of 86.2% (N4)
@@ -530,13 +545,16 @@ pub struct RankingConfig {
     /// applies to each candidate must be below the lowest correct answer, and
     /// not below the best result of each query.
     ///
-    /// Two negatives score above any usable floor, and the cause is the
+    /// Three negatives score above any usable floor, and the cause is the
     /// reranker. N11 asks which city Tandi's brother works in as a blacksmith.
     /// It scores 97.1% on a passage that names Tandi, a brother, a blacksmith
     /// and a city, but the brother is Mira's. N4 asks for a Precept who does not
     /// exist, and scores 86.2% on a section that gives the person who runs the
-    /// location. No floor can reject either one and keep P6 and P7. The pool
-    /// table records both.
+    /// location. N10 asks for a spell that cleans clothing and scores 97.87% on
+    /// one that purifies a body. No floor can reject any of them and keep P6 and
+    /// P7. The pool table records all three, and #58 measured
+    /// Qwen3-Reranker-4B separating the N10 pair that the 0.6B inverts, so this
+    /// is a property of the model and not of the class.
     pub answer_floor: f64,
     /// How many sections of one document can appear in the results. `0` means no
     /// limit.
