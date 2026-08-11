@@ -50,6 +50,7 @@ git fetch upstream && git diff --stat upstream/main main
 | `ranking::retrieval_width` | how deep the content lanes dig is a setting; `top_n` truncates the output and nothing else | this fork, issue #49 |
 | `chunk_min_chars` | a section too short to stand on its own merges into the preceding chunk rather than becoming a row. Ships at 120 — see #43 | this fork, issue #43 |
 | `structure_headings` | a bold-only line opens a section, deeper than any `#` heading and an ancestor of nothing. Ships on — see #44 | this fork, issue #44 |
+| `tags` + `file_tags` | a tag is an attribute of a note, and it joins to the note. Usage and last use are derived, so neither can drift | this fork, issue #60 |
 | `.github/workflows/ci.yml` | manual dispatch only — upstream runs it on push and PR | this fork, Actions minutes |
 
 Cherry-picked rather than merged: PR #41 branched before upstream's #40 graph fix, so merging the
@@ -520,6 +521,11 @@ has never executed on this box.
   `eval/probes.md` §7: the kernels are not bitwise identical, the embeddings differ in
   the low bits, and the retrieved candidate set differs with them. Comparing a GPU rank table with a
   CPU one measures the backend, not the change under test.
+- **A tag is file-level, because Obsidian defines it that way.** A tag is an attribute of a note, so
+  `file_tags` keys on `files(id)` and not on a chunk. A body `#tag` does have a position, and
+  attributing it to its chunk would give a tag a meaning Obsidian does not give it. The two sources
+  are peers: the `tags` property and the body's `#tags` are a union, and a reader of one alone holds
+  a subset of the vault.
 
 ## Open work
 

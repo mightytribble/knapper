@@ -38,7 +38,7 @@ use crate::store::Store;
 
 /// Bump when the markdown parser changes what it extracts from a file:
 /// frontmatter splitting, heading detection, tag parsing.
-pub const PARSER_VERSION: u32 = 1;
+pub const PARSER_VERSION: u32 = 2;
 
 /// Bump when the chunker's *rules* change — break-point scoring, section
 /// structuring, sentence splitting, overlap construction.
