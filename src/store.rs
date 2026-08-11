@@ -2555,6 +2555,64 @@ impl Store {
         Ok(out)
     }
 
+    /// The notes tagged exactly `path`.
+    pub fn files_with_tag(&self, path: &str) -> Result<Vec<FileRecord>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {FILE_COLUMNS} FROM files f
+               JOIN file_tags ft ON ft.file_id = f.id
+               JOIN tags t ON t.id = ft.tag_id
+              WHERE t.path = ?1 ORDER BY f.path"
+        ))?;
+        let rows = stmt.query_map(params![path.to_lowercase()], file_from_row)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// The notes Obsidian's `tag:<path>` returns: the tag and every descendant.
+    ///
+    /// Left-anchored, so the unique index on `path` serves it. `DISTINCT`
+    /// because one note may carry several descendants of one tag.
+    pub fn files_under_tag(&self, path: &str) -> Result<Vec<FileRecord>> {
+        let folded = path.to_lowercase();
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT DISTINCT {FILE_COLUMNS} FROM files f
+               JOIN file_tags ft ON ft.file_id = f.id
+               JOIN tags t ON t.id = ft.tag_id
+              WHERE t.path = ?1 OR t.path LIKE ?2 ORDER BY f.path"
+        ))?;
+        let rows = stmt.query_map(params![folded, format!("{folded}/%")], file_from_row)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// The axes this vault holds, and how many notes each covers (#60).
+    ///
+    /// engraph names no axis. This reports what the vault wrote: the first
+    /// segment of every path, counting each note once however many tags of that
+    /// axis it carries.
+    pub fn tag_axes(&self) -> Result<Vec<(String, usize)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT substr(t.path, 1, COALESCE(NULLIF(instr(t.path, '/'), 0) - 1, length(t.path))) AS axis,
+                    COUNT(DISTINCT ft.file_id) AS notes
+               FROM tags t JOIN file_tags ft ON ft.tag_id = t.id
+              GROUP BY axis ORDER BY notes DESC, axis",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     // ── CLI Events ──────────────────────────────────────────────
 
     /// Log a CLI event for observability/analytics.
@@ -5374,5 +5432,69 @@ mod tests {
 
         let top = store.top_tags(10).unwrap();
         assert_eq!(top[0], ("Shared".to_string(), 2));
+    }
+
+    fn axis_fixture() -> Store {
+        let store = Store::open_memory().unwrap();
+        let tag = |p: &str| crate::tags::Tag {
+            path: p.into(),
+            display: p.into(),
+        };
+        let undead = store
+            .insert_file("undead.md", "h", 1, "d000001", None, None)
+            .unwrap();
+        let beast = store
+            .insert_file("beast.md", "h", 2, "d000002", None, None)
+            .unwrap();
+        let plain = store
+            .insert_file("plain.md", "h", 3, "d000003", None, None)
+            .unwrap();
+        // A note carrying two tags of one axis, to prove the axis counts notes.
+        store
+            .reconcile_file_tags(
+                undead,
+                &[tag("type/undead"), tag("type/wight"), tag("habitat/swamp")],
+            )
+            .unwrap();
+        store
+            .reconcile_file_tags(beast, &[tag("type/beast")])
+            .unwrap();
+        store.reconcile_file_tags(plain, &[tag("type")]).unwrap();
+        store
+    }
+
+    #[test]
+    fn the_descendant_query_returns_what_obsidians_tag_search_returns() {
+        let store = axis_fixture();
+        // `tag:type` matches `type` and every descendant of it.
+        let mut paths: Vec<String> = store
+            .files_under_tag("type")
+            .unwrap()
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+        paths.sort();
+        assert_eq!(paths, ["beast.md", "plain.md", "undead.md"]);
+
+        // The exact query is the tag a note carries and no descendant.
+        let exact: Vec<String> = store
+            .files_with_tag("type")
+            .unwrap()
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+        assert_eq!(exact, ["plain.md"]);
+    }
+
+    #[test]
+    fn an_axis_counts_each_note_once() {
+        let store = axis_fixture();
+        let axes = store.tag_axes().unwrap();
+        assert_eq!(
+            axes[0],
+            ("type".to_string(), 3),
+            "undead.md carries two of them"
+        );
+        assert!(axes.contains(&("habitat".to_string(), 1)));
     }
 }
