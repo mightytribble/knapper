@@ -695,7 +695,6 @@ pub fn create_note(
             &rel_path,
             &content_hash,
             mtime,
-            &resolved_tags,
             &docid,
             Some(&input.created_by),
             None,
@@ -732,7 +731,6 @@ pub fn create_note(
                 &rel_path,
                 &content_hash,
                 actual_mtime,
-                &resolved_tags,
                 &docid,
                 Some(&input.created_by),
                 None,
@@ -847,7 +845,6 @@ pub fn append_to_note(
             &file_record.path,
             &content_hash,
             mtime,
-            &file_record.tags,
             &docid,
             file_record.created_by.as_deref(),
             None,
@@ -877,7 +874,6 @@ pub fn append_to_note(
                 &file_record.path,
                 &content_hash,
                 actual_mtime,
-                &file_record.tags,
                 &docid,
                 file_record.created_by.as_deref(),
                 None,
@@ -962,7 +958,6 @@ pub fn update_metadata(
         &file_record.path,
         &content_hash,
         mtime,
-        &tags,
         &docid,
         file_record.created_by.as_deref(),
         None,
@@ -1207,19 +1202,10 @@ pub fn edit_frontmatter(
         .clone()
         .unwrap_or_else(|| generate_docid(&file_record.path));
 
-    // Extract updated tags from the written content for store update
-    let (updated_fm, _) = crate::markdown::split_frontmatter(&new_content);
-    let updated_tags: Vec<String> = if let Some(ref fm) = updated_fm {
-        extract_yaml_sequence(fm, "tags")
-    } else {
-        vec![]
-    };
-
     let file_id = store.insert_file(
         &file_record.path,
         &content_hash,
         mtime,
-        &updated_tags,
         &docid,
         file_record.created_by.as_deref(),
         None,
@@ -1257,30 +1243,6 @@ fn apply_remove_from_sequence(mapping: &mut serde_yaml::Mapping, key: &str, valu
     if let Some(serde_yaml::Value::Sequence(items)) = mapping.get_mut(&key_val) {
         items.retain(|item| item != &remove_item);
     }
-}
-
-/// Helper: extract string values from a YAML sequence field.
-fn extract_yaml_sequence(yaml_str: &str, key: &str) -> Vec<String> {
-    let val: serde_yaml::Value = match serde_yaml::from_str(yaml_str) {
-        Ok(v) => v,
-        Err(_) => return vec![],
-    };
-    if let serde_yaml::Value::Mapping(ref m) = val
-        && let Some(serde_yaml::Value::Sequence(items)) =
-            m.get(serde_yaml::Value::String(key.to_string()))
-    {
-        return items
-            .iter()
-            .filter_map(|v| {
-                if let serde_yaml::Value::String(s) = v {
-                    Some(s.clone())
-                } else {
-                    None
-                }
-            })
-            .collect();
-    }
-    vec![]
 }
 
 /// Move a note to a new folder.
@@ -1412,7 +1374,6 @@ pub fn delete_note(
             std::fs::rename(&old_path, &new_full_path)?;
 
             // Update store: remove old record, insert under new path
-            let tags = file_record.tags.clone();
             let docid = file_record.docid.as_deref().unwrap_or("").to_string();
             let created_by = file_record.created_by.clone();
             let mtime = file_record.mtime;
@@ -1428,7 +1389,6 @@ pub fn delete_note(
                 &new_rel_path,
                 &content_hash,
                 mtime,
-                &tags,
                 &docid,
                 created_by.as_deref(),
                 None,
@@ -1627,7 +1587,6 @@ pub fn unarchive_note(
             &original_path,
             &content_hash,
             mtime,
-            &tags,
             &docid,
             Some("unarchive"),
             None,
@@ -1828,7 +1787,6 @@ mod tests {
                 "notes/existing.md",
                 "hash1",
                 100,
-                &[],
                 &crate::docid::generate_docid("notes/existing.md"),
                 None,
                 None,
@@ -1839,7 +1797,6 @@ mod tests {
                 "notes/gone.md",
                 "hash2",
                 100,
-                &[],
                 &crate::docid::generate_docid("notes/gone.md"),
                 None,
                 None,
@@ -1921,7 +1878,7 @@ mod tests {
         let content = "# Person\n\n## Interactions\n\nOld entry\n\n## Links\n\nSome links\n";
         std::fs::write(root.join("person.md"), content).unwrap();
         store
-            .insert_file("person.md", "hash", 100, &[], "per123", None, None)
+            .insert_file("person.md", "hash", 100, "per123", None, None)
             .unwrap();
 
         let input = EditInput {
@@ -1950,7 +1907,7 @@ mod tests {
         let content = "# Note\n\n## Tasks\n\n- [x] Old task\n\n## Notes\n\nText\n";
         std::fs::write(root.join("note.md"), content).unwrap();
         store
-            .insert_file("note.md", "hash", 100, &[], "not123", None, None)
+            .insert_file("note.md", "hash", 100, "not123", None, None)
             .unwrap();
 
         let input = EditInput {
@@ -1974,7 +1931,7 @@ mod tests {
         let content = "# Doc\n\n## Log\n\nExisting line\n\n## Footer\n\nEnd\n";
         std::fs::write(root.join("doc.md"), content).unwrap();
         store
-            .insert_file("doc.md", "hash", 100, &[], "doc123", None, None)
+            .insert_file("doc.md", "hash", 100, "doc123", None, None)
             .unwrap();
 
         let input = EditInput {
@@ -2001,7 +1958,7 @@ mod tests {
         let content = "# Note\n\n## Existing\n\nContent\n";
         std::fs::write(root.join("note.md"), content).unwrap();
         store
-            .insert_file("note.md", "hash", 100, &[], "not123", None, None)
+            .insert_file("note.md", "hash", 100, "not123", None, None)
             .unwrap();
 
         let input = EditInput {
@@ -2043,15 +2000,7 @@ mod tests {
         let content = "---\ntags:\n  - project\nstatus: active\n---\n\n# Old Content\n\nOld body\n";
         std::fs::write(root.join("note.md"), content).unwrap();
         store
-            .insert_file(
-                "note.md",
-                "hash",
-                100,
-                &["project".to_string()],
-                "rew123",
-                None,
-                None,
-            )
+            .insert_file("note.md", "hash", 100, "rew123", None, None)
             .unwrap();
 
         let input = RewriteInput {
@@ -2075,15 +2024,7 @@ mod tests {
         let content = "---\ntags:\n  - project\n---\n\n# Content\n";
         std::fs::write(root.join("note.md"), content).unwrap();
         store
-            .insert_file(
-                "note.md",
-                "hash",
-                100,
-                &["project".to_string()],
-                "efm123",
-                None,
-                None,
-            )
+            .insert_file("note.md", "hash", 100, "efm123", None, None)
             .unwrap();
 
         let input = EditFrontmatterInput {
@@ -2104,15 +2045,7 @@ mod tests {
         let content = "---\ntags:\n  - project\n  - old\n---\n\n# Content\n";
         std::fs::write(root.join("note.md"), content).unwrap();
         store
-            .insert_file(
-                "note.md",
-                "hash",
-                100,
-                &["project".to_string(), "old".to_string()],
-                "efm456",
-                None,
-                None,
-            )
+            .insert_file("note.md", "hash", 100, "efm456", None, None)
             .unwrap();
 
         let input = EditFrontmatterInput {
@@ -2133,7 +2066,7 @@ mod tests {
         let content = "---\nstatus: draft\n---\n\n# Content\n";
         std::fs::write(root.join("note.md"), content).unwrap();
         store
-            .insert_file("note.md", "hash", 100, &[], "efm789", None, None)
+            .insert_file("note.md", "hash", 100, "efm789", None, None)
             .unwrap();
 
         let input = EditFrontmatterInput {
@@ -2154,7 +2087,7 @@ mod tests {
         let content = "---\nstatus: draft\ntitle: Test\n---\n\n# Content\n";
         std::fs::write(root.join("note.md"), content).unwrap();
         store
-            .insert_file("note.md", "hash", 100, &[], "efmrm1", None, None)
+            .insert_file("note.md", "hash", 100, "efmrm1", None, None)
             .unwrap();
 
         let input = EditFrontmatterInput {
@@ -2175,15 +2108,7 @@ mod tests {
         let content = "---\ntags:\n  - test\n---\n\n# Content\n";
         std::fs::write(root.join("note.md"), content).unwrap();
         store
-            .insert_file(
-                "note.md",
-                "hash",
-                100,
-                &["test".to_string()],
-                "efmal1",
-                None,
-                None,
-            )
+            .insert_file("note.md", "hash", 100, "efmal1", None, None)
             .unwrap();
 
         let input = EditFrontmatterInput {
@@ -2204,7 +2129,7 @@ mod tests {
         let content = "# Content\n\nJust body, no frontmatter.\n";
         std::fs::write(root.join("note.md"), content).unwrap();
         store
-            .insert_file("note.md", "hash", 100, &[], "efmnf1", None, None)
+            .insert_file("note.md", "hash", 100, "efmnf1", None, None)
             .unwrap();
 
         let input = EditFrontmatterInput {
@@ -2230,15 +2155,7 @@ mod tests {
         let content = "---\ntags:\n  - old-tag\nstatus: draft\n---\n\n# Content\n";
         std::fs::write(root.join("note.md"), content).unwrap();
         store
-            .insert_file(
-                "note.md",
-                "hash",
-                100,
-                &["old-tag".to_string()],
-                "efmmo1",
-                None,
-                None,
-            )
+            .insert_file("note.md", "hash", 100, "efmmo1", None, None)
             .unwrap();
 
         let input = EditFrontmatterInput {
@@ -2267,7 +2184,7 @@ mod tests {
         std::fs::create_dir_all(root.join("04-Archive")).unwrap();
         std::fs::write(root.join("deleteme.md"), "# Delete me").unwrap();
         store
-            .insert_file("deleteme.md", "hash", 100, &[], "del123", None, None)
+            .insert_file("deleteme.md", "hash", 100, "del123", None, None)
             .unwrap();
 
         delete_note(
@@ -2289,7 +2206,7 @@ mod tests {
         let (tmp, store, root) = setup_vault();
         std::fs::write(root.join("gone.md"), "# Gone forever").unwrap();
         store
-            .insert_file("gone.md", "hash", 100, &[], "gon123", None, None)
+            .insert_file("gone.md", "hash", 100, "gon123", None, None)
             .unwrap();
 
         delete_note(&store, &root, "gone.md", DeleteMode::Hard, "").unwrap();
@@ -2496,7 +2413,7 @@ mod tests {
         // derives the display snippet from it (issue #14).
         let store = Store::open_memory().unwrap();
         let file_id = store
-            .insert_file("places/coast.md", "h", 0, &[], "d", None, None)
+            .insert_file("places/coast.md", "h", 0, "d", None, None)
             .unwrap();
         store.insert_chunk(&c.record(file_id, 0, 1)).unwrap();
 
@@ -2526,7 +2443,7 @@ mod tests {
         std::fs::write(&file_path, "# Coast\n\n## The Coast Road\n\nOriginal.\n").unwrap();
         let mtime = file_mtime(&file_path).unwrap();
         store
-            .insert_file("coast.md", "hash", mtime, &[], "co123", None, None)
+            .insert_file("coast.md", "hash", mtime, "co123", None, None)
             .unwrap();
 
         append_to_note(
@@ -2571,7 +2488,7 @@ mod tests {
         // Register in store with the ACTUAL mtime from disk
         let mtime = file_mtime(&file_path).unwrap();
         store
-            .insert_file("mtime-test.md", "hash", mtime, &[], "mt123", None, None)
+            .insert_file("mtime-test.md", "hash", mtime, "mt123", None, None)
             .unwrap();
 
         // Step 1: edit_note modifies the file
@@ -2628,15 +2545,7 @@ mod tests {
         // Register with actual mtime
         let mtime = file_mtime(&file_path).unwrap();
         store
-            .insert_file(
-                "rewrite-mtime.md",
-                "hash",
-                mtime,
-                &["test".to_string()],
-                "rwmt1",
-                None,
-                None,
-            )
+            .insert_file("rewrite-mtime.md", "hash", mtime, "rwmt1", None, None)
             .unwrap();
 
         // Step 1: rewrite_note modifies the file
@@ -2691,15 +2600,7 @@ mod tests {
         // Register with actual mtime
         let mtime = file_mtime(&file_path).unwrap();
         store
-            .insert_file(
-                "fm-mtime.md",
-                "hash",
-                mtime,
-                &["original".to_string()],
-                "fmmt1",
-                None,
-                None,
-            )
+            .insert_file("fm-mtime.md", "hash", mtime, "fmmt1", None, None)
             .unwrap();
 
         // Step 1: edit_frontmatter modifies the file
@@ -2788,15 +2689,7 @@ mod tests {
         std::fs::write(&file_path, content).unwrap();
         let mtime = file_mtime(&file_path).unwrap();
         let id = store
-            .insert_file(
-                "n.md",
-                "hash",
-                mtime,
-                &["habitat/swamp".to_string()],
-                "fmtag1",
-                None,
-                None,
-            )
+            .insert_file("n.md", "hash", mtime, "fmtag1", None, None)
             .unwrap();
         store
             .reconcile_file_tags(id, &crate::tags::extract(content))
@@ -2827,15 +2720,7 @@ mod tests {
         std::fs::write(&file_path, content).unwrap();
         let mtime = file_mtime(&file_path).unwrap();
         let id = store
-            .insert_file(
-                "n.md",
-                "hash",
-                mtime,
-                &["solo".to_string()],
-                "arctag",
-                None,
-                None,
-            )
+            .insert_file("n.md", "hash", mtime, "arctag", None, None)
             .unwrap();
         store
             .reconcile_file_tags(id, &crate::tags::extract(content))

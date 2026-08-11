@@ -36,7 +36,6 @@ fn setup(vault_dir: &Path) -> (Store, Embedder) {
             "03-Resources/People/Steve Barbera.md",
             "hash1",
             0,
-            &[],
             &docid,
             None,
             None,

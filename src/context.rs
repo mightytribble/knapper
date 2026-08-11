@@ -142,7 +142,10 @@ fn find_person_by_search(
     // Pass 2: any note tagged "person"/"people".
     for result in &fts_results {
         if let Some(file) = params.store.get_file_by_id(result.file_id)?
-            && file.tags.iter().any(|t| t == "person" || t == "people")
+            && file
+                .tags
+                .iter()
+                .any(|t| t.eq_ignore_ascii_case("person") || t.eq_ignore_ascii_case("people"))
         {
             return Ok(Some(file));
         }
@@ -751,6 +754,14 @@ mod tests {
     use crate::store::{DOC_LEVEL, NewChunk, Store};
     use tempfile::TempDir;
 
+    /// A tag whose display form is its path.
+    fn tag(path: &str) -> crate::tags::Tag {
+        crate::tags::Tag {
+            path: path.into(),
+            display: path.into(),
+        }
+    }
+
     fn setup_vault() -> (TempDir, Store, std::path::PathBuf) {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().to_path_buf();
@@ -765,11 +776,12 @@ mod tests {
         let store = Store::open_memory().unwrap();
         let d1 = generate_docid("note.md");
         let d2 = generate_docid("other.md");
-        store
-            .insert_file("note.md", "h1", 100, &["rust".into()], &d1, None, None)
+        let note = store
+            .insert_file("note.md", "h1", 100, &d1, None, None)
             .unwrap();
+        store.reconcile_file_tags(note, &[tag("rust")]).unwrap();
         store
-            .insert_file("other.md", "h2", 100, &[], &d2, None, None)
+            .insert_file("other.md", "h2", 100, &d2, None, None)
             .unwrap();
 
         let f1 = store.get_file("note.md").unwrap().unwrap().id;
@@ -820,7 +832,7 @@ mod tests {
     fn test_read_file_not_on_disk() {
         let (_tmp, store, root) = setup_vault();
         store
-            .insert_file("ghost.md", "h3", 100, &[], "ggg333", None, None)
+            .insert_file("ghost.md", "h3", 100, "ggg333", None, None)
             .unwrap();
         let params = ContextParams {
             store: &store,
@@ -911,18 +923,11 @@ mod tests {
 
         let store = Store::open_memory().unwrap();
         let f1 = store
-            .insert_file(
-                "People/John.md",
-                "h1",
-                100,
-                &["person".into()],
-                "aaa111",
-                None,
-                None,
-            )
+            .insert_file("People/John.md", "h1", 100, "aaa111", None, None)
             .unwrap();
+        store.reconcile_file_tags(f1, &[tag("person")]).unwrap();
         let f2 = store
-            .insert_file("daily.md", "h2", 100, &[], "bbb222", None, None)
+            .insert_file("daily.md", "h2", 100, "bbb222", None, None)
             .unwrap();
         store
             .insert_edge(f2, DOC_LEVEL, f1, DOC_LEVEL, "mention")
@@ -982,18 +987,11 @@ mod tests {
 
         let store = Store::open_memory().unwrap();
         let f1 = store
-            .insert_file(
-                "01-Projects/MyProject.md",
-                "h1",
-                100,
-                &["project".into()],
-                "aaa111",
-                None,
-                None,
-            )
+            .insert_file("01-Projects/MyProject.md", "h1", 100, "aaa111", None, None)
             .unwrap();
+        store.reconcile_file_tags(f1, &[tag("project")]).unwrap();
         let f2 = store
-            .insert_file("01-Projects/child.md", "h2", 100, &[], "bbb222", None, None)
+            .insert_file("01-Projects/child.md", "h2", 100, "bbb222", None, None)
             .unwrap();
         store
             .insert_edge(f2, DOC_LEVEL, f1, DOC_LEVEL, "wikilink")
@@ -1043,17 +1041,10 @@ mod tests {
         .unwrap();
 
         let store = Store::open_memory().unwrap();
-        store
-            .insert_file(
-                "result.md",
-                "h1",
-                100,
-                &["topic".into()],
-                "aaa111",
-                None,
-                None,
-            )
+        let result = store
+            .insert_file("result.md", "h1", 100, "aaa111", None, None)
             .unwrap();
+        store.reconcile_file_tags(result, &[tag("topic")]).unwrap();
 
         let params = ContextParams {
             store: &store,
@@ -1087,7 +1078,7 @@ mod tests {
 
         let store = Store::open_memory().unwrap();
         store
-            .insert_file("long.md", "h1", 100, &[], "aaa111", None, None)
+            .insert_file("long.md", "h1", 100, "aaa111", None, None)
             .unwrap();
 
         let params = ContextParams {
@@ -1122,10 +1113,10 @@ mod tests {
 
         let store = Store::open_memory().unwrap();
         let f1 = store
-            .insert_file("main.md", "h1", 100, &[], "aaa111", None, None)
+            .insert_file("main.md", "h1", 100, "aaa111", None, None)
             .unwrap();
         let f2 = store
-            .insert_file("related.md", "h2", 100, &[], "bbb222", None, None)
+            .insert_file("related.md", "h2", 100, "bbb222", None, None)
             .unwrap();
         store
             .insert_edge(f1, DOC_LEVEL, f2, DOC_LEVEL, "wikilink")
@@ -1197,7 +1188,7 @@ mod tests {
         let content = "# Person\n\n## Role\n\nEngineer\n\n## Interactions\n\nMet on 2026-03-26\n";
         std::fs::write(root.join("person.md"), content).unwrap();
         store
-            .insert_file("person.md", "hash", 100, &[], "per123", None, None)
+            .insert_file("person.md", "hash", 100, "per123", None, None)
             .unwrap();
 
         let result = read_section(&store, &root, "person.md", "Interactions").unwrap();
