@@ -73,27 +73,43 @@ fn push_tag(out: &mut Vec<Tag>, seen: &mut HashSet<String>, written: &str) {
 /// runs through the same token test as a body tag: the character set of
 /// `is_tag_char` and at least one non-numeric character. A value that fails
 /// the test is dropped, and dropping it does not drop the other values on the
-/// line. A `#` that opens the trailing part of the line, after whitespace, is
-/// a YAML comment and is cut before the value split; a `#` that opens a value
-/// itself is not preceded by whitespace and stays. The key is read at column
-/// 0 only, because Obsidian's properties are top level and an indented
-/// `tags:` belongs to some other mapping. The singular `tag` property is not
-/// read: Obsidian dropped support for it at 1.9.
+/// line.
+///
+/// A trailing YAML comment is cut before the value split, and the cut is
+/// shaped to where a comment can be. The flow-sequence form reads only the
+/// text between `[` and the matching `]`, so a `#` anywhere inside the
+/// brackets — first item or later — is always a value's own hash, never a
+/// comment mark: `tags: [alpha, #beta]` keeps `beta`, and anything past the
+/// `]` is a comment or nothing, either way not a value. The scalar and
+/// block-sequence forms carry no brackets, so `strip_trailing_comment` runs
+/// on them instead: a `#` after whitespace opens a comment, and a `#` at the
+/// front of the value is that value's own hash and stays. The key is read at
+/// column 0 only, because Obsidian's properties are top level and an
+/// indented `tags:` belongs to some other mapping. The singular `tag`
+/// property is not read: Obsidian dropped support for it at 1.9.
 fn property_tags(frontmatter: &str) -> Vec<String> {
     let lines: Vec<&str> = frontmatter.lines().collect();
     for (i, line) in lines.iter().enumerate() {
         let Some(after) = line.strip_prefix("tags:") else {
             continue;
         };
-        let after = strip_trailing_comment(after.trim());
+        let after = after.trim();
         if let Some(inner) = after.strip_prefix('[') {
-            return inner
-                .trim_end_matches(']')
+            // A comment can only follow the closing `]`. Read up to the
+            // first `]` only, so nothing past it, comment or not, reaches
+            // the split, and a `#` inside the brackets is never mistaken
+            // for one.
+            let items = match inner.find(']') {
+                Some(close) => &inner[..close],
+                None => inner,
+            };
+            return items
                 .split(',')
                 .map(clean_property_value)
                 .filter(|s| is_valid_tag_token(s))
                 .collect();
         }
+        let after = strip_trailing_comment(after);
         if !after.is_empty() {
             let value = clean_property_value(after);
             return if is_valid_tag_token(&value) {
@@ -121,12 +137,16 @@ fn property_tags(frontmatter: &str) -> Vec<String> {
     Vec::new()
 }
 
-/// Cut a trailing YAML comment from the rest of a `tags:` line.
+/// Cut a trailing YAML comment from a property value that carries no
+/// brackets: the scalar form and one block-sequence item.
 ///
 /// A `#` is a comment mark when it follows a space. A `#` at the very start
-/// of the text, or right after `[` or `,`, opens a value instead and is kept:
-/// this is what lets `tags: [#undead]` keep its tag and lets a bare
-/// `tags: #undead` keep its tag too, while still cutting `tags: alpha  # todo`.
+/// of the text opens a value instead and is kept: this is what lets a bare
+/// `tags: #undead` keep its tag, while still cutting `tags: alpha  # todo`
+/// down to `alpha`. The flow-sequence form does not call this function: it
+/// reads only the text inside its brackets, where every `#` is a value's own
+/// hash by construction, so a comment cut there would misread the space
+/// before a later item's `#` as a comment mark.
 fn strip_trailing_comment(s: &str) -> &str {
     let mut prev_is_space = false;
     for (idx, c) in s.char_indices() {
@@ -449,6 +469,22 @@ mod tests {
             ["alpha", "beta"]
         );
         assert_eq!(paths("---\ntags: alpha  # todo\n---\nbody\n"), ["alpha"]);
+    }
+
+    #[test]
+    fn a_hash_prefixed_value_after_the_first_is_not_a_comment() {
+        assert_eq!(
+            paths("---\ntags: [alpha, #beta]\n---\nbody\n"),
+            ["alpha", "beta"]
+        );
+    }
+
+    #[test]
+    fn a_flow_sequence_may_carry_hash_values_and_a_trailing_comment() {
+        assert_eq!(
+            paths("---\ntags: [#alpha, #beta]  # todo\n---\nbody\n"),
+            ["alpha", "beta"]
+        );
     }
 
     fn setup_store() -> Store {
