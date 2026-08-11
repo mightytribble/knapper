@@ -262,38 +262,47 @@ pub enum TagResolution {
     New(String),
 }
 
-/// Resolve a single proposed tag against the registry.
+/// Resolve a single proposed tag against the vocabulary the vault holds.
 ///
 /// Resolution tiers (priority order):
-/// 1. Exact match (case-insensitive)
-/// 2. Fuzzy match (Levenshtein distance ≤ 2, pick closest)
+/// 1. Exact match (without regard to case), returning the vault's own spelling
+/// 2. Fuzzy match (Levenshtein distance ≤ 2) against the tags that share a
+///    parent, comparing the last segment alone
 /// 3. Prefix extension (proposed starts with `existing_tag/`)
 /// 4. New tag
+///
+/// Tier 2 is scoped because a tag is a path and its segments are not
+/// interchangeable: `type/undead` and `type/undeed` are one misspelling apart,
+/// and `type/undead` and `habitat/undead` are two different attributes.
 pub fn resolve_tag(conn: &Connection, proposed: &str) -> Result<TagResolution> {
     let lower = proposed.to_lowercase();
 
-    // Tier 1: Exact case-insensitive match.
     let exact: Option<String> = conn
-        .prepare("SELECT name FROM tag_registry WHERE LOWER(name) = ?1")?
+        .prepare("SELECT display FROM tags WHERE path = ?1")?
         .query_map(params![lower], |row| row.get::<_, String>(0))?
         .filter_map(|r| r.ok())
         .next();
 
-    if let Some(name) = exact {
-        return Ok(TagResolution::Exact(name));
+    if let Some(display) = exact {
+        return Ok(TagResolution::Exact(display));
     }
 
-    // Load all registered tags for fuzzy + prefix checks.
     let all_tags: Vec<String> = conn
-        .prepare("SELECT name FROM tag_registry")?
+        .prepare("SELECT display FROM tags")?
         .query_map([], |row| row.get::<_, String>(0))?
         .filter_map(|r| r.ok())
         .collect();
 
-    // Tier 2: Fuzzy match — Levenshtein distance ≤ 2.
+    // Tier 2: the last segment, against the last segments under the same parent.
+    let (parent, leaf) = split_leaf(&lower);
     let mut best: Option<(String, usize)> = None;
     for tag in &all_tags {
-        let dist = levenshtein(&lower, &tag.to_lowercase());
+        let candidate = tag.to_lowercase();
+        let (candidate_parent, candidate_leaf) = split_leaf(&candidate);
+        if candidate_parent != parent {
+            continue;
+        }
+        let dist = levenshtein(leaf, candidate_leaf);
         if dist > 0 && dist <= 2 && (best.is_none() || dist < best.as_ref().unwrap().1) {
             best = Some((tag.clone(), dist));
         }
@@ -306,28 +315,22 @@ pub fn resolve_tag(conn: &Connection, proposed: &str) -> Result<TagResolution> {
         });
     }
 
-    // Tier 3: Prefix extension — proposed starts with `existing_tag/`.
+    // Tier 3: prefix extension — proposed starts with `existing_tag/`.
     for tag in &all_tags {
         if lower.starts_with(&format!("{}/", tag.to_lowercase())) {
             return Ok(TagResolution::Extension(proposed.to_string()));
         }
     }
 
-    // Tier 4: New tag.
     Ok(TagResolution::New(proposed.to_string()))
 }
 
-/// Register (upsert) a tag: increment usage_count if it exists, insert otherwise.
-pub fn register_tag(conn: &Connection, name: &str, created_by: &str) -> Result<()> {
-    conn.execute(
-        "INSERT INTO tag_registry (name, usage_count, last_used, created_by)
-         VALUES (?1, 1, datetime('now'), ?2)
-         ON CONFLICT(name) DO UPDATE SET
-             usage_count = usage_count + 1,
-             last_used = datetime('now')",
-        params![name, created_by],
-    )?;
-    Ok(())
+/// `type/undead` → (`type`, `undead`). A top-level tag has the empty parent.
+fn split_leaf(path: &str) -> (&str, &str) {
+    match path.rsplit_once('/') {
+        Some((parent, leaf)) => (parent, leaf),
+        None => ("", path),
+    }
 }
 
 /// Resolve a list of proposed tags, returning the final tag names.
@@ -490,22 +493,46 @@ mod tests {
     fn setup_store() -> Store {
         let store = Store::open_memory().unwrap();
         let conn = store.conn();
-        // Seed tags with varying usage counts.
-        for (name, count) in [
-            ("domaine", 15),
-            ("scentbird", 10),
-            ("engraph", 8),
-            ("work", 20),
-            ("work/domaine", 5),
+        for display in [
+            "domaine",
+            "scentbird",
+            "engraph",
+            "work",
+            "work/domaine",
+            "Type/Undead",
+            "habitat/undead",
         ] {
             conn.execute(
-                "INSERT INTO tag_registry (name, usage_count, last_used, created_by)
-                 VALUES (?1, ?2, datetime('now'), 'test')",
-                params![name, count],
+                "INSERT INTO tags (path, display) VALUES (?1, ?2)",
+                params![display.to_lowercase(), display],
             )
             .unwrap();
         }
         store
+    }
+
+    #[test]
+    fn fuzzy_matching_is_scoped_to_the_segments_that_share_a_parent() {
+        let store = setup_store();
+        match resolve_tag(store.conn(), "type/undeed").unwrap() {
+            TagResolution::Fuzzy { resolved, .. } => assert_eq!(resolved, "Type/Undead"),
+            other => panic!("expected Fuzzy, got {other:?}"),
+        }
+        // `habitat/undead` is one edit from `habitat/undeed` and nothing else:
+        // a different parent is a different tag, not a misspelling of this one.
+        match resolve_tag(store.conn(), "quality/undead").unwrap() {
+            TagResolution::New(name) => assert_eq!(name, "quality/undead"),
+            other => panic!("expected New, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_exact_match_returns_the_vaults_own_spelling() {
+        let store = setup_store();
+        assert_eq!(
+            resolve_tag(store.conn(), "type/undead").unwrap(),
+            TagResolution::Exact("Type/Undead".to_string())
+        );
     }
 
     #[test]
@@ -556,33 +583,6 @@ mod tests {
         let store = setup_store();
         let res = resolve_tag(store.conn(), "completely-new").unwrap();
         assert_eq!(res, TagResolution::New("completely-new".to_string()));
-    }
-
-    #[test]
-    fn test_register_tag() {
-        let store = setup_store();
-        register_tag(store.conn(), "new-tag", "test").unwrap();
-        let count: i64 = store
-            .conn()
-            .query_row(
-                "SELECT usage_count FROM tag_registry WHERE name = 'new-tag'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(count, 1);
-
-        // Register again — count should increment.
-        register_tag(store.conn(), "new-tag", "test").unwrap();
-        let count: i64 = store
-            .conn()
-            .query_row(
-                "SELECT usage_count FROM tag_registry WHERE name = 'new-tag'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(count, 2);
     }
 
     #[test]

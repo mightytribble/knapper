@@ -672,21 +672,20 @@ impl Store {
             );",
         )?;
 
-        // Tag registry table
-        self.conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS tag_registry (
-                name        TEXT PRIMARY KEY,
-                usage_count INTEGER NOT NULL DEFAULT 0,
-                last_used   TEXT,
-                created_by  TEXT NOT NULL DEFAULT 'indexer'
-            );",
-        )?;
-
         // The tag store (#60). A tag is an attribute of a note, so `file_tags`
         // is the fact table and every count over it is derived: usage is
         // `COUNT(*)` and last use is `MAX(files.mtime)`. Both numbers come
         // from `file_tags`, so neither can drift from the vault.
         self.conn.execute_batch(TAGS_SCHEMA)?;
+
+        // `tag_registry` held a flat vocabulary with no join to `files`. Its
+        // `usage_count` counted index events, not files; `remove_file` never
+        // touched it; and nothing reported the drift. Both numbers now come
+        // from `file_tags`. Dropping the table needs no backfill: the
+        // re-index that `PARSER_VERSION` declares rebuilds `tags` and
+        // `file_tags` from the vault.
+        self.conn
+            .execute_batch("DROP TABLE IF EXISTS tag_registry;")?;
 
         // `files.tags` was a JSON copy of the same fact, and nothing kept the
         // two in step (#60). The display path joins `file_tags` and `tags`.
@@ -2358,33 +2357,6 @@ impl Store {
 
     // ── Tags ────────────────────────────────────────────────────
 
-    /// Tags created by agents (not by indexer).
-    pub fn agent_created_tags(&self) -> Result<Vec<(String, String, i64)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT name, created_by, usage_count FROM tag_registry WHERE created_by != 'indexer' ORDER BY usage_count DESC",
-        )?;
-        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.into())
-    }
-
-    /// Tags used fewer than N times (cleanup candidates).
-    pub fn low_usage_tags(&self, max_count: i64) -> Result<Vec<(String, i64)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT name, usage_count FROM tag_registry WHERE usage_count < ?1 ORDER BY usage_count",
-        )?;
-        let rows = stmt.query_map(params![max_count], |row| Ok((row.get(0)?, row.get(1)?)))?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.into())
-    }
-
-    /// Tags unused for more than N days.
-    pub fn stale_tags(&self, days: i64) -> Result<Vec<(String, String)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT name, last_used FROM tag_registry WHERE last_used IS NOT NULL AND julianday('now') - julianday(last_used) > ?1 ORDER BY last_used",
-        )?;
-        let rows = stmt.query_map(params![days], |row| Ok((row.get(0)?, row.get(1)?)))?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.into())
-    }
-
     /// Borrow the underlying connection (for modules that need direct access).
     pub fn conn(&self) -> &Connection {
         &self.conn
@@ -2472,10 +2444,6 @@ impl Store {
 
     pub fn resolve_tags(&self, proposed: &[String]) -> Result<Vec<String>> {
         crate::tags::resolve_tags(&self.conn, proposed)
-    }
-
-    pub fn register_tag(&self, name: &str, created_by: &str) -> Result<()> {
-        crate::tags::register_tag(&self.conn, name, created_by)
     }
 
     /// The tag ids a file currently holds.
@@ -4192,42 +4160,6 @@ mod tests {
     fn test_next_vector_id_empty() {
         let store = Store::open_memory().unwrap();
         assert_eq!(store.next_vector_id().unwrap(), 0);
-    }
-
-    // ── Tag query tests ──────────────────────────────────────────
-
-    #[test]
-    fn test_tag_query_functions() {
-        let store = Store::open_memory().unwrap();
-
-        // Register tags with different creators
-        store.register_tag("rust", "indexer").unwrap();
-        store.register_tag("work", "indexer").unwrap();
-        store.register_tag("engraph", "claude-code").unwrap();
-        store.register_tag("decision", "claude-code").unwrap();
-
-        // Bump usage counts
-        store.register_tag("rust", "indexer").unwrap();
-        store.register_tag("rust", "indexer").unwrap();
-
-        // agent_created_tags: should return only non-indexer tags
-        let agent_tags = store.agent_created_tags().unwrap();
-        assert_eq!(agent_tags.len(), 2);
-        assert!(agent_tags.iter().all(|(_, by, _)| by != "indexer"));
-        let names: Vec<&str> = agent_tags.iter().map(|(n, _, _)| n.as_str()).collect();
-        assert!(names.contains(&"engraph"));
-        assert!(names.contains(&"decision"));
-
-        // low_usage_tags: tags with usage_count < 2
-        let low = store.low_usage_tags(2).unwrap();
-        // engraph and decision have count 1, work has count 1, rust has count 3
-        assert!(low.iter().any(|(n, _)| n == "engraph"));
-        assert!(low.iter().any(|(n, _)| n == "work"));
-        assert!(!low.iter().any(|(n, _)| n == "rust"));
-
-        // stale_tags: no tags should be stale since they were just created
-        let stale = store.stale_tags(1).unwrap();
-        assert!(stale.is_empty());
     }
 
     #[test]
