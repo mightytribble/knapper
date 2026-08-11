@@ -2573,7 +2573,12 @@ impl Store {
 
     /// The notes Obsidian's `tag:<path>` returns: the tag and every descendant.
     ///
-    /// Left-anchored, so the unique index on `path` serves it. `DISTINCT`
+    /// Left-anchored, so the unique index on `path` serves it. The descendant
+    /// arm is a range, not a `LIKE` pattern: `_` is a legal tag-path character
+    /// and is also `LIKE`'s single-character wildcard, and an `ESCAPE` clause
+    /// would turn off SQLite's `LIKE` optimisation. `?3` is `?2` with the
+    /// slash's next ASCII character in place of the slash, so the range holds
+    /// every path that starts with `<path>/` and nothing else. `DISTINCT`
     /// because one note may carry several descendants of one tag.
     pub fn files_under_tag(&self, path: &str) -> Result<Vec<FileRecord>> {
         let folded = path.to_lowercase();
@@ -2581,9 +2586,12 @@ impl Store {
             "SELECT DISTINCT {FILE_COLUMNS} FROM files f
                JOIN file_tags ft ON ft.file_id = f.id
                JOIN tags t ON t.id = ft.tag_id
-              WHERE t.path = ?1 OR t.path LIKE ?2 ORDER BY f.path"
+              WHERE t.path = ?1 OR (t.path >= ?2 AND t.path < ?3) ORDER BY f.path"
         ))?;
-        let rows = stmt.query_map(params![folded, format!("{folded}/%")], file_from_row)?;
+        let rows = stmt.query_map(
+            params![folded, format!("{folded}/"), format!("{folded}0")],
+            file_from_row,
+        )?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
@@ -5484,6 +5492,53 @@ mod tests {
             .map(|f| f.path)
             .collect();
         assert_eq!(exact, ["plain.md"]);
+    }
+
+    #[test]
+    fn an_underscore_in_a_tag_path_is_not_a_wildcard() {
+        let store = Store::open_memory().unwrap();
+        let tag = |p: &str| crate::tags::Tag {
+            path: p.into(),
+            display: p.into(),
+        };
+        let one = store
+            .insert_file("one.md", "h", 1, "d000001", None, None)
+            .unwrap();
+        let two = store
+            .insert_file("two.md", "h", 2, "d000002", None, None)
+            .unwrap();
+        let exact_note = store
+            .insert_file("exact.md", "h", 3, "d000003", None, None)
+            .unwrap();
+        // `_` is a legal tag-path character and also `LIKE`'s single-character
+        // wildcard. A `LIKE` pattern `type_a/%` would also match `typeXa/two`.
+        store
+            .reconcile_file_tags(one, &[tag("type_a/one")])
+            .unwrap();
+        store
+            .reconcile_file_tags(two, &[tag("typeXa/two")])
+            .unwrap();
+        store
+            .reconcile_file_tags(exact_note, &[tag("type_a")])
+            .unwrap();
+
+        let mut paths: Vec<String> = store
+            .files_under_tag("type_a")
+            .unwrap()
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+        paths.sort();
+        assert_eq!(paths, ["exact.md", "one.md"]);
+
+        // The exact arm still answers for the tag itself.
+        let exact: Vec<String> = store
+            .files_with_tag("type_a")
+            .unwrap()
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+        assert_eq!(exact, ["exact.md"]);
     }
 
     #[test]
