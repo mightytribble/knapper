@@ -519,20 +519,23 @@ See issues on this repo:
 
 - ~~**#1** structure-first chunking (section → sub-section → paragraph → size)~~ — **done**, 93.1%
   heading attribution (best measured). Retrieval barely moved; see #6 for why.
-- ~~**#2** contextual embedding prefix (filename / heading path / tags into every chunk)~~ —
-  **built, measured, shipped off by default.** Net negative on the seed probes: +3 ranks on the
-  conceptual probe, −4 (out of the window) on the exact-name non-regression probe. Both of its
-  retrieval acceptance criteria turned out to have been met already by #1 + #6. Whether a length-scaled or conditional prefix is worth
-  having is an open question, and a cheap one — every component is separately switchable.
+- **#2** contextual embedding prefix (filename / heading path / tags into every chunk) — **built,
+  measured, shipped off by default, and open on the question it did not answer.** Net negative on the
+  seed probes: +3 ranks on the conceptual probe, −4 (out of the window) on the exact-name
+  non-regression probe. Both of its retrieval acceptance criteria turned out to have been met already
+  by #1 + #6. Whether a length-scaled or conditional prefix is worth having is what keeps it open, and
+  it is cheap to answer — every component is separately switchable.
 - ~~**#11** FTS indexes the 200-char snippet, not the chunk~~ — **done.** Keyword search had been
   reaching 27.6% of the corpus; `Saltmere` and four other verified-present terms returned zero hits.
   Probe 3 went @5 → **@1**, the best result any configuration has produced on it, and probe 4 held
   at @2 under the heaviest churn of any probe. Nothing regressed. Moved 73 of 100 probe slots, so
   every lexical number recorded before it is superseded.
-- **#3** more probes, drawn from real usage — *not* a battery, and not a prerequisite for anything.
-  The five seed probes catch regressions and resolve large effects; what they cannot do is settle a
-  one-up-one-down at n=5 (#14). Fix is sample count, plus negative controls and section-vs-file
-  scoring recorded separately. Calibrates #4
+- **#3** more probes, drawn from real usage — *not* a battery. The five seed probes catch regressions
+  and resolve large effects; what they cannot do is settle a one-up-one-down at n=5 (#14). Fix is
+  sample count, plus negative controls and section-vs-file scoring recorded separately. Calibrates #4,
+  and **#41 blocks on it**: that question needs two probes the eighteen-query pool does not have —
+  one whose answer sits under a heading whose terms are absent from the chunk body, and one naming a
+  folder term
 - **#4** relevance floor — §8.3's per-lane dense candidate floor. Deferred, and narrower than its
   title. #34 shipped the half that makes a query with no answer return nothing, and it uses the
   calibrated cross-encoder score. The retrieval lanes have no calibrated score, so the per-lane half
@@ -690,15 +693,15 @@ See issues on this repo:
   this code** — the calibration corpus is authored, not written — so the evidence is unit tests over
   a fixture and no arm can be run. It becomes urgent the first time a workflow writes notes into a
   vault that is then searched
-- **#45** score the pool's queries against a ground-truth responsive set, not against churn — the
-  two metrics this file has used are both broken. *"Result slots that moved"* counts change and calls
-  it quality; *"read the swaps against the vault"* inspects only what differs between arms, so it
-  cannot see a responsive chunk absent from both or a noise chunk high in both.
+- ~~**#45** score the pool's queries against a ground-truth responsive set, not against churn~~ —
+  **DONE.** The two metrics this file used before it are both broken. *"Result slots that moved"*
+  counts change and calls it quality; *"read the swaps against the vault"* inspects only what differs
+  between arms, so it cannot see a responsive chunk absent from both or a noise chunk high in both.
   `rules/developer-console.md > ## [3] SPELLS`, a console menu, has sat at **rank 2, 95.65%** on probe
   3 in every arm of #36, #37 and #38 and no reading ever saw it. Per query: a tier-1 responsive set
   and a tier-2 informative set drafted from the vault by the author, then coverage, the rank of each
-  tier-1 member, and inversions. **The instrument #41, #43 and #44 should be judged with, so do it
-  first.**
+  tier-1 member, and inversions. **It is the instrument #43 and #44 were judged with, and the one
+  #41 needs.**
   **The sets are agreed and shipped as data**, one query per comment on the issue with the author
   ruling every reading. `eval/ground-truth.json`, built by `eval/build-ground-truth.py` and read by
   `eval/score-ground-truth.py`. At the pin: P1 **7/7**, inversions 0; P2 **5/5**, 4; P3 **4/5**, 7;
@@ -756,28 +759,48 @@ See issues on this repo:
   prefix-stable from 20 to 25 and to 100. `candidates` is the ceiling on a result list, so
   `top_n = 100` returns 30. The width is query-time and reaches no fingerprint, so an arm is a re-run.
   `eval/probes.md` holds the tables
-- **#50** the inversion count falls when an arm loses coverage — `eval/score-ground-truth.py` counts
-  noise above the **lowest-ranked tier-1 member present**, so the window an arm is judged over is one
-  the arm itself sets. On P3 the shipped arm holds that member at rank 15 and reports 7 inversions;
-  the `breadcrumb` arm at `breadcrumb_root = "path"` loses it, holds the next member at rank 4, and
-  reports **1** — while carrying 10 noise chunks in the top 20 against the shipped arm's 12. Two arms
-  compare on inversions only when that member holds the same rank, which is true of all four
-  reconstructions in #45 step 4 and false for that pair. Two candidate fixes are on the issue: print
-  the whole-window noise count beside the inversion count, or report the anchor rank and refuse the
-  comparison when it moves
-- **#52** a noise stamp cannot survive a re-chunk, because it carries no anchor — `(file, seq)` is a
-  position and a merge moves positions. Tier 1 falls back to its anchor sentence since #43; noise has
-  none, so five stamps dropped on #43's arm and P2 read `inversions 3` where the truth was 4, the
-  missing row being its own noise row an ordinal lower. Nothing is miscounted silently — the builder
-  reports each drop and the scorer reports the row unclassified — but every re-chunk costs a hand pass
-  over the lists. **Take it before #44**, which re-chunks again. About sixty pairs, and the anchors can
-  be generated from the pinned store and read over, so no ruling is re-opened
+- ~~**#50** the inversion count falls when an arm loses coverage~~ — **DONE.**
+  `eval/score-ground-truth.py` counts noise above the **lowest-ranked tier-1 member present**, so an
+  inversion count is taken over a window the arm itself sets: an arm that loses that member shortens
+  the window, and its count falls with the coverage it lost. On P3 the shipped arm holds the member at
+  rank 15 and reports 7 inversions; the `breadcrumb` arm at `breadcrumb_root = "path"` loses it, holds
+  the next member at rank 4, and reports **1** — while carrying 10 noise chunks in the top 20 against
+  the shipped arm's 12. The scorer now prints the **anchor rank** beside the inversion count and a
+  **noise count over the whole returned window**, which compares whatever the coverage. Both fixes the
+  issue proposed, because the anchor rank is what says whether the inversion count may be read at all.
+  One row of the #57 grid changes meaning: Exploratory / Qwen reads 3 inversions, the joint lowest in
+  the table, over a P4 window three ranks deep, and on the window count it carries 27 noise chunks
+  against 25 for the cell returning seven more answers
+- ~~**#52** a noise stamp cannot survive a re-chunk, because it carries no anchor~~ — **DONE.**
+  `(file, seq)` is a position and a merge moves positions. Tier 1 falls back to its anchor sentence
+  since #43; noise had none, so five stamps dropped on #43's arm and P2 read `inversions 3` where the
+  truth was 4, the missing row being its own noise row an ordinal lower. Every one of the 56 noise
+  entries now carries an anchor, and `eval/pick-noise-anchors.py` reads them from
+  `eval/ground-truth.json` rather than from a second copy of the table it held itself. Each entry is
+  located **by its anchor** — content, not position — and an anchor naming no chunk, or more than one,
+  prints `None` and is reported; a stamp that moved is reported with the ordinal it moved to. A silent
+  wrong-chunk pick is unreachable, where the old default store picked 10 of 56 anchors from the wrong
+  chunk and said nothing.
+  **`eval/chunk-rows-sha.py` had the same class of defect.** Its `0x1f` separator sat between the
+  fields of a row and not at the end of one, so one row's `text` abutted the next row's `path` — the
+  run the separator exists to stop. The separator terminates the row as well, and the hashes in
+  `eval/probes.md` move with it
 - **#51** a short **piece** of a split section escapes the chunk minimum — `emit_section` flushes
   whatever it has packed when the next paragraph alone busts the budget, so a section over the minimum
   can still emit a short row. `summaries/session-013.md > ## NPC Activity` is 68 characters at seq 5,
   and it is the only row under 120 characters in the shipped corpus that is not its file's first
   chunk. One row of 1461, so it is a paper cut, and #43's own mechanism is the fix: merge the flushed
   piece into the preceding chunk on the same terms
+- **#39** should neighbouring chunks be coalesced, and when? — when a lane returns chunks that are
+  adjacent in their file, does merging them before the answer is presented help, even where they are
+  not adjacent in the ranking? The case for it is that a weak claim beside a strong one may be the
+  context the strong one needs. It touches what #35 emits and not what the lanes retrieve, and #43's
+  merge is the same operation at index time on a different criterion
+- **#40** find out what information makes tags useful — #37 measured the tags out of the keyword
+  index on the reading that a tag records an attribute of a note rather than something the note
+  discusses, and the lane cannot tell the two apart: `npcs/tandi.md` is tagged `velthos`, a city. The
+  question this asks is the other direction — what a tag would have to record for the lane to gain by
+  matching it. It decides what #17's registry half is worth
 - ~~**#48** the per-document shortlist cap hides a responsive chunk from the cross-encoder~~ —
   **closed, not reproducible.** Both of its arms ran in a home at `top_n = 100`, so neither was the
   shipped configuration. The chunk it reported as hidden is rank 2 at 93.50% in the shipped arm, and
@@ -804,7 +827,8 @@ See issues on this repo:
   and a noise stamp, which carries none, is dropped and reported (**#52**). Four of the five that
   dropped are the same row an ordinal lower and are re-stamped; `hell-moth.md > ## Resources` merged
   into `## Stat Block` and wants a ruling if it ever surfaces
-- **#44** a bold-only line is a heading the chunker cannot see — `**Skills**` is structure to a reader
+- ~~**#44** a bold-only line is a heading the chunker cannot see~~ — **DONE, and the default is a
+  ruling rather than the measurement's reading.** `**Skills**` is structure to a reader
   and a paragraph to `emit_section`, so **33% of the bestiary's structure markers never reach a
   breadcrumb**. The vault cannot separate two candidate guards: all 219 bold-only lines are inside a
   section and all 73 that are not are preamble stat lines, so the content test and a
@@ -815,7 +839,65 @@ See issues on this repo:
   `### Notes` at 99.73%** against 98.02%. The choice is vault-authoring against a chunker rule; the
   chunker version generalises to any Obsidian vault in this house style. **#43 unblocked it**: the
   first probe pass destroyed N10's abstention, that was #43's bug, and `chunk_min_chars = 120` put all
-  eleven negatives back to the baseline. It is the default now, so #44's arm inherits it
+  eleven negatives back to the baseline. It is the default now, so #44's arm inherits it.
+  **The rule is a content test and it is flat.** One bold span and nothing else — `**Text**`,
+  `__Text__`, or either with one colon after the closing marker — so the bestiary's
+  `**Rank**: S • **Levels**: …` preamble is not promoted, and the test separates 219 bold-only lines
+  from 73 preamble lines exactly. `structure_headings` merges the promoted lines into what
+  `markdown::parse_headings` returns, deeper than any `#` heading and an ancestor of nothing, so the
+  enclosing heading stays in the breadcrumb, the next promoted line ends the section and the next `#`
+  heading of any depth ends it too. The raw line stays at the head of the chunk body, so the keyword
+  index reads `**Spells**` and only the breadcrumb reads the stripped text. A promoted line with no
+  body of its own is not promoted, and a `#` heading emptied by promotion is carried into that
+  promoted section rather than lost — a flat line has no descendants to carry its text.
+  **The control is exact.** `.engraph-i44-off` reproduces `.engraph-i43-min120` row for row over one
+  SHA-256 of every `(path, seq, heading, heading_path, text)`, after a full re-chunk. Promotion takes
+  the corpus from 1461 chunks to 1559 over the same 247 files, adds no row under 120 characters, and
+  moves the longest row not at all.
+  **Three of the plan's four conditions are met and the second is not.** P2's best rises 97.9795 to
+  99.6961 onto a `**Notes**` chunk that reads as the answer alone, P7's falls 98.3475 to 97.7192 onto
+  a `**Spells**` chunk a third the size of the stat block that held it and still rank 1, and P1, P2,
+  P6 and P7 hold their coverage. **P3 falls 4/5 to 1/5**: six per-creature `**Spells**` rows take
+  ranks 10, 12, 14, 15, 17 and 18, and three members that scored 84–96% leave the window. What removes
+  them before the cross-encoder sorts is not diagnosed. P3's inversion count falling 7 to 0 is #50's
+  artifact and not a gain, and P4's denominator changes so its two figures do not compare.
+  It ships `true` by the repository owner's ruling, taken with these numbers in front of them, and the
+  P3 regression is to be debugged rather than to block the rule.
+  **`CHUNKER_VERSION` is 2 because of the carry rule**, so every store built by an earlier binary
+  re-chunks once on its next open, whatever its settings. The final review filed **#53**, **#54** and
+  **#55**, and #51 is the fourth defect of the same pass
+- **#53** a promoted heading is not addressable by `read_section` or `edit` — `chunks.heading` holds
+  the raw promoted line, so a result prints `lore/bestiary/archdragon.md > **Spells**` and
+  `markdown::find_section` reads ATX headings only. `**Spells**` and `Spells` both answer "Section not
+  found", and `writer::edit_note` fails the same way. **107 of the shipped arm's 1559 chunks** carry a
+  promoted heading, `**Abilities**` 67 times and `**Spells**` 22, so 7% of the corpus breaks the
+  search-then-read path that is the main route through the MCP server. Three treatments are on the
+  issue: teach `find_section` the promoted form, which would then address a construct the writer
+  cannot edit as a section, since a promoted section ends at the next promoted line or the next `#`
+  heading and that is the chunker's rule and not the parser's; return the addressable ancestor and
+  keep the promoted leaf in the breadcrumb, which gives a reader more than the chunk that matched; or
+  report it and have the caller read the whole note
+- **#54** a bodyless heading above a same-level sibling loses its heading line — `structure_chunk`
+  skips a heading with no body of its own, because the text survives in its descendants'
+  `heading_path`. That holds for a deeper heading and fails for a sibling: `## A` above `## B` pops
+  from the ancestor stack before `B` pushes itself, so `A` is in no chunk's text and in no breadcrumb.
+  It predates #44 and happens at every setting of `promote_bold_headings`, since no bold line is
+  involved. #44 fixed the neighbouring case and deliberately did not widen the carry, because
+  widening it changes the control arm's rows and #44's result rests on that control being exact. **The
+  pinned vault does not hold this shape**, so no measurement is affected, and the fix is
+  `Action::Reindex`, a `CHUNKER_VERSION` bump and a new chunk-boundary baseline for every table in
+  `eval/probes.md`. What decides it is whether an empty heading is worth a row of text at all
+- **#55** the setup and apply reindex path chunks at settings the session did not choose —
+  `EngraphServer::setup` and `handle_setup` each load a fresh `Config::load().unwrap_or_default()` and
+  hand it to `onboarding::run_apply_json`, which runs a full vault index. Neither applies the
+  session's captured `chunk_opts`, so the index runs at whatever is on disk, or at the shipped
+  defaults if the load fails, while every later single-file `reindex_file` runs at the session's value.
+  That is the mixed chunking `ChunkOptions` exists to make impossible, and the chunker keys are
+  `chunker_fingerprint` components, so a full index at the wrong settings records the wrong
+  fingerprint too and the store then looks consistent. `reindex_file` had the same defect and is
+  fixed, at both call sites, with `Config::set_chunk_options`. The wider fix is to stop handing a bare
+  `Config` to anything that indexes. No measurement is affected, because every arm was indexed through
+  the CLI
 - **#41** does the keyword lane's breadcrumb column still earn its default? — **two arms, on against
   off.** The column exists for one case: a chunk whose answering terms are in its heading and not in
   its body. #37 shipped `[fts] heading_path = true` on one reading — it returns `## Level 4 Silence`
@@ -830,6 +912,14 @@ See issues on this repo:
   term. The pool needs two probes it does not have: one whose answer sits under a heading whose terms
   are absent from the chunk body, and one naming a folder term. **#45 is the instrument that scores
   them, so take it first.** A flag flip is a 0.1 s keyword-index rebuild, so the arms are nearly free
+- ~~**#33** compile llama.cpp's CUDA backend, and read the device at load~~ — **DONE.** The `cuda`
+  cargo feature is out of `default`, so the CPU build and CI's two legs are unchanged, and
+  `llm::device_identity` reads what device the process actually got and folds it into both model
+  fingerprints — so swapping between a CPU and a CUDA binary forces a re-embed each way, and a hidden
+  GPU is caught by the read path rather than answering from the wrong vector space. It is a 30×
+  speedup on the reranker, which is what closed #21, and a new measurement baseline: the kernels are
+  not bitwise identical, so a GPU rank table and a CPU one are not comparable. **See "The CUDA build"
+  above** for the toolkit install, the four environment variables and the two silent build failures
 - **#5** embedding model config — expose output dim, tie max chunk tokens to the model's context window
 - **#8** pick a better local embedder — >512 tokens, >768 dim (pairs with #5, which exposes the knobs)
 - ~~**#12** embed at the model's native dimension~~ — **done.** Every vector had been truncated to its
@@ -892,9 +982,11 @@ See issues on this repo:
   Two things came out of it that were not expected. **`default_no_intelligence()` is never called** —
   intelligence-off still runs `search_with_intelligence`, just with `orchestrator: None`, so the
   heuristic classifier and the weight table govern every search this engine performs and the gate was
-  firing in the baseline configuration all along. And **the graph lane's contribution at 0.8 is not
-  zero but is not evidence of value either**: with intelligence off its only appearances across the
-  five probes are two tail slots on probe 1 and two on probe 5, *the nonsense control*. A disjoint
+  firing in the baseline configuration all along. (#59 deleted that classifier and that table; the
+  weights are `[lane_weights]` and the constant this issue set is their default.) And **the graph
+  lane's contribution at 0.8 is not zero but is not evidence of value either**: with intelligence off
+  its only appearances across the five probes are two tail slots on probe 1 and two on probe 5, *the
+  nonsense control*. A disjoint
   set contributes most where the content lanes have least to say. The category error itself is
   untouched and belongs to #15
 - ~~**#22** `fts_search` phrase-quotes every query~~ — **done, and it had never worked.** The whole
@@ -935,6 +1027,59 @@ See issues on this repo:
   handed out in vault-walk order, so two rebuilds at the *same* thread count disagree on any digest
   keyed by it. Pre-existing and unrelated, but it briefly looked like corruption — index comparisons
   must key on `path`
+- ~~**#59** remove query expansion and intent classification; put the lane weights in config~~ —
+  **DONE.** Gone: `OrchestratorModel`, `LlamaOrchestrator`, `heuristic_orchestrate`,
+  `parse_orchestration_json`, `QueryIntent`, `OrchestrationResult`, `ensure_original`,
+  `LaneWeights::from_intent`, the `llm_cache` table and its accessors, `models.expand` and the 600 MB
+  Qwen3-0.6B download, `QueryTemplate::PerIntent`, and `temporal::parse_date_range_from_json`. The
+  temporal lane keeps its date range, which comes from `parse_date_range_heuristic` and was never the
+  model's. A store carried across this drops `llm_cache` on migrate.
+  **`[lane_weights]` is what replaces the classifier** — `semantic 1.0 / fts 1.0 / graph 0.8 /
+  rerank 1.0 / temporal 0.0`, the vector `Exploratory` named and the best cell the #57 grid measured.
+  Query-time, reaching no fingerprint, so a sweep is a config edit with no index work. `--explain`
+  keeps one retrieval row: the query as run, its FTS MATCH expression, and per-lane hit counts.
+  **Verified against the arm home**: 23/29 coverage, 5 inversions, 25 noise, N10 97.8715 and N11
+  97.8242 — the seeded cell reproduced with no seeding. Closes #18, #19 and #57
+- ~~**#57** the orchestrator's output holds no JSON on 13 of 18 pool queries, and the heuristic
+  fallback is cached as the model's~~ — **DONE, and it decided #59.** `LlamaOrchestrator::orchestrate`
+  generated 256 tokens, found no `{` in them, and fell to `heuristic_orchestrate` on 13 of the 18 pool
+  queries, every time, warning to stderr — after which `search.rs` cached the fallback under
+  `model = "orchestrator"` with nothing recording that no model produced it. The cause is the
+  template: `format_prompt` ends the prompt at `<|im_start|>assistant\n` and Qwen3-0.6B opens a
+  thinking block it never closes, so the budget is spent inside `<think>` before any JSON is written —
+  P3's generation is 1157 characters of reasoning and no object. Same family as #32 and #10.
+  **Both treatments work and neither matters.** A 1024-token budget parses 18 of 18 at 736 ms
+  median, and a `<think></think>` prefill parses 18 of 18 at **175 ms** against the defect's 5 of 18
+  at 610 ms. Measured against the
+  responsive sets, no expander this pool has been run with — the word-splitter, Qwen, or a hand-written
+  set — ever put a tier-1 member in front of the cross-encoder that the user's own query would not
+  have, and against the 22-slot shortlist expansion cost six of them by displacement. So the fix was to
+  delete the feature.
+  **Forty-four arm homes hold a byte-identical `llm_cache`**, `.engraph-i36-*` through
+  `.engraph-i46-*`, the `diag-*` homes and `.engraph-eval`. Every table from #36 onward, the
+  ground-truth build and the `answer_floor` fit ran under one set of eighteen rows, fourteen of them
+  word-splits. Nothing in `--json` records the intent, so a saved pool run carries no trace of what it
+  ran under and the cache is the only record. #59 deleted the table, so those homes are the last
+  stores that hold one
+- ~~**#58** N10's abstention is the shortlist gate, not the ranking~~ — **DONE, diagnosed and
+  reproduced three ways.** N10, *What spell can be used to clean clothing?*, is the near negative the
+  chunk minimum was fitted against and shipping condition one of both #43 and #44: "N10 stays at
+  1.6135". It stayed there only while the content lanes got 22 shortlist slots. The cross-encoder
+  scores `rules/restoration-spells.md > ## Level 5 Purify Body` **0.98** for that query every time it
+  is shown it, and `graph_reserve = 0`, `candidates = 90`, dropping the expansions, or lane weights of
+  `semantic 1.2 / fts 0.8` each surface it at 97.87%. Widening the gate is one half of the cause: the
+  eight slots go to a graph reserve that reaches the output on no probe. Reducing what competes for
+  the 22 is the other, and the competitor was the word-split branch — 68 fused candidates with no
+  expansion against 409 with the seven word-splits, and 1.61% appears in four of seventeen #57 cells,
+  all four word-splits at 22 slots. **After #59 the "N10 stays at 1.6135" condition is dead rather
+  than unmeaning.**
+  Truncating the lanes before fusion cannot help — the chunk is semantic rank 1 with no keyword-lane
+  presence, as P3's three lost members are semantic 2, 3 and 4 with none, so for any non-negative
+  weights and any cut, every configuration that admits them admits this first.
+  **"No floor can survive it" is narrower than the ticket read.** It holds for Qwen3-Reranker-0.6B and
+  not for the model class: the 4B scores the wrong chunk 73.87 against the right one's 86.88 and opens
+  a band that separates them, where the 0.6B reads 97.87 against 91.74. It does not solve the general
+  case — N11 reads 97.87% under both models, above every positive in the pool — which is #4
 - ~~**#19** intent classification looks inverted on two probes~~ — **closed by #59, which deleted the
   classifier.** It selected a weight vector that had never been swept, and twelve of the eighteen pool
   queries took its default branch anyway. The weights are now `[lane_weights]`, one configured vector
@@ -950,7 +1095,10 @@ See issues on this repo:
   lane's vote outweighs any position within one. Tags resolve semantically (a `tag_centroids` table,
   the same machinery as `folder_centroids`), aliases lexically (`links.rs`'s fuzzy name matching).
   Replaces the withdrawn FTS-injection experiment. Probe 4 is the guard, probe 5 the control
-- **#21** multi-sequence decode — phase 2 of #13, which built the batch *API* and then looped inside
+- ~~**#21** multi-sequence decode~~ — **closed: the GPU took the latency the batch was for.** #33's
+  CUDA backend is a 30× speedup on the reranker, which is the whole of what this was going to buy.
+  The diagnosis stands if a CPU build ever needs the throughput again — phase 2 of #13, which built
+  the batch *API* and then looped inside
   it. `LlamaBatch::new(max_tokens + 16, 1)` sets `n_seq_max = 1` and `n_ctx` is sized for one
   document, so all 30 candidates get their own forward pass. Packing them under distinct `seq_id`s
   and decoding once is where quantized CPU inference gets its throughput. **Acceptance is bit-identical
@@ -1042,7 +1190,8 @@ See issues on this repo:
   moves. A correctness fix the pipeline was nearly insensitive to on the day, because #9 holds the
   graph lane at or below the content lanes; **#29 is what made it pay**, since `Σ seed_score × 1/L`
   would otherwise be summing incommensurable units. `merge_seeds` logs `seeds`/`fts_won`/`top10_fts` at
-  DEBUG. Knock-on: `LaneWeights::from_intent` is meaningful for the first time
+  DEBUG. Knock-on: `LaneWeights::from_intent` is meaningful for the first time — a symbol #59 deleted,
+  so the knock-on now reads on `[lane_weights]`
 - ~~**#27** — **editing any file destroys every backlink into it**~~ — **DONE.** The ticket named
   `delete_edges_for_file`'s `from_file = ?1 OR to_file = ?1` as the cause. It was a symptom: **the
   real cause is that re-indexing deleted the `files` row**, and both `edges` columns are
@@ -1303,7 +1452,8 @@ pipeline can finally use it. Two corrections to the paragraphs above came out of
 gate was firing with intelligence **off** as well — `default_no_intelligence()` is dead code, and
 turning intelligence off only sets `orchestrator: None`, leaving `heuristic_orchestrate` and the same
 weight table in charge — so this was the baseline configuration's behaviour, not a
-models-loaded-only bug. And graph's contribution at 0.8 is not quite "invisible": it is two tail
+models-loaded-only bug. (#59 deleted the orchestrator and the weight table both.) And graph's
+contribution at 0.8 is not quite "invisible": it is two tail
 slots on probe 1 and two on probe 5, *the nonsense control*, which is what a disjoint set does when
 the content lanes have nothing to say. Full audit in `eval/probes.md`.
 
