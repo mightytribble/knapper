@@ -42,7 +42,7 @@ engraph search "architecture decisions" -n 5 --json
 
 ### Query Tips
 
-- **Conceptual / vague**: Use natural language. The orchestrator classifies intent and boosts semantic weight automatically.
+- **Conceptual / vague**: Use natural language. The cross-encoder reads each candidate jointly with the query, so a full question works better than keywords.
 - **Keyword-heavy**: Exact terms, identifiers, and names work well via the BM25 lane.
 - **Temporal**: "last week", "yesterday", "March 2026" — the temporal lane activates automatically.
 

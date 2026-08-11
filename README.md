@@ -20,7 +20,7 @@ engraph turns your markdown vault into a searchable knowledge graph that any AI 
 
 Plain vector search treats your notes as isolated documents. But knowledge isn't flat — your notes link to each other, share tags, reference the same people and projects. engraph understands these connections.
 
-- **5-lane hybrid search** — semantic embeddings + BM25 full-text + graph expansion + cross-encoder reranking + temporal scoring, fused via [Reciprocal Rank Fusion](https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf). An LLM orchestrator classifies queries and adapts lane weights per intent. Time-aware queries like "what happened last week" or "March 2026 notes" activate the temporal lane automatically.
+- **5-lane hybrid search** — semantic embeddings + BM25 full-text + graph expansion + cross-encoder reranking + temporal scoring, fused via [Reciprocal Rank Fusion](https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf). Lane weights are configurable. Time-aware queries like "what happened last week" or "March 2026 notes" activate the temporal lane automatically.
 - **MCP server for AI agents** — `engraph serve` exposes 25 tools (search, read, section-level editing, frontmatter mutations, vault health, context bundles, note creation, PARA migration, identity) that Claude, Cursor, or any MCP client can call directly.
 - **HTTP REST API** — `engraph serve --http` adds an axum-based HTTP server alongside MCP with 26 REST endpoints, API key authentication, rate limiting, and CORS. Web-based agents and scripts can query your vault with simple `curl` calls.
 - **Section-level editing** — AI agents can read, replace, prepend, or append to specific sections by heading. Full note rewriting with frontmatter preservation. Granular frontmatter mutations (set/remove fields, add/remove tags and aliases).
@@ -28,7 +28,7 @@ Plain vector search treats your notes as isolated documents. But knowledge isn't
 - **Obsidian CLI integration** — auto-detects running Obsidian and delegates compatible operations. Circuit breaker (Closed/Degraded/Open) ensures graceful fallback.
 - **Real-time sync** — file watcher keeps the index fresh as you edit in Obsidian. No manual re-indexing needed.
 - **Smart write pipeline** — AI agents can create, edit, rewrite, and delete notes with automatic tag resolution, wikilink discovery, and folder placement based on semantic similarity.
-- **Fully local** — [llama.cpp](https://github.com/ggml-org/llama.cpp) inference with GGUF models (~300MB mandatory, ~1.3GB optional for intelligence). Metal GPU-accelerated on macOS (88 files indexed in 70s). No API keys, no cloud.
+- **Fully local** — [llama.cpp](https://github.com/ggml-org/llama.cpp) inference with GGUF models (~300MB mandatory, ~650MB optional for the cross-encoder). Metal GPU-accelerated on macOS (88 files indexed in 70s). No API keys, no cloud.
 
 ## What problem it solves
 
@@ -58,8 +58,8 @@ Your vault (markdown files)
 │  MCP Server (stdio) + File Watcher          │
 │  + HTTP REST API (--http, optional)         │
 │                                             │
-│  Search: Orchestrator → 4-lane retrieval    │
-│          → Reranker → Two-pass RRF fusion   │
+│  Search: 3-lane retrieval → Reranker        │
+│          → Two-pass RRF fusion              │
 │                                             │
 │  25 MCP tools + 26 REST endpoints           │
 └─────────────────────────────────────────────┘
@@ -69,7 +69,7 @@ Your vault (markdown files)
 ```
 
 1. **Index** — walks your vault, chunks markdown by headings, embeds with a local GGUF model via llama.cpp (Metal GPU on macOS), stores everything in SQLite with FTS5 + sqlite-vec + a wikilink graph
-2. **Search** — an orchestrator classifies the query and sets lane weights, then runs up to five lanes (semantic KNN, BM25 keyword, graph expansion, cross-encoder reranking, temporal scoring), fused via RRF
+2. **Search** — runs the query through up to five lanes (semantic KNN, BM25 keyword, graph expansion, cross-encoder reranking, temporal scoring), fused via RRF at configurable per-lane weights
 3. **Serve** — starts an MCP server that AI agents connect to, with a file watcher that re-indexes changes in real time
 
 ## Quick start
@@ -170,17 +170,17 @@ engraph configure --list-api-keys
 engraph configure --revoke-api-key eg_abc123...
 ```
 
-**Enable intelligence (optional, ~1.3GB download):**
+**Enable intelligence (optional, ~650MB download):**
 
 ```bash
 engraph configure --enable-intelligence
-# Downloads Qwen3-0.6B (orchestrator) + Qwen3-Reranker (cross-encoder)
-# Adds LLM query expansion + 4th reranker lane to search
+# Downloads Qwen3-Reranker (cross-encoder)
+# Adds the reranker lane to search
 ```
 
 ## Example usage
 
-**4-lane search with intent classification:**
+**Search with the cross-encoder lane:**
 
 ```bash
 engraph search "how does authentication work" --explain
@@ -188,8 +188,6 @@ engraph search "how does authentication work" --explain
 ```
  1. [97%] 01-Projects/API-Design.md > # API Design  #e3e350
     All endpoints require Bearer token authentication...
-
-Intent: Conceptual
 
 --- Explain ---
 01-Projects/API-Design.md
@@ -202,7 +200,7 @@ Intent: Conceptual
     rerank: rank #4, raw 0.00, +0.0187
 ```
 
-The orchestrator classified the query as **Conceptual** (boosting semantic lane weight). The reranker scored each result for relevance as the 4th RRF lane.
+The reranker scored each result for relevance as the 4th RRF lane.
 
 **Rich context for AI agents:**
 
@@ -537,7 +535,7 @@ STYLE:
 | | engraph | Basic RAG (vector-only) | Obsidian search |
 |---|---|---|---|
 | Search method | 5-lane RRF (semantic + BM25 + graph + reranker + temporal) | Vector similarity only | Keyword only |
-| Query understanding | LLM orchestrator classifies intent, adapts weights | None | None |
+| Query understanding | Cross-encoder reads each candidate jointly with the query | None | None |
 | Understands note links | Yes (wikilink graph traversal) | No | Limited (backlinks panel) |
 | AI agent access | MCP server (25 tools) + HTTP REST API (26 endpoints) | Custom API needed | No |
 | Write capability | Create/edit/rewrite/delete with smart filing | No | Manual |
@@ -553,9 +551,8 @@ engraph is not a replacement for Obsidian — it's the intelligence layer that s
 - 5-lane hybrid search (semantic + FTS5 + graph + cross-encoder reranker + temporal) with two-pass RRF fusion
 - Temporal search: natural language date queries ("last week", "March 2026", "recent"), date extraction from frontmatter and filenames, smooth decay scoring
 - Confidence % display: search results show normalized 0-100% confidence instead of raw RRF scores
-- LLM research orchestrator: query intent classification + query expansion + adaptive lane weights
 - llama.cpp inference via Rust bindings (GGUF models, Metal GPU on macOS, CUDA on Linux)
-- Intelligence opt-in: heuristic fallback when disabled, LLM-powered when enabled
+- Intelligence opt-in: the cross-encoder lane is off unless enabled
 - MCP server with 25 tools (8 read, 10 write, 2 identity, 1 index, 1 diagnostic, 3 migrate) via stdio
 - HTTP REST API with 26 endpoints, API key auth (`eg_` prefix), rate limiting, CORS — enabled via `engraph serve --http`
 - User identity with L0/L1 tiered context for AI agent session starts
@@ -578,7 +575,6 @@ engraph is not a replacement for Obsidian — it's the intelligence layer that s
 
 ## Roadmap
 
-- [x] ~~Research orchestrator — query classification and adaptive lane weighting~~ (v1.0)
 - [x] ~~LLM reranker — optional local model for result quality~~ (v1.0)
 - [x] ~~MCP edit/rewrite tools — full note editing for AI agents~~ (v1.1)
 - [x] ~~Vault health monitor — orphan notes, broken links, stale content, tag hygiene~~ (v1.1)
@@ -606,8 +602,20 @@ exclude = [".obsidian/", "node_modules/", ".git/", "*-index.md", "templates/"]
 group_by = "chunk"
 max_chunks_per_file = 3
 
-# Enable LLM-powered intelligence (query expansion + reranking)
+# Enable the cross-encoder rerank lane
 intelligence = true
+
+# What each lane's rank is worth to RRF fusion. The values below are the
+# defaults. They are query-time, so a sweep costs no re-index. Under the
+# default ranking stage the cross-encoder sorts the shortlist, so only
+# `semantic` and `fts` decide anything; the rest are read by
+# `[ranking] mode = "legacy"`, where all five lanes vote.
+[lane_weights]
+# semantic = 1.0
+# fts = 1.0
+# graph = 0.8
+# rerank = 1.0
+# temporal = 0.0
 
 # Prepend document identity to each chunk before embedding. Off by default —
 # it helped conceptual queries and hurt exact-name lookup on the test vault.

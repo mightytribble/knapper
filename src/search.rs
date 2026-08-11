@@ -7,16 +7,9 @@ use serde_json::json;
 use crate::config::{GroupBy, RankingMode};
 use crate::fusion::{self, FusedResult, RankedResult};
 use crate::graph;
-use crate::llm::{self, EmbedModel, OrchestratorModel, RerankModel};
+use crate::llm::{self, EmbedModel, RerankModel};
 use crate::ranking;
 use crate::store::{Store, StoreStats};
-
-/// Compute cache key for orchestration results (SHA256 of query).
-fn orchestration_cache_key(query: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let hash = Sha256::digest(query.as_bytes());
-    format!("{:x}", hash)
-}
 
 /// A single search result with metadata.
 pub struct SearchResult {
@@ -54,25 +47,24 @@ pub struct SearchOutput {
     /// A fallback nobody is told about becomes the real ranking the moment the
     /// model is slow or missing, and no number in the result distinguishes it.
     pub degraded: bool,
-    pub intent: Option<crate::llm::QueryIntent>,
-    /// What each expanded query actually retrieved — the `--explain` record of
-    /// the retrieval step, as opposed to the fusion step.
-    pub expansions: Vec<ExpansionTrace>,
+    /// What the query actually retrieved — the `--explain` record of the
+    /// retrieval step, as opposed to the fusion step.
+    pub retrieval: RetrievalTrace,
     /// The keyword index's declared columns and their BM25 weights (#37).
     /// Printed by `--explain` because the weights are a measurement input that
     /// leaves no other trace in the output.
     pub fts_columns: Vec<(&'static str, f64)>,
 }
 
-/// One expanded query and what it brought back, per lane.
+/// The query as run, and what it brought back, per lane.
 ///
 /// This exists because three separate defects (#18, #22, #23) all lived in the
 /// gap between what the pipeline was asked to search for and what it searched
 /// for, and none of them were visible from the outside: `--explain` reported
 /// how the lanes were fused while saying nothing about what went into them.
 /// Reconstructing that needed direct SQL against the index.
-pub struct ExpansionTrace {
-    /// The query as run — the original, or whatever the orchestrator returned.
+pub struct RetrievalTrace {
+    /// The user's own words, which is now the only thing searched for (#59).
     pub query: String,
     /// The FTS5 MATCH expression this became, or `None` if it had no searchable
     /// token and the lane was skipped.
@@ -83,7 +75,6 @@ pub struct ExpansionTrace {
 
 /// Configuration for the intelligence search pipeline.
 pub struct SearchConfig<'a> {
-    pub orchestrator: Option<&'a mut dyn OrchestratorModel>,
     pub reranker: Option<&'a mut dyn RerankModel>,
     pub store: &'a Store,
     /// How many candidates the legacy stage shows the cross-encoder. The sorted
@@ -97,6 +88,8 @@ pub struct SearchConfig<'a> {
     pub group_by: GroupBy,
     /// Which ranking stage runs, and what reaches it (issue #30).
     pub ranking: crate::config::RankingConfig,
+    /// What each lane's rank is worth to fusion (issue #59).
+    pub lane_weights: crate::config::LaneWeights,
     /// What the keyword lane indexes, and how each column is weighted (#37).
     /// The flags have to be the ones the store was built with — the BM25
     /// weights are positional over the declared columns — and `fingerprint`
@@ -108,7 +101,6 @@ impl<'a> SearchConfig<'a> {
     /// A model-free config carrying the caller's retrieval settings.
     pub fn new(store: &'a Store, config: &crate::config::Config) -> Self {
         Self {
-            orchestrator: None,
             reranker: None,
             store,
             rerank_candidates: 30,
@@ -116,6 +108,7 @@ impl<'a> SearchConfig<'a> {
             max_chunks_per_file: config.max_chunks_per_file,
             group_by: config.group_by,
             ranking: config.ranking,
+            lane_weights: config.lane_weights,
             fts: config.fts,
         }
     }
@@ -134,7 +127,6 @@ pub fn search_internal(
     group_by: GroupBy,
 ) -> Result<SearchOutput> {
     let mut config = SearchConfig {
-        orchestrator: None,
         reranker: None,
         store,
         rerank_candidates: 30,
@@ -146,6 +138,7 @@ pub fn search_internal(
         // other `[fts]` gives this lane fewer weights rather than an error.
         fts: crate::config::FtsConfig::default(),
         ranking: crate::config::RankingConfig::default(),
+        lane_weights: crate::config::LaneWeights::default(),
     };
     search_with_intelligence(query, top_n, embedder, &mut config)
 }
@@ -248,163 +241,126 @@ fn document_title(file_path: &str) -> &str {
         .unwrap_or(file_path)
 }
 
-/// Full intelligence search pipeline.
+/// Full search pipeline.
 ///
-/// 1. Orchestrate (intent + expansions + weights) — LLM if available, else heuristic.
-/// 2. 3-lane retrieval per expanded query (semantic, FTS, graph).
-/// 3. RRF Pass 1 with top candidates.
-/// 4. Reranker scores each candidate (4th lane) if available.
-/// 5. RRF Pass 2 with all 4 lanes for final ranking.
+/// 1. 3-lane retrieval for the query (semantic, FTS, graph).
+/// 2. RRF Pass 1 with top candidates.
+/// 3. Reranker scores each candidate (4th lane) if available.
+/// 4. RRF Pass 2 with all 4 lanes for final ranking.
+///
+/// The query is the user's own words and nothing else. Query expansion is gone:
+/// seventeen pool cells in the #57 section of `eval/probes.md` measure it, and
+/// no expander — the word-splitter, Qwen3-0.6B, or a hand-written set — ever put
+/// a tier-1 member in front of the cross-encoder that the query would not have.
+/// Against a 22-slot shortlist it cost six of them by displacement (#59).
 pub fn search_with_intelligence(
     query: &str,
     top_n: usize,
     embedder: &mut impl EmbedModel,
     config: &mut SearchConfig<'_>,
 ) -> Result<SearchOutput> {
-    // --- Step 1: Orchestrate (with LLM cache when orchestrator is present) ---
-    let mut orchestration = match &mut config.orchestrator {
-        Some(orch) => {
-            let cache_key = orchestration_cache_key(query);
-            if let Some(cached_json) = config.store.get_llm_cache(&cache_key)? {
-                serde_json::from_str(&cached_json).unwrap_or_else(|_| {
-                    orch.orchestrate(query)
-                        .unwrap_or_else(|_| llm::heuristic_orchestrate(query))
-                })
-            } else {
-                let result = orch.orchestrate(query)?;
-                if let Ok(json) = serde_json::to_string(&result) {
-                    let _ = config
-                        .store
-                        .set_llm_cache(&cache_key, &json, "orchestrator");
-                }
-                result
-            }
-        }
-        None => llm::heuristic_orchestrate(query),
-    };
-    // Every source of expansions passes through here — model, cache hit,
-    // heuristic fallback — so the invariant has one entrance rather than
-    // three. #9's weight-table defect survived four tickets by having two.
-    orchestration.ensure_original(query);
-    tracing::debug!(
-        intent = ?orchestration.intent,
-        expansions = orchestration.expansions.len(),
-        "orchestration complete"
-    );
-    let weights = llm::LaneWeights::from_intent(&orchestration.intent);
+    // The date range is a regex over the query and was never the model's, so it
+    // outlives the orchestrator that used to carry it.
+    let date_range = crate::temporal::parse_date_range_heuristic(query);
+    let weights = config.lane_weights;
 
-    // --- Step 2: Run 3-lane retrieval for EACH expanded query ---
+    // --- Step 1: Run 3-lane retrieval ---
     //
     // Two pools per lane, holding the same hits with different score semantics:
-    // `all_*` keeps the lane's own scores and feeds fusion, `*_seeds` is
-    // normalised and feeds graph expansion. See `normalise_lane_scores` for why
-    // one pool cannot serve both (#26).
+    // the lane's own scores feed fusion, and a normalised copy feeds graph
+    // expansion. See `normalise_lane_scores` for why one pool cannot serve both
+    // (#26).
     //
     // How deep each content lane digs is `[ranking] retrieval_width` and not
     // `top_n`. The two were one number until #49, so asking for five more
     // results changed which candidates reached the model and rewrote the top of
     // the ranking. `top_n` now truncates the output and nothing else.
     let lane_width = config.ranking.retrieval_width;
-    let mut all_semantic: Vec<RankedResult> = Vec::new();
-    let mut all_fts: Vec<RankedResult> = Vec::new();
-    let mut semantic_seeds: Vec<RankedResult> = Vec::new();
-    let mut fts_seeds: Vec<RankedResult> = Vec::new();
-    let mut traces: Vec<ExpansionTrace> = Vec::new();
+    let mut semantic_hits: Vec<RankedResult> = Vec::new();
+    let mut fts_hits: Vec<RankedResult> = Vec::new();
 
-    for expanded_query in &orchestration.expansions {
-        // One expansion's hits are held apart from the pool so they can be
-        // normalised against their own range before joining it (#26).
-        let mut semantic_hits: Vec<RankedResult> = Vec::new();
-        let mut fts_hits: Vec<RankedResult> = Vec::new();
+    // Semantic lane
+    let query_vec = embedder.embed_query(query).context("embedding query")?;
+    let tombstones = std::collections::HashSet::new();
+    let raw_results = config
+        .store
+        .search_vec(&query_vec, lane_width, &tombstones)?;
 
-        // Semantic lane
-        // The intent reaches the embedder because `[embedding_prompt] query =
-        // "per_intent"` names a task from it (issue #10). Every other setting
-        // ignores it.
-        let query_vec = embedder
-            .embed_query(expanded_query, Some(&orchestration.intent))
-            .context("embedding query")?;
-        let tombstones = std::collections::HashSet::new();
-        let raw_results = config
-            .store
-            .search_vec(&query_vec, lane_width, &tombstones)?;
-
-        for (vector_id, distance) in raw_results {
-            if let Some(chunk) = config.store.get_chunk_by_vector_id(vector_id)? {
-                let (file_path, docid) = match config.store.get_file_by_id(chunk.file_id)? {
-                    Some(f) => (f.path, f.docid),
-                    None => ("<unknown>".to_string(), None),
-                };
-                let heading = if chunk.heading.is_empty() {
-                    None
-                } else {
-                    Some(chunk.heading)
-                };
-
-                semantic_hits.push(RankedResult {
-                    file_path,
-                    file_id: chunk.file_id,
-                    chunk_seq: chunk.seq,
-                    score: (1.0 - distance) as f64,
-                    heading,
-                    snippet: chunk.snippet,
-                    docid,
-                });
-            }
-        }
-
-        // FTS lane. `fts_search_any` and not `fts_search`: the latter phrase-
-        // matches the whole string, which returned nothing for four of the five
-        // seed probes and left this lane empty for every multi-word query (#22).
-        let fts_raw = config
-            .store
-            .fts_search_any(expanded_query, lane_width, &config.fts.weights())
-            .unwrap_or_default();
-
-        for fr in fts_raw {
-            let (file_path, docid) = match config.store.get_file_by_id(fr.file_id)? {
+    for (vector_id, distance) in raw_results {
+        if let Some(chunk) = config.store.get_chunk_by_vector_id(vector_id)? {
+            let (file_path, docid) = match config.store.get_file_by_id(chunk.file_id)? {
                 Some(f) => (f.path, f.docid),
-                None => continue,
+                None => ("<unknown>".to_string(), None),
             };
-            // The FTS index holds text only; the heading lives on the chunk row,
-            // which `(file_id, chunk_seq)` now reaches.
-            let heading = config
-                .store
-                .get_chunk_by_seq(fr.file_id, fr.chunk_seq)?
-                .map(|c| c.heading)
-                .filter(|h| !h.is_empty());
+            let heading = if chunk.heading.is_empty() {
+                None
+            } else {
+                Some(chunk.heading)
+            };
 
-            fts_hits.push(RankedResult {
+            semantic_hits.push(RankedResult {
                 file_path,
-                file_id: fr.file_id,
-                chunk_seq: fr.chunk_seq,
-                score: fr.score,
+                file_id: chunk.file_id,
+                chunk_seq: chunk.seq,
+                score: (1.0 - distance) as f64,
                 heading,
-                snippet: fr.snippet,
+                snippet: chunk.snippet,
                 docid,
             });
         }
-
-        traces.push(ExpansionTrace {
-            query: expanded_query.clone(),
-            fts_expr: crate::fts::any_term_expr(expanded_query),
-            semantic_hits: semantic_hits.len(),
-            fts_hits: fts_hits.len(),
-        });
-
-        // Rescale each lane against its own range for THIS query on the way
-        // into the seed pool. Before this, `1.0 - distance` (0.2-0.7) and
-        // negated BM25 (2-17) reached `merge_seeds` raw, and every comparison
-        // between them was decided by which lane's unit was bigger (#26).
-        semantic_seeds.extend(normalised(&semantic_hits));
-        fts_seeds.extend(normalised(&fts_hits));
-        all_semantic.extend(semantic_hits);
-        all_fts.extend(fts_hits);
     }
 
-    // Deduplicate across expanded queries, then bound each file's share of the
-    // lane. Without the bound a 33-chunk document would take 33 of the ranks
-    // this lane hands to RRF, pushing every other document down.
+    // FTS lane. `fts_search_any` and not `fts_search`: the latter phrase-
+    // matches the whole string, which returned nothing for four of the five
+    // seed probes and left this lane empty for every multi-word query (#22).
+    let fts_raw = config
+        .store
+        .fts_search_any(query, lane_width, &config.fts.weights())
+        .unwrap_or_default();
+
+    for fr in fts_raw {
+        let (file_path, docid) = match config.store.get_file_by_id(fr.file_id)? {
+            Some(f) => (f.path, f.docid),
+            None => continue,
+        };
+        // The FTS index holds text only; the heading lives on the chunk row,
+        // which `(file_id, chunk_seq)` now reaches.
+        let heading = config
+            .store
+            .get_chunk_by_seq(fr.file_id, fr.chunk_seq)?
+            .map(|c| c.heading)
+            .filter(|h| !h.is_empty());
+
+        fts_hits.push(RankedResult {
+            file_path,
+            file_id: fr.file_id,
+            chunk_seq: fr.chunk_seq,
+            score: fr.score,
+            heading,
+            snippet: fr.snippet,
+            docid,
+        });
+    }
+
+    let trace = RetrievalTrace {
+        query: query.to_string(),
+        fts_expr: crate::fts::any_term_expr(query),
+        semantic_hits: semantic_hits.len(),
+        fts_hits: fts_hits.len(),
+    };
+
+    // Rescale each lane against its own range on the way into the seed pool.
+    // Before this, `1.0 - distance` (0.2-0.7) and negated BM25 (2-17) reached
+    // `merge_seeds` raw, and every comparison between them was decided by which
+    // lane's unit was bigger (#26).
+    let semantic_seeds = normalised(&semantic_hits);
+    let fts_seeds = normalised(&fts_hits);
+    let all_semantic = semantic_hits;
+    let all_fts = fts_hits;
+
+    // Bound each file's share of the lane. Without the bound a 33-chunk document
+    // would take 33 of the ranks this lane hands to RRF, pushing every other
+    // document down.
     //
     // Under the sorted stage this is the *shortlist* cap and nothing else: what
     // the model is shown is bounded, what it returns is not (#30).
@@ -440,7 +396,7 @@ pub fn search_with_intelligence(
     // normalised (#26). Before, it landed in the dead zone between them: always
     // above every semantic seed, never above any FTS one — a position that
     // described neither lane's confidence nor the date match's.
-    let temporal_seeds: Vec<RankedResult> = if let Some(range) = &orchestration.date_range {
+    let temporal_seeds: Vec<RankedResult> = if let Some(range) = &date_range {
         config
             .store
             .get_files_in_date_range(range.0, range.1)
@@ -469,12 +425,10 @@ pub fn search_with_intelligence(
         }
     }
 
-    // The lane no longer reads the query: its admission filter was a weaker
-    // second copy of the FTS lane, scoped to one file and run on the *original*
-    // query while the content lanes ran every expansion (#29). What it was
-    // protecting against — an unrankable score — is gone now that mass
-    // accumulates, so a structurally implicated chunk simply sorts where its
-    // mass puts it.
+    // The lane does not read the query: its admission filter was a weaker second
+    // copy of the FTS lane, scoped to one file (#29). What it was protecting
+    // against — an unrankable score — is gone now that mass accumulates, so a
+    // structurally implicated chunk simply sorts where its mass puts it.
     let graph_started = std::time::Instant::now();
     let default_expansions = graph::PprParams::default().max_expansions;
     let graph_results = graph::graph_expand(
@@ -506,7 +460,7 @@ pub fn search_with_intelligence(
 
     const RRF_K: usize = 60;
 
-    // --- Steps 3-5: the ranking stage ---
+    // --- Steps 2-4: the ranking stage ---
     //
     // Two of them, chosen by `[ranking] mode`. The sorted stage is #30; the
     // legacy stage below is what it is measured against, and reproduces the
@@ -529,7 +483,7 @@ pub fn search_with_intelligence(
             &fts_results,
             &graph_results,
             &weights,
-            orchestration.date_range,
+            date_range,
             RRF_K,
         );
 
@@ -567,13 +521,12 @@ pub fn search_with_intelligence(
             results,
             fused: final_fused,
             degraded,
-            intent: Some(orchestration.intent),
-            expansions: traces,
+            retrieval: trace,
             fts_columns: config.fts.columns(),
         });
     }
 
-    // --- Step 3: RRF Pass 1 (3-lane) ---
+    // --- Step 2: RRF Pass 1 (3-lane) ---
     let fused_pass1 = fusion::rrf_fuse(
         &[
             ("semantic", &semantic_results, weights.semantic),
@@ -583,7 +536,7 @@ pub fn search_with_intelligence(
         RRF_K,
     );
 
-    // --- Step 4: Reranker (4th lane) if available ---
+    // --- Step 3: Reranker (4th lane) if available ---
     let mut rerank_results: Vec<RankedResult> = Vec::new();
     let reranker_used = if let Some(reranker) = &mut config.reranker {
         let candidates: Vec<_> = fused_pass1.iter().take(config.rerank_candidates).collect();
@@ -633,8 +586,8 @@ pub fn search_with_intelligence(
         false
     };
 
-    // --- Step 5: Temporal lane (5th lane) when date_range is present ---
-    let final_fused = if let Some(range) = &orchestration.date_range {
+    // --- Step 4: Temporal lane (5th lane) when date_range is present ---
+    let final_fused = if let Some(range) = &date_range {
         // Build temporal lane: score ALL candidates from pass1/reranked by date proximity
         let base_fused = if reranker_used {
             fusion::rrf_fuse(
@@ -731,8 +684,7 @@ pub fn search_with_intelligence(
         results,
         fused: final_fused,
         degraded: false,
-        intent: Some(orchestration.intent),
-        expansions: traces,
+        retrieval: trace,
         fts_columns: config.fts.columns(),
     })
 }
@@ -767,7 +719,7 @@ fn sorted_stage(
     semantic_results: &[RankedResult],
     fts_results: &[RankedResult],
     graph_results: &[RankedResult],
-    weights: &llm::LaneWeights,
+    weights: &crate::config::LaneWeights,
     date_range: Option<(i64, i64)>,
     rrf_k: usize,
 ) -> (Vec<FusedResult>, bool) {
@@ -964,12 +916,13 @@ fn temporal_promotions(
 /// The bottom of the normalised seed range.
 ///
 /// Not zero. `graph_expand` computes `seed.score * decay` and sorts the result
-/// before truncating, so a seed scored 0 is deleted from the expansion ordering
-/// rather than placed last in it — and the weakest hit of a lane is still a hit.
+/// before truncating, so a seed scored 0 is deleted from the graph lane's
+/// ordering rather than placed last in it — and the weakest hit of a lane is
+/// still a hit.
 const SEED_SCORE_FLOOR: f64 = 0.1;
 
-/// Rescale one lane's hits for one expanded query into `[SEED_SCORE_FLOOR, 1.0]`
-/// against their own range (issue #26).
+/// Rescale one lane's hits into `[SEED_SCORE_FLOOR, 1.0]` against their own
+/// range (issue #26).
 ///
 /// The two lanes fill `RankedResult::score` from incommensurable units —
 /// `1.0 - cosine_distance`, measured at 0.2–0.7 on the eval vault, against
@@ -977,12 +930,6 @@ const SEED_SCORE_FLOOR: f64 = 0.1;
 /// mixed them was decided by which lane's unit was larger: `merge_seeds` handed
 /// every contested file to FTS, and the ordering that feeds `graph_expand`'s
 /// `truncate` was BM25 magnitude rather than anything about the graph.
-///
-/// Per **expansion**, not per lane-total, because BM25 is a function of term
-/// rarity, document length and corpus statistics — the same document scores
-/// differently for a rare word than a common one, so the FTS lane's magnitudes
-/// are not comparable across expansions either. `1.0 - distance` is comparable
-/// across expansions, and normalising it per expansion costs nothing.
 ///
 /// Each lane is scaled against *itself*. No raw unit crosses a lane boundary,
 /// and the two lanes are never mapped onto a shared range against each other —
@@ -1001,12 +948,9 @@ const SEED_SCORE_FLOOR: f64 = 0.1;
 ///
 /// `score` has two consumers and they want opposite things. **Fusion consumes
 /// rank** — `rrf_fuse` reads position and never the number — and the rank comes
-/// from `collapse_lane` sorting the lane's own scores. Renormalising per
-/// expansion changes that sort: every expansion's best hit becomes exactly 1.0,
-/// so a weak expansion's best now ties a strong one's, and the pooled lane is
-/// reordered on no evidence. For the semantic lane that is pure loss, because
-/// `1.0 - distance` **is** comparable across expansions — same metric, same
-/// vector space. **Seeding consumes magnitude**: `graph_expand` computes
+/// from `collapse_lane` sorting the lane's own scores, which normalising would
+/// not change but would obscure. **Seeding consumes magnitude**: `graph_expand`
+/// computes
 /// `seed.score * decay`, sorts, and truncates, so the two lanes have to be on
 /// one scale or the bigger unit wins every time.
 ///
@@ -1077,38 +1021,26 @@ fn collapse_lane(results: Vec<RankedResult>, cap: usize) -> Vec<RankedResult> {
     deduped
 }
 
-/// Render the retrieval step for `--explain`: every query that was actually
-/// run, and what each lane returned for it.
+/// Render the retrieval step for `--explain`: the query that was actually run,
+/// and what each lane returned for it.
 ///
-/// Hit counts are pre-collapse — what the lane read, before dedup across
-/// expansions and before the per-file cap. That is the number that answers
-/// "was anything retrieved at all", which is the question these three tickets
-/// kept turning out to hinge on.
-fn format_expansions(traces: &[ExpansionTrace], columns: &[(&str, f64)]) -> String {
-    if traces.is_empty() {
-        return String::new();
-    }
+/// Hit counts are pre-collapse — what the lane read, before the per-file cap.
+/// That is the number that answers "was anything retrieved at all", which is
+/// the question these three tickets kept turning out to hinge on.
+fn format_retrieval(trace: &RetrievalTrace, columns: &[(&str, f64)]) -> String {
     let declared = columns
         .iter()
         .map(|(name, weight)| format!("{name}·{weight}"))
         .collect::<Vec<_>>()
         .join(" ");
-    let mut out = format!(
-        "--- Queries run ({}) ---\nkeyword index: {declared}\n",
-        traces.len()
-    );
-    for (i, t) in traces.iter().enumerate() {
-        out.push_str(&format!(
-            "{}. {:?}\n   semantic {} · fts {}",
-            i + 1,
-            t.query,
-            t.semantic_hits,
-            t.fts_hits
-        ));
-        match &t.fts_expr {
-            Some(expr) => out.push_str(&format!("  ← {expr}\n")),
-            None => out.push_str("  ← (no searchable term; fts skipped)\n"),
-        }
+    let mut out = format!("--- Query run ---\nkeyword index: {declared}\n");
+    out.push_str(&format!(
+        "{:?}\n   semantic {} · fts {}",
+        trace.query, trace.semantic_hits, trace.fts_hits
+    ));
+    match &trace.fts_expr {
+        Some(expr) => out.push_str(&format!("  ← {expr}\n")),
+        None => out.push_str("  ← (no searchable term; fts skipped)\n"),
     }
     out.push('\n');
     out
@@ -1182,19 +1114,7 @@ pub fn run_search(
     let store = Store::open(&db_path).context("opening store")?;
     store.verify_embedding_dim(embedder.dim())?;
 
-    // Load intelligence models if enabled.
-    let mut orchestrator_model: Option<Box<dyn llm::OrchestratorModel>> =
-        if config.intelligence_enabled() {
-            match crate::llm::LlamaOrchestrator::new(&models_dir, config) {
-                Ok(o) => Some(Box::new(o)),
-                Err(e) => {
-                    tracing::warn!("failed to load orchestrator: {e}");
-                    None
-                }
-            }
-        } else {
-            None
-        };
+    // Load the cross-encoder if enabled.
     let mut reranker_model: Option<Box<dyn llm::RerankModel>> = if config.intelligence_enabled() {
         match crate::llm::LlamaRerank::new(&models_dir, config) {
             Ok(r) => Some(Box::new(r)),
@@ -1221,9 +1141,6 @@ pub fn run_search(
 
     let output = {
         let mut search_config = SearchConfig {
-            orchestrator: orchestrator_model
-                .as_mut()
-                .map(|o| o.as_mut() as &mut dyn llm::OrchestratorModel),
             reranker: reranker_model
                 .as_mut()
                 .map(|r| r.as_mut() as &mut dyn llm::RerankModel),
@@ -1259,10 +1176,7 @@ pub fn run_search(
 
     if explain && !json {
         let mut explain_out = String::new();
-        if let Some(ref intent) = output.intent {
-            explain_out.push_str(&format!("Intent: {:?}\n\n", intent));
-        }
-        explain_out.push_str(&format_expansions(&output.expansions, &output.fts_columns));
+        explain_out.push_str(&format_retrieval(&output.retrieval, &output.fts_columns));
         explain_out.push_str("--- Explain ---\n");
         for f in output.fused.iter().take(top_n) {
             explain_out.push_str(&format!("{}\n", f.file_path));
@@ -1618,42 +1532,6 @@ mod tests {
         assert_eq!(format_bytes(2_516_582), "2.4 MB");
     }
 
-    #[test]
-    fn test_cache_key_deterministic() {
-        let key1 = super::orchestration_cache_key("how does auth work");
-        let key2 = super::orchestration_cache_key("how does auth work");
-        assert_eq!(key1, key2);
-
-        let key3 = super::orchestration_cache_key("different query");
-        assert_ne!(key1, key3);
-    }
-
-    #[test]
-    fn test_search_output_has_intent() {
-        let output = SearchOutput {
-            fts_columns: crate::config::FtsConfig::default().columns(),
-            results: vec![],
-            fused: vec![],
-            degraded: false,
-            intent: Some(crate::llm::QueryIntent::Conceptual),
-            expansions: vec![],
-        };
-        assert_eq!(output.intent, Some(crate::llm::QueryIntent::Conceptual));
-    }
-
-    #[test]
-    fn test_search_output_intent_none() {
-        let output = SearchOutput {
-            fts_columns: crate::config::FtsConfig::default().columns(),
-            results: vec![],
-            fused: vec![],
-            degraded: false,
-            intent: None,
-            expansions: vec![],
-        };
-        assert!(output.intent.is_none());
-    }
-
     fn ranked(file_path: &str, file_id: i64, chunk_seq: i64, score: f64) -> RankedResult {
         RankedResult {
             file_path: file_path.to_string(),
@@ -1827,10 +1705,10 @@ mod tests {
     ) -> SearchOutput {
         let mut config = SearchConfig {
             fts: crate::config::FtsConfig::default(),
-            orchestrator: None,
             reranker: None,
             store,
             rerank_candidates: 30,
+            lane_weights: crate::config::LaneWeights::default(),
             rerank: crate::config::RerankConfig::default(),
             max_chunks_per_file: crate::config::default_max_chunks_per_file(),
             group_by: GroupBy::Chunk,
@@ -1852,7 +1730,7 @@ mod tests {
         let wide = search_at("warding", 20, 4, &store, &mut embedder);
 
         for output in [&narrow, &wide] {
-            let trace = &output.expansions[0];
+            let trace = &output.retrieval;
             assert_eq!(trace.fts_hits, 4, "the keyword lane fetches the width");
             assert_eq!(
                 trace.semantic_hits, 4,
@@ -1938,10 +1816,10 @@ mod tests {
         {
             let mut config = SearchConfig {
                 fts: crate::config::FtsConfig::default(),
-                orchestrator: None,
                 reranker: Some(&mut reranker),
                 store,
                 rerank_candidates: 30,
+                lane_weights: crate::config::LaneWeights::default(),
                 rerank: settings,
                 max_chunks_per_file: 3,
                 group_by: GroupBy::Chunk,
@@ -2161,10 +2039,10 @@ mod tests {
         {
             let mut config = SearchConfig {
                 fts: crate::config::FtsConfig::default(),
-                orchestrator: None,
                 reranker: Some(&mut reranker),
                 store: &store,
                 rerank_candidates: 30,
+                lane_weights: crate::config::LaneWeights::default(),
                 rerank: crate::config::RerankConfig::default(),
                 max_chunks_per_file: 3,
                 group_by: GroupBy::Chunk,
@@ -2193,10 +2071,10 @@ mod tests {
         for cap in [1, 2] {
             let mut config = SearchConfig {
                 fts: crate::config::FtsConfig::default(),
-                orchestrator: None,
                 reranker: None,
                 store: &store,
                 rerank_candidates: 30,
+                lane_weights: crate::config::LaneWeights::default(),
                 rerank: crate::config::RerankConfig::default(),
                 max_chunks_per_file: cap,
                 group_by: GroupBy::Chunk,
@@ -2280,10 +2158,10 @@ mod tests {
             let mut reranker = CountingReranker::new();
             let mut config = SearchConfig {
                 fts: crate::config::FtsConfig::default(),
-                orchestrator: None,
                 reranker: Some(&mut reranker),
                 store: &store,
                 rerank_candidates: 30,
+                lane_weights: crate::config::LaneWeights::default(),
                 rerank: crate::config::RerankConfig::default(),
                 max_chunks_per_file: 3,
                 group_by: GroupBy::Chunk,
@@ -2338,10 +2216,10 @@ mod tests {
             let mut reranker = CountingReranker::new();
             let mut config = SearchConfig {
                 fts: crate::config::FtsConfig::default(),
-                orchestrator: None,
                 reranker: Some(&mut reranker),
                 store: &store,
                 rerank_candidates: 30,
+                lane_weights: crate::config::LaneWeights::default(),
                 rerank: crate::config::RerankConfig::default(),
                 max_chunks_per_file: 3,
                 group_by: GroupBy::Chunk,
@@ -2384,10 +2262,10 @@ mod tests {
             let mut reranker = CountingReranker::new();
             let mut config = SearchConfig {
                 fts: crate::config::FtsConfig::default(),
-                orchestrator: None,
                 reranker: Some(&mut reranker),
                 store: &store,
                 rerank_candidates: 30,
+                lane_weights: crate::config::LaneWeights::default(),
                 rerank: crate::config::RerankConfig::default(),
                 max_chunks_per_file: 3,
                 group_by: GroupBy::Chunk,
@@ -2425,10 +2303,10 @@ mod tests {
         {
             let mut config = SearchConfig {
                 fts: crate::config::FtsConfig::default(),
-                orchestrator: None,
                 reranker: Some(&mut reranker),
                 store: &store,
                 rerank_candidates: 30,
+                lane_weights: crate::config::LaneWeights::default(),
                 rerank: crate::config::RerankConfig {
                     max_document_chars: 0,
                     ..Default::default()
@@ -2491,10 +2369,10 @@ mod tests {
         let mut reranker = BrokenReranker;
         let mut config = SearchConfig {
             fts: crate::config::FtsConfig::default(),
-            orchestrator: None,
             reranker: Some(&mut reranker),
             store: &store,
             rerank_candidates: 30,
+            lane_weights: crate::config::LaneWeights::default(),
             rerank: crate::config::RerankConfig::default(),
             max_chunks_per_file: 3,
             group_by: GroupBy::Chunk,
@@ -2514,10 +2392,10 @@ mod tests {
 
         let mut config = SearchConfig {
             fts: crate::config::FtsConfig::default(),
-            orchestrator: None,
             reranker: None,
             store: &store,
             rerank_candidates: 30,
+            lane_weights: crate::config::LaneWeights::default(),
             rerank: crate::config::RerankConfig::default(),
             max_chunks_per_file: 3,
             group_by: GroupBy::Chunk,
@@ -2549,10 +2427,10 @@ mod tests {
         let mut reranker = CountingReranker::new();
         let mut config = SearchConfig {
             fts: crate::config::FtsConfig::default(),
-            orchestrator: None,
             reranker: Some(&mut reranker),
             store: &store,
             rerank_candidates: 30,
+            lane_weights: crate::config::LaneWeights::default(),
             rerank: crate::config::RerankConfig::default(),
             max_chunks_per_file: 3,
             group_by: GroupBy::Chunk,
@@ -2574,10 +2452,10 @@ mod tests {
 
         let mut config = SearchConfig {
             fts: crate::config::FtsConfig::default(),
-            orchestrator: None,
             reranker: None,
             store: &store,
             rerank_candidates: 30,
+            lane_weights: crate::config::LaneWeights::default(),
             rerank: crate::config::RerankConfig::default(),
             max_chunks_per_file: 3,
             group_by: GroupBy::File,

@@ -15,7 +15,7 @@ use tokio::sync::Mutex;
 
 use crate::config::Config;
 use crate::context::{self, ContextParams};
-use crate::llm::{EmbedModel, OrchestratorModel, RerankModel};
+use crate::llm::{EmbedModel, RerankModel};
 use crate::profile::VaultProfile;
 use crate::search;
 use crate::store::Store;
@@ -244,8 +244,6 @@ pub struct EngraphServer {
     profile: Arc<Option<VaultProfile>>,
     #[allow(dead_code)] // Required by rmcp #[tool_router] macro infrastructure
     tool_router: ToolRouter<Self>,
-    /// Query expansion orchestrator (None when intelligence is disabled or failed to load).
-    orchestrator: Option<Arc<Mutex<Box<dyn OrchestratorModel + Send>>>>,
     /// Result reranker (None when intelligence is disabled or failed to load).
     reranker: Option<Arc<Mutex<Box<dyn RerankModel + Send>>>>,
     /// Tracks files recently written by MCP tools so the watcher can skip re-indexing them.
@@ -260,6 +258,7 @@ pub struct EngraphServer {
     rerank: crate::config::RerankConfig,
     /// Ranking-stage settings from `config.toml`.
     ranking: crate::config::RankingConfig,
+    lane_weights: crate::config::LaneWeights,
     /// Keyword-lane settings from `config.toml`. The BM25 weights are
     /// positional over the columns the store's index is declared with, so this
     /// has to be the config the store was built from (issue #37).
@@ -401,20 +400,13 @@ impl EngraphServer {
         let store = self.store.lock().await;
         let mut embedder = self.embedder.lock().await;
 
-        // Lock orchestrator and reranker if available for intelligence-enhanced search.
-        let mut orch_guard = match &self.orchestrator {
-            Some(o) => Some(o.lock().await),
-            None => None,
-        };
+        // Lock the cross-encoder if it is available.
         let mut rerank_guard = match &self.reranker {
             Some(r) => Some(r.lock().await),
             None => None,
         };
 
         let mut config = search::SearchConfig {
-            orchestrator: orch_guard
-                .as_mut()
-                .map(|g| g.as_mut() as &mut dyn OrchestratorModel),
             reranker: rerank_guard
                 .as_mut()
                 .map(|g| g.as_mut() as &mut dyn RerankModel),
@@ -424,6 +416,7 @@ impl EngraphServer {
             max_chunks_per_file: self.max_chunks_per_file,
             group_by: self.group_by,
             ranking: self.ranking,
+            lane_weights: self.lane_weights,
             fts: self.fts,
         };
 
@@ -1082,22 +1075,7 @@ pub async fn run_serve(
 
     let profile = Config::load_vault_profile().ok().flatten();
 
-    // Load intelligence models if enabled
-    let orchestrator: Option<Arc<Mutex<Box<dyn OrchestratorModel + Send>>>> =
-        if config.intelligence_enabled() {
-            match crate::llm::LlamaOrchestrator::new(&models_dir, &config) {
-                Ok(orch) => Some(Arc::new(Mutex::new(
-                    Box::new(orch) as Box<dyn OrchestratorModel + Send>
-                ))),
-                Err(e) => {
-                    tracing::warn!("failed to load orchestrator: {e}, intelligence disabled");
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
+    // Load the cross-encoder if enabled
     let reranker: Option<Arc<Mutex<Box<dyn RerankModel + Send>>>> = if config.intelligence_enabled()
     {
         match crate::llm::LlamaRerank::new(&models_dir, &config) {
@@ -1145,7 +1123,6 @@ pub async fn run_serve(
     let http_embedder = embedder_arc.clone();
     let http_vault_path = vault_path_arc.clone();
     let http_profile = profile_arc.clone();
-    let http_orchestrator = orchestrator.as_ref().map(Arc::clone);
     let http_reranker = reranker.as_ref().map(Arc::clone);
     let http_recent_writes = recent_writes.clone();
 
@@ -1164,6 +1141,7 @@ pub async fn run_serve(
     let group_by = config.group_by;
     let rerank = config.rerank;
     let ranking = config.ranking;
+    let lane_weights = config.lane_weights;
     let fts = config.fts;
     let embed = crate::prefix::EmbedComposition::from_config(&config);
     let chunk_opts = config.chunk_options();
@@ -1188,7 +1166,6 @@ pub async fn run_serve(
         vault_path: vault_path_arc,
         profile: profile_arc,
         tool_router: EngraphServer::tool_router(),
-        orchestrator,
         reranker,
         recent_writes,
         read_only,
@@ -1196,6 +1173,7 @@ pub async fn run_serve(
         group_by,
         rerank,
         ranking,
+        lane_weights,
         fts,
         embed,
         chunk_opts,
@@ -1212,7 +1190,6 @@ pub async fn run_serve(
             embedder: http_embedder,
             vault_path: http_vault_path,
             profile: http_profile,
-            orchestrator: http_orchestrator,
             reranker: http_reranker,
             http_config: Arc::new(config.http.clone()),
             no_auth: opts.no_auth,
@@ -1223,6 +1200,7 @@ pub async fn run_serve(
             group_by,
             rerank,
             ranking,
+            lane_weights,
             fts,
             embed,
             chunk_opts,

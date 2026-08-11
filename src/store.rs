@@ -329,12 +329,6 @@ CREATE TABLE IF NOT EXISTS tombstones (
     created_at TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS llm_cache (
-    query_hash TEXT PRIMARY KEY,
-    result     TEXT NOT NULL,
-    model      TEXT NOT NULL,
-    created_at TEXT NOT NULL
-);
 "#;
 
 pub struct Store {
@@ -524,6 +518,10 @@ impl Store {
 
     /// Run migrations for existing databases that may be missing newer columns.
     fn migrate(&self) -> Result<()> {
+        // The orchestrator's result cache. Nothing reads it since #59, and a
+        // cache row has no expiry, so a store carried across the upgrade would
+        // hold rows forever that describe a pipeline that no longer exists.
+        self.conn.execute_batch("DROP TABLE IF EXISTS llm_cache;")?;
         if !self.column_exists("files", "docid")? {
             self.conn
                 .execute_batch("ALTER TABLE files ADD COLUMN docid TEXT;")?;
@@ -731,29 +729,6 @@ impl Store {
             Some(val) => Ok(Some(val?)),
             None => Ok(None),
         }
-    }
-
-    // ── LLM Cache ───────────────────────────────────────────────
-
-    /// Cache an LLM orchestration result by query hash.
-    pub fn set_llm_cache(&self, query_hash: &str, result: &str, model: &str) -> Result<()> {
-        self.conn.execute(
-            "INSERT OR REPLACE INTO llm_cache (query_hash, result, model, created_at)
-             VALUES (?1, ?2, ?3, datetime('now'))",
-            params![query_hash, result, model],
-        )?;
-        Ok(())
-    }
-
-    /// Retrieve a cached LLM result by query hash.
-    pub fn get_llm_cache(&self, query_hash: &str) -> Result<Option<String>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT result FROM llm_cache WHERE query_hash = ?1")?;
-        let result = stmt
-            .query_row(params![query_hash], |row| row.get::<_, String>(0))
-            .optional()?;
-        Ok(result)
     }
 
     // ── Files ───────────────────────────────────────────────────
@@ -4607,32 +4582,27 @@ mod tests {
         assert_eq!(corrections[1].file_path, "notes/first.md");
     }
 
-    // ── LLM cache tests ────────────────────────────────────────
-
+    /// A store carried across #59 loses the orchestrator's cache table.
+    ///
+    /// The rows have no expiry and describe a pipeline that no longer exists,
+    /// so leaving them would be dead weight that outlives every binary.
     #[test]
-    fn test_llm_cache_roundtrip() {
+    fn migrating_drops_the_orchestrator_cache() {
         let store = Store::open_memory().unwrap();
         store
-            .set_llm_cache("abc123", r#"{"intent":"exact"}"#, "qwen3-0.6B")
+            .conn
+            .execute_batch("CREATE TABLE llm_cache (query_hash TEXT PRIMARY KEY);")
             .unwrap();
-        let result = store.get_llm_cache("abc123").unwrap();
-        assert_eq!(result, Some(r#"{"intent":"exact"}"#.to_string()));
-    }
-
-    #[test]
-    fn test_llm_cache_miss() {
-        let store = Store::open_memory().unwrap();
-        let result = store.get_llm_cache("nonexistent").unwrap();
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_llm_cache_overwrite() {
-        let store = Store::open_memory().unwrap();
-        store.set_llm_cache("key1", "old", "model1").unwrap();
-        store.set_llm_cache("key1", "new", "model1").unwrap();
-        let result = store.get_llm_cache("key1").unwrap();
-        assert_eq!(result, Some("new".to_string()));
+        store.migrate().unwrap();
+        let present: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'llm_cache'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(present, 0);
     }
 
     #[test]

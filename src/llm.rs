@@ -2,7 +2,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Result, bail};
 use indicatif::{ProgressBar, ProgressStyle};
 use sha2::{Digest, Sha256};
 
@@ -11,7 +11,6 @@ use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel};
-use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::{LlamaBackendDeviceType, list_llama_ggml_backend_devices};
 
 static BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
@@ -220,51 +219,30 @@ pub enum QueryTemplate {
     /// `<bos>search_query: {query}` — nomic-embed-text's convention.
     /// The control the documented template was measured against.
     Legacy,
-    /// `<bos>task: search result | query: {query}`, whatever the intent is.
+    /// `<bos>task: search result | query: {query}`.
     #[default]
     Documented,
-    /// The documented template, with the task chosen from [`QueryIntent`].
-    ///
-    /// Off by default: it differs from [`Self::Documented`] on two of the
-    /// eighteen calibration queries and on no tracked target, and it hands the
-    /// choice of prompt to a classifier that calls the bare name `Archdragon`
-    /// conceptual (issue #19).
-    PerIntent,
 }
 
 /// The task an EmbeddingGemma query prompt names.
 ///
-/// The model card documents eight of them. These are the ones a retrieval
-/// engine can reach: the others describe classification, clustering and
-/// similarity, which engraph never asks for.
+/// The model card documents eight of them. `search result` is the one a
+/// retrieval engine asks for: the others describe classification, clustering
+/// and similarity, which engraph never wants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmbedTask {
     /// No task field at all — the legacy `search_query:` prefix.
     Legacy,
     /// `task: search result` — retrieval.
     SearchResult,
-    /// `task: question answering` — a query written as a question.
-    QuestionAnswering,
 }
 
 impl EmbedTask {
-    /// Resolve the task from the configured template and the query's intent.
-    ///
-    /// `intent` is `None` where the caller has not classified the query — the
-    /// orchestrator runs after some embedding sites, and a task it did not
-    /// choose is `SearchResult` rather than a guess.
-    ///
-    /// The per-intent mapping differs from [`QueryTemplate::Documented`] on
-    /// `Conceptual` alone. `Exact`, `Relationship`, `Exploratory` and `Temporal`
-    /// all describe retrieval of a passage, which is what `search result` names.
-    pub fn resolve(template: QueryTemplate, intent: Option<&QueryIntent>) -> Self {
+    /// Resolve the task from the configured template.
+    pub fn resolve(template: QueryTemplate) -> Self {
         match template {
             QueryTemplate::Legacy => Self::Legacy,
             QueryTemplate::Documented => Self::SearchResult,
-            QueryTemplate::PerIntent => match intent {
-                Some(QueryIntent::Conceptual) => Self::QuestionAnswering,
-                _ => Self::SearchResult,
-            },
         }
     }
 
@@ -272,7 +250,6 @@ impl EmbedTask {
     fn description(self) -> &'static str {
         match self {
             Self::Legacy | Self::SearchResult => "search result",
-            Self::QuestionAnswering => "question answering",
         }
     }
 }
@@ -394,146 +371,6 @@ pub struct EmbeddingPromptConfig {
     pub document_title: DocumentTitle,
 }
 
-// ── Types ────────────────────────────────────────────────────────────────────
-
-/// Classified intent of an incoming search query.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum QueryIntent {
-    /// User wants a precise fact or term match.
-    Exact,
-    /// User wants related ideas and concepts.
-    Conceptual,
-    /// User wants to explore connections between entities.
-    Relationship,
-    /// User is browsing without a clear target.
-    Exploratory,
-    /// User is asking about a specific time period.
-    Temporal,
-}
-
-/// Output produced by an orchestrator model for a query.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct OrchestrationResult {
-    /// Classified query intent.
-    pub intent: QueryIntent,
-    /// Query string(s) to actually run (original + any expansions).
-    pub expansions: Vec<String>,
-    /// Optional unix-timestamp range for temporal queries (start, end).
-    #[serde(default)]
-    pub date_range: Option<(i64, i64)>,
-}
-
-impl OrchestrationResult {
-    /// Put the user's own words back at the head of the expansion list if the
-    /// orchestrator left them out.
-    ///
-    /// The system prompt asks for the original query first. Qwen3-0.6B ignores
-    /// that routinely — measured on the eval vault, three of the three probes
-    /// it answered came back without it, including the bare name `Archdragon`,
-    /// which was replaced by `Archdragon character` and `Archdragon concept`.
-    /// So the exact-name probe ran with no exact name in it, which is most of
-    /// what `eval/probes.md` has been recording as "intelligence breaks probe 4"
-    /// since the file was started (#23).
-    ///
-    /// Applied on read rather than before caching, so `llm_cache` keeps what the
-    /// model actually said and rows written before this existed are repaired
-    /// without invalidation.
-    pub fn ensure_original(&mut self, query: &str) {
-        let original = query.trim();
-        if original.is_empty() {
-            return;
-        }
-        if self
-            .expansions
-            .iter()
-            .any(|e| e.trim().eq_ignore_ascii_case(original))
-        {
-            return;
-        }
-        self.expansions.insert(0, original.to_string());
-    }
-}
-
-/// Per-lane weights for the RRF fusion step.
-#[derive(Debug, Clone)]
-pub struct LaneWeights {
-    pub semantic: f64,
-    pub fts: f64,
-    pub graph: f64,
-    pub rerank: f64,
-    pub temporal: f64,
-}
-
-impl LaneWeights {
-    /// Map a classified intent to recommended lane weights.
-    pub fn from_intent(intent: &QueryIntent) -> Self {
-        match intent {
-            QueryIntent::Exact => Self {
-                fts: 1.5,
-                semantic: 0.6,
-                graph: 0.6,
-                rerank: 0.8,
-                temporal: 0.0,
-            },
-            QueryIntent::Conceptual => Self {
-                semantic: 1.2,
-                fts: 0.8,
-                graph: 1.0,
-                rerank: 1.2,
-                temporal: 0.0,
-            },
-            // Graph sits at 0.8 here, not above the content lanes, and this is
-            // load-bearing — see issue #9. `graph_expand` skips any neighbour
-            // already in the seed set, so the graph lane's results are disjoint
-            // from the other lanes' by construction. RRF scores agreement
-            // between rankings of the same corpus; a disjoint set can never
-            // accumulate any, so a graph result's fused score is a pure function
-            // of this constant. At 1.5 its 20 capped expansions swept the whole
-            // top 20, since 1.5/(60+20) beats 0.8/(60+1) by 43% — every content
-            // result was locked out of every "who" query.
-            QueryIntent::Relationship => Self {
-                graph: 0.8,
-                semantic: 1.0,
-                fts: 1.0,
-                rerank: 1.0,
-                temporal: 0.0,
-            },
-            QueryIntent::Exploratory => Self {
-                semantic: 1.0,
-                fts: 1.0,
-                graph: 0.8,
-                rerank: 1.0,
-                temporal: 0.0,
-            },
-            QueryIntent::Temporal => Self {
-                semantic: 0.6,
-                fts: 0.8,
-                graph: 0.5,
-                rerank: 0.8,
-                temporal: 1.5,
-            },
-        }
-    }
-
-    /// Weights used when no intelligence layer is available (legacy mode).
-    ///
-    /// **Nothing calls this outside tests.** Turning intelligence off does not
-    /// reach it: `search_with_intelligence` still runs, just with
-    /// `orchestrator: None`, so the intent comes from `heuristic_orchestrate`
-    /// and the weights from [`Self::from_intent`] exactly as they do with the
-    /// models loaded. That is why issue #9's gate fired in *both*
-    /// configurations, and why the fix had to be in the table above.
-    pub fn default_no_intelligence() -> Self {
-        Self {
-            semantic: 1.0,
-            fts: 1.0,
-            graph: 0.8,
-            rerank: 0.0,
-            temporal: 0.0,
-        }
-    }
-}
-
 // ── Traits ───────────────────────────────────────────────────────────────────
 
 /// One document as the embedder is shown it: the two fields the document half of
@@ -577,14 +414,9 @@ pub trait EmbedModel: Send {
 
     /// Embed a search query — the other half of an asymmetric model's pair.
     ///
-    /// `intent` is what the orchestrator classified the query as, where the
-    /// caller has one. Only `[embedding_prompt] query = "per_intent"` reads it
-    /// (issue #10); every other setting produces one template for every query.
-    ///
-    /// The default implementation ignores both the intent and the asymmetry,
-    /// which is correct for a symmetric model and for the test embedders.
-    fn embed_query(&mut self, text: &str, intent: Option<&QueryIntent>) -> Result<Vec<f32>> {
-        let _ = intent;
+    /// The default implementation ignores the asymmetry, which is correct for a
+    /// symmetric model and for the test embedders.
+    fn embed_query(&mut self, text: &str) -> Result<Vec<f32>> {
         self.embed_one(text)
     }
 
@@ -662,11 +494,6 @@ pub trait RerankModel: Send {
             .map(|document| self.rerank_score(query, document))
             .collect()
     }
-}
-
-/// Orchestrator — interprets a query and produces an enriched search plan.
-pub trait OrchestratorModel: Send {
-    fn orchestrate(&mut self, query: &str) -> Result<OrchestrationResult>;
 }
 
 // ── MockLlm ──────────────────────────────────────────────────────────────────
@@ -784,16 +611,6 @@ impl RerankModel for MockLlm {
 
         let score = intersection as f32 / union as f32;
         Ok(score.clamp(0.0, 1.0))
-    }
-}
-
-impl OrchestratorModel for MockLlm {
-    fn orchestrate(&mut self, query: &str) -> Result<OrchestrationResult> {
-        Ok(OrchestrationResult {
-            intent: QueryIntent::Exploratory,
-            expansions: vec![query.to_owned()],
-            date_range: None,
-        })
     }
 }
 
@@ -1100,7 +917,6 @@ fn try_external_tokenizer(
 pub struct ModelDefaults {
     pub embed_uri: String,
     pub rerank_uri: String,
-    pub expand_uri: String,
 }
 
 impl Default for ModelDefaults {
@@ -1109,7 +925,6 @@ impl Default for ModelDefaults {
             embed_uri: "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf".into(),
             rerank_uri: "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf"
                 .into(),
-            expand_uri: "hf:Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf".into(),
         }
     }
 }
@@ -1188,10 +1003,9 @@ fn physical_cores() -> Option<usize> {
 ///
 /// Both context knobs get this value. `n_threads` governs single-token
 /// autoregressive decode and `n_threads_batch` governs multi-token forward
-/// passes, and engraph is nearly all of the latter: the reranker decodes a
-/// whole ~155-token pair and reads the final logits, the embedder encodes a
-/// chunk, and only the orchestrator generates — one short JSON object per
-/// uncached query.
+/// passes, and engraph is all of the latter: nothing generates. The reranker
+/// decodes a whole ~155-token pair and reads the final logits, and the embedder
+/// encodes a chunk.
 pub fn resolve_n_threads(config: &crate::config::Config) -> i32 {
     let n = config
         .models
@@ -1459,12 +1273,12 @@ impl EmbedModel for LlamaEmbed {
     }
 
     fn embed_one(&mut self, text: &str) -> Result<Vec<f32>> {
-        self.embed_query(text, None)
+        self.embed_query(text)
     }
 
-    fn embed_query(&mut self, text: &str, intent: Option<&QueryIntent>) -> Result<Vec<f32>> {
+    fn embed_query(&mut self, text: &str) -> Result<Vec<f32>> {
         // Apply query prompt format (asymmetric models like embeddinggemma need this).
-        let task = EmbedTask::resolve(self.query_template, intent);
+        let task = EmbedTask::resolve(self.query_template);
         let formatted = self.prompt_format.format_query(text, task);
         self.embed_text(&formatted)
     }
@@ -1479,322 +1293,6 @@ impl EmbedModel for LlamaEmbed {
 
     fn fingerprint(&self) -> String {
         self.fingerprint.clone()
-    }
-}
-
-// ── Heuristic orchestrator ───────────────────────────────────────────────────
-
-/// Heuristic orchestrator — no LLM, fast path when intelligence is off.
-pub fn heuristic_orchestrate(query: &str) -> OrchestrationResult {
-    let trimmed = query.trim();
-
-    // Temporal: detect date/time references in the query
-    let date_range = crate::temporal::parse_date_range_heuristic(query);
-    if date_range.is_some() {
-        return OrchestrationResult {
-            intent: QueryIntent::Temporal,
-            expansions: vec![trimmed.to_string()],
-            date_range,
-        };
-    }
-
-    // Exact: docids (#abc123) or ticket IDs (ABC-1234)
-    if trimmed.starts_with('#') && trimmed.len() <= 8 {
-        return OrchestrationResult {
-            intent: QueryIntent::Exact,
-            expansions: vec![trimmed.to_string()],
-            date_range: None,
-        };
-    }
-    // Ticket ID pattern: PREFIX-1234
-    if trimmed.contains('-')
-        && let Some(prefix) = trimmed.split('-').next()
-        && prefix.chars().all(|c| c.is_ascii_uppercase())
-    {
-        let after = trimmed.split('-').nth(1).unwrap_or("");
-        if after.chars().all(|c| c.is_ascii_digit()) && !after.is_empty() {
-            return OrchestrationResult {
-                intent: QueryIntent::Exact,
-                expansions: vec![trimmed.to_string()],
-                date_range: None,
-            };
-        }
-    }
-
-    // Relationship: "who" queries
-    let lower = trimmed.to_lowercase();
-    if lower.starts_with("who ") || lower.contains(" who ") {
-        return OrchestrationResult {
-            intent: QueryIntent::Relationship,
-            expansions: vec![trimmed.to_string()],
-            date_range: None,
-        };
-    }
-
-    // Default: exploratory with word splitting for multi-word queries
-    let words: Vec<&str> = trimmed.split_whitespace().collect();
-    let mut expansions = vec![trimmed.to_string()];
-    if words.len() > 2 {
-        let stopwords = [
-            "how", "does", "the", "a", "an", "is", "are", "was", "to", "in", "on", "for", "with",
-            "what", "when", "where",
-        ];
-        for word in &words {
-            if word.len() > 2 && !stopwords.contains(&word.to_lowercase().as_str()) {
-                expansions.push(word.to_string());
-            }
-        }
-    }
-
-    OrchestrationResult {
-        intent: QueryIntent::Exploratory,
-        expansions,
-        date_range: None,
-    }
-}
-
-// ── Orchestration JSON parsing ────────────────────────────────────────────────
-
-/// Parse orchestration JSON from LLM output.
-/// Handles: raw JSON, JSON embedded in text, and partial/malformed responses.
-pub fn parse_orchestration_json(text: &str) -> Result<OrchestrationResult> {
-    let json_str = extract_json_object(text)
-        .ok_or_else(|| anyhow::anyhow!("no JSON object found in LLM response"))?;
-
-    let parsed: serde_json::Value =
-        serde_json::from_str(json_str).with_context(|| "parsing orchestration JSON")?;
-
-    let intent_str = parsed["intent"].as_str().unwrap_or("exploratory");
-    let intent = match intent_str {
-        "exact" => QueryIntent::Exact,
-        "conceptual" => QueryIntent::Conceptual,
-        "relationship" => QueryIntent::Relationship,
-        "temporal" => QueryIntent::Temporal,
-        _ => QueryIntent::Exploratory,
-    };
-
-    let expansions: Vec<String> = parsed["expansions"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    if expansions.is_empty() {
-        anyhow::bail!("no expansions in orchestration response");
-    }
-
-    let date_range = crate::temporal::parse_date_range_from_json(&parsed);
-    let intent = if date_range.is_some() && intent != QueryIntent::Temporal {
-        QueryIntent::Temporal
-    } else {
-        intent
-    };
-
-    Ok(OrchestrationResult {
-        intent,
-        expansions,
-        date_range,
-    })
-}
-
-/// Extract the first JSON object ({...}) from text, handling nested braces.
-fn extract_json_object(text: &str) -> Option<&str> {
-    let start = text.find('{')?;
-    let mut depth = 0;
-    for (i, b) in text[start..].bytes().enumerate() {
-        match b {
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(&text[start..start + i + 1]);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-// ── LlamaOrchestrator — GGUF text generation via llama.cpp ─────────────────────
-
-const ORCHESTRATOR_SYSTEM_PROMPT: &str = r#"You are a search query analyzer. Given a user's search query, classify it and expand it.
-
-Return JSON with:
-- "intent": one of "exact", "conceptual", "relationship", "exploratory", "temporal"
-- "expansions": 2-4 alternative phrasings (always include the original query first)
-- "date_range": (only for temporal queries) {"start":"YYYY-MM-DD","end":"YYYY-MM-DD"}
-
-Use "temporal" intent when the query references a time period (e.g. "yesterday", "last week", "March 2026").
-
-Be concise. Only return the JSON object."#;
-
-/// Quantized Qwen3 model for query orchestration and expansion via llama.cpp.
-///
-/// Loads a Qwen3 GGUF model and performs autoregressive generation to classify
-/// queries and produce expansions. Falls back to `heuristic_orchestrate` if
-/// generation or JSON parsing fails. Uses Metal acceleration on macOS automatically.
-///
-/// Uses llama.cpp's built-in tokenizer for both encoding and decoding — no
-/// external tokenizer.json required. The global `LlamaBackend` is used via
-/// `llama_backend()`.
-pub struct LlamaOrchestrator {
-    model: LlamaModel,
-    /// Resolved once at load — see [`resolve_n_threads`].
-    n_threads: i32,
-}
-
-// Safety: LlamaModel is Send+Sync per llama-cpp-2 docs.
-// LlamaContext is created per-call and never stored.
-unsafe impl Send for LlamaOrchestrator {}
-
-impl std::fmt::Debug for LlamaOrchestrator {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LlamaOrchestrator").finish()
-    }
-}
-
-impl LlamaOrchestrator {
-    /// Load a Qwen3 GGUF model for orchestration from `models_dir`.
-    ///
-    /// Steps:
-    /// 1. Resolve model URI (from config override or `ModelDefaults`)
-    /// 2. `ensure_model()` to download if needed
-    /// 3. Load GGUF model via llama.cpp (uses built-in tokenizer — no tokenizer.json needed)
-    pub fn new(models_dir: &Path, config: &crate::config::Config) -> Result<Self> {
-        let defaults = ModelDefaults::default();
-        let uri_str = config
-            .models
-            .expand
-            .as_deref()
-            .unwrap_or(&defaults.expand_uri);
-        let uri = HfModelUri::parse(uri_str)?;
-        let model_path = ensure_model(&uri, models_dir)?;
-
-        // Use global backend and llama.cpp's built-in tokenizer (no tokenizer.json required).
-        let backend = llama_backend()?;
-        let model_params = LlamaModelParams::default();
-        let model =
-            LlamaModel::load_from_file(backend, &model_path, &model_params).map_err(|e| {
-                anyhow::anyhow!("loading orchestrator model {}: {e}", model_path.display())
-            })?;
-
-        let n_threads = resolve_n_threads(config);
-        tracing::info!(
-            "loaded LlamaOrchestrator from {}, n_threads={}",
-            uri_str,
-            n_threads
-        );
-
-        Ok(Self { model, n_threads })
-    }
-
-    /// Format a chat prompt in Qwen3 ChatML format.
-    fn format_prompt(query: &str) -> String {
-        format!(
-            "<|im_start|>system\n{ORCHESTRATOR_SYSTEM_PROMPT}<|im_end|>\n\
-             <|im_start|>user\n{query}<|im_end|>\n\
-             <|im_start|>assistant\n"
-        )
-    }
-
-    /// Run autoregressive generation (greedy decode) up to `max_tokens`.
-    /// Returns the generated text (excluding the prompt).
-    fn generate(&self, prompt: &str, max_tokens: usize) -> Result<String> {
-        // Tokenize using llama.cpp's built-in tokenizer.
-        let tokens = self
-            .model
-            .str_to_token(prompt, AddBos::Always)
-            .map_err(|e| anyhow::anyhow!("tokenization failed: {e}"))?;
-        if tokens.is_empty() {
-            bail!("tokenizer returned empty token sequence");
-        }
-
-        // Create context per-call (LlamaContext is !Send).
-        let n_ctx = (tokens.len() + max_tokens + 16) as u32;
-        // The one place `n_threads` (as opposed to `n_threads_batch`) does any
-        // work: the loop below decodes a single token at a time.
-        let ctx_params = LlamaContextParams::default()
-            .with_n_ctx(std::num::NonZeroU32::new(n_ctx))
-            .with_n_threads(self.n_threads)
-            .with_n_threads_batch(self.n_threads);
-        let mut ctx = self
-            .model
-            .new_context(llama_backend()?, ctx_params)
-            .map_err(|e| anyhow::anyhow!("creating orchestrator context: {e}"))?;
-
-        // Process prompt tokens in a batch.
-        let mut batch = LlamaBatch::new(tokens.len() + max_tokens + 16, 1);
-        for (i, token) in tokens.iter().enumerate() {
-            let is_last = i == tokens.len() - 1;
-            batch
-                .add(*token, i as i32, &[0], is_last)
-                .map_err(|e| anyhow::anyhow!("adding prompt token to batch: {e}"))?;
-        }
-
-        ctx.decode(&mut batch)
-            .map_err(|e| anyhow::anyhow!("prompt decode failed: {e}"))?;
-
-        // Autoregressive generation loop.
-        let mut sampler = LlamaSampler::greedy();
-        let mut output = String::new();
-        // Each token may produce multi-byte UTF-8 sequences; use an encoding_rs decoder
-        // to correctly reassemble them across token boundaries.
-        let mut decoder = encoding_rs::UTF_8.new_decoder();
-        let prompt_len = tokens.len();
-
-        for step in 0..max_tokens {
-            let new_token = sampler.sample(&ctx, batch.n_tokens() - 1);
-            sampler.accept(new_token);
-
-            // Check for end-of-generation.
-            if self.model.is_eog_token(new_token) {
-                break;
-            }
-
-            // Decode this token to text using llama.cpp's built-in tokenizer.
-            let piece = self
-                .model
-                .token_to_piece(new_token, &mut decoder, false, None)
-                .map_err(|e| anyhow::anyhow!("token_to_piece failed: {e}"))?;
-            output.push_str(&piece);
-
-            // Add token to batch for next iteration.
-            batch.clear();
-            batch
-                .add(new_token, (prompt_len + step) as i32, &[0], true)
-                .map_err(|e| anyhow::anyhow!("adding generated token to batch: {e}"))?;
-
-            ctx.decode(&mut batch)
-                .map_err(|e| anyhow::anyhow!("generation decode failed: {e}"))?;
-        }
-
-        Ok(output)
-    }
-}
-
-impl OrchestratorModel for LlamaOrchestrator {
-    fn orchestrate(&mut self, query: &str) -> Result<OrchestrationResult> {
-        let prompt = Self::format_prompt(query);
-
-        match self.generate(&prompt, 256) {
-            Ok(text) => match parse_orchestration_json(&text) {
-                Ok(result) => Ok(result),
-                Err(e) => {
-                    tracing::warn!(
-                        "orchestrator JSON parse failed, falling back to heuristic: {e:#}"
-                    );
-                    Ok(heuristic_orchestrate(query))
-                }
-            },
-            Err(e) => {
-                tracing::warn!("orchestrator generation failed, falling back to heuristic: {e:#}");
-                Ok(heuristic_orchestrate(query))
-            }
-        }
     }
 }
 
@@ -2160,15 +1658,6 @@ mod tests {
     }
 
     #[test]
-    fn test_mock_orchestrate() {
-        let mut mock = MockLlm::new(256);
-        let result = mock.orchestrate("how does auth work").unwrap();
-        assert_eq!(result.intent, QueryIntent::Exploratory);
-        assert!(!result.expansions.is_empty());
-        assert_eq!(result.expansions[0], "how does auth work");
-    }
-
-    #[test]
     fn the_default_rerank_batch_agrees_with_scoring_each_pair() {
         // MockLlm does not override `rerank_batch`, so this exercises the
         // trait's default implementation — the one every backend without setup
@@ -2199,60 +1688,6 @@ mod tests {
         let mut mock = MockLlm::new(256);
         let score = mock.rerank_score("", "document text").unwrap();
         assert_eq!(score, 0.0, "empty query should score 0.0");
-    }
-
-    #[test]
-    fn test_lane_weights_from_intent() {
-        let exact = LaneWeights::from_intent(&QueryIntent::Exact);
-        assert!(exact.fts > exact.semantic, "exact intent should favor FTS");
-
-        let conceptual = LaneWeights::from_intent(&QueryIntent::Conceptual);
-        assert!(
-            conceptual.semantic > conceptual.fts,
-            "conceptual should favor semantic"
-        );
-
-        let relationship = LaneWeights::from_intent(&QueryIntent::Relationship);
-        assert!(
-            relationship.graph >= LaneWeights::from_intent(&QueryIntent::Exact).graph,
-            "relationship should still lean on the graph more than a lookup does"
-        );
-    }
-
-    /// The graph lane must never outweigh a content lane, under any intent.
-    ///
-    /// Not a style rule — issue #9. `graph_expand` excludes seed files, so graph
-    /// results share no documents with the semantic or FTS lanes and can never
-    /// gain an agreement term in RRF. Their fused score is therefore just
-    /// `weight/(60+rank)`, and once that constant is large enough for the lane's
-    /// *worst* result to beat a content lane's *best*, the graph lane takes the
-    /// entire ranking. With expansions capped at 20 and `k = 60`, the crossover
-    /// is at `graph/80 > content/61`, i.e. a ratio of about 1.31.
-    ///
-    /// Holding graph at or below the content lanes keeps it inside the ranking
-    /// instead of on top of it. Delete this test only along with the
-    /// disjointness itself (#15).
-    #[test]
-    fn the_graph_lane_never_outweighs_a_content_lane() {
-        let intents = [
-            QueryIntent::Exact,
-            QueryIntent::Conceptual,
-            QueryIntent::Relationship,
-            QueryIntent::Exploratory,
-            QueryIntent::Temporal,
-        ];
-        for intent in &intents {
-            let w = LaneWeights::from_intent(intent);
-            let content = w.semantic.max(w.fts);
-            assert!(
-                w.graph <= content,
-                "{intent:?}: graph {} exceeds the strongest content lane {content} — \
-                 disjoint graph results would crowd the ranking out (#9)",
-                w.graph,
-            );
-        }
-        let w = LaneWeights::default_no_intelligence();
-        assert!(w.graph <= w.semantic.max(w.fts));
     }
 
     #[test]
@@ -2402,54 +1837,19 @@ mod tests {
         for document in [DocumentTemplate::Legacy, DocumentTemplate::Documented] {
             let fmt = gemma(document);
             assert!(fmt.format_document("t", "x").starts_with("<bos>"));
-            for task in [
-                EmbedTask::Legacy,
-                EmbedTask::SearchResult,
-                EmbedTask::QuestionAnswering,
-            ] {
+            for task in [EmbedTask::Legacy, EmbedTask::SearchResult] {
                 assert!(fmt.format_query("q", task).starts_with("<bos>"));
             }
         }
     }
 
     #[test]
-    fn the_question_answering_task_reaches_the_query() {
+    fn each_query_template_names_its_own_task() {
         assert_eq!(
-            gemma(DocumentTemplate::Documented)
-                .format_query("who guards the gate", EmbedTask::QuestionAnswering),
-            "<bos>task: question answering | query: who guards the gate"
-        );
-    }
-
-    #[test]
-    fn per_intent_differs_from_documented_on_conceptual_alone() {
-        use QueryIntent::*;
-        for intent in [Exact, Relationship, Exploratory, Temporal] {
-            assert_eq!(
-                EmbedTask::resolve(QueryTemplate::PerIntent, Some(&intent)),
-                EmbedTask::SearchResult,
-                "{intent:?}"
-            );
-        }
-        assert_eq!(
-            EmbedTask::resolve(QueryTemplate::PerIntent, Some(&Conceptual)),
-            EmbedTask::QuestionAnswering
-        );
-        // An unclassified query is not a guess.
-        assert_eq!(
-            EmbedTask::resolve(QueryTemplate::PerIntent, None),
+            EmbedTask::resolve(QueryTemplate::Documented),
             EmbedTask::SearchResult
         );
-    }
-
-    #[test]
-    fn the_legacy_template_ignores_the_intent() {
-        for intent in [QueryIntent::Conceptual, QueryIntent::Exact] {
-            assert_eq!(
-                EmbedTask::resolve(QueryTemplate::Legacy, Some(&intent)),
-                EmbedTask::Legacy
-            );
-        }
+        assert_eq!(EmbedTask::resolve(QueryTemplate::Legacy), EmbedTask::Legacy);
     }
 
     #[test]
@@ -2473,164 +1873,6 @@ mod tests {
             "cpu",
         );
         assert_ne!(legacy, documented);
-    }
-
-    // ── heuristic_orchestrate tests ──────────────────────────────────────────
-
-    #[test]
-    fn test_heuristic_orchestrate_single_word() {
-        let result = heuristic_orchestrate("auth");
-        assert_eq!(result.intent, QueryIntent::Exploratory);
-        assert_eq!(result.expansions, vec!["auth"]);
-    }
-
-    #[test]
-    fn test_heuristic_orchestrate_multi_word() {
-        let result = heuristic_orchestrate("how does auth work");
-        assert_eq!(result.intent, QueryIntent::Exploratory);
-        assert!(
-            result
-                .expansions
-                .contains(&"how does auth work".to_string())
-        );
-        assert!(result.expansions.len() > 1);
-    }
-
-    #[test]
-    fn test_heuristic_orchestrate_docid() {
-        let result = heuristic_orchestrate("#ab12cd");
-        assert_eq!(result.intent, QueryIntent::Exact);
-    }
-
-    #[test]
-    fn test_heuristic_orchestrate_ticket_id() {
-        let result = heuristic_orchestrate("BRE-1234");
-        assert_eq!(result.intent, QueryIntent::Exact);
-    }
-
-    #[test]
-    fn test_heuristic_orchestrate_who_query() {
-        let result = heuristic_orchestrate("who works on checkout");
-        assert_eq!(result.intent, QueryIntent::Relationship);
-    }
-
-    // ── parse_orchestration_json tests ───────────────────────────────────────
-
-    #[test]
-    fn test_parse_orchestration_json_valid() {
-        let json =
-            r#"{"intent": "conceptual", "expansions": ["auth work", "authentication design"]}"#;
-        let result = parse_orchestration_json(json).unwrap();
-        assert_eq!(result.intent, QueryIntent::Conceptual);
-        assert_eq!(result.expansions.len(), 2);
-    }
-
-    #[test]
-    fn test_parse_orchestration_json_with_surrounding_text() {
-        let text =
-            "Here is the analysis:\n{\"intent\": \"exact\", \"expansions\": [\"BRE-1234\"]}\nDone.";
-        let result = parse_orchestration_json(text).unwrap();
-        assert_eq!(result.intent, QueryIntent::Exact);
-    }
-
-    #[test]
-    fn test_parse_orchestration_json_invalid() {
-        let bad = "not json at all";
-        assert!(parse_orchestration_json(bad).is_err());
-    }
-
-    #[test]
-    fn test_parse_orchestration_json_unknown_intent() {
-        let json = r#"{"intent": "unknown_type", "expansions": ["query"]}"#;
-        let result = parse_orchestration_json(json).unwrap();
-        assert_eq!(result.intent, QueryIntent::Exploratory);
-    }
-
-    #[test]
-    fn test_extract_json_object_nested() {
-        let text = r#"prefix {"a": {"b": 1}} suffix"#;
-        let extracted = extract_json_object(text).unwrap();
-        assert_eq!(extracted, r#"{"a": {"b": 1}}"#);
-    }
-
-    #[test]
-    fn test_extract_json_object_none() {
-        assert!(extract_json_object("no braces here").is_none());
-    }
-
-    #[test]
-    fn test_extract_json_object_unclosed() {
-        assert!(extract_json_object("{ open but never closed").is_none());
-    }
-
-    /// #23: the model is asked for the original query first and routinely
-    /// omits it, so the parser stops trusting and the caller repairs it.
-    #[test]
-    fn the_original_query_is_restored_when_the_model_drops_it() {
-        let mut result = parse_orchestration_json(
-            r#"{"intent": "conceptual", "expansions": ["Archdragon character", "Archdragon concept"]}"#,
-        )
-        .unwrap();
-        result.ensure_original("Archdragon");
-        assert_eq!(
-            result.expansions,
-            vec!["Archdragon", "Archdragon character", "Archdragon concept"]
-        );
-    }
-
-    #[test]
-    fn restoring_the_original_does_not_duplicate_one_already_present() {
-        let mut result = parse_orchestration_json(
-            r#"{"intent": "exact", "expansions": ["auth work", "authentication design"]}"#,
-        )
-        .unwrap();
-        result.ensure_original("  AUTH WORK  ");
-        assert_eq!(
-            result.expansions,
-            vec!["auth work", "authentication design"]
-        );
-    }
-
-    #[test]
-    fn restoring_the_original_ignores_a_blank_query() {
-        let mut result = OrchestrationResult {
-            intent: QueryIntent::Exploratory,
-            expansions: vec!["something".to_string()],
-            date_range: None,
-        };
-        result.ensure_original("   ");
-        assert_eq!(result.expansions, vec!["something"]);
-    }
-
-    #[test]
-    fn test_parse_orchestration_json_empty_expansions() {
-        let json = r#"{"intent": "exact", "expansions": []}"#;
-        assert!(parse_orchestration_json(json).is_err());
-    }
-
-    #[test]
-    fn test_parse_orchestration_json_missing_expansions() {
-        let json = r#"{"intent": "exact"}"#;
-        assert!(parse_orchestration_json(json).is_err());
-    }
-
-    // ── LlamaOrchestrator tests ─────────────────────────────────────────────
-
-    #[test]
-    fn test_llama_orchestrator_format_prompt() {
-        let prompt = LlamaOrchestrator::format_prompt("how does auth work");
-        assert!(prompt.contains("<|im_start|>system"));
-        assert!(prompt.contains("<|im_end|>"));
-        assert!(prompt.contains("<|im_start|>user"));
-        assert!(prompt.contains("how does auth work"));
-        assert!(prompt.contains("<|im_start|>assistant"));
-    }
-
-    #[test]
-    fn test_llama_orchestrator_implements_trait() {
-        // Compile-time check: LlamaOrchestrator implements OrchestratorModel.
-        fn assert_orchestrator<O: OrchestratorModel>() {}
-        assert_orchestrator::<LlamaOrchestrator>();
     }
 
     // ── LlamaRerank tests ──────────────────────────────────────────────────
@@ -2665,52 +1907,6 @@ mod tests {
         fn assert_rerank<R: RerankModel>(_r: &R) {}
         let mock = MockLlm::new(256);
         assert_rerank(&mock);
-    }
-
-    // ── Temporal intent tests ────────────────────────────────────────────────
-
-    #[test]
-    fn test_temporal_intent_weights() {
-        let weights = LaneWeights::from_intent(&QueryIntent::Temporal);
-        assert!(weights.temporal > weights.semantic);
-        assert!(weights.temporal > 1.0);
-    }
-
-    #[test]
-    fn test_non_temporal_intent_has_zero_temporal() {
-        let exact = LaneWeights::from_intent(&QueryIntent::Exact);
-        assert!((exact.temporal - 0.0).abs() < f64::EPSILON);
-        let conceptual = LaneWeights::from_intent(&QueryIntent::Conceptual);
-        assert!((conceptual.temporal - 0.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn test_heuristic_orchestrate_temporal() {
-        let result = heuristic_orchestrate("what happened yesterday");
-        assert_eq!(result.intent, QueryIntent::Temporal);
-        assert!(result.date_range.is_some());
-    }
-
-    #[test]
-    fn test_heuristic_orchestrate_non_temporal() {
-        let result = heuristic_orchestrate("how does auth work");
-        assert!(result.date_range.is_none());
-        assert_ne!(result.intent, QueryIntent::Temporal);
-    }
-
-    #[test]
-    fn test_parse_json_with_date_range() {
-        let json = r#"{"intent":"temporal","expansions":["last week updates"],"date_range":{"start":"2026-03-19","end":"2026-03-25"}}"#;
-        let result = parse_orchestration_json(json).unwrap();
-        assert_eq!(result.intent, QueryIntent::Temporal);
-        assert!(result.date_range.is_some());
-    }
-
-    #[test]
-    fn test_parse_json_without_date_range_backward_compat() {
-        let json = r#"{"intent":"exact","expansions":["BRE-1234"]}"#;
-        let result = parse_orchestration_json(json).unwrap();
-        assert!(result.date_range.is_none());
     }
 
     /// The same weights on two devices are two fingerprints (issue #33).

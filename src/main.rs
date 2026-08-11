@@ -123,7 +123,7 @@ enum Command {
         #[arg(long, conflicts_with = "enable_intelligence")]
         disable_intelligence: bool,
 
-        /// Override a model: --model embed|rerank|expand <uri>
+        /// Override a model: --model embed|rerank <uri>
         #[arg(long, num_args = 2, value_names = &["TYPE", "URI"])]
         model: Option<Vec<String>>,
 
@@ -378,9 +378,8 @@ enum MigrateAction {
 fn prompt_intelligence(data_dir: &std::path::Path) -> Result<bool> {
     eprint!(
         "\nEnable AI-powered search intelligence?\n\n\
-         This downloads ~1.3GB of additional models for:\n\
-         \x20 - Query expansion (rewrites your search into multiple variations)\n\
-         \x20 - Result reranking (LLM scores each result for relevance)\n\n\
+         This downloads ~650MB of additional models for:\n\
+         \x20 - Result reranking (a cross-encoder scores each result for relevance)\n\n\
          Enable now? [y/N] "
     );
     io::stderr().flush()?;
@@ -391,11 +390,9 @@ fn prompt_intelligence(data_dir: &std::path::Path) -> Result<bool> {
     if enable {
         let models_dir = data_dir.join("models");
         let defaults = engraph::llm::ModelDefaults::default();
-        println!("Downloading intelligence models (~1.3GB)...");
+        println!("Downloading the cross-encoder (~650MB)...");
         let rerank_uri = engraph::llm::HfModelUri::parse(&defaults.rerank_uri)?;
         engraph::llm::ensure_model(&rerank_uri, &models_dir)?;
-        let expand_uri = engraph::llm::HfModelUri::parse(&defaults.expand_uri)?;
-        engraph::llm::ensure_model(&expand_uri, &models_dir)?;
         println!("Done.");
     } else {
         println!(
@@ -680,15 +677,11 @@ async fn main() -> Result<()> {
                 println!("Intelligence enabled. Models will be downloaded on first search.");
                 let models_dir = data_dir.join("models");
                 let defaults = engraph::llm::ModelDefaults::default();
-                println!("Downloading intelligence models (~1.3GB)...");
+                println!("Downloading the cross-encoder (~650MB)...");
                 let rerank_uri = engraph::llm::HfModelUri::parse(
                     cfg.models.rerank.as_deref().unwrap_or(&defaults.rerank_uri),
                 )?;
                 engraph::llm::ensure_model(&rerank_uri, &models_dir)?;
-                let expand_uri = engraph::llm::HfModelUri::parse(
-                    cfg.models.expand.as_deref().unwrap_or(&defaults.expand_uri),
-                )?;
-                engraph::llm::ensure_model(&expand_uri, &models_dir)?;
                 println!("Done.");
             } else if disable_intelligence {
                 cfg.intelligence = Some(false);
@@ -711,14 +704,8 @@ async fn main() -> Result<()> {
                         cfg.models.rerank = Some(uri.clone());
                         println!("Reranker model set to: {uri}");
                     }
-                    "expand" => {
-                        cfg.models.expand = Some(uri.clone());
-                        println!("Expansion model set to: {uri}");
-                    }
                     other => {
-                        anyhow::bail!(
-                            "Unknown model type: {other}. Use: embed, rerank, or expand."
-                        );
+                        anyhow::bail!("Unknown model type: {other}. Use: embed or rerank.");
                     }
                 }
             }

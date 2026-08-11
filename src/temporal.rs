@@ -184,23 +184,6 @@ fn parse_date_range_heuristic_with_ref(query: &str, now: OffsetDateTime) -> Opti
     None
 }
 
-// ── JSON date range parsing ─────────────────────────────────────
-
-/// Parse a date range from LLM orchestrator JSON.
-///
-/// Expected format: `{"date_range": {"start": "YYYY-MM-DD", "end": "YYYY-MM-DD"}}`.
-/// The end date gets +86399 seconds (end of day).
-pub fn parse_date_range_from_json(json: &serde_json::Value) -> Option<(i64, i64)> {
-    let range = json.get("date_range")?;
-    let start_str = range.get("start")?.as_str()?;
-    let end_str = range.get("end")?.as_str()?;
-
-    let start_ts = parse_iso_date(start_str)?;
-    let end_ts = parse_iso_date(end_str)? + 86399; // end of day
-
-    Some((start_ts, end_ts))
-}
-
 // ── Helpers ─────────────────────────────────────────────────────
 
 /// Return (start_of_day, end_of_day) timestamps for a given date.
@@ -604,58 +587,6 @@ mod tests {
     #[test]
     fn heuristic_no_temporal_match_empty() {
         assert!(parse_date_range_heuristic_with_ref("", ref_time()).is_none());
-    }
-
-    // ── parse_date_range_from_json ──────────────────────────────
-
-    #[test]
-    fn json_valid_range() {
-        let json: serde_json::Value = serde_json::json!({
-            "date_range": {
-                "start": "2026-03-19",
-                "end": "2026-03-25"
-            }
-        });
-        let (start, end) = parse_date_range_from_json(&json).unwrap();
-        assert_eq!(start, date_ts(2026, 3, 19));
-        assert_eq!(end, date_ts(2026, 3, 25) + 86399);
-    }
-
-    #[test]
-    fn json_missing_date_range() {
-        let json: serde_json::Value = serde_json::json!({"query": "test"});
-        assert!(parse_date_range_from_json(&json).is_none());
-    }
-
-    #[test]
-    fn json_missing_start() {
-        let json: serde_json::Value = serde_json::json!({
-            "date_range": {
-                "end": "2026-03-25"
-            }
-        });
-        assert!(parse_date_range_from_json(&json).is_none());
-    }
-
-    #[test]
-    fn json_missing_end() {
-        let json: serde_json::Value = serde_json::json!({
-            "date_range": {
-                "start": "2026-03-19"
-            }
-        });
-        assert!(parse_date_range_from_json(&json).is_none());
-    }
-
-    #[test]
-    fn json_invalid_date_format() {
-        let json: serde_json::Value = serde_json::json!({
-            "date_range": {
-                "start": "not-a-date",
-                "end": "2026-03-25"
-            }
-        });
-        assert!(parse_date_range_from_json(&json).is_none());
     }
 
     // ── Test helpers ────────────────────────────────────────────

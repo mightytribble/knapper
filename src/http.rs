@@ -17,7 +17,7 @@ use tower_http::cors::{Any, CorsLayer};
 use crate::config::{ApiKeyConfig, HttpConfig};
 use crate::context::{self, ContextParams};
 use crate::health;
-use crate::llm::{EmbedModel, OrchestratorModel, RerankModel};
+use crate::llm::{EmbedModel, RerankModel};
 use crate::profile::VaultProfile;
 use crate::search;
 use crate::serve::{FrontmatterOpInput, FrontmatterOpKind, RecentWrites};
@@ -37,7 +37,6 @@ pub struct ApiState {
     pub embedder: Arc<Mutex<Box<dyn EmbedModel + Send>>>,
     pub vault_path: Arc<std::path::PathBuf>,
     pub profile: Arc<Option<VaultProfile>>,
-    pub orchestrator: Option<Arc<Mutex<Box<dyn OrchestratorModel + Send>>>>,
     pub reranker: Option<Arc<Mutex<Box<dyn RerankModel + Send>>>>,
     pub http_config: Arc<HttpConfig>,
     pub no_auth: bool,
@@ -51,6 +50,7 @@ pub struct ApiState {
     pub rerank: crate::config::RerankConfig,
     /// Ranking-stage settings from `config.toml`.
     pub ranking: crate::config::RankingConfig,
+    pub lane_weights: crate::config::LaneWeights,
     /// Keyword-lane settings from `config.toml` (issue #37).
     pub fts: crate::config::FtsConfig,
     /// Embedding-prefix settings from `config.toml`. Notes written over HTTP
@@ -475,19 +475,12 @@ async fn handle_search(
     let store = state.store.lock().await;
     let mut embedder = state.embedder.lock().await;
 
-    let mut orch_guard = match &state.orchestrator {
-        Some(o) => Some(o.lock().await),
-        None => None,
-    };
     let mut rerank_guard = match &state.reranker {
         Some(r) => Some(r.lock().await),
         None => None,
     };
 
     let mut config = search::SearchConfig {
-        orchestrator: orch_guard
-            .as_mut()
-            .map(|g| g.as_mut() as &mut dyn OrchestratorModel),
         reranker: rerank_guard
             .as_mut()
             .map(|g| g.as_mut() as &mut dyn RerankModel),
@@ -497,6 +490,7 @@ async fn handle_search(
         max_chunks_per_file: state.max_chunks_per_file,
         group_by: state.group_by,
         ranking: state.ranking,
+        lane_weights: state.lane_weights,
         fts: state.fts,
     };
 
@@ -1218,7 +1212,6 @@ mod tests {
             )),
             vault_path: Arc::new(PathBuf::from("/tmp/test-vault")),
             profile: Arc::new(None),
-            orchestrator: None,
             reranker: None,
             http_config: Arc::new(config),
             no_auth: false,
@@ -1229,6 +1222,7 @@ mod tests {
             group_by: crate::config::GroupBy::default(),
             rerank: crate::config::RerankConfig::default(),
             ranking: crate::config::RankingConfig::default(),
+            lane_weights: crate::config::LaneWeights::default(),
             fts: crate::config::FtsConfig::default(),
             embed: crate::prefix::EmbedComposition::default(),
             chunk_opts: crate::chunker::ChunkOptions {

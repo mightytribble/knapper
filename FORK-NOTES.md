@@ -26,10 +26,10 @@ git fetch upstream && git diff --stat upstream/main main
 | `ensure_embedding_dim` | embed at the model's native width; no hidden truncation | this fork, issue #12 |
 | `embed_formatted` / `rerank_batch` | one llama.cpp context per batch, not per call | this fork, issue #13 |
 | `chunks.text` | the reranker scores the whole chunk, not a preview | this fork, issue #14 |
-| `from_intent` `Relationship` | graph no longer outweighs the content lanes | this fork, issue #9 |
+| `[lane_weights]` | the lane weights are one configured vector, not a classifier's guess; graph never outweighs the content lanes | this fork, issues #9, #59 |
 | `resolve_n_threads` | llama.cpp runs on the machine's cores, not a constant 4 | this fork, issue #20 |
 | `fts::any_term_expr` | the keyword lane matches terms, not the query as one phrase | this fork, issue #22 |
-| `ensure_original` | the user's own query is always searched for | this fork, issue #23 |
+| no query expansion | the user's own query is the only one searched for | this fork, issues #23, #59 |
 | `rerank::max_document_chars` | the cross-encoder's input *can* be bounded; upstream has no budget at all. Ships off — see #42 | this fork, issues #25, #42 |
 | re-index keeps the `files` row | editing a note no longer cascades away every backlink into it | this fork, issue #27 |
 | normalised seed pool | graph seeds are ranked by relevance, not by which lane's unit is bigger | this fork, issue #26 |
@@ -84,7 +84,7 @@ export LIBCLANG_PATH="$HOME/.engraph-buildenv/lib/python3.12/site-packages/clang
 export BINDGEN_EXTRA_CLANG_ARGS="-I/usr/lib/gcc/x86_64-linux-gnu/13/include -I/usr/include -I/usr/include/x86_64-linux-gnu"
 
 cargo build --release        # ~10 min cold, ~20s incremental
-cargo test --lib             # 642 pass
+cargo test --lib             # 682 pass
 ```
 
 Each env var exists for a specific failure. Omit one and you get:
@@ -146,7 +146,7 @@ relinks the same path and a rebuild each way costs the llama.cpp compile.
 `cargo test` (full) fails to compile `tests/integration.rs` and `tests/write_pipeline.rs`:
 `unresolved import engraph::embedder`, `engraph::hnsw`, and a `walk_vault` arity mismatch.
 **These are broken on pristine upstream** — verify with `git stash && cargo clippy --all-targets`.
-Upstream PR #47 addresses them. Use `cargo test --lib` (642 tests) as the working suite.
+Upstream PR #47 addresses them. Use `cargo test --lib` (682 tests) as the working suite.
 `cargo clippy -- -D warnings`, which is what CI runs, is clean.
 
 ### CI is manual-only in this fork
@@ -237,9 +237,8 @@ has never executed on this box.
     key is a chunker-digest component, so an open without it re-chunks the whole home.
 
   The nine homes hold **four** configurations, because each experiment was copied to a new home
-  rather than run again, and the fifth is `.engraph-i46-name`. Copy a home to keep the `llm_cache`
-  and the query expansions with it. See `eval/probes.md` (#45), which holds the four configurations,
-  the control check for each and the scores.
+  rather than run again, and the fifth is `.engraph-i46-name`. See `eval/probes.md` (#45), which
+  holds the four configurations, the control check for each and the scores.
   **The store itself does not exclude derived files.** Its `exclude` is `[".obsidian/"]`, so
   `*-index.md` and `templates/` are in the corpus. Issue #7 measured that exclusion as a clear gain and
   the baseline never adopted it. Every table in `eval/probes.md` from #26 to #10 therefore holds about
@@ -251,11 +250,10 @@ has never executed on this box.
   live `cc-isekai` repo and it grew in between. Rank tables from either side of that are not
   comparable. Earlier stores lived in session scratchpads and expired with the sessions.
 - **`[ranking] retrieval_width` is part of the measurement, not a display setting** (#49). Both
-  content lanes retrieve this many rows per expansion, so a probe table taken at 15 and one taken at
-  60 are different experiments — probe 2's tracked answer is absent at 15 and rank 1 at 60.
-  `eval/probes.md`'s tables are at 60, which is the default. The orchestration cache (`llm_cache`,
-  keyed on the query) is what holds expansions constant across variants, so reusing one warm store is
-  the control rather than a shortcut. **`top_n` is a display setting**: it truncates the result list,
+  content lanes retrieve this many rows, so a probe table taken at 15 and one taken at 60 are
+  different experiments — probe 2's tracked answer is absent at 15 and rank 1 at 60.
+  `eval/probes.md`'s tables are at 60, which is the default. **`top_n` is a display setting**: it
+  truncates the result list,
   and the eighteen pool queries are prefix-stable from 20 to 25 and to 100. A table taken before #49
   names `top_n = 20` in place of the width, on a binary whose width was `top_n * 3`, and that is the
   same 60.
@@ -265,8 +263,8 @@ has never executed on this box.
   before that repair is measuring a degraded graph.
 - **`engraph status` misreports the model** as `all-MiniLM-L6-v2` while actually loading
   `embeddinggemma-300M`. Upstream PR #48 fixes it.
-- **Intelligence is not a quality dial.** Enabling it (query expansion + Qwen3 reranker, 1.6GB)
-  *regressed* exact-name lookup in testing. Treat on/off as distinct configurations.
+- **Intelligence is the cross-encoder and nothing else** since #59 — one 640 MB Qwen3-Reranker. It
+  is still not a quality dial: treat on/off as distinct configurations.
 - **A `LlamaContext` spans a batch, not a call** (this fork, issue #13). `embed_formatted` and
   `rerank_batch` each create one context and run the whole slice through it, clearing the KV cache
   between items. Upstream created one per text and per (query, document) pair — 1598 per reindex, 30
@@ -329,10 +327,6 @@ has never executed on this box.
   - **Which template built a store is hashed as data**, from `PromptFormat::template_id`. Nothing is
     hand-bumped to switch templates; `fingerprint::PROMPT_TEMPLATE_VERSION` covers a reword of a
     template that keeps its name.
-  - **`query = "per_intent"` picks the task from `QueryIntent` and ships off.** It differs from flat
-    `documented` on `Conceptual` alone — two of the eighteen calibration queries, and no tracked
-    target. `Archdragon` classifies as `Conceptual` (#19), so it asks the exact-name guard a
-    question.
   - **`document_title` decides what fills the `title:` field** (#36, #38). `none` ships, and it is
     the literal the model card gives for a document with no title. `breadcrumb` is design §5.4's
     `Note Title > H1 > H2 > H3`; #36 shipped it and #38 measured it out again — it costs no tracked
@@ -918,10 +912,8 @@ See issues on this repo:
   probe ran with no exact name in it, and the 34-hit, 7.068-BM25 query that would have answered it
   was never issued. `ensure_original` repairs the list in `search_with_intelligence`, after **every**
   source — model, cache hit, heuristic — because #9 showed what a rule with two entrances costs.
-  Applied on read, so old cache rows are fixed without invalidation. **The provenance half is not
-  done**: `orchestrate` still swallows failures into `heuristic_orchestrate` and the caller still
-  writes the result as `model = 'orchestrator'`, so two of the five cached probes are heuristic
-  word-splits wearing that label
+  Applied on read, so old cache rows were fixed without invalidation. **#59 closed the gap for
+  good**: there is no expansion list to repair, because the user's query is the only one run
 - ~~**#20** llama.cpp runs on 4 threads regardless of the machine~~ — **done, and the first latency
   ticket that actually pays.** All three wrappers inherited `GGML_DEFAULT_N_THREADS = 4` — a
   constant, on every machine, carrying llama.cpp's own `// TODO: better default`. `models.n_threads`
@@ -943,16 +935,14 @@ See issues on this repo:
   handed out in vault-walk order, so two rebuilds at the *same* thread count disagree on any digest
   keyed by it. Pre-existing and unrelated, but it briefly looked like corruption — index comparisons
   must key on `path`
-- **#19** intent classification looks inverted on two probes — with the orchestrator running,
-  `dragon that can take human form` classifies `Exact` and the bare noun `Archdragon` classifies
-  `Conceptual`. Both then show zero FTS contributions in their top 20 regardless. Picked up from
-  #9's `--explain` audit; probe 4's intelligence-on regression may live here rather than in the
-  reranker. The sharper fact is that an `fts 1.5` lane contributes nothing to a 20-slot ranking,
-  which should be explained before the classifier is touched — likely #18
-- **#18** query expansion splits on words against a 16-item stopword list containing no modals and
-  no verbs, so `dragon that can take human form` becomes seven expansions including `that` and
-  `can` — ~840 result slots for one question, and `collapse_lane` then pools BM25 scores from
-  different queries and sorts them as if commensurable
+- ~~**#19** intent classification looks inverted on two probes~~ — **closed by #59, which deleted the
+  classifier.** It selected a weight vector that had never been swept, and twelve of the eighteen pool
+  queries took its default branch anyway. The weights are now `[lane_weights]`, one configured vector
+- ~~**#18** query expansion splits on words against a 16-item stopword list~~ — **closed by #59, which
+  deleted the branch.** The list held no modals and no verbs, so `dragon that can take human form`
+  became seven expansions including `that` and `can`. Seventeen pool cells measured the whole feature:
+  no expander ever put a tier-1 member in front of the cross-encoder that the query itself would not
+  have, and against a 22-slot shortlist expansion cost six of them by displacement
 - **#17** resolve queries against a tag/alias registry and expand on what they name. Aliases are
   parsed at index time and **thrown away** — there is no registry to resolve against — and tags reach
   retrieval only as a yes/no admission test on graph expansion. Hangs on the expansion slot rather

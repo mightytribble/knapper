@@ -13,8 +13,6 @@ pub struct ModelConfig {
     pub embed: Option<String>,
     /// Override reranker model URI.
     pub rerank: Option<String>,
-    /// Override expansion/orchestrator model URI.
-    pub expand: Option<String>,
     /// How many threads llama.cpp may use per forward pass.
     ///
     /// `None` means the machine's **physical core count** — SMT siblings are
@@ -572,6 +570,50 @@ impl Default for RankingConfig {
     }
 }
 
+/// What each lane's rank is worth to the RRF fusion step.
+///
+/// The default vector is the best configuration the seventeen pool cells in the
+/// #57 section of `eval/probes.md` measured. Every value is query-time and
+/// reaches no fingerprint, so a sweep is a config edit with no index work, no
+/// vault read and no model reload — which is what #9 and #19 both needed and
+/// neither had.
+///
+/// Under the shipped ranking stage the cross-encoder sorts the shortlist, so
+/// `semantic` and `fts` are the two weights that decide anything: `graph`,
+/// `rerank` and `temporal` are read by [`RankingMode::Legacy`] alone, where all
+/// five lanes vote. The graph lane reaches the shortlist by `graph_reserve`
+/// instead.
+///
+/// `graph` sits at 0.8, below the content lanes, and that is deliberate (#9).
+/// `graph_expand` skips any neighbour already in the seed set, so the graph
+/// lane's results are disjoint from the other lanes' by construction. RRF scores
+/// agreement between rankings of the same corpus; a disjoint set can never
+/// accumulate any, so a graph result's fused score is a pure function of this
+/// number. At 1.5 its 20 capped expansions swept the whole top 20, since
+/// 1.5/(60+20) beats 0.8/(60+1) by 43%, and every content result was locked out
+/// of every "who" query.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LaneWeights {
+    pub semantic: f64,
+    pub fts: f64,
+    pub graph: f64,
+    pub rerank: f64,
+    pub temporal: f64,
+}
+
+impl Default for LaneWeights {
+    fn default() -> Self {
+        Self {
+            semantic: 1.0,
+            fts: 1.0,
+            graph: 0.8,
+            rerank: 1.0,
+            temporal: 0.0,
+        }
+    }
+}
+
 /// The lane width every table in `eval/probes.md` was measured at.
 ///
 /// A function and not a literal in `Default`, so the number and the run that
@@ -641,6 +683,9 @@ pub struct Config {
     /// What reaches the cross-encoder, and what it does there (issue #30).
     #[serde(default)]
     pub ranking: RankingConfig,
+    /// What each lane's rank is worth to fusion (issue #59).
+    #[serde(default)]
+    pub lane_weights: LaneWeights,
     /// What the keyword lane indexes beside the chunk body (issue #37).
     #[serde(default)]
     pub fts: FtsConfig,
@@ -692,6 +737,7 @@ impl Default for Config {
             models: ModelConfig::default(),
             rerank: RerankConfig::default(),
             ranking: RankingConfig::default(),
+            lane_weights: LaneWeights::default(),
             fts: FtsConfig::default(),
             obsidian: ObsidianConfig::default(),
             agents: AgentsConfig::default(),
@@ -925,12 +971,11 @@ batch_size = 128
 
     #[test]
     fn embedding_prompt_round_trips_and_each_half_is_separate() {
-        let cfg: Config = toml::from_str(
-            "[embedding_prompt]\ndocument = \"documented\"\nquery = \"per_intent\"\n",
-        )
-        .unwrap();
+        let cfg: Config =
+            toml::from_str("[embedding_prompt]\ndocument = \"documented\"\nquery = \"legacy\"\n")
+                .unwrap();
         assert_eq!(cfg.embedding_prompt.document, DocumentTemplate::Documented);
-        assert_eq!(cfg.embedding_prompt.query, QueryTemplate::PerIntent);
+        assert_eq!(cfg.embedding_prompt.query, QueryTemplate::Legacy);
 
         // Naming one half leaves the other alone. The two carry very different
         // costs — the document half re-indexes the vault (issue #10).
@@ -1072,7 +1117,46 @@ rerank = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.ggu
         assert_eq!(cfg.intelligence, Some(true));
         assert!(cfg.models.embed.is_some());
         assert!(cfg.models.rerank.is_some());
-        assert!(cfg.models.expand.is_none());
+    }
+
+    #[test]
+    fn the_lane_weights_are_the_measured_vector_and_each_is_settable() {
+        let bare: Config = toml::from_str("").unwrap();
+        assert_eq!(bare.lane_weights.semantic, 1.0);
+        assert_eq!(bare.lane_weights.fts, 1.0);
+        assert_eq!(bare.lane_weights.graph, 0.8);
+        assert_eq!(bare.lane_weights.rerank, 1.0);
+        assert_eq!(bare.lane_weights.temporal, 0.0);
+
+        // Naming one weight leaves the rest at the measured vector, so a sweep
+        // states what it changed rather than restating the whole table.
+        let swept: Config = toml::from_str("[lane_weights]\nsemantic = 1.2\nfts = 0.8\n").unwrap();
+        assert_eq!(swept.lane_weights.semantic, 1.2);
+        assert_eq!(swept.lane_weights.fts, 0.8);
+        assert_eq!(swept.lane_weights.graph, 0.8);
+    }
+
+    /// The graph lane must not outweigh a content lane by default.
+    ///
+    /// Not a style rule — issue #9. `graph_expand` excludes seed files, so graph
+    /// results share no documents with the semantic or FTS lanes and can never
+    /// gain an agreement term in RRF. Their fused score is therefore just
+    /// `weight/(60+rank)`, and once that number is large enough for the lane's
+    /// *worst* result to beat a content lane's *best*, the graph lane takes the
+    /// entire ranking. With expansions capped at 20 and `k = 60`, the crossover
+    /// is at `graph/80 > content/61`, a ratio of about 1.31.
+    ///
+    /// A sweep can set whatever it likes; this holds the shipped vector.
+    #[test]
+    fn the_graph_lane_never_outweighs_a_content_lane() {
+        let w = LaneWeights::default();
+        let content = w.semantic.max(w.fts);
+        assert!(
+            w.graph <= content,
+            "graph {} exceeds the strongest content lane {content} — disjoint graph \
+             results would crowd the ranking out (#9)",
+            w.graph,
+        );
     }
 
     #[test]

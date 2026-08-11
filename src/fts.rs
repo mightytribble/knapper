@@ -35,8 +35,8 @@ pub fn phrase_expr(query: &str) -> String {
 /// lane used to, makes it a phrase query — and a phrase query matches only where
 /// the user has already guessed the corpus's exact wording. Measured on the
 /// 1598-chunk eval vault, four of the five seed probes returned zero rows, and
-/// the keyword lane's only source of hits was the single-word fragments that
-/// query expansion happened to produce (#22, and why #18 turns into a deletion).
+/// the keyword lane's only source of hits was the single-word fragments the
+/// word-splitter happened to produce (#22, and why #18 became a deletion).
 ///
 /// One OR expression also scores better than the same tokens run as separate
 /// queries: BM25 weights each term by IDF *within* the expression, where
