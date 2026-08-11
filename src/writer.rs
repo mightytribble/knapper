@@ -930,9 +930,14 @@ pub fn update_metadata(
 
     // Step 3: Parse existing frontmatter and build new
     let existing_content = std::fs::read_to_string(&full_path)?;
-    let (_old_fm, body) = split_frontmatter(&existing_content);
+    let (old_fm, body) = split_frontmatter(&existing_content);
 
-    let tags = input.tags.unwrap_or_else(|| file_record.tags.clone());
+    // The note's own `tags:` property, not `FileRecord.tags`. The junction
+    // holds the property tags and the body hashtags together (#60), and a
+    // hashtag must stay in the body: this write rebuilds a property of the
+    // user's file.
+    let (_, property_tags, _) = parse_frontmatter_fields(&old_fm);
+    let tags = input.tags.unwrap_or(property_tags);
     let aliases_vec = input.aliases.unwrap_or_default();
     let aliases_ref: Option<&[String]> = if aliases_vec.is_empty() {
         None
@@ -1438,10 +1443,12 @@ pub fn archive_note(
 
     // Read content and inject archive frontmatter
     let content = std::fs::read_to_string(&old_path)?;
-    let (_old_fm, body) = split_frontmatter(&content);
+    let (old_fm, body) = split_frontmatter(&content);
 
-    // Preserve existing tags, add archived metadata
-    let mut tags = file_record.tags.clone();
+    // Keep the note's own `tags:` property and add the archive tag. The source
+    // is the property, not `FileRecord.tags`: the junction also holds the body
+    // hashtags (#60), which stay in the body.
+    let (_, mut tags, _) = parse_frontmatter_fields(&old_fm);
     if !tags.contains(&"archived".to_string()) {
         tags.push("archived".to_string());
     }
@@ -2733,5 +2740,65 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM tags", [], |row| row.get(0))
             .unwrap();
         assert_eq!(remaining, 0, "the note was the tag's only carrier");
+    }
+
+    /// A note whose property holds one tag and whose body holds another.
+    ///
+    /// The junction holds both, because the property and the body are peers
+    /// (#60). A write to the user's frontmatter must carry the property alone.
+    fn note_with_a_body_hashtag(store: &Store, root: &std::path::Path) {
+        let content = "---\ntags:\n  - work\n---\n\nBlocked on #todo today.\n";
+        let file_path = root.join("n.md");
+        std::fs::write(&file_path, content).unwrap();
+        let mtime = file_mtime(&file_path).unwrap();
+        let id = store
+            .insert_file("n.md", "hash", mtime, "bodytg", None, None)
+            .unwrap();
+        store
+            .reconcile_file_tags(id, &crate::tags::extract(content))
+            .unwrap();
+        assert_eq!(
+            stored_tags(store, "n.md"),
+            vec!["todo", "work"],
+            "the junction holds the property tag and the body tag"
+        );
+    }
+
+    #[test]
+    fn update_metadata_keeps_a_body_hashtag_out_of_the_property() {
+        let (_tmp, store, root) = setup_vault();
+        note_with_a_body_hashtag(&store, &root);
+
+        update_metadata(
+            UpdateMetadataInput {
+                file: "n.md".to_string(),
+                tags: None,
+                aliases: None,
+                modified_by: "test".to_string(),
+            },
+            &store,
+            &root,
+        )
+        .unwrap();
+
+        let written = std::fs::read_to_string(root.join("n.md")).unwrap();
+        let (fm, _) = split_frontmatter(&written);
+        let (_, property_tags, _) = parse_frontmatter_fields(&fm);
+        assert_eq!(property_tags, vec!["work"]);
+        assert!(written.contains("#todo"), "the body tag stays in the body");
+    }
+
+    #[test]
+    fn archiving_keeps_a_body_hashtag_out_of_the_property() {
+        let (_tmp, store, root) = setup_vault();
+        note_with_a_body_hashtag(&store, &root);
+
+        archive_note("n.md", &store, &root, None).unwrap();
+
+        let written = std::fs::read_to_string(root.join("04-Archive/n.md")).unwrap();
+        let (fm, _) = split_frontmatter(&written);
+        let (_, property_tags, _) = parse_frontmatter_fields(&fm);
+        assert_eq!(property_tags, vec!["work", "archived"]);
+        assert!(written.contains("#todo"), "the body tag stays in the body");
     }
 }
