@@ -82,6 +82,24 @@ CREATE INDEX IF NOT EXISTS idx_edges_from ON edges(from_file, from_chunk_seq);
 CREATE INDEX IF NOT EXISTS idx_edges_to ON edges(to_file, to_chunk_seq);
 CREATE INDEX IF NOT EXISTS idx_edges_type ON edges(edge_type);";
 
+/// The tag store (#60). A tag is an attribute of a note, so `file_tags` is the
+/// fact and every count over it is derived.
+///
+/// No `parent_id` and no `depth`: the path text holds the ancestors, a leaf row
+/// has no parent to orphan, and a materialised ancestor would need a recursive
+/// delete that leaves rows behind when it stops early.
+const TAGS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS tags (
+    id      INTEGER PRIMARY KEY,
+    path    TEXT NOT NULL UNIQUE,
+    display TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS file_tags (
+    file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    tag_id  INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+    PRIMARY KEY (file_id, tag_id)
+);
+CREATE INDEX IF NOT EXISTS file_tags_tag ON file_tags(tag_id);";
+
 /// Reduce a heading to the form two spellings of the same section share.
 ///
 /// Strips the leading `#`s a stored heading carries and a link's does not,
@@ -634,6 +652,12 @@ impl Store {
                 created_by  TEXT NOT NULL DEFAULT 'indexer'
             );",
         )?;
+
+        // The tag store (#60). A tag is an attribute of a note, so `file_tags`
+        // is the fact table and every count over it is derived: usage is
+        // `COUNT(*)` and last use is `MAX(files.mtime)`. Both numbers come
+        // from `file_tags`, so neither can drift from the vault.
+        self.conn.execute_batch(TAGS_SCHEMA)?;
 
         // Placement corrections table
         self.conn.execute_batch(
@@ -2530,6 +2554,83 @@ impl Store {
 
     pub fn register_tag(&self, name: &str, created_by: &str) -> Result<()> {
         crate::tags::register_tag(&self.conn, name, created_by)
+    }
+
+    /// The tag ids a file currently holds.
+    pub fn file_tag_ids(&self, file_id: i64) -> Result<Vec<i64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT tag_id FROM file_tags WHERE file_id = ?1")?;
+        let rows = stmt.query_map(params![file_id], |row| row.get::<_, i64>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Make `tags` the tags of this file, in three steps (#60).
+    ///
+    /// Read the ids the file holds, replace its rows, then delete each id it
+    /// released that no other file holds. Step three reads only the released
+    /// ids: a scan of the whole table costs a full pass for each file and finds
+    /// the same rows.
+    ///
+    /// The caller owns the file's tag rows the way `index_file` owns its
+    /// chunks, its vectors and its outgoing edges.
+    pub fn reconcile_file_tags(&self, file_id: i64, tags: &[crate::tags::Tag]) -> Result<()> {
+        let released = self.file_tag_ids(file_id)?;
+        self.conn
+            .execute("DELETE FROM file_tags WHERE file_id = ?1", params![file_id])?;
+        for tag in tags {
+            // The first spelling indexed supplies `display`.
+            self.conn.execute(
+                "INSERT INTO tags (path, display) VALUES (?1, ?2) ON CONFLICT(path) DO NOTHING",
+                params![tag.path, tag.display],
+            )?;
+            let tag_id: i64 = self.conn.query_row(
+                "SELECT id FROM tags WHERE path = ?1",
+                params![tag.path],
+                |row| row.get(0),
+            )?;
+            // A tag written in both the property and the body writes one row.
+            self.conn.execute(
+                "INSERT OR IGNORE INTO file_tags (file_id, tag_id) VALUES (?1, ?2)",
+                params![file_id, tag_id],
+            )?;
+        }
+        self.prune_unused_tags(&released)
+    }
+
+    /// Delete each released id that now has no row in `file_tags`.
+    ///
+    /// The counterpart of [`reconcile_file_tags`](Self::reconcile_file_tags)
+    /// for a path that removes the links itself — `remove_file` cascades them
+    /// off `files(id)` and then calls this with the ids the file held.
+    pub fn prune_unused_tags(&self, released: &[i64]) -> Result<()> {
+        let mut stmt = self.conn.prepare(
+            "DELETE FROM tags WHERE id = ?1
+               AND NOT EXISTS (SELECT 1 FROM file_tags WHERE tag_id = ?1)",
+        )?;
+        for id in released {
+            stmt.execute(params![id])?;
+        }
+        Ok(())
+    }
+
+    /// A file's tags as the vault spelled them, ordered by path.
+    pub fn file_tags(&self, file_id: i64) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT t.display FROM file_tags ft
+               JOIN tags t ON t.id = ft.tag_id
+              WHERE ft.file_id = ?1 ORDER BY t.path",
+        )?;
+        let rows = stmt.query_map(params![file_id], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     }
 
     // ── CLI Events ──────────────────────────────────────────────
@@ -5308,5 +5409,147 @@ mod tests {
             )
             .unwrap();
         assert_eq!(indexes, 3);
+    }
+
+    // ── The tag store ────────────────────────────────────────────
+
+    fn tag_fixture() -> (Store, i64, i64) {
+        let store = Store::open_memory().unwrap();
+        let one = store
+            .insert_file("one.md", "h1", 1, &[], "d000001", None, None)
+            .unwrap();
+        let two = store
+            .insert_file("two.md", "h2", 2, &[], "d000002", None, None)
+            .unwrap();
+        (store, one, two)
+    }
+
+    fn tag_row_count(store: &Store) -> i64 {
+        store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM tags", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn link_count(store: &Store) -> i64 {
+        store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM file_tags", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn two_spellings_of_one_tag_are_one_row() {
+        let (store, one, two) = tag_fixture();
+        store
+            .reconcile_file_tags(
+                one,
+                &[crate::tags::Tag {
+                    path: "type/undead".into(),
+                    display: "Type/Undead".into(),
+                }],
+            )
+            .unwrap();
+        store
+            .reconcile_file_tags(
+                two,
+                &[crate::tags::Tag {
+                    path: "type/undead".into(),
+                    display: "type/undead".into(),
+                }],
+            )
+            .unwrap();
+
+        assert_eq!(tag_row_count(&store), 1);
+        assert_eq!(link_count(&store), 2);
+        let display: String = store
+            .conn()
+            .query_row("SELECT display FROM tags", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            display, "Type/Undead",
+            "the first spelling supplies display"
+        );
+    }
+
+    #[test]
+    fn a_note_carrying_one_tag_twice_holds_one_link() {
+        let (store, one, _) = tag_fixture();
+        let tag = crate::tags::Tag {
+            path: "habitat/swamp".into(),
+            display: "habitat/swamp".into(),
+        };
+        store.reconcile_file_tags(one, &[tag.clone(), tag]).unwrap();
+        assert_eq!(link_count(&store), 1);
+    }
+
+    #[test]
+    fn dropping_the_last_use_of_a_tag_deletes_its_row() {
+        let (store, one, _) = tag_fixture();
+        let swamp = crate::tags::Tag {
+            path: "habitat/swamp".into(),
+            display: "habitat/swamp".into(),
+        };
+        store.reconcile_file_tags(one, &[swamp]).unwrap();
+        assert_eq!(tag_row_count(&store), 1);
+
+        store.reconcile_file_tags(one, &[]).unwrap();
+        assert_eq!(tag_row_count(&store), 0);
+        assert_eq!(link_count(&store), 0);
+    }
+
+    #[test]
+    fn a_tag_two_notes_carry_survives_one_of_them_dropping_it() {
+        let (store, one, two) = tag_fixture();
+        let swamp = crate::tags::Tag {
+            path: "habitat/swamp".into(),
+            display: "habitat/swamp".into(),
+        };
+        store.reconcile_file_tags(one, &[swamp.clone()]).unwrap();
+        store.reconcile_file_tags(two, &[swamp]).unwrap();
+
+        store.reconcile_file_tags(one, &[]).unwrap();
+        assert_eq!(tag_row_count(&store), 1);
+        assert_eq!(link_count(&store), 1);
+    }
+
+    #[test]
+    fn deleting_a_file_cascades_its_links_away() {
+        let (store, one, _) = tag_fixture();
+        let swamp = crate::tags::Tag {
+            path: "habitat/swamp".into(),
+            display: "habitat/swamp".into(),
+        };
+        store.reconcile_file_tags(one, &[swamp]).unwrap();
+        let released = store.file_tag_ids(one).unwrap();
+        assert_eq!(released.len(), 1);
+
+        store.delete_file(one).unwrap();
+        assert_eq!(link_count(&store), 0);
+        // The junction cascades; the vocabulary row is the caller's step 3.
+        assert_eq!(tag_row_count(&store), 1);
+        store.prune_unused_tags(&released).unwrap();
+        assert_eq!(tag_row_count(&store), 0);
+    }
+
+    #[test]
+    fn a_files_display_tags_come_back_in_path_order() {
+        let (store, one, _) = tag_fixture();
+        store
+            .reconcile_file_tags(
+                one,
+                &[
+                    crate::tags::Tag {
+                        path: "zebra".into(),
+                        display: "Zebra".into(),
+                    },
+                    crate::tags::Tag {
+                        path: "apex".into(),
+                        display: "Apex".into(),
+                    },
+                ],
+            )
+            .unwrap();
+        assert_eq!(store.file_tags(one).unwrap(), vec!["Apex", "Zebra"]);
     }
 }
