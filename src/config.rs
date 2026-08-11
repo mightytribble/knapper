@@ -524,19 +524,23 @@ pub struct RankingConfig {
     /// and is the control.
     ///
     /// The value comes from the pool in `eval/probes.md`. On the GPU baseline
-    /// store the rejectable negatives score below 6.8% on their best candidate.
-    /// The lowest score of a correct answer is 52.5%, at probe 1's
-    /// `archivist-lenne.md`, rank 5. The default is the midpoint of those two
-    /// values. The margin is about 23 points on each side, and CPU and GPU
-    /// scores differ by about 1 point.
+    /// store the highest negative a floor can reject scores 5.33% on its best
+    /// candidate (N6). The lowest score of a correct answer is 52.52%, at probe
+    /// 1's `archivist-lenne.md`, rank 5. The default is the midpoint of those
+    /// two values, 28.93%, and CPU and GPU scores differ by about 1 point.
     ///
-    /// **The count of negatives the floor rejects is owed a pool run.** N10 was
-    /// the highest rejectable one at 6.77%, and it is not rejectable: the
-    /// shortlist gate that held it there is described on
-    /// [`RankingConfig::graph_reserve`], and #59 removed the query expansion
-    /// that made the gate bind, so N10 scores 97.87%. The lower anchor is then
-    /// N6 at 6.76% and the midpoint is unmoved, which is why the value stands
-    /// while the per-query counts do not.
+    /// **Eight of the eleven negatives return nothing at this floor**, and so
+    /// does the nonsense control. N4, N10 and N11 return results. N10 is above
+    /// any usable floor because the cross-encoder scores a body-purifying spell
+    /// 97.87% against a query about cleaning clothing — see
+    /// [`RankingConfig::graph_reserve`] for the shortlist gate that used to keep
+    /// that candidate out of the model's view.
+    ///
+    /// **What "a correct answer" means here is #34's reading and it is open.**
+    /// The responsive sets of #45 put two more P1 members below 52.52%, at
+    /// 23.50% and 1.33%. Read against those, no floor both keeps every
+    /// responsive chunk and rejects anything. The pool section in
+    /// `eval/probes.md` states both readings.
     ///
     /// #34 specifies a fit against the best score of each query, and the probes
     /// show that this is wrong. That fit gives 89%, the midpoint of 86.2% (N4)

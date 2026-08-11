@@ -491,21 +491,28 @@ has never executed on this box.
   result set prints *"No relevant content found for this query in the vault."* A floor of 0.0
   removes nothing and gives the same output as the build before #34.
   - **The floor value is only correct for the pinned corpus and the current reranker.** It is fit
-    against the 17-query pool in `eval/probes.md`. A new pin makes the pool invalid, and the floor
+    against the eighteen-query pool in `eval/probes.md`. A new pin makes the pool invalid, and the floor
     with it. A new reranker also makes it invalid. This is what `reranker_fingerprint` and its
     `InvalidateThresholds` action are for.
   - **The floor applies to each candidate, and this decides the value.** #34 specifies a fit against
     the best score of each query, which gives 89%. A floor of 89% removes probe 2's correct answer,
     which scores 81% below two better results from a different file. The limit is the lowest correct
-    answer, 52.5% at probe 1's `archivist-lenne.md`, rank 5.
-  - **Two negatives score higher than two positives.** *In which city is Tandi's brother a
-    blacksmith?* scores 97.1%. The passage names Tandi, a brother, a blacksmith and a city, but the
-    brother is Mira's. That score is above P6 and P7, so no floor can reject it and keep them. The
-    reranker scores the topic of a passage, and one incorrect entity does not lower the score. Nine
-    of the eleven negatives return no results. These two do not, and the cause is the reranker.
-  - **How many results the floor removes depends on the query.** Probe 5 goes from 20 to 0. P6 goes
-    from 20 to 1. Probes 1 and 2 go from 20 to 5. Probe 4 stays at 20, because all 20 sections of
-    that exact-name query score above 89%.
+    answer, 52.52% at probe 1's `archivist-lenne.md`, rank 5, against 5.33% for the highest negative
+    a floor can reject — a 28.93% midpoint.
+  - **Three negatives score above any usable floor, and the cause is the reranker.** *In which city
+    is Tandi's brother a blacksmith?* scores 97.82% on a passage that names Tandi, a brother, a
+    blacksmith and a city, where the brother is Mira's. *What spell can be used to clean clothing?*
+    scores 97.87% on one that purifies a body. *Who is the Precept of Alder's Crossing?* scores
+    86.20% on the section naming who runs the place. The reranker scores the topic of a passage, and
+    one incorrect entity does not lower the score. **Eight of the eleven negatives return no
+    results**, and so does the nonsense control; these three do not.
+  - **How many results the floor removes depends on the query.** The control goes from 20 to 0, P6 to
+    2, P1 to 5, P2 to 8, and P4 stays at 20, because all 20 sections of that exact-name query score
+    above the floor.
+  - **What counts as a correct answer is #34's reading, and it is open.** The 52.52% anchor is the
+    lowest result #34 judged an answer; the responsive sets of #45 put two more P1 members below it,
+    at 23.50% and 1.33%. Read against tier 1 no floor both keeps every responsive chunk and rejects
+    anything. `eval/probes.md`'s re-taken pool section holds both readings.
   - **`[ranking] per_note_cap` is 0, which means no limit.** The conflict between §9.1 and #30 stays
     open, and the key makes a sweep possible without a code change.
 - **GPU numbers and CPU numbers are different baselines.** `eval/probes.md`'s CUDA section is a fresh
@@ -552,10 +559,12 @@ See issues on this repo:
   the topic of a passage, and one incorrect entity does not lower the score. Second, the fit the
   ticket specifies gives 89%, and 89% removes probe 2's correct answer at 81%. A floor that applies
   to each candidate must be below the lowest correct answer, not below the best result of each
-  query. The value is the midpoint of two scores: 6.77%, the highest negative a floor can reject,
-  and 52.5%, probe 1's `archivist-lenne.md` at rank 5. The margin is about 23 points on each side.
-  Nine of the eleven negatives return no results. Every correct answer keeps its rank. The result
-  count goes from 20 to 1 on P6, and stays at 20 on probe 4. `[ranking] per_note_cap` ships at 0.
+  query. The value is the midpoint of two scores, and both are re-taken on the shipped engine:
+  **5.33%**, the highest negative a floor can reject, and **52.52%**, probe 1's `archivist-lenne.md`
+  at rank 5, for a 28.93% midpoint. The margin is 23 points above and 5 below. Eight of the eleven
+  negatives return no results, and N10 joins N11 and N4 above any usable floor. Every correct answer
+  keeps its rank. The result count goes from 20 to 2 on P6, and stays at 20 on probe 4.
+  `[ranking] per_note_cap` ships at 0.
   **Layer 2 of `docs/vault-search-convergence.md`, first half**
 - **#35** output contract — the scored window is the emitted window (today the model reads
   `chunks.text` capped at `max_document_chars` and the caller gets the 200-char `snippet`, so the
