@@ -1,6 +1,187 @@
 use anyhow::Result;
 use rusqlite::{Connection, params};
+use std::collections::HashSet;
 use strsim::levenshtein;
+
+/// A tag, as the store keys it and as the vault wrote it.
+///
+/// Obsidian matches a tag without regard to case and displays the capitalisation
+/// the vault used, so both strings are kept: `path` is the identity and
+/// `display` is what a reader sees.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tag {
+    /// Folded: `type/undead`. Unique in the `tags` table.
+    pub path: String,
+    /// As written: `Type/Undead`.
+    pub display: String,
+}
+
+impl Tag {
+    fn new(written: &str) -> Self {
+        Tag {
+            path: written.to_lowercase(),
+            display: written.to_string(),
+        }
+    }
+
+    /// The first segment of the path. `type/undead` has the axis `type`.
+    pub fn axis(&self) -> &str {
+        match self.path.split_once('/') {
+            Some((head, _)) => head,
+            None => &self.path,
+        }
+    }
+}
+
+/// Every tag a note carries, property and body, in that order.
+///
+/// The two sources are peers: neither requires the other, and a note tagged in
+/// both holds the tag once. Only the path a note carries is returned —
+/// `type/undead` does not imply a `type` tag, and a query reads the ancestors
+/// out of the path text.
+pub fn extract(content: &str) -> Vec<Tag> {
+    let (frontmatter, body) = crate::markdown::split_frontmatter(content);
+    let mut out: Vec<Tag> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    if let Some(fm) = frontmatter {
+        for written in property_tags(&fm) {
+            push_tag(&mut out, &mut seen, &written);
+        }
+    }
+    for written in body_tags(&body) {
+        push_tag(&mut out, &mut seen, &written);
+    }
+    out
+}
+
+/// Keep the first spelling of a path and drop the rest.
+fn push_tag(out: &mut Vec<Tag>, seen: &mut HashSet<String>, written: &str) {
+    let tag = Tag::new(written);
+    if tag.path.is_empty() {
+        return;
+    }
+    if seen.insert(tag.path.clone()) {
+        out.push(tag);
+    }
+}
+
+/// The `tags` property, in the three forms Obsidian accepts.
+///
+/// `tags: [a, b]`, a block sequence of `- a` lines, and a single scalar
+/// `tags: a`. A value may carry one leading `#`, which is stripped. The key is
+/// read at column 0 only, because Obsidian's properties are top level and an
+/// indented `tags:` belongs to some other mapping. The singular `tag` property
+/// is not read: Obsidian dropped support for it at 1.9.
+fn property_tags(frontmatter: &str) -> Vec<String> {
+    let lines: Vec<&str> = frontmatter.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
+        let Some(after) = line.strip_prefix("tags:") else {
+            continue;
+        };
+        let after = after.trim();
+        if let Some(inner) = after.strip_prefix('[') {
+            return inner
+                .trim_end_matches(']')
+                .split(',')
+                .map(clean_property_value)
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+        if !after.is_empty() {
+            let value = clean_property_value(after);
+            return if value.is_empty() {
+                Vec::new()
+            } else {
+                vec![value]
+            };
+        }
+        let mut out = Vec::new();
+        for subsequent in &lines[i + 1..] {
+            let trimmed = subsequent.trim();
+            if let Some(item) = trimmed.strip_prefix("- ") {
+                let value = clean_property_value(item);
+                if !value.is_empty() {
+                    out.push(value);
+                }
+            } else if trimmed.is_empty() {
+                continue;
+            } else {
+                break;
+            }
+        }
+        return out;
+    }
+    Vec::new()
+}
+
+fn clean_property_value(raw: &str) -> String {
+    let trimmed = raw.trim().trim_matches('"').trim_matches('\'').trim();
+    trimmed.strip_prefix('#').unwrap_or(trimmed).to_string()
+}
+
+/// Every `#tag` token the body holds, with the five rejections applied.
+fn body_tags(body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut fenced = false;
+    for line in body.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced {
+            continue;
+        }
+        out.extend(line_tags(line));
+    }
+    out
+}
+
+/// The token rule, over one line of body text.
+fn line_tags(line: &str) -> Vec<String> {
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = Vec::new();
+    let mut in_code_span = false;
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '`' {
+            in_code_span = !in_code_span;
+            i += 1;
+            continue;
+        }
+        if chars[i] != '#' || in_code_span {
+            i += 1;
+            continue;
+        }
+        // A tag opens a line or follows whitespace. That one test rejects three
+        // of the five constructions: a URL fragment (`…/#section`) is preceded
+        // by `/`, a wikilink heading (`[[note#Heading]]`) by a letter or `[`,
+        // and an escaped `\#` by the backslash.
+        if i > 0 && !chars[i - 1].is_whitespace() {
+            i += 1;
+            continue;
+        }
+        let start = i + 1;
+        let mut end = start;
+        while end < chars.len() && is_tag_char(chars[end]) {
+            end += 1;
+        }
+        let token: String = chars[start..end].iter().collect();
+        // An ATX heading is `#` followed by a space, which leaves the token
+        // empty. `#1984` holds no non-numeric character and is not a tag.
+        if !token.is_empty() && token.chars().any(|c| !c.is_ascii_digit()) {
+            out.push(token);
+        }
+        i = end.max(start);
+    }
+    out
+}
+
+/// Letters, digits, `_`, `-`, `/` and Unicode characters. A tag holds no space.
+fn is_tag_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '-' || c == '/'
+}
 
 /// Result of resolving a proposed tag against the registry.
 #[derive(Debug, Clone, PartialEq)]
@@ -110,6 +291,108 @@ pub fn resolve_tags(conn: &Connection, proposed: &[String]) -> Result<Vec<String
 mod tests {
     use super::*;
     use crate::store::Store;
+
+    // ── The extraction rule ──────────────────────────────────────
+
+    fn paths(content: &str) -> Vec<String> {
+        extract(content).into_iter().map(|t| t.path).collect()
+    }
+
+    #[test]
+    fn the_property_is_read_in_its_three_forms() {
+        assert_eq!(
+            paths("---\ntags: [alpha, beta]\n---\nbody\n"),
+            ["alpha", "beta"]
+        );
+        assert_eq!(
+            paths("---\ntags:\n  - alpha\n  - beta\n---\nbody\n"),
+            ["alpha", "beta"]
+        );
+        assert_eq!(paths("---\ntags: alpha\n---\nbody\n"), ["alpha"]);
+    }
+
+    #[test]
+    fn a_property_value_may_carry_one_hash() {
+        assert_eq!(paths("---\ntags: [#undead]\n---\nbody\n"), ["undead"]);
+    }
+
+    #[test]
+    fn the_singular_tag_property_is_not_read() {
+        // Obsidian dropped support for it at 1.9.
+        assert!(paths("---\ntag: alpha\n---\nbody\n").is_empty());
+    }
+
+    #[test]
+    fn the_body_supplies_tags_and_the_two_sources_are_a_union() {
+        assert_eq!(paths("body with #alpha in it\n"), ["alpha"]);
+        assert_eq!(
+            paths("---\ntags: [alpha]\n---\nbody with #beta\n"),
+            ["alpha", "beta"]
+        );
+    }
+
+    #[test]
+    fn one_tag_from_both_sources_is_one_tag() {
+        assert_eq!(
+            paths("---\ntags: [alpha]\n---\nbody with #alpha\n"),
+            ["alpha"]
+        );
+    }
+
+    #[test]
+    fn an_atx_heading_is_not_a_tag() {
+        assert!(paths("# Heading\n\n## Deeper\n").is_empty());
+    }
+
+    #[test]
+    fn code_is_not_a_tag() {
+        assert!(paths("```\n#alpha\n```\n").is_empty());
+        assert!(paths("~~~\n#alpha\n~~~\n").is_empty());
+        assert!(paths("a `#alpha` span\n").is_empty());
+    }
+
+    #[test]
+    fn a_url_fragment_is_not_a_tag() {
+        assert!(paths("see https://example.com/#section for more\n").is_empty());
+    }
+
+    #[test]
+    fn a_wikilink_heading_is_not_a_tag() {
+        assert!(paths("see [[note#Heading]]\n").is_empty());
+    }
+
+    #[test]
+    fn an_escaped_hash_is_not_a_tag() {
+        assert!(paths("a literal \\#alpha\n").is_empty());
+    }
+
+    #[test]
+    fn a_tag_holds_at_least_one_non_numeric_character() {
+        assert!(paths("in #1984 nothing happened\n").is_empty());
+        assert_eq!(paths("in #y1984 something did\n"), ["y1984"]);
+    }
+
+    #[test]
+    fn a_tag_ends_at_the_first_character_outside_the_set() {
+        assert_eq!(paths("tagged #type/undead, and armed.\n"), ["type/undead"]);
+        assert_eq!(paths("#alpha_beta-1/two.\n"), ["alpha_beta-1/two"]);
+    }
+
+    #[test]
+    fn the_path_is_folded_and_the_display_form_is_not() {
+        let tags = extract("body #Type/Undead here\n");
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].path, "type/undead");
+        assert_eq!(tags[0].display, "Type/Undead");
+        assert_eq!(tags[0].axis(), "type");
+    }
+
+    #[test]
+    fn one_tag_in_two_spellings_keeps_the_first() {
+        let tags = extract("---\ntags: [Type/Undead]\n---\nbody #type/undead\n");
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].display, "Type/Undead");
+    }
 
     fn setup_store() -> Store {
         let store = Store::open_memory().unwrap();
