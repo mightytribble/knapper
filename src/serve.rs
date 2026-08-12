@@ -434,6 +434,7 @@ impl EngraphServer {
             ranking: self.ranking,
             lane_weights: self.lane_weights,
             fts: self.fts,
+            scope: crate::tags::TagFilter::default(),
         };
 
         let output =

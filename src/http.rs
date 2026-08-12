@@ -522,6 +522,7 @@ async fn handle_search(
         ranking: state.ranking,
         lane_weights: state.lane_weights,
         fts: state.fts,
+        scope: crate::tags::TagFilter::default(),
     };
 
     let output = search::search_with_intelligence(&body.query, top_n, &mut *embedder, &mut config)
