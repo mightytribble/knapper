@@ -556,7 +556,8 @@ async fn handle_list(
         profile: state.profile.as_ref().as_ref(),
     };
     let limit = params.limit.unwrap_or(20);
-    let filter = crate::tags::TagFilter::parse(&params.tags, &[], &[]);
+    let filter = crate::tags::TagFilter::parse(&params.tags, &[], &[])
+        .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
     let items = context::context_list(
         &ctx,
         params.folder.as_deref(),

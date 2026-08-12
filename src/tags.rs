@@ -407,14 +407,18 @@ pub fn check_terms(conn: &Connection, terms: &[&TagTerm]) -> Result<()> {
 /// Each prefix is tested by equality, never `LIKE`: a tag may hold `_` or
 /// `%`, which `LIKE` reads as wildcards rather than literal characters.
 fn longest_existing_ancestor(conn: &Connection, path: &str) -> Result<Option<String>> {
+    use rusqlite::OptionalExtension;
+
     let segments: Vec<&str> = path.split('/').collect();
     for end in (1..segments.len()).rev() {
         let prefix = segments[..end].join("/");
         let display: Option<String> = conn
-            .prepare("SELECT display FROM tags WHERE path = ?1")?
-            .query_map(params![prefix], |row| row.get::<_, String>(0))?
-            .filter_map(|r| r.ok())
-            .next();
+            .query_row(
+                "SELECT display FROM tags WHERE path = ?1",
+                params![prefix],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
         if display.is_some() {
             return Ok(display);
         }
@@ -435,19 +439,33 @@ pub struct TagFilter {
 
 impl TagFilter {
     /// Read each field's terms, dropping the ones with no path.
-    pub fn parse(all: &[String], any: &[String], none: &[String]) -> Self {
-        let read = |field: &[String]| field.iter().filter_map(|t| parse_term(t)).collect();
-        TagFilter {
-            all: read(all),
-            any: read(any),
-            none: read(none),
-        }
+    ///
+    /// A trailing comma leaves other terms standing and is not an error. A
+    /// field that holds input and none of it survives — `--all ""` — is an
+    /// error naming the field, because a silent empty field would constrain
+    /// nothing and list every note the caller meant to filter.
+    pub fn parse(all: &[String], any: &[String], none: &[String]) -> Result<Self> {
+        let read = |name: &str, field: &[String]| -> Result<Vec<TagTerm>> {
+            let terms: Vec<TagTerm> = field.iter().filter_map(|t| parse_term(t)).collect();
+            if !field.is_empty() && terms.is_empty() {
+                anyhow::bail!("'{name}' names no tag");
+            }
+            Ok(terms)
+        };
+        Ok(TagFilter {
+            all: read("all", all)?,
+            any: read("any", any)?,
+            none: read("none", none)?,
+        })
     }
+}
 
-    /// No field holds a term, so the filter adds no SQL.
-    pub fn is_empty(&self) -> bool {
-        self.all.is_empty() && self.any.is_empty() && self.none.is_empty()
-    }
+/// Fold the `tags` alias into `all`. `tags` is the older spelling of `--all`,
+/// on the CLI and on MCP's `list` tool.
+pub fn merge_all_alias(tags: Vec<String>, all: Vec<String>) -> Vec<String> {
+    let mut merged = tags;
+    merged.extend(all);
+    merged
 }
 
 /// Result of resolving a proposed tag against the registry.
@@ -803,6 +821,39 @@ mod tests {
             args,
             vec!["type".to_string(), "type/".into(), "type0".into()]
         );
+    }
+
+    #[test]
+    fn a_trailing_comma_drops_one_term_and_keeps_the_rest() {
+        let filter =
+            TagFilter::parse(&["type/undead".to_string(), "".to_string()], &[], &[]).unwrap();
+        assert_eq!(filter.all, vec![TagTerm::Exact("type/undead".into())]);
+    }
+
+    #[test]
+    fn a_field_that_is_all_empty_terms_is_an_error() {
+        let err = TagFilter::parse(&["".to_string()], &[], &[]).unwrap_err();
+        assert_eq!(err.to_string(), "'all' names no tag");
+
+        let err = TagFilter::parse(&[], &["".to_string()], &[]).unwrap_err();
+        assert_eq!(err.to_string(), "'any' names no tag");
+
+        let err = TagFilter::parse(&[], &[], &["".to_string()]).unwrap_err();
+        assert_eq!(err.to_string(), "'none' names no tag");
+    }
+
+    #[test]
+    fn an_absent_field_is_not_an_error() {
+        assert!(TagFilter::parse(&[], &[], &[]).unwrap().all.is_empty());
+    }
+
+    #[test]
+    fn the_tags_alias_folds_into_all() {
+        assert_eq!(
+            merge_all_alias(vec!["a".to_string()], vec!["b".to_string()]),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert_eq!(merge_all_alias(vec![], vec!["b".to_string()]), vec!["b"]);
     }
 
     fn setup_store() -> Store {

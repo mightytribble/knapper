@@ -1050,10 +1050,8 @@ async fn main() -> Result<()> {
                     created_by,
                     limit,
                 } => {
-                    // `--tags` is the older spelling of `--all`.
-                    let mut all_terms = tags;
-                    all_terms.extend(all);
-                    let filter = engraph::tags::TagFilter::parse(&all_terms, &any, &none);
+                    let all_terms = engraph::tags::merge_all_alias(tags, all);
+                    let filter = engraph::tags::TagFilter::parse(&all_terms, &any, &none)?;
                     let items = engraph::context::context_list(
                         &params,
                         folder.as_deref(),

@@ -882,7 +882,7 @@ mod tests {
         let items = context_list(
             &params,
             None,
-            &crate::tags::TagFilter::parse(&["rust".into()], &[], &[]),
+            &crate::tags::TagFilter::parse(&["rust".into()], &[], &[]).unwrap(),
             None,
             20,
         )

@@ -482,13 +482,16 @@ impl EngraphServer {
             vault_path: &self.vault_path,
             profile: self.profile.as_ref().as_ref(),
         };
-        let mut all_terms = params.0.tags.unwrap_or_default();
-        all_terms.extend(params.0.all.unwrap_or_default());
+        let all_terms = crate::tags::merge_all_alias(
+            params.0.tags.unwrap_or_default(),
+            params.0.all.unwrap_or_default(),
+        );
         let tags = crate::tags::TagFilter::parse(
             &all_terms,
             &params.0.any.unwrap_or_default(),
             &params.0.none.unwrap_or_default(),
-        );
+        )
+        .map_err(|e| mcp_err(&e))?;
         let limit = params.0.limit.unwrap_or(20);
         let items = context::context_list(
             &ctx,
