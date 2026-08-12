@@ -284,6 +284,77 @@ fn is_tag_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_' || c == '-' || c == '/'
 }
 
+/// A term names one tag or one subtree of the hierarchy.
+///
+/// `type/undead` is the tag alone. `type/undead/` — and its synonym
+/// `type/undead/*` — is the tag and every descendant, which is what Obsidian's
+/// `tag:type/undead` returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TagTerm {
+    Exact(String),
+    Subtree(String),
+}
+
+impl TagTerm {
+    /// The folded path the term names, without the subtree marker.
+    pub fn path(&self) -> &str {
+        match self {
+            TagTerm::Exact(p) | TagTerm::Subtree(p) => p,
+        }
+    }
+}
+
+impl std::fmt::Display for TagTerm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TagTerm::Exact(p) => write!(f, "{p}"),
+            TagTerm::Subtree(p) => write!(f, "{p}/"),
+        }
+    }
+}
+
+/// Read a term the way a caller writes one.
+///
+/// One leading `#` is dropped, a trailing `/*` folds to a trailing `/`, a
+/// trailing `/` is the subtree marker, and the rest folds to the path the store
+/// keys on. A term with no path left returns `None`, so a trailing comma in a
+/// comma-separated list is not an error.
+pub fn parse_term(written: &str) -> Option<TagTerm> {
+    let trimmed = written.trim();
+    let stripped = trimmed.strip_prefix('#').unwrap_or(trimmed);
+    let (head, subtree) = match stripped.strip_suffix("/*") {
+        Some(head) => (head, true),
+        None => match stripped.strip_suffix('/') {
+            Some(head) => (head, true),
+            None => (stripped, false),
+        },
+    };
+    let path = head.trim_end_matches('/').to_lowercase();
+    if path.is_empty() {
+        return None;
+    }
+    Some(if subtree {
+        TagTerm::Subtree(path)
+    } else {
+        TagTerm::Exact(path)
+    })
+}
+
+/// The SQL predicate over a `tags` row aliased `t`, and its arguments in order.
+///
+/// The subtree bound is a range, so the unique index on `path` serves it. A
+/// `LIKE` pattern would neither use the index nor treat `_` and `%` in a tag as
+/// literal characters.
+pub fn predicate(term: &TagTerm) -> (String, Vec<String>) {
+    match term {
+        TagTerm::Exact(path) => ("t.path = ?".to_string(), vec![path.clone()]),
+        TagTerm::Subtree(path) => (
+            "(t.path = ? OR (t.path >= ? AND t.path < ?))".to_string(),
+            vec![path.clone(), format!("{path}/"), format!("{path}0")],
+        ),
+    }
+}
+
 /// Result of resolving a proposed tag against the registry.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TagResolution {
@@ -573,6 +644,69 @@ mod tests {
         assert_eq!(
             paths("---\ntags: [#alpha, #beta]  # todo\n---\nbody\n"),
             ["alpha", "beta"]
+        );
+    }
+
+    // ── The term grammar ─────────────────────────────────────────
+
+    #[test]
+    fn a_bare_path_is_exact_and_a_trailing_slash_is_a_subtree() {
+        assert_eq!(
+            parse_term("type/undead"),
+            Some(TagTerm::Exact("type/undead".into()))
+        );
+        assert_eq!(
+            parse_term("type/undead/"),
+            Some(TagTerm::Subtree("type/undead".into()))
+        );
+    }
+
+    #[test]
+    fn the_star_form_folds_to_the_slash_form() {
+        assert_eq!(parse_term("type/undead/*"), parse_term("type/undead/"));
+    }
+
+    #[test]
+    fn a_term_folds_case_and_drops_one_leading_hash() {
+        assert_eq!(
+            parse_term("#Type/Undead"),
+            Some(TagTerm::Exact("type/undead".into()))
+        );
+    }
+
+    #[test]
+    fn a_term_with_no_path_left_is_dropped() {
+        assert_eq!(parse_term(""), None);
+        assert_eq!(parse_term("#"), None);
+        assert_eq!(parse_term("/"), None);
+        assert_eq!(parse_term("   "), None);
+    }
+
+    #[test]
+    fn a_term_prints_the_form_it_was_written_in() {
+        assert_eq!(
+            parse_term("Type/Undead").unwrap().to_string(),
+            "type/undead"
+        );
+        assert_eq!(
+            parse_term("type/undead/*").unwrap().to_string(),
+            "type/undead/"
+        );
+    }
+
+    #[test]
+    fn the_exact_predicate_takes_one_argument_and_the_subtree_three() {
+        let (sql, args) = predicate(&TagTerm::Exact("type".into()));
+        assert_eq!(sql, "t.path = ?");
+        assert_eq!(args, vec!["type".to_string()]);
+
+        let (sql, args) = predicate(&TagTerm::Subtree("type".into()));
+        assert_eq!(sql.matches('?').count(), 3);
+        // The upper bound is exclusive of everything after the subtree: `/` is
+        // 0x2F and `0` is 0x30.
+        assert_eq!(
+            args,
+            vec!["type".to_string(), "type/".into(), "type0".into()]
         );
     }
 
