@@ -45,11 +45,12 @@ pub struct ListParams {
     pub folder: Option<String>,
     /// Filter to notes with all listed tags. Alias of `all`.
     pub tags: Option<Vec<String>>,
-    /// Notes carrying every term. A term is a tag path; a trailing `/` matches
-    /// the tag and its descendants. An unknown term is an error naming the
-    /// nearest tag the vault holds.
+    /// Notes carrying every term. A term is a tag path; a trailing `/` or
+    /// `/*` matches the tag and its descendants. An unknown term is an error
+    /// naming the nearest tag the vault holds.
     pub all: Option<Vec<String>>,
-    /// Notes carrying at least one of these terms.
+    /// Notes carrying at least one of these terms. An unknown term is an
+    /// error naming the nearest tag the vault holds.
     pub any: Option<Vec<String>>,
     /// Notes carrying none of these terms. An unknown term here is ignored.
     pub none: Option<Vec<String>>,
@@ -62,8 +63,8 @@ pub struct ListParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct TagListParams {
-    /// Limit to one tag and its descendants, as `type/`. Omit for the whole
-    /// vocabulary.
+    /// Limit to one tag and its descendants, as `type/` or `type/*`. Omit
+    /// for the whole vocabulary.
     pub under: Option<String>,
 }
 

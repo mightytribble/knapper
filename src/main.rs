@@ -241,7 +241,8 @@ enum ContextAction {
         /// `/` or `/*` matches the tag and its descendants.
         #[arg(long, value_delimiter = ',')]
         tags: Vec<String>,
-        /// Filter to notes carrying every term (comma-separated). Alias of --tags.
+        /// Filter to notes carrying every term (comma-separated). A trailing
+        /// `/` or `/*` matches the tag and its descendants.
         #[arg(long, value_delimiter = ',')]
         all: Vec<String>,
         /// Filter to notes carrying at least one term (comma-separated).
