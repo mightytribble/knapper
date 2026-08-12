@@ -399,6 +399,11 @@ impl Store {
         crate::vecstore::init_sqlite_vec();
         let conn = Connection::open(path)
             .with_context(|| format!("failed to open database at {}", path.display()))?;
+        // The `rarray` table-valued function, which is how the search lanes
+        // bind a tag scope: one pointer to a Vec<Value> rather than one bound
+        // parameter per file id (#60). It is per-connection, so it is
+        // registered where connections are made.
+        rusqlite::vtab::array::load_module(&conn).context("registering rarray")?;
         let store = Self { conn };
         store.init()?;
         Ok(store)
@@ -408,6 +413,7 @@ impl Store {
     pub fn open_memory() -> Result<Self> {
         crate::vecstore::init_sqlite_vec();
         let conn = Connection::open_in_memory().context("failed to open in-memory database")?;
+        rusqlite::vtab::array::load_module(&conn).context("registering rarray")?;
         let store = Self { conn };
         store.init()?;
         Ok(store)
@@ -1706,7 +1712,54 @@ impl Store {
             isolated_file_count: (total_files - connected) as usize,
         })
     }
+}
 
+/// The tag half of a note query: SQL over a `files` row aliased `f`, and its
+/// arguments in the order the SQL binds them.
+///
+/// One author for the three operators, because `list_files` and
+/// `files_in_scope` ask the same question of the same junction and a second
+/// copy of the rule is a second thing to keep right (#60). The per-term rule
+/// stays in `tags::predicate`.
+fn tag_clauses(tags: &crate::tags::TagFilter) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
+    let mut sql = String::new();
+    let mut args: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+    // The junction, not `json_each` over a JSON column: the old test scanned
+    // `files` and parsed JSON for each row (#60). A term folds its own path, so
+    // a folded query side meets a folded column.
+    for term in &tags.all {
+        let (pred, values) = crate::tags::predicate(term);
+        sql.push_str(&format!(
+            " AND EXISTS (SELECT 1 FROM file_tags ft JOIN tags t ON t.id = ft.tag_id
+                            WHERE ft.file_id = f.id AND {pred})"
+        ));
+        for value in values {
+            args.push(Box::new(value));
+        }
+    }
+    for (field, keyword) in [(&tags.any, "EXISTS"), (&tags.none, "NOT EXISTS")] {
+        if field.is_empty() {
+            continue;
+        }
+        let mut ors: Vec<String> = Vec::new();
+        for term in field {
+            let (pred, values) = crate::tags::predicate(term);
+            ors.push(pred);
+            for value in values {
+                args.push(Box::new(value));
+            }
+        }
+        sql.push_str(&format!(
+            " AND {keyword} (SELECT 1 FROM file_tags ft JOIN tags t ON t.id = ft.tag_id
+                               WHERE ft.file_id = f.id AND ({}))",
+            ors.join(" OR ")
+        ));
+    }
+    (sql, args)
+}
+
+impl Store {
     /// List files filtered by folder prefix, tag operators and creator.
     pub fn list_files(
         &self,
@@ -1725,37 +1778,9 @@ impl Store {
             sql.push_str(" AND f.path LIKE ?");
             param_values.push(Box::new(format!("{}%", folder)));
         }
-        // The junction, not `json_each` over a JSON column: the old test
-        // scanned `files` and parsed JSON for each row (#60). A term folds its
-        // own path, so a folded query side meets a folded column.
-        for term in &tags.all {
-            let (pred, args) = crate::tags::predicate(term);
-            sql.push_str(&format!(
-                " AND EXISTS (SELECT 1 FROM file_tags ft JOIN tags t ON t.id = ft.tag_id
-                                WHERE ft.file_id = f.id AND {pred})"
-            ));
-            for arg in args {
-                param_values.push(Box::new(arg));
-            }
-        }
-        for (field, keyword) in [(&tags.any, "EXISTS"), (&tags.none, "NOT EXISTS")] {
-            if field.is_empty() {
-                continue;
-            }
-            let mut ors: Vec<String> = Vec::new();
-            for term in field {
-                let (pred, args) = crate::tags::predicate(term);
-                ors.push(pred);
-                for arg in args {
-                    param_values.push(Box::new(arg));
-                }
-            }
-            sql.push_str(&format!(
-                " AND {keyword} (SELECT 1 FROM file_tags ft JOIN tags t ON t.id = ft.tag_id
-                                   WHERE ft.file_id = f.id AND ({}))",
-                ors.join(" OR ")
-            ));
-        }
+        let (tag_sql, tag_args) = tag_clauses(tags);
+        sql.push_str(&tag_sql);
+        param_values.extend(tag_args);
         if let Some(cb) = created_by {
             sql.push_str(" AND f.created_by = ?");
             param_values.push(Box::new(cb.to_string()));
@@ -1773,6 +1798,30 @@ impl Store {
             results.push(row?);
         }
         Ok(results)
+    }
+
+    /// The ids of the notes a tag filter admits (#60).
+    ///
+    /// The scope a search runs under, resolved once so that all three lanes
+    /// filter against the same set and `--explain` can report a count that is
+    /// the one the lanes saw. `none` is not checked, for the reason
+    /// `list_files` does not check it: excluding a tag no note carries is a
+    /// no-op, and erroring on it would refuse a correct query.
+    pub fn files_in_scope(&self, filter: &crate::tags::TagFilter) -> Result<Vec<i64>> {
+        let checked: Vec<&crate::tags::TagTerm> =
+            filter.all.iter().chain(filter.any.iter()).collect();
+        crate::tags::check_terms(&self.conn, &checked)?;
+
+        let (tag_sql, args) = tag_clauses(filter);
+        let mut stmt = self
+            .conn
+            .prepare(&format!("SELECT f.id FROM files f WHERE 1=1{tag_sql}"))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |row| row.get(0))?;
+        let mut ids = Vec::new();
+        for row in rows {
+            ids.push(row?);
+        }
+        Ok(ids)
     }
 
     /// Top-level folder grouping with note counts.
@@ -5521,6 +5570,98 @@ mod tests {
             .collect();
         paths.sort();
         paths
+    }
+
+    /// The scoped file ids as paths, sorted, so an assertion reads as notes.
+    fn scoped_paths(store: &Store, filter: &crate::tags::TagFilter) -> Vec<String> {
+        let mut paths: Vec<String> = store
+            .files_in_scope(filter)
+            .unwrap()
+            .into_iter()
+            .map(|id| store.get_file_by_id(id).unwrap().unwrap().path)
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    #[test]
+    fn a_scope_resolves_each_operator_the_way_list_does() {
+        let store = operator_fixture();
+        let parse = |all: &[&str], any: &[&str], none: &[&str]| {
+            crate::tags::TagFilter::parse(
+                &all.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                &any.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                &none.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(
+            scoped_paths(&store, &parse(&["type/beast"], &[], &[])),
+            vec!["draft.md", "wolf.md"]
+        );
+        assert_eq!(
+            scoped_paths(&store, &parse(&[], &["type/undead", "status/draft"], &[])),
+            vec!["draft.md", "wight.md"]
+        );
+        assert_eq!(
+            scoped_paths(&store, &parse(&["type/"], &[], &["status/draft"])),
+            vec!["wight.md", "wolf.md"]
+        );
+        assert_eq!(
+            scoped_paths(&store, &parse(&["type/beast", "status/draft"], &[], &[])),
+            vec!["draft.md"]
+        );
+    }
+
+    #[test]
+    fn a_scope_reads_a_subtree_and_a_case_folded_term() {
+        let store = operator_fixture();
+        // `type/` takes the descendants; the bare `type` is a tag no note
+        // carries, and its own subtree is what the error names instead.
+        let subtree = crate::tags::TagFilter::parse(&["TYPE/".to_string()], &[], &[]).unwrap();
+        assert_eq!(
+            scoped_paths(&store, &subtree),
+            vec!["draft.md", "wight.md", "wolf.md"]
+        );
+        let folded =
+            crate::tags::TagFilter::parse(&["Habitat/Swamp".to_string()], &[], &[]).unwrap();
+        assert_eq!(scoped_paths(&store, &folded), vec!["wight.md"]);
+    }
+
+    #[test]
+    fn a_scope_naming_no_tag_errors_and_names_the_nearest() {
+        let store = operator_fixture();
+        let filter = crate::tags::TagFilter::parse(&["type/undeed".to_string()], &[], &[]).unwrap();
+        let err = store.files_in_scope(&filter).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "no such tag 'type/undeed'; nearest: 'type/undead'"
+        );
+    }
+
+    #[test]
+    fn a_scope_excluding_an_unknown_tag_is_not_an_error() {
+        let store = operator_fixture();
+        let filter =
+            crate::tags::TagFilter::parse(&["type/".to_string()], &[], &["nowhere".to_string()])
+                .unwrap();
+        assert_eq!(
+            scoped_paths(&store, &filter),
+            vec!["draft.md", "wight.md", "wolf.md"]
+        );
+    }
+
+    #[test]
+    fn a_scope_that_no_note_satisfies_is_empty_and_not_an_error() {
+        let store = operator_fixture();
+        let filter = crate::tags::TagFilter::parse(
+            &["type/undead".to_string(), "status/draft".to_string()],
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert!(store.files_in_scope(&filter).unwrap().is_empty());
     }
 
     #[test]

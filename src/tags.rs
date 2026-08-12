@@ -458,6 +458,14 @@ impl TagFilter {
             none: read("none", none)?,
         })
     }
+
+    /// Whether the filter constrains nothing.
+    ///
+    /// The one test for "no scope", so a caller never decides that question by
+    /// inspecting the three fields itself and getting one of them wrong (#60).
+    pub fn is_empty(&self) -> bool {
+        self.all.is_empty() && self.any.is_empty() && self.none.is_empty()
+    }
 }
 
 /// Fold the `tags` alias into `all`. `tags` is the older spelling of `--all`,
@@ -845,6 +853,26 @@ mod tests {
     #[test]
     fn an_absent_field_is_not_an_error() {
         assert!(TagFilter::parse(&[], &[], &[]).unwrap().all.is_empty());
+    }
+
+    #[test]
+    fn an_empty_filter_is_the_one_that_constrains_nothing() {
+        assert!(TagFilter::default().is_empty());
+        assert!(
+            !TagFilter::parse(&["type/undead".into()], &[], &[])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !TagFilter::parse(&[], &["type/undead".into()], &[])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !TagFilter::parse(&[], &[], &["type/undead".into()])
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

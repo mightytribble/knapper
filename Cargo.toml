@@ -18,7 +18,7 @@ serde_yaml = "0.9"
 toml = "0.8"
 dirs = "5"
 anyhow = "1"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled", "array"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
