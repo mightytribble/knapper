@@ -2468,19 +2468,27 @@ impl Store {
     ///
     /// The caller owns the file's tag rows the way `index_file` owns its
     /// chunks, its vectors and its outgoing edges.
+    ///
+    /// The store folds what it is given: `tags.path` is the identity and
+    /// Obsidian matches a tag without regard to case, so the path is written
+    /// folded here rather than trusted from the caller. `Type/Undead` and
+    /// `type/undead` are one row whichever spelling arrives, and every query
+    /// that folds its own argument — `files_with_tag`, `files_under_tag`, the
+    /// `list_files` tag filter — meets a folded column.
     pub fn reconcile_file_tags(&self, file_id: i64, tags: &[crate::tags::Tag]) -> Result<()> {
         let released = self.file_tag_ids(file_id)?;
         self.conn
             .execute("DELETE FROM file_tags WHERE file_id = ?1", params![file_id])?;
         for tag in tags {
+            let path = tag.path.to_lowercase();
             // The first spelling indexed supplies `display`.
             self.conn.execute(
                 "INSERT INTO tags (path, display) VALUES (?1, ?2) ON CONFLICT(path) DO NOTHING",
-                params![tag.path, tag.display],
+                params![path, tag.display],
             )?;
             let tag_id: i64 = self.conn.query_row(
                 "SELECT id FROM tags WHERE path = ?1",
-                params![tag.path],
+                params![path],
                 |row| row.get(0),
             )?;
             // A tag written in both the property and the body writes one row.
@@ -2524,12 +2532,15 @@ impl Store {
     }
 
     /// The notes tagged exactly `path`.
+    ///
+    /// The joins are aliased `ftag` and `tg`, because `FILE_COLUMNS` carries a
+    /// subquery of its own that uses `ft` and `t`.
     pub fn files_with_tag(&self, path: &str) -> Result<Vec<FileRecord>> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {FILE_COLUMNS} FROM files f
-               JOIN file_tags ft ON ft.file_id = f.id
-               JOIN tags t ON t.id = ft.tag_id
-              WHERE t.path = ?1 ORDER BY f.path"
+               JOIN file_tags ftag ON ftag.file_id = f.id
+               JOIN tags tg ON tg.id = ftag.tag_id
+              WHERE tg.path = ?1 ORDER BY f.path"
         ))?;
         let rows = stmt.query_map(params![path.to_lowercase()], file_from_row)?;
         let mut out = Vec::new();
@@ -2548,13 +2559,16 @@ impl Store {
     /// slash's next ASCII character in place of the slash, so the range holds
     /// every path that starts with `<path>/` and nothing else. `DISTINCT`
     /// because one note may carry several descendants of one tag.
+    ///
+    /// The joins are aliased `ftag` and `tg`, because `FILE_COLUMNS` carries a
+    /// subquery of its own that uses `ft` and `t`.
     pub fn files_under_tag(&self, path: &str) -> Result<Vec<FileRecord>> {
         let folded = path.to_lowercase();
         let mut stmt = self.conn.prepare(&format!(
             "SELECT DISTINCT {FILE_COLUMNS} FROM files f
-               JOIN file_tags ft ON ft.file_id = f.id
-               JOIN tags t ON t.id = ft.tag_id
-              WHERE t.path = ?1 OR (t.path >= ?2 AND t.path < ?3) ORDER BY f.path"
+               JOIN file_tags ftag ON ftag.file_id = f.id
+               JOIN tags tg ON tg.id = ftag.tag_id
+              WHERE tg.path = ?1 OR (tg.path >= ?2 AND tg.path < ?3) ORDER BY f.path"
         ))?;
         let rows = stmt.query_map(
             params![folded, format!("{folded}/"), format!("{folded}0")],
@@ -5257,6 +5271,45 @@ mod tests {
         assert_eq!(tag_row_count(&store), 1);
         store.prune_unused_tags(&released).unwrap();
         assert_eq!(tag_row_count(&store), 0);
+    }
+
+    /// The reconciler folds the path it is given, so the folding contract is
+    /// an invariant of the store and not of the caller (#60).
+    #[test]
+    fn the_reconciler_folds_the_path_it_is_given() {
+        let (store, one, two) = tag_fixture();
+        store
+            .reconcile_file_tags(
+                one,
+                &[crate::tags::Tag {
+                    path: "Type/Undead".into(),
+                    display: "Type/Undead".into(),
+                }],
+            )
+            .unwrap();
+        store
+            .reconcile_file_tags(
+                two,
+                &[crate::tags::Tag {
+                    path: "type/undead".into(),
+                    display: "type/undead".into(),
+                }],
+            )
+            .unwrap();
+
+        // One row, so the two spellings are one tag and one axis value.
+        assert_eq!(tag_row_count(&store), 1);
+        assert_eq!(store.tag_axes().unwrap(), vec![("type".to_string(), 2)]);
+        // And the folded query side meets a folded column.
+        assert_eq!(store.files_with_tag("Type/Undead").unwrap().len(), 2);
+        assert_eq!(store.files_under_tag("type").unwrap().len(), 2);
+        assert_eq!(
+            store
+                .list_files(None, &["TYPE/UNDEAD".to_string()], None, 10)
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[test]

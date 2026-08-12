@@ -50,7 +50,7 @@ git fetch upstream && git diff --stat upstream/main main
 | `ranking::retrieval_width` | how deep the content lanes dig is a setting; `top_n` truncates the output and nothing else | this fork, issue #49 |
 | `chunk_min_chars` | a section too short to stand on its own merges into the preceding chunk rather than becoming a row. Ships at 120 — see #43 | this fork, issue #43 |
 | `structure_headings` | a bold-only line opens a section, deeper than any `#` heading and an ancestor of nothing. Ships on — see #44 | this fork, issue #44 |
-| `tags` + `file_tags` | a tag is an attribute of a note, and it joins to the note. Usage and last use are derived, so neither can drift | this fork, issue #60 |
+| `tags` + `file_tags` | a tag is an attribute of a note, and it joins to the note. Usage and last use are derived, so neither can drift. Upstream keys its vocabulary in `tag_registry`, a flat table with no join to `files` whose `usage_count` counts index events | this fork, issue #60 |
 | `.github/workflows/ci.yml` | manual dispatch only — upstream runs it on push and PR | this fork, Actions minutes |
 
 Cherry-picked rather than merged: PR #41 branched before upstream's #40 graph fix, so merging the
@@ -178,6 +178,13 @@ has never executed on this box.
   re-downloads 300MB (1.6GB with intelligence enabled).
 - **MCP servers launch once per session**, so a mid-session `git checkout` leaves the server pointed
   at the previous branch's store.
+- **Re-index before you trust a tag reader (#60).** `PARSER_VERSION = 2` declares the re-index that
+  fills `tags` and `file_tags`, and until that index runs the two tables are empty. The paths that
+  call `fingerprint::verify` refuse to run at all — `engraph search`, `engraph serve` and the
+  `engraph write` CLI all answer "Run 'engraph index'". `engraph context read/list/who/project` and
+  `engraph status` do not verify, so they answer from the empty tables with no warning: `who` finds
+  nobody through its tag pass, and `health` reports every note as missing its tags. Run
+  `engraph index` once on an upgraded store before reading any of them.
 - **A promoted heading is not addressable by `read_section` or `write edit`.** Promotion (#44) puts a
   bold-only line in `chunks.heading`, so a search result prints
   `lore/bestiary/archdragon.md > **Spells**` — 107 of the shipped arm's 1559 chunks are labelled this
