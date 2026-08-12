@@ -446,6 +446,7 @@ pub fn search_with_intelligence(
             },
             ..graph::PprParams::default()
         },
+        None,
     )
     .unwrap_or_default();
     // The lane's cost was the second-largest stage in the query before #29 and

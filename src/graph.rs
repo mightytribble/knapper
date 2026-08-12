@@ -181,10 +181,17 @@ const MAX_FRONTIER: usize = 2000;
 /// Seeds are the top results from the semantic + FTS lanes, normalised to a
 /// shared scale (#26); the walk is over chunk-to-chunk edges (#28); the output
 /// is chunks, so nothing downstream has to guess which passage was meant.
+///
+/// `scope` is the tag scope's file ids, or `None` for the whole vault (#60).
+/// It filters admission and not traversal: mass still flows through an
+/// untagged note to reach an in-scope one, because that link is the
+/// co-citation signal this lane exists to read. Confining the walk itself
+/// would strip most of the lane's reach on a partly tagged vault.
 pub fn graph_expand(
     store: &Store,
     seeds: &[RankedResult],
     params: &PprParams,
+    scope: Option<&std::collections::HashSet<i64>>,
 ) -> Result<Vec<RankedResult>> {
     // The restart distribution. Two seeds on the same chunk are one mass — the
     // dedup that replaced the disjointness skip.
@@ -227,6 +234,12 @@ pub fn graph_expand(
     // every passage of its target the same share — so break them on identity.
     let mut ranked: Vec<((i64, i64), f64)> = accumulated.into_iter().collect();
     ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    // Before the cap and before the truncate: a candidate that cannot be an
+    // answer must not spend one of `max_expansions`, or the reserve is a quota
+    // filled with rows the caller asked to exclude (#60).
+    if let Some(scope) = scope {
+        ranked.retain(|((file_id, _), _)| scope.contains(file_id));
+    }
     if params.cap_per_file > 0 {
         let mut per_file: HashMap<i64, usize> = HashMap::new();
         ranked.retain(|((file_id, _), _)| {
@@ -522,7 +535,13 @@ mod tests {
         let b = chunked(&store, "b.md", 3);
         store.insert_edge(a, 0, b, 1, "wikilink").unwrap();
 
-        let out = graph_expand(&store, &[seed(&store, a, 0, 1.0)], &PprParams::default()).unwrap();
+        let out = graph_expand(
+            &store,
+            &[seed(&store, a, 0, 1.0)],
+            &PprParams::default(),
+            None,
+        )
+        .unwrap();
         assert_eq!(reached(&out), vec![("b.md".to_string(), 1)]);
         assert_eq!(out[0].heading.as_deref(), Some("## S1"));
         assert_eq!(out[0].snippet, "b.md passage 1");
@@ -550,7 +569,7 @@ mod tests {
             .unwrap();
         seeds.push(seed(&store, strong, 0, 0.9));
 
-        let out = graph_expand(&store, &seeds, &ppr()).unwrap();
+        let out = graph_expand(&store, &seeds, &ppr(), None).unwrap();
         assert_eq!(
             reached(&out),
             vec![("shared.md".to_string(), 0), ("solo.md".to_string(), 0)]
@@ -586,7 +605,7 @@ mod tests {
 
         // 1/L: the hub sends 1/9 = 0.111 down each of its nine links, which is
         // less than the sparse seed's whole 0.2.
-        let full = graph_expand(&store, &seeds, &ppr()).unwrap();
+        let full = graph_expand(&store, &seeds, &ppr(), None).unwrap();
         assert_eq!(full[0].file_path, "from-sparse.md");
         assert!((full[0].score - 0.2).abs() < 1e-9);
         assert!((full[1].score - 1.0 / 9.0).abs() < 1e-9);
@@ -598,7 +617,7 @@ mod tests {
             out_degree_exp: 0.5,
             ..ppr()
         };
-        let soft = graph_expand(&store, &seeds, &softened).unwrap();
+        let soft = graph_expand(&store, &seeds, &softened, None).unwrap();
         assert_eq!(soft[0].file_path, "from-hub.md");
         assert!((soft[0].score - 1.0 / 3.0).abs() < 1e-9);
     }
@@ -627,7 +646,7 @@ mod tests {
             target_spread_exp: 1.0,
             ..ppr()
         };
-        let out = graph_expand(&store, &seeds, &conserving).unwrap();
+        let out = graph_expand(&store, &seeds, &conserving, None).unwrap();
         assert_eq!(out[0].file_path, "short.md");
         assert!((out[0].score - 0.5).abs() < 1e-9);
         assert_eq!(
@@ -647,7 +666,7 @@ mod tests {
         // one-passage note's total from the same link rather than the same — and
         // rather than the four times #28's rejected materialisation would have
         // given it. It is still each passage individually that ranks below.
-        let shipped = graph_expand(&store, &seeds, &ppr()).unwrap();
+        let shipped = graph_expand(&store, &seeds, &ppr(), None).unwrap();
         assert_eq!(shipped[0].file_path, "short.md");
         for r in &shipped[1..] {
             assert!((r.score - 0.25).abs() < 1e-9, "0.5 split by √4");
@@ -674,17 +693,17 @@ mod tests {
             ..ppr()
         };
         assert_eq!(
-            reached(&graph_expand(&store, &[seed(&store, hub, 0, 1.0)], &hard).unwrap()),
+            reached(&graph_expand(&store, &[seed(&store, hub, 0, 1.0)], &hard, None).unwrap()),
             vec![("near.md".to_string(), 0)]
         );
         assert_eq!(
-            reached(&graph_expand(&store, &[seed(&store, hub, 1, 1.0)], &hard).unwrap()),
+            reached(&graph_expand(&store, &[seed(&store, hub, 1, 1.0)], &hard, None).unwrap()),
             vec![("far.md".to_string(), 0)]
         );
 
         // Two-tier: the document's other link is still reachable, at a discount,
         // and the degree is taken over the weighted edges — 1.0 + 0.5 = 1.5.
-        let tiered = graph_expand(&store, &[seed(&store, hub, 0, 1.0)], &ppr()).unwrap();
+        let tiered = graph_expand(&store, &[seed(&store, hub, 0, 1.0)], &ppr(), None).unwrap();
         assert_eq!(
             reached(&tiered),
             vec![("near.md".to_string(), 0), ("far.md".to_string(), 0)]
@@ -709,7 +728,7 @@ mod tests {
             ..PprParams::default()
         };
         for seq in [0, 7] {
-            let out = graph_expand(&store, &[seed(&store, hub, seq, 1.0)], &hard).unwrap();
+            let out = graph_expand(&store, &[seed(&store, hub, seq, 1.0)], &hard, None).unwrap();
             assert_eq!(
                 reached(&out),
                 vec![("other.md".to_string(), 3)],
@@ -730,7 +749,7 @@ mod tests {
         store.insert_edge(a, 0, b, DOC_LEVEL, "wikilink").unwrap();
 
         let seeds = [seed(&store, a, 0, 0.9), seed(&store, b, 0, 0.8)];
-        let out = graph_expand(&store, &seeds, &PprParams::default()).unwrap();
+        let out = graph_expand(&store, &seeds, &PprParams::default(), None).unwrap();
         assert_eq!(
             reached(&out),
             vec![("b.md".to_string(), 0), ("a.md".to_string(), 0)],
@@ -756,6 +775,7 @@ mod tests {
                 alpha: 0.1,
                 ..Default::default()
             },
+            None,
         )
         .unwrap();
         let high = graph_expand(
@@ -765,6 +785,7 @@ mod tests {
                 alpha: 0.9,
                 ..Default::default()
             },
+            None,
         )
         .unwrap();
         assert_eq!(reached(&low), reached(&high));
@@ -783,7 +804,7 @@ mod tests {
         store.insert_edge(b, 0, c, DOC_LEVEL, "wikilink").unwrap();
 
         let seeds = [seed(&store, a, 0, 1.0)];
-        let one = graph_expand(&store, &seeds, &PprParams::default()).unwrap();
+        let one = graph_expand(&store, &seeds, &PprParams::default(), None).unwrap();
         assert_eq!(reached(&one), vec![("b.md".to_string(), 0)]);
 
         let two = PprParams {
@@ -791,7 +812,7 @@ mod tests {
             alpha: 0.5,
             ..PprParams::default()
         };
-        let out = graph_expand(&store, &seeds, &two).unwrap();
+        let out = graph_expand(&store, &seeds, &two, None).unwrap();
         let scores: HashMap<String, f64> =
             out.iter().map(|r| (r.file_path.clone(), r.score)).collect();
         assert!((scores["b.md"] - 0.5).abs() < 1e-9);
@@ -815,6 +836,7 @@ mod tests {
             &store,
             &[seed(&store, seed_file, 0, 0.85)],
             &PprParams::default(),
+            None,
         )
         .unwrap();
         assert_eq!(reached(&out), vec![("backlink.md".to_string(), 0)]);
@@ -824,10 +846,16 @@ mod tests {
     fn an_unconnected_seed_expands_to_nothing() {
         let store = Store::open_memory().unwrap();
         let a = chunked(&store, "a.md", 1);
-        let out = graph_expand(&store, &[seed(&store, a, 0, 0.9)], &PprParams::default()).unwrap();
+        let out = graph_expand(
+            &store,
+            &[seed(&store, a, 0, 0.9)],
+            &PprParams::default(),
+            None,
+        )
+        .unwrap();
         assert!(out.is_empty());
         assert!(
-            graph_expand(&store, &[], &PprParams::default())
+            graph_expand(&store, &[], &PprParams::default(), None)
                 .unwrap()
                 .is_empty()
         );
@@ -844,9 +872,97 @@ mod tests {
             .insert_edge(src, 0, empty, DOC_LEVEL, "wikilink")
             .unwrap();
         assert!(
-            graph_expand(&store, &[seed(&store, src, 0, 1.0)], &PprParams::default())
-                .unwrap()
-                .is_empty()
+            graph_expand(
+                &store,
+                &[seed(&store, src, 0, 1.0)],
+                &PprParams::default(),
+                None
+            )
+            .unwrap()
+            .is_empty()
         );
+    }
+
+    // ── Tag scope (#60) ──────────────────────────────────────────
+
+    /// Tag `file_id` with one path, so a scope can select it.
+    fn tagged(store: &Store, file_id: i64, path: &str) {
+        store
+            .reconcile_file_tags(
+                file_id,
+                &[crate::tags::Tag {
+                    path: path.into(),
+                    display: path.into(),
+                }],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_scope_drops_an_expansion_outside_it_and_the_next_one_takes_the_slot() {
+        // #60. Two targets, one in scope and one out. Unscoped the lane is
+        // allowed one expansion and takes the heavier target; scoped, the
+        // filter runs before the truncate, so the quota goes to the in-scope
+        // one instead of being spent and then emptied.
+        let store = Store::open_memory().unwrap();
+        let a = chunked(&store, "a.md", 1);
+        let heavy = chunked(&store, "heavy.md", 1);
+        let light = chunked(&store, "light.md", 1);
+        tagged(&store, light, "type/undead");
+
+        // Two edges into `heavy` and one into `light`, so `heavy` ranks first.
+        store.insert_edge(a, 0, heavy, 0, "wikilink").unwrap();
+        store.insert_edge(a, 0, light, 0, "wikilink").unwrap();
+        let b = chunked(&store, "b.md", 1);
+        store.insert_edge(b, 0, heavy, 0, "wikilink").unwrap();
+
+        let one = PprParams {
+            max_expansions: 1,
+            ..ppr()
+        };
+        let seeds = vec![seed(&store, a, 0, 1.0), seed(&store, b, 0, 1.0)];
+
+        let unscoped = graph_expand(&store, &seeds, &one, None).unwrap();
+        assert_eq!(reached(&unscoped), vec![("heavy.md".to_string(), 0)]);
+
+        let scope = std::collections::HashSet::from([light]);
+        let scoped = graph_expand(&store, &seeds, &one, Some(&scope)).unwrap();
+        assert_eq!(reached(&scoped), vec![("light.md".to_string(), 0)]);
+    }
+
+    #[test]
+    fn a_walk_through_an_untagged_note_still_credits_its_in_scope_target() {
+        // #60. The scope filters answers, not the vault. Two iterations, so
+        // the mass reaches `target` only by passing through `middle`, which
+        // carries no tag at all.
+        let store = Store::open_memory().unwrap();
+        let start = chunked(&store, "start.md", 1);
+        let middle = chunked(&store, "middle.md", 1);
+        let target = chunked(&store, "target.md", 1);
+        tagged(&store, target, "type/undead");
+
+        store.insert_edge(start, 0, middle, 0, "wikilink").unwrap();
+        store.insert_edge(middle, 0, target, 0, "wikilink").unwrap();
+
+        let two = PprParams {
+            iterations: 2,
+            ..ppr()
+        };
+        let scope = std::collections::HashSet::from([target]);
+        let out = graph_expand(&store, &[seed(&store, start, 0, 1.0)], &two, Some(&scope)).unwrap();
+
+        assert_eq!(reached(&out), vec![("target.md".to_string(), 0)]);
+    }
+
+    #[test]
+    fn an_empty_scope_empties_the_graph_lane() {
+        let store = Store::open_memory().unwrap();
+        let a = chunked(&store, "a.md", 1);
+        let b = chunked(&store, "b.md", 1);
+        store.insert_edge(a, 0, b, 0, "wikilink").unwrap();
+
+        let empty = std::collections::HashSet::new();
+        let out = graph_expand(&store, &[seed(&store, a, 0, 1.0)], &ppr(), Some(&empty)).unwrap();
+        assert!(out.is_empty());
     }
 }
