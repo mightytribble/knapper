@@ -263,10 +263,25 @@ struct ReadSectionQuery {
 #[derive(Debug, Deserialize)]
 struct ListQuery {
     folder: Option<String>,
-    #[serde(default)]
+    /// One comma-separated string, per the OpenAPI description: `serde_urlencoded`
+    /// has no sequence support, so a repeated `tags=` key is never read here.
+    #[serde(default, deserialize_with = "deserialize_comma_separated")]
     tags: Vec<String>,
     limit: Option<usize>,
     created_by: Option<String>,
+}
+
+/// `?tags=a,b` split on commas. An absent parameter stays empty; the split
+/// terms reach `TagFilter::parse`, which drops the ones with no path.
+fn deserialize_comma_separated<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw: Option<String> = Option::deserialize(deserializer)?;
+    Ok(match raw {
+        Some(s) if !s.is_empty() => s.split(',').map(str::to_string).collect(),
+        _ => Vec::new(),
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -541,14 +556,24 @@ async fn handle_list(
         profile: state.profile.as_ref().as_ref(),
     };
     let limit = params.limit.unwrap_or(20);
+    let filter = crate::tags::TagFilter::parse(&params.tags, &[], &[]);
     let items = context::context_list(
         &ctx,
         params.folder.as_deref(),
-        &crate::tags::TagFilter::parse(&params.tags, &[], &[]),
+        &filter,
         params.created_by.as_deref(),
         limit,
     )
-    .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    .map_err(|e| {
+        // An unknown tag is a caller's typo, not a server fault. The message
+        // text is the cheapest honest signal check_terms gives a caller this
+        // far from the error's construction.
+        if e.to_string().starts_with("no such tag") {
+            ApiError::bad_request(&format!("{e:#}"))
+        } else {
+            ApiError::internal(&format!("{e:#}"))
+        }
+    })?;
     Ok(Json(serde_json::json!(items)))
 }
 
