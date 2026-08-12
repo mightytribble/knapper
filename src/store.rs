@@ -2092,13 +2092,14 @@ impl Store {
         query: &[f32],
         k: usize,
         tombstones: &std::collections::HashSet<u64>,
+        scope: Option<&[i64]>,
     ) -> Result<Vec<(u64, f32)>> {
         // A database that has never been indexed has no vec table at all, and
         // an empty semantic lane is the honest answer there.
         if self.vec_table_dim()?.is_none() {
             return Ok(Vec::new());
         }
-        crate::vecstore::search_vec(&self.conn, query, k, tombstones)
+        crate::vecstore::search_vec(&self.conn, query, k, tombstones, scope)
     }
 
     pub fn clear_vec(&self) -> Result<()> {
@@ -4213,7 +4214,7 @@ mod tests {
         store.insert_vec(0, &vector).unwrap();
 
         let results = store
-            .search_vec(&vector, 1, &std::collections::HashSet::new())
+            .search_vec(&vector, 1, &std::collections::HashSet::new(), None)
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, 0);
@@ -4250,7 +4251,7 @@ mod tests {
 
         // Verify vec0 is now populated.
         let results = store
-            .search_vec(&vector, 1, &std::collections::HashSet::new())
+            .search_vec(&vector, 1, &std::collections::HashSet::new(), None)
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, 0);
@@ -4577,7 +4578,7 @@ mod tests {
     fn searching_a_never_indexed_database_returns_nothing() {
         let store = Store::open_memory().unwrap();
         let hits = store
-            .search_vec(&[0.1_f32; 768], 5, &std::collections::HashSet::new())
+            .search_vec(&[0.1_f32; 768], 5, &std::collections::HashSet::new(), None)
             .unwrap();
         assert!(hits.is_empty());
     }

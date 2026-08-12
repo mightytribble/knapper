@@ -284,7 +284,7 @@ pub fn search_with_intelligence(
     let tombstones = std::collections::HashSet::new();
     let raw_results = config
         .store
-        .search_vec(&query_vec, lane_width, &tombstones)?;
+        .search_vec(&query_vec, lane_width, &tombstones, None)?;
 
     for (vector_id, distance) in raw_results {
         if let Some(chunk) = config.store.get_chunk_by_vector_id(vector_id)? {
