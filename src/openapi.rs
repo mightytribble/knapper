@@ -130,7 +130,7 @@ fn build_list() -> serde_json::Value {
             "summary": "List notes filtered by folder, tags, creator, or limit.",
             "parameters": [
                 { "name": "folder", "in": "query", "required": false, "description": "Folder path prefix filter", "schema": { "type": "string" } },
-                { "name": "tags", "in": "query", "required": false, "description": "Comma-separated tags", "schema": { "type": "string" } },
+                { "name": "tags", "in": "query", "required": false, "description": "Comma-separated tag terms; a trailing / matches the tag and its descendants", "schema": { "type": "string" } },
                 { "name": "created_by", "in": "query", "required": false, "description": "Agent filter", "schema": { "type": "string" } },
                 { "name": "limit", "in": "query", "required": false, "description": "Max results (default 20)", "schema": { "type": "integer" } }
             ],

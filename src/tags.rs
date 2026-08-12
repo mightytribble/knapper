@@ -284,6 +284,190 @@ fn is_tag_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_' || c == '-' || c == '/'
 }
 
+/// A term names one tag or one subtree of the hierarchy.
+///
+/// `type/undead` is the tag alone. `type/undead/` — and its synonym
+/// `type/undead/*` — is the tag and every descendant, which is what Obsidian's
+/// `tag:type/undead` returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TagTerm {
+    Exact(String),
+    Subtree(String),
+}
+
+impl TagTerm {
+    /// The folded path the term names, without the subtree marker.
+    pub fn path(&self) -> &str {
+        match self {
+            TagTerm::Exact(p) | TagTerm::Subtree(p) => p,
+        }
+    }
+}
+
+impl std::fmt::Display for TagTerm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TagTerm::Exact(p) => write!(f, "{p}"),
+            TagTerm::Subtree(p) => write!(f, "{p}/"),
+        }
+    }
+}
+
+/// Read a term the way a caller writes one.
+///
+/// One leading `#` is dropped, a trailing `/*` folds to a trailing `/`, a
+/// trailing `/` is the subtree marker, and the rest folds to the path the store
+/// keys on. A term with no path left returns `None`, so a trailing comma in a
+/// comma-separated list is not an error.
+pub fn parse_term(written: &str) -> Option<TagTerm> {
+    let trimmed = written.trim();
+    let stripped = trimmed.strip_prefix('#').unwrap_or(trimmed);
+    let (head, subtree) = match stripped.strip_suffix("/*") {
+        Some(head) => (head, true),
+        None => match stripped.strip_suffix('/') {
+            Some(head) => (head, true),
+            None => (stripped, false),
+        },
+    };
+    let path = head.trim_end_matches('/').to_lowercase();
+    if path.is_empty() {
+        return None;
+    }
+    Some(if subtree {
+        TagTerm::Subtree(path)
+    } else {
+        TagTerm::Exact(path)
+    })
+}
+
+/// The SQL predicate over a `tags` row aliased `t`, and its arguments in order.
+///
+/// The subtree bound is a range, so the unique index on `path` serves it. A
+/// `LIKE` pattern would neither use the index nor treat `_` and `%` in a tag as
+/// literal characters.
+pub fn predicate(term: &TagTerm) -> (String, Vec<String>) {
+    match term {
+        TagTerm::Exact(path) => ("t.path = ?".to_string(), vec![path.clone()]),
+        TagTerm::Subtree(path) => (
+            "(t.path = ? OR (t.path >= ? AND t.path < ?))".to_string(),
+            vec![path.clone(), format!("{path}/"), format!("{path}0")],
+        ),
+    }
+}
+
+/// Whether the vault holds a tag matching `term`'s own predicate.
+fn tag_exists(conn: &Connection, term: &TagTerm) -> Result<bool> {
+    let (pred, args) = predicate(term);
+    Ok(conn.query_row(
+        &format!("SELECT EXISTS (SELECT 1 FROM tags t WHERE {pred})"),
+        rusqlite::params_from_iter(args.iter()),
+        |row| row.get(0),
+    )?)
+}
+
+/// Reject a term the vault holds no tag for, naming the nearest tag it holds.
+///
+/// A silent empty result leaves a caller unable to tell a typo from an empty
+/// set, and an agent retries the call unchanged. The error carries the repair.
+pub fn check_terms(conn: &Connection, terms: &[&TagTerm]) -> Result<()> {
+    for term in terms {
+        if tag_exists(conn, term)? {
+            continue;
+        }
+        // Naming an ancestor and forgetting the subtree marker is the
+        // likeliest mistake, so an `Exact` term gets a second chance: its own
+        // subtree may match even though the exact tag does not. A `Subtree`
+        // term that matched nothing has no such chance, because its subtree
+        // is what already failed.
+        let nearest = match term {
+            TagTerm::Exact(p) if tag_exists(conn, &TagTerm::Subtree(p.clone()))? => {
+                Some(TagTerm::Subtree(p.clone()).to_string())
+            }
+            _ => match resolve_tag(conn, term.path())? {
+                // `tag_exists` above is already true whenever `resolve_tag`
+                // would return `Exact` for this path, so this arm cannot fire.
+                TagResolution::Exact(display) => Some(display),
+                TagResolution::Fuzzy { resolved, .. } => Some(resolved),
+                // `Extension` echoes the proposed path back, not an existing
+                // one — the term runs past a real tag, so name that ancestor.
+                TagResolution::Extension(_) => longest_existing_ancestor(conn, term.path())?,
+                TagResolution::New(_) => None,
+            },
+        };
+        match nearest {
+            Some(near) => anyhow::bail!("no such tag '{term}'; nearest: '{near}'"),
+            None => anyhow::bail!("no such tag '{term}'"),
+        }
+    }
+    Ok(())
+}
+
+/// The longest ancestor of `path` that has a row in `tags`, if any.
+///
+/// Each prefix is tested by equality, never `LIKE`: a tag may hold `_` or
+/// `%`, which `LIKE` reads as wildcards rather than literal characters.
+fn longest_existing_ancestor(conn: &Connection, path: &str) -> Result<Option<String>> {
+    use rusqlite::OptionalExtension;
+
+    let segments: Vec<&str> = path.split('/').collect();
+    for end in (1..segments.len()).rev() {
+        let prefix = segments[..end].join("/");
+        let display: Option<String> = conn
+            .query_row(
+                "SELECT display FROM tags WHERE path = ?1",
+                params![prefix],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if display.is_some() {
+            return Ok(display);
+        }
+    }
+    Ok(None)
+}
+
+/// The tag side of a note query: three fields that combine with AND.
+///
+/// A note is returned when it carries every `all` term, at least one `any`
+/// term, and no `none` term. An empty field constrains nothing.
+#[derive(Debug, Clone, Default)]
+pub struct TagFilter {
+    pub all: Vec<TagTerm>,
+    pub any: Vec<TagTerm>,
+    pub none: Vec<TagTerm>,
+}
+
+impl TagFilter {
+    /// Read each field's terms, dropping the ones with no path.
+    ///
+    /// A trailing comma leaves other terms standing and is not an error. A
+    /// field that holds input and none of it survives — `--all ""` — is an
+    /// error naming the field, because a silent empty field would constrain
+    /// nothing and list every note the caller meant to filter.
+    pub fn parse(all: &[String], any: &[String], none: &[String]) -> Result<Self> {
+        let read = |name: &str, field: &[String]| -> Result<Vec<TagTerm>> {
+            let terms: Vec<TagTerm> = field.iter().filter_map(|t| parse_term(t)).collect();
+            if !field.is_empty() && terms.is_empty() {
+                anyhow::bail!("'{name}' names no tag");
+            }
+            Ok(terms)
+        };
+        Ok(TagFilter {
+            all: read("all", all)?,
+            any: read("any", any)?,
+            none: read("none", none)?,
+        })
+    }
+}
+
+/// Fold the `tags` alias into `all`. `tags` is the older spelling of `--all`,
+/// on the CLI and on MCP's `list` tool.
+pub fn merge_all_alias(tags: Vec<String>, all: Vec<String>) -> Vec<String> {
+    let mut merged = tags;
+    merged.extend(all);
+    merged
+}
+
 /// Result of resolving a proposed tag against the registry.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TagResolution {
@@ -574,6 +758,102 @@ mod tests {
             paths("---\ntags: [#alpha, #beta]  # todo\n---\nbody\n"),
             ["alpha", "beta"]
         );
+    }
+
+    // ── The term grammar ─────────────────────────────────────────
+
+    #[test]
+    fn a_bare_path_is_exact_and_a_trailing_slash_is_a_subtree() {
+        assert_eq!(
+            parse_term("type/undead"),
+            Some(TagTerm::Exact("type/undead".into()))
+        );
+        assert_eq!(
+            parse_term("type/undead/"),
+            Some(TagTerm::Subtree("type/undead".into()))
+        );
+    }
+
+    #[test]
+    fn the_star_form_folds_to_the_slash_form() {
+        assert_eq!(parse_term("type/undead/*"), parse_term("type/undead/"));
+    }
+
+    #[test]
+    fn a_term_folds_case_and_drops_one_leading_hash() {
+        assert_eq!(
+            parse_term("#Type/Undead"),
+            Some(TagTerm::Exact("type/undead".into()))
+        );
+    }
+
+    #[test]
+    fn a_term_with_no_path_left_is_dropped() {
+        assert_eq!(parse_term(""), None);
+        assert_eq!(parse_term("#"), None);
+        assert_eq!(parse_term("/"), None);
+        assert_eq!(parse_term("   "), None);
+    }
+
+    #[test]
+    fn a_term_prints_the_form_it_was_written_in() {
+        assert_eq!(
+            parse_term("Type/Undead").unwrap().to_string(),
+            "type/undead"
+        );
+        assert_eq!(
+            parse_term("type/undead/*").unwrap().to_string(),
+            "type/undead/"
+        );
+    }
+
+    #[test]
+    fn the_exact_predicate_takes_one_argument_and_the_subtree_three() {
+        let (sql, args) = predicate(&TagTerm::Exact("type".into()));
+        assert_eq!(sql, "t.path = ?");
+        assert_eq!(args, vec!["type".to_string()]);
+
+        let (sql, args) = predicate(&TagTerm::Subtree("type".into()));
+        assert_eq!(sql.matches('?').count(), 3);
+        // The upper bound is exclusive of everything after the subtree: `/` is
+        // 0x2F and `0` is 0x30.
+        assert_eq!(
+            args,
+            vec!["type".to_string(), "type/".into(), "type0".into()]
+        );
+    }
+
+    #[test]
+    fn a_trailing_comma_drops_one_term_and_keeps_the_rest() {
+        let filter =
+            TagFilter::parse(&["type/undead".to_string(), "".to_string()], &[], &[]).unwrap();
+        assert_eq!(filter.all, vec![TagTerm::Exact("type/undead".into())]);
+    }
+
+    #[test]
+    fn a_field_that_is_all_empty_terms_is_an_error() {
+        let err = TagFilter::parse(&["".to_string()], &[], &[]).unwrap_err();
+        assert_eq!(err.to_string(), "'all' names no tag");
+
+        let err = TagFilter::parse(&[], &["".to_string()], &[]).unwrap_err();
+        assert_eq!(err.to_string(), "'any' names no tag");
+
+        let err = TagFilter::parse(&[], &[], &["".to_string()]).unwrap_err();
+        assert_eq!(err.to_string(), "'none' names no tag");
+    }
+
+    #[test]
+    fn an_absent_field_is_not_an_error() {
+        assert!(TagFilter::parse(&[], &[], &[]).unwrap().all.is_empty());
+    }
+
+    #[test]
+    fn the_tags_alias_folds_into_all() {
+        assert_eq!(
+            merge_all_alias(vec!["a".to_string()], vec!["b".to_string()]),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert_eq!(merge_all_alias(vec![], vec!["b".to_string()]), vec!["b"]);
     }
 
     fn setup_store() -> Store {

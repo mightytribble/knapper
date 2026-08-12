@@ -43,13 +43,29 @@ pub struct ReadParams {
 pub struct ListParams {
     /// Filter to folder path prefix.
     pub folder: Option<String>,
-    /// Filter to notes with all listed tags.
+    /// Filter to notes with all listed tags. Alias of `all`.
     pub tags: Option<Vec<String>>,
+    /// Notes carrying every term. A term is a tag path; a trailing `/` or
+    /// `/*` matches the tag and its descendants. An unknown term is an error
+    /// naming the nearest tag the vault holds.
+    pub all: Option<Vec<String>>,
+    /// Notes carrying at least one of these terms. An unknown term is an
+    /// error naming the nearest tag the vault holds.
+    pub any: Option<Vec<String>>,
+    /// Notes carrying none of these terms. An unknown term here is ignored.
+    pub none: Option<Vec<String>>,
     /// Filter to notes created by a specific agent.
     pub created_by: Option<String>,
     /// Maximum results (default 20). Raising it adds results below the same
     /// ranking; it does not change what the top of the ranking holds.
     pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct TagListParams {
+    /// Limit to one tag and its descendants, as `type/` or `type/*`. Omit
+    /// for the whole vocabulary.
+    pub under: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -457,7 +473,7 @@ impl EngraphServer {
 
     #[tool(
         name = "list",
-        description = "List notes filtered by folder prefix and/or tags. Returns paths, docids, tags, and edge counts."
+        description = "List notes filtered by folder prefix and tag operators (all/any/none). A term is a tag path; a trailing `/` matches the tag and its descendants. Returns paths, docids, tags, and edge counts."
     )]
     async fn list(&self, params: Parameters<ListParams>) -> Result<CallToolResult, McpError> {
         let store = self.store.lock().await;
@@ -466,7 +482,16 @@ impl EngraphServer {
             vault_path: &self.vault_path,
             profile: self.profile.as_ref().as_ref(),
         };
-        let tags = params.0.tags.unwrap_or_default();
+        let all_terms = crate::tags::merge_all_alias(
+            params.0.tags.unwrap_or_default(),
+            params.0.all.unwrap_or_default(),
+        );
+        let tags = crate::tags::TagFilter::parse(
+            &all_terms,
+            &params.0.any.unwrap_or_default(),
+            &params.0.none.unwrap_or_default(),
+        )
+        .map_err(|e| mcp_err(&e))?;
         let limit = params.0.limit.unwrap_or(20);
         let items = context::context_list(
             &ctx,
@@ -477,6 +502,20 @@ impl EngraphServer {
         )
         .map_err(|e| mcp_err(&e))?;
         to_json_result(&items)
+    }
+
+    #[tool(
+        name = "tag_list",
+        description = "The vault's tag vocabulary: every tag, or the subtree under one term, each with the notes carrying it. Call before filtering with list."
+    )]
+    async fn tag_list(
+        &self,
+        params: Parameters<TagListParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let store = self.store.lock().await;
+        let prefix = params.0.under.as_deref().and_then(crate::tags::parse_term);
+        let rows = store.tags_under(prefix.as_ref()).map_err(|e| mcp_err(&e))?;
+        to_json_result(&rows)
     }
 
     #[tool(
@@ -1007,7 +1046,7 @@ impl rmcp::handler::server::ServerHandler for EngraphServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "engraph: vault intelligence for Obsidian. \
-                 Read: vault_map to orient, search to find, read/read_section for content, who/project for context bundles, health for vault diagnostics. \
+                 Read: vault_map to orient, tag_list for the tag vocabulary, search to find, read/read_section for content, who/project for context bundles, health for vault diagnostics. \
                  Write: create for new notes, append to add content, edit to modify a section, rewrite to replace body, \
                  edit_frontmatter for tags/properties, update_metadata for bulk tag/alias replacement. \
                  Lifecycle: move_note to relocate, archive to soft-delete, unarchive to restore, delete for permanent removal. \
