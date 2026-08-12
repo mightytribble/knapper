@@ -1654,13 +1654,19 @@ pub fn verify_index_integrity(store: &Store, vault_path: &Path) -> Result<usize>
         let full_path = vault_path.join(&file.path);
         if !full_path.exists() {
             // Clean up orphan: vectors, edges, file record. The chunks and
-            // their keyword index go with the `files` row (issue #37).
+            // their keyword index go with the `files` row (issue #37), and
+            // so do the file's `file_tags` rows. The tag ids are read
+            // before the cascade takes the links away, and each id no
+            // other note holds is deleted after it, the way every other
+            // removal path does it (#60).
+            let released = store.file_tag_ids(file.id)?;
             let vids = store.get_vector_ids_for_file(file.id)?;
             for vid in &vids {
                 store.delete_vec(*vid)?;
             }
             store.delete_edges_for_file(file.id)?;
             store.delete_file(file.id)?;
+            store.prune_unused_tags(&released)?;
             orphans += 1;
         }
     }
@@ -1817,6 +1823,72 @@ mod tests {
         assert!(store.get_file("notes/gone.md").unwrap().is_none());
         // The existing file should still be there
         assert!(store.get_file("notes/existing.md").unwrap().is_some());
+    }
+
+    /// A note removed from disk releases its tags, and a tag no other note
+    /// carries leaves the vocabulary with it (#60). `resolve_tag` reads
+    /// `tags` with no join, so a row left behind keeps being offered as a
+    /// match for a tag the vault no longer holds.
+    #[test]
+    fn verify_index_integrity_prunes_the_tags_the_removed_note_released() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let vault = dir.path();
+        std::fs::write(vault.join("kept.md"), "---\ntags: [shared]\n---\nbody\n").unwrap();
+
+        let store = crate::store::Store::open_memory().unwrap();
+        let kept = store
+            .insert_file(
+                "kept.md",
+                "hash1",
+                100,
+                &crate::docid::generate_docid("kept.md"),
+                None,
+                None,
+            )
+            .unwrap();
+        let gone = store
+            .insert_file(
+                "gone.md",
+                "hash2",
+                100,
+                &crate::docid::generate_docid("gone.md"),
+                None,
+                None,
+            )
+            .unwrap();
+        store
+            .reconcile_file_tags(
+                kept,
+                &crate::tags::extract("---\ntags: [shared]\n---\nbody\n"),
+            )
+            .unwrap();
+        store
+            .reconcile_file_tags(
+                gone,
+                &crate::tags::extract("---\ntags: [shared, solitary]\n---\nbody\n"),
+            )
+            .unwrap();
+        assert!(matches!(
+            store.resolve_tag("solitary").unwrap(),
+            crate::tags::TagResolution::Exact(_)
+        ));
+
+        assert_eq!(verify_index_integrity(&store, vault).unwrap(), 1);
+
+        // The tag only the removed note carried is gone from the vocabulary.
+        assert!(
+            matches!(
+                store.resolve_tag("solitary").unwrap(),
+                crate::tags::TagResolution::New(_)
+            ),
+            "a tag whose only note was removed must not stay in the vocabulary"
+        );
+        // The tag the surviving note carries stays.
+        assert!(matches!(
+            store.resolve_tag("shared").unwrap(),
+            crate::tags::TagResolution::Exact(_)
+        ));
+        assert_eq!(store.top_tags(10).unwrap(), vec![("shared".to_string(), 1)]);
     }
 
     #[test]
