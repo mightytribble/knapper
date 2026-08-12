@@ -82,11 +82,10 @@ fn push_tag(out: &mut Vec<Tag>, seen: &mut HashSet<String>, written: &str) {
 /// comment mark: `tags: [alpha, #beta]` keeps `beta`, and anything past the
 /// `]` is a comment or nothing, either way not a value. The scalar and
 /// block-sequence forms carry no brackets, so `strip_trailing_comment` runs
-/// on them instead: a `#` after whitespace opens a comment, and a `#` at the
-/// front of the value is that value's own hash and stays. The key is read at
-/// column 0 only, because Obsidian's properties are top level and an
-/// indented `tags:` belongs to some other mapping. The singular `tag`
-/// property is not read: Obsidian dropped support for it at 1.9.
+/// on them instead. The key is read at column 0 only, because Obsidian's
+/// properties are top level and an indented `tags:` belongs to some other
+/// mapping. The singular `tag` property is not read: Obsidian dropped
+/// support for it at 1.9.
 fn property_tags(frontmatter: &str) -> Vec<String> {
     let lines: Vec<&str> = frontmatter.lines().collect();
     for (i, line) in lines.iter().enumerate() {
@@ -98,11 +97,27 @@ fn property_tags(frontmatter: &str) -> Vec<String> {
             // A comment can only follow the closing `]`. Read up to the
             // first `]` only, so nothing past it, comment or not, reaches
             // the split, and a `#` inside the brackets is never mistaken
-            // for one.
-            let items = match inner.find(']') {
-                Some(close) => &inner[..close],
-                None => inner,
-            };
+            // for one. The bracket may close on a later line, so the read
+            // runs on until it does. A continuation line is indented,
+            // because YAML holds a flow sequence deeper than the key it
+            // belongs to, so an unclosed `[` stops at the next top-level
+            // key instead of taking the rest of the frontmatter.
+            let mut items = String::new();
+            let mut rest = inner;
+            let mut n = i;
+            loop {
+                if let Some(close) = rest.find(']') {
+                    items.push_str(&rest[..close]);
+                    break;
+                }
+                items.push_str(rest);
+                items.push(' ');
+                n += 1;
+                match lines.get(n) {
+                    Some(next) if next.starts_with(char::is_whitespace) => rest = next.trim(),
+                    _ => break,
+                }
+            }
             return items
                 .split(',')
                 .map(clean_property_value)
@@ -140,17 +155,22 @@ fn property_tags(frontmatter: &str) -> Vec<String> {
 /// Cut a trailing YAML comment from a property value that carries no
 /// brackets: the scalar form and one block-sequence item.
 ///
-/// A `#` is a comment mark when it follows a space. A `#` at the very start
-/// of the text opens a value instead and is kept: this is what lets a bare
-/// `tags: #undead` keep its tag, while still cutting `tags: alpha  # todo`
-/// down to `alpha`. The flow-sequence form does not call this function: it
-/// reads only the text inside its brackets, where every `#` is a value's own
-/// hash by construction, so a comment cut there would misread the space
-/// before a later item's `#` as a comment mark.
+/// A `#` is a comment mark when it opens the text or follows whitespace,
+/// **and** the character after it is whitespace or the end of the line. The
+/// character after the `#` is what tells a comment from a value: a YAML
+/// comment mark is followed by a space, and an Obsidian tag is followed by
+/// its first character. So `tags: #undead` keeps its tag, `tags: alpha  #
+/// todo` is cut to `alpha`, and `tags:  # the note's tags` is cut to
+/// nothing — which is what lets the block sequence under such a line be
+/// read. The flow-sequence form does not call this function: it reads only
+/// the text inside its brackets, where every `#` is a value's own hash by
+/// construction.
 fn strip_trailing_comment(s: &str) -> &str {
-    let mut prev_is_space = false;
-    for (idx, c) in s.char_indices() {
-        if c == '#' && prev_is_space {
+    let mut chars = s.char_indices().peekable();
+    let mut prev_is_space = true;
+    while let Some((idx, c)) = chars.next() {
+        let next_is_space = chars.peek().is_none_or(|(_, next)| next.is_whitespace());
+        if c == '#' && prev_is_space && next_is_space {
             return s[..idx].trim_end();
         }
         prev_is_space = c.is_whitespace();
@@ -472,6 +492,28 @@ mod tests {
             ["alpha", "beta"]
         );
         assert_eq!(paths("---\ntags: alpha  # todo\n---\nbody\n"), ["alpha"]);
+    }
+
+    #[test]
+    fn a_comment_alone_on_the_tags_line_keeps_the_block_sequence() {
+        assert_eq!(
+            paths("---\ntags:  # the note's tags\n  - alpha\n  - beta\n---\nbody\n"),
+            ["alpha", "beta"]
+        );
+        // The value's own hash is not a comment mark, so the scalar holds.
+        assert_eq!(paths("---\ntags: #undead\n---\nbody\n"), ["undead"]);
+    }
+
+    #[test]
+    fn a_flow_sequence_may_close_on_a_later_line() {
+        assert_eq!(
+            paths("---\ntags: [alpha,\n  beta]\n---\nbody\n"),
+            ["alpha", "beta"]
+        );
+        assert_eq!(
+            paths("---\ntags: [alpha,\n  beta,\n  gamma]  # todo\n---\nbody\n"),
+            ["alpha", "beta", "gamma"]
+        );
     }
 
     #[test]
