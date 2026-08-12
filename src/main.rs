@@ -237,15 +237,31 @@ enum ContextAction {
         /// Filter to folder path prefix.
         #[arg(long)]
         folder: Option<String>,
-        /// Filter to notes with all listed tags (comma-separated).
+        /// Filter to notes with all listed tags (comma-separated). A trailing
+        /// `/` or `/*` matches the tag and its descendants.
         #[arg(long, value_delimiter = ',')]
         tags: Vec<String>,
+        /// Filter to notes carrying every term (comma-separated). Alias of --tags.
+        #[arg(long, value_delimiter = ',')]
+        all: Vec<String>,
+        /// Filter to notes carrying at least one term (comma-separated).
+        #[arg(long, value_delimiter = ',')]
+        any: Vec<String>,
+        /// Filter out notes carrying any of these terms (comma-separated).
+        #[arg(long, value_delimiter = ',')]
+        none: Vec<String>,
         /// Filter to notes created by a specific agent.
         #[arg(long)]
         created_by: Option<String>,
         /// Maximum results.
         #[arg(long, default_value = "20")]
         limit: usize,
+    },
+    /// List the vault's tag vocabulary.
+    Tags {
+        /// Limit to one tag and its descendants, as `type/` or `type/*`.
+        #[arg(long)]
+        under: Option<String>,
     },
     /// Vault structure overview.
     VaultMap,
@@ -1025,13 +1041,20 @@ async fn main() -> Result<()> {
                 ContextAction::List {
                     folder,
                     tags,
+                    all,
+                    any,
+                    none,
                     created_by,
                     limit,
                 } => {
+                    // `--tags` is the older spelling of `--all`.
+                    let mut all_terms = tags;
+                    all_terms.extend(all);
+                    let filter = engraph::tags::TagFilter::parse(&all_terms, &any, &none);
                     let items = engraph::context::context_list(
                         &params,
                         folder.as_deref(),
-                        &engraph::tags::TagFilter::parse(&tags, &[], &[]),
+                        &filter,
                         created_by.as_deref(),
                         limit,
                     )?;
@@ -1055,6 +1078,17 @@ async fn main() -> Result<()> {
                             );
                         }
                         println!("\n{} notes", items.len());
+                    }
+                }
+                ContextAction::Tags { under } => {
+                    let prefix = under.as_deref().and_then(engraph::tags::parse_term);
+                    let rows = store.tags_under(prefix.as_ref())?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&rows)?);
+                    } else {
+                        for row in &rows {
+                            println!("{} ({})", row.display, row.note_count);
+                        }
                     }
                 }
                 ContextAction::VaultMap => {
