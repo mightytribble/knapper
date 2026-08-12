@@ -355,6 +355,34 @@ pub fn predicate(term: &TagTerm) -> (String, Vec<String>) {
     }
 }
 
+/// The tag side of a note query: three fields that combine with AND.
+///
+/// A note is returned when it carries every `all` term, at least one `any`
+/// term, and no `none` term. An empty field constrains nothing.
+#[derive(Debug, Clone, Default)]
+pub struct TagFilter {
+    pub all: Vec<TagTerm>,
+    pub any: Vec<TagTerm>,
+    pub none: Vec<TagTerm>,
+}
+
+impl TagFilter {
+    /// Read each field's terms, dropping the ones with no path.
+    pub fn parse(all: &[String], any: &[String], none: &[String]) -> Self {
+        let read = |field: &[String]| field.iter().filter_map(|t| parse_term(t)).collect();
+        TagFilter {
+            all: read(all),
+            any: read(any),
+            none: read(none),
+        }
+    }
+
+    /// No field holds a term, so the filter adds no SQL.
+    pub fn is_empty(&self) -> bool {
+        self.all.is_empty() && self.any.is_empty() && self.none.is_empty()
+    }
+}
+
 /// Result of resolving a proposed tag against the registry.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TagResolution {

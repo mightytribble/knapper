@@ -1696,11 +1696,11 @@ impl Store {
         })
     }
 
-    /// List files filtered by folder prefix and/or tags (AND logic).
+    /// List files filtered by folder prefix, tag operators and creator.
     pub fn list_files(
         &self,
         folder: Option<&str>,
-        tags: &[String],
+        tags: &crate::tags::TagFilter,
         created_by: Option<&str>,
         limit: usize,
     ) -> Result<Vec<FileRecord>> {
@@ -1710,15 +1710,36 @@ impl Store {
             sql.push_str(" AND f.path LIKE ?");
             param_values.push(Box::new(format!("{}%", folder)));
         }
-        for tag in tags {
-            // The junction, not `json_each` over a JSON column: the old test
-            // scanned `files` and parsed JSON for each row (#60). Obsidian
-            // matches without regard to case, so the filter takes the path.
-            sql.push_str(
+        // The junction, not `json_each` over a JSON column: the old test
+        // scanned `files` and parsed JSON for each row (#60). A term folds its
+        // own path, so a folded query side meets a folded column.
+        for term in &tags.all {
+            let (pred, args) = crate::tags::predicate(term);
+            sql.push_str(&format!(
                 " AND EXISTS (SELECT 1 FROM file_tags ft JOIN tags t ON t.id = ft.tag_id
-                                WHERE ft.file_id = f.id AND t.path = ?)",
-            );
-            param_values.push(Box::new(tag.to_lowercase()));
+                                WHERE ft.file_id = f.id AND {pred})"
+            ));
+            for arg in args {
+                param_values.push(Box::new(arg));
+            }
+        }
+        for (field, keyword) in [(&tags.any, "EXISTS"), (&tags.none, "NOT EXISTS")] {
+            if field.is_empty() {
+                continue;
+            }
+            let mut ors: Vec<String> = Vec::new();
+            for term in field {
+                let (pred, args) = crate::tags::predicate(term);
+                ors.push(pred);
+                for arg in args {
+                    param_values.push(Box::new(arg));
+                }
+            }
+            sql.push_str(&format!(
+                " AND {keyword} (SELECT 1 FROM file_tags ft JOIN tags t ON t.id = ft.tag_id
+                                   WHERE ft.file_id = f.id AND ({}))",
+                ors.join(" OR ")
+            ));
         }
         if let Some(cb) = created_by {
             sql.push_str(" AND f.created_by = ?");
@@ -3877,7 +3898,9 @@ mod tests {
         store
             .insert_file("01-Projects/c.md", "h3", 300, "ccc333", None, None)
             .unwrap();
-        let files = store.list_files(None, &[], None, 20).unwrap();
+        let files = store
+            .list_files(None, &crate::tags::TagFilter::default(), None, 20)
+            .unwrap();
         assert_eq!(files.len(), 3);
     }
 
@@ -3891,7 +3914,12 @@ mod tests {
             .insert_file("02-Areas/b.md", "h2", 200, "bbb222", None, None)
             .unwrap();
         let files = store
-            .list_files(Some("01-Projects"), &[], None, 20)
+            .list_files(
+                Some("01-Projects"),
+                &crate::tags::TagFilter::default(),
+                None,
+                20,
+            )
             .unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, "01-Projects/a.md");
@@ -3918,10 +3946,22 @@ mod tests {
             .unwrap();
         store.reconcile_file_tags(b, &[tag("rust")]).unwrap();
         store.reconcile_file_tags(c, &[tag("python")]).unwrap();
-        let files = store.list_files(None, &["rust".into()], None, 20).unwrap();
+        let files = store
+            .list_files(
+                None,
+                &crate::tags::TagFilter::parse(&["rust".to_string()], &[], &[]),
+                None,
+                20,
+            )
+            .unwrap();
         assert_eq!(files.len(), 2);
         let files = store
-            .list_files(None, &["rust".into(), "cli".into()], None, 20)
+            .list_files(
+                None,
+                &crate::tags::TagFilter::parse(&["rust".to_string(), "cli".to_string()], &[], &[]),
+                None,
+                20,
+            )
             .unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, "a.md");
@@ -3941,18 +3981,24 @@ mod tests {
             .unwrap();
 
         // Filter by "cli" → only the cli-created file
-        let files = store.list_files(None, &[], Some("cli"), 20).unwrap();
+        let files = store
+            .list_files(None, &crate::tags::TagFilter::default(), Some("cli"), 20)
+            .unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, "a.md");
         assert_eq!(files[0].created_by, Some("cli".to_string()));
 
         // Filter by "mcp" → only the mcp-created file
-        let files = store.list_files(None, &[], Some("mcp"), 20).unwrap();
+        let files = store
+            .list_files(None, &crate::tags::TagFilter::default(), Some("mcp"), 20)
+            .unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, "b.md");
 
         // Filter by None → all 3
-        let files = store.list_files(None, &[], None, 20).unwrap();
+        let files = store
+            .list_files(None, &crate::tags::TagFilter::default(), None, 20)
+            .unwrap();
         assert_eq!(files.len(), 3);
     }
 
@@ -5305,7 +5351,12 @@ mod tests {
         assert_eq!(store.files_under_tag("type").unwrap().len(), 2);
         assert_eq!(
             store
-                .list_files(None, &["TYPE/UNDEAD".to_string()], None, 10)
+                .list_files(
+                    None,
+                    &crate::tags::TagFilter::parse(&["TYPE/UNDEAD".to_string()], &[], &[]),
+                    None,
+                    10,
+                )
                 .unwrap()
                 .len(),
             2
@@ -5391,16 +5442,152 @@ mod tests {
         store.reconcile_file_tags(one, &[tag("alpha")]).unwrap();
 
         let hits = store
-            .list_files(None, &["alpha".to_string(), "beta".to_string()], None, 10)
+            .list_files(
+                None,
+                &crate::tags::TagFilter::parse(
+                    &["alpha".to_string(), "beta".to_string()],
+                    &[],
+                    &[],
+                ),
+                None,
+                10,
+            )
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path, "both.md");
 
         // Obsidian matches a tag without regard to case.
         let folded = store
-            .list_files(None, &["ALPHA".to_string()], None, 10)
+            .list_files(
+                None,
+                &crate::tags::TagFilter::parse(&["ALPHA".to_string()], &[], &[]),
+                None,
+                10,
+            )
             .unwrap();
         assert_eq!(folded.len(), 2);
+    }
+
+    /// Three notes: a wight under `type/undead`, a wolf under `type/beast`,
+    /// and a draft that is also `type/beast`.
+    fn operator_fixture() -> Store {
+        let store = Store::open_memory().unwrap();
+        let tag = |p: &str| crate::tags::Tag {
+            path: p.into(),
+            display: p.into(),
+        };
+        let wight = store
+            .insert_file("wight.md", "h", 1, "d000001", None, None)
+            .unwrap();
+        let wolf = store
+            .insert_file("wolf.md", "h", 2, "d000002", None, None)
+            .unwrap();
+        let draft = store
+            .insert_file("draft.md", "h", 3, "d000003", None, None)
+            .unwrap();
+        store
+            .reconcile_file_tags(wight, &[tag("type/undead"), tag("habitat/swamp")])
+            .unwrap();
+        store
+            .reconcile_file_tags(wolf, &[tag("type/beast")])
+            .unwrap();
+        store
+            .reconcile_file_tags(draft, &[tag("type/beast"), tag("status/draft")])
+            .unwrap();
+        store
+    }
+
+    fn listed_paths(store: &Store, filter: &crate::tags::TagFilter) -> Vec<String> {
+        let mut paths: Vec<String> = store
+            .list_files(None, filter, None, 20)
+            .unwrap()
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    #[test]
+    fn an_exact_term_matches_the_tag_alone_and_a_subtree_term_matches_below_it() {
+        let store = operator_fixture();
+        let exact = crate::tags::TagFilter::parse(&["type".to_string()], &[], &[]);
+        assert!(listed_paths(&store, &exact).is_empty());
+
+        let subtree = crate::tags::TagFilter::parse(&["type/".to_string()], &[], &[]);
+        assert_eq!(
+            listed_paths(&store, &subtree),
+            vec!["draft.md", "wight.md", "wolf.md"]
+        );
+    }
+
+    #[test]
+    fn all_terms_intersect_and_any_terms_union() {
+        let store = operator_fixture();
+        let all = crate::tags::TagFilter::parse(
+            &["type/undead".to_string(), "habitat/swamp".to_string()],
+            &[],
+            &[],
+        );
+        assert_eq!(listed_paths(&store, &all), vec!["wight.md"]);
+
+        let any = crate::tags::TagFilter::parse(
+            &[],
+            &["type/undead".to_string(), "status/draft".to_string()],
+            &[],
+        );
+        assert_eq!(listed_paths(&store, &any), vec!["draft.md", "wight.md"]);
+    }
+
+    #[test]
+    fn a_none_term_removes_a_note_the_other_fields_returned() {
+        let store = operator_fixture();
+        let filter = crate::tags::TagFilter::parse(
+            &["type/".to_string()],
+            &[],
+            &["status/draft".to_string()],
+        );
+        assert_eq!(listed_paths(&store, &filter), vec!["wight.md", "wolf.md"]);
+    }
+
+    #[test]
+    fn the_three_fields_combine_in_one_query() {
+        let store = operator_fixture();
+        let filter = crate::tags::TagFilter::parse(
+            &["type/".to_string()],
+            &["habitat/swamp".to_string(), "status/draft".to_string()],
+            &["status/draft".to_string()],
+        );
+        assert_eq!(listed_paths(&store, &filter), vec!["wight.md"]);
+    }
+
+    #[test]
+    fn a_subtree_term_stops_at_the_segment_boundary() {
+        let store = Store::open_memory().unwrap();
+        let tag = |p: &str| crate::tags::Tag {
+            path: p.into(),
+            display: p.into(),
+        };
+        let inside = store
+            .insert_file("inside.md", "h", 1, "d000001", None, None)
+            .unwrap();
+        let beside = store
+            .insert_file("beside.md", "h", 2, "d000002", None, None)
+            .unwrap();
+        store
+            .reconcile_file_tags(inside, &[tag("type/undead")])
+            .unwrap();
+        // `type_a` sorts after `type/` and must not fall inside the range.
+        store.reconcile_file_tags(beside, &[tag("type_a")]).unwrap();
+        let filter = crate::tags::TagFilter::parse(&["type/".to_string()], &[], &[]);
+        assert_eq!(listed_paths(&store, &filter), vec!["inside.md"]);
+    }
+
+    #[test]
+    fn an_empty_filter_returns_every_note() {
+        let store = operator_fixture();
+        let filter = crate::tags::TagFilter::default();
+        assert_eq!(listed_paths(&store, &filter).len(), 3);
     }
 
     #[test]

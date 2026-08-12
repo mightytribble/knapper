@@ -544,7 +544,7 @@ async fn handle_list(
     let items = context::context_list(
         &ctx,
         params.folder.as_deref(),
-        &params.tags,
+        &crate::tags::TagFilter::parse(&params.tags, &[], &[]),
         params.created_by.as_deref(),
         limit,
     )

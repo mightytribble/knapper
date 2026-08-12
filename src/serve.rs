@@ -466,7 +466,7 @@ impl EngraphServer {
             vault_path: &self.vault_path,
             profile: self.profile.as_ref().as_ref(),
         };
-        let tags = params.0.tags.unwrap_or_default();
+        let tags = crate::tags::TagFilter::parse(&params.0.tags.unwrap_or_default(), &[], &[]);
         let limit = params.0.limit.unwrap_or(20);
         let items = context::context_list(
             &ctx,

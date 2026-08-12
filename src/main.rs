@@ -1031,7 +1031,7 @@ async fn main() -> Result<()> {
                     let items = engraph::context::context_list(
                         &params,
                         folder.as_deref(),
-                        &tags,
+                        &engraph::tags::TagFilter::parse(&tags, &[], &[]),
                         created_by.as_deref(),
                         limit,
                     )?;
