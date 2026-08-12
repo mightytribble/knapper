@@ -21,8 +21,8 @@ engraph turns your markdown vault into a searchable knowledge graph that any AI 
 Plain vector search treats your notes as isolated documents. But knowledge isn't flat — your notes link to each other, share tags, reference the same people and projects. engraph understands these connections.
 
 - **5-lane hybrid search** — semantic embeddings + BM25 full-text + graph expansion + cross-encoder reranking + temporal scoring, fused via [Reciprocal Rank Fusion](https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf). Lane weights are configurable. Time-aware queries like "what happened last week" or "March 2026 notes" activate the temporal lane automatically.
-- **MCP server for AI agents** — `engraph serve` exposes 25 tools (search, read, section-level editing, frontmatter mutations, vault health, context bundles, note creation, PARA migration, identity) that Claude, Cursor, or any MCP client can call directly.
-- **HTTP REST API** — `engraph serve --http` adds an axum-based HTTP server alongside MCP with 26 REST endpoints, API key authentication, rate limiting, and CORS. Web-based agents and scripts can query your vault with simple `curl` calls.
+- **MCP server for AI agents** — `engraph serve` exposes 26 tools (search, read, the tag vocabulary, section-level editing, frontmatter mutations, vault health, context bundles, note creation, PARA migration, identity) that Claude, Cursor, or any MCP client can call directly.
+- **HTTP REST API** — `engraph serve --http` adds an axum-based HTTP server alongside MCP with 27 REST endpoints, API key authentication, rate limiting, and CORS. Web-based agents and scripts can query your vault with simple `curl` calls.
 - **Section-level editing** — AI agents can read, replace, prepend, or append to specific sections by heading. Full note rewriting with frontmatter preservation. Granular frontmatter mutations (set/remove fields, add/remove tags and aliases).
 - **Vault health diagnostics** — detect orphan notes, broken wikilinks, stale content, and tag hygiene issues. Available as MCP tool and CLI command.
 - **Obsidian CLI integration** — auto-detects running Obsidian and delegates compatible operations. Circuit breaker (Closed/Degraded/Open) ensures graceful fallback.
@@ -61,7 +61,7 @@ Your vault (markdown files)
 │  Search: 3-lane retrieval → Reranker        │
 │          → Two-pass RRF fusion              │
 │                                             │
-│  25 MCP tools + 26 REST endpoints           │
+│  26 MCP tools + 27 REST endpoints           │
 └─────────────────────────────────────────────┘
         │
         ▼
@@ -277,7 +277,7 @@ Returns orphan notes (no links in or out), broken wikilinks, stale notes, and ta
 
 `engraph serve --http` adds a full REST API alongside the MCP server, exposing the same capabilities over HTTP for web agents, scripts, and integrations.
 
-**26 endpoints:**
+**27 endpoints:**
 
 | Method | Endpoint | Permission | Description |
 |--------|----------|------------|-------------|
@@ -285,7 +285,8 @@ Returns orphan notes (no links in or out), broken wikilinks, stale notes, and ta
 | POST | `/api/search` | read | Hybrid search (semantic + FTS5 + graph + reranker + temporal) |
 | GET | `/api/read/{file}` | read | Read full note content + metadata |
 | GET | `/api/read-section` | read | Read a specific section by heading |
-| GET | `/api/list` | read | List notes with optional tag/folder/created_by filters |
+| GET | `/api/list` | read | List notes by folder and tag terms (`tags`/`all`, `any`, `none`), creator, limit |
+| GET | `/api/tags` | read | The tag vocabulary, whole or under one term (`under`) |
 | GET | `/api/vault-map` | read | Vault structure overview (folders, tags, recent files) |
 | GET | `/api/who/{name}` | read | Person context bundle |
 | GET | `/api/project/{name}` | read | Project context bundle |
@@ -537,7 +538,7 @@ STYLE:
 | Search method | 5-lane RRF (semantic + BM25 + graph + reranker + temporal) | Vector similarity only | Keyword only |
 | Query understanding | Cross-encoder reads each candidate jointly with the query | None | None |
 | Understands note links | Yes (wikilink graph traversal) | No | Limited (backlinks panel) |
-| AI agent access | MCP server (25 tools) + HTTP REST API (26 endpoints) | Custom API needed | No |
+| AI agent access | MCP server (26 tools) + HTTP REST API (27 endpoints) | Custom API needed | No |
 | Write capability | Create/edit/rewrite/delete with smart filing | No | Manual |
 | Vault health | Orphans, broken links, stale notes, tag hygiene | No | Limited |
 | Real-time sync | File watcher, 2s debounce | Manual re-index | N/A |
@@ -553,8 +554,8 @@ engraph is not a replacement for Obsidian — it's the intelligence layer that s
 - Confidence % display: search results show normalized 0-100% confidence instead of raw RRF scores
 - llama.cpp inference via Rust bindings (GGUF models, Metal GPU on macOS, CUDA on Linux)
 - Intelligence opt-in: the cross-encoder lane is off unless enabled
-- MCP server with 25 tools (8 read, 10 write, 2 identity, 1 index, 1 diagnostic, 3 migrate) via stdio
-- HTTP REST API with 26 endpoints, API key auth (`eg_` prefix), rate limiting, CORS — enabled via `engraph serve --http`
+- MCP server with 26 tools (9 read, 11 write, 2 diagnostic, 3 migrate, 1 setup) via stdio
+- HTTP REST API with 27 endpoints, API key auth (`eg_` prefix), rate limiting, CORS — enabled via `engraph serve --http`
 - User identity with L0/L1 tiered context for AI agent session starts
 - Section-level reading and editing: target specific headings with replace/prepend/append modes
 - Full note rewriting with automatic frontmatter preservation

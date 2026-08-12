@@ -10,6 +10,7 @@ pub fn build_openapi_spec(server_url: &str) -> serde_json::Value {
     paths.insert("/api/read/{file}".into(), build_read());
     paths.insert("/api/read-section".into(), build_read_section());
     paths.insert("/api/list".into(), build_list());
+    paths.insert("/api/tags".into(), build_tags());
     paths.insert("/api/vault-map".into(), build_vault_map());
     paths.insert("/api/who/{name}".into(), build_who());
     paths.insert("/api/project/{name}".into(), build_project());
@@ -130,11 +131,27 @@ fn build_list() -> serde_json::Value {
             "summary": "List notes filtered by folder, tags, creator, or limit.",
             "parameters": [
                 { "name": "folder", "in": "query", "required": false, "description": "Folder path prefix filter", "schema": { "type": "string" } },
-                { "name": "tags", "in": "query", "required": false, "description": "Comma-separated tag terms; a trailing / matches the tag and its descendants", "schema": { "type": "string" } },
+                { "name": "tags", "in": "query", "required": false, "description": "Comma-separated tag terms; a trailing / matches the tag and its descendants. Alias of all", "schema": { "type": "string" } },
+                { "name": "all", "in": "query", "required": false, "description": "Comma-separated tag terms a note carries every one of", "schema": { "type": "string" } },
+                { "name": "any", "in": "query", "required": false, "description": "Comma-separated tag terms a note carries at least one of", "schema": { "type": "string" } },
+                { "name": "none", "in": "query", "required": false, "description": "Comma-separated tag terms a note carries none of", "schema": { "type": "string" } },
                 { "name": "created_by", "in": "query", "required": false, "description": "Agent filter", "schema": { "type": "string" } },
                 { "name": "limit", "in": "query", "required": false, "description": "Max results (default 20)", "schema": { "type": "integer" } }
             ],
             "responses": { "200": { "description": "Array of note summaries" } }
+        }
+    })
+}
+
+fn build_tags() -> serde_json::Value {
+    serde_json::json!({
+        "get": {
+            "operationId": "listTags",
+            "summary": "The vault's tag vocabulary, whole or under one term, each tag with the notes carrying it.",
+            "parameters": [
+                { "name": "under", "in": "query", "required": false, "description": "One tag term; the rows returned are that tag and its descendants. Omit for the whole vocabulary", "schema": { "type": "string" } }
+            ],
+            "responses": { "200": { "description": "Array of tag rows: path, display, note_count" } }
         }
     })
 }
@@ -589,6 +606,34 @@ mod tests {
         );
     }
 
+    /// The tag filter is one capability on three surfaces (#61), so the
+    /// spec names every operator the CLI and MCP take.
+    #[test]
+    fn test_list_documents_every_tag_operator() {
+        let spec = build_openapi_spec("http://localhost:3000");
+        let named: Vec<&str> = spec["paths"]["/api/list"]["get"]["parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["name"].as_str().unwrap())
+            .collect();
+        for operator in ["tags", "all", "any", "none"] {
+            assert!(named.contains(&operator), "missing parameter: {operator}");
+        }
+    }
+
+    #[test]
+    fn test_tags_documents_under() {
+        let spec = build_openapi_spec("http://localhost:3000");
+        let named: Vec<&str> = spec["paths"]["/api/tags"]["get"]["parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(named, vec!["under"]);
+    }
+
     #[test]
     fn test_openapi_has_all_operation_ids() {
         let spec = build_openapi_spec("http://localhost:3000");
@@ -607,6 +652,7 @@ mod tests {
             "readNote",
             "readSection",
             "listNotes",
+            "listTags",
             "getVaultMap",
             "getWho",
             "getProject",

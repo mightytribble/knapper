@@ -15,7 +15,8 @@ engraph serve --http --no-auth    # Local dev only (127.0.0.1)
 | POST   | `/api/search`           | Hybrid search with semantic + FTS5 + graph + reranker + temporal |
 | GET    | `/api/read/{file}`      | Read full document content + metadata                            |
 | GET    | `/api/read-section`     | Read specific section by heading                                 |
-| GET    | `/api/list`             | List documents with tag/folder filters                           |
+| GET    | `/api/list`             | List documents by folder and tag terms (`tags`/`all`, `any`, `none`) |
+| GET    | `/api/tags`             | The tag vocabulary, whole or under one term (`under`)            |
 | GET    | `/api/vault-map`        | Collection structure overview                                    |
 | POST   | `/api/context`          | Rich topic context with token budget                             |
 | GET    | `/api/health`           | Collection health diagnostics                                    |

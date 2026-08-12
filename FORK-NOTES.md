@@ -51,7 +51,8 @@ git fetch upstream && git diff --stat upstream/main main
 | `chunk_min_chars` | a section too short to stand on its own merges into the preceding chunk rather than becoming a row. Ships at 120 — see #43 | this fork, issue #43 |
 | `structure_headings` | a bold-only line opens a section, deeper than any `#` heading and an ancestor of nothing. Ships on — see #44 | this fork, issue #44 |
 | `tags` + `file_tags` | a tag is an attribute of a note, and it joins to the note. Usage and last use are derived, so neither can drift. Upstream keys its vocabulary in `tag_registry`, a flat table with no join to `files` whose `usage_count` counts index events | this fork, issue #60 |
-| `tags::predicate` / `TagFilter` / `tags_under` | notes filter by tag term (`all`/`any`/`none`) and the vocabulary lists whole or by subtree, through `context tags`/`list` and MCP `tag_list`/`list` | this fork, issue #60 |
+| `tags::predicate` / `TagFilter` / `tags_under` | notes filter by tag term (`all`/`any`/`none`) and the vocabulary lists whole or by subtree | this fork, issue #60 |
+| one tag vocabulary on three surfaces | the filter and the vocabulary each carry one name and one parameter set across `context list`/`context tags`, MCP `list`/`tags` and `GET /api/list`/`GET /api/tags`. A term is a tag path, a trailing `/` names the subtree, `tags` is the alias of `all`, and an unmatched `all`/`any` term is an error naming the nearest tag. Only the container encoding is per-surface: a JSON body reads an array, and a query string reads one comma-separated value, because `serde_urlencoded` reads no sequence | this fork, issue #61 |
 | `.github/workflows/ci.yml` | manual dispatch only — upstream runs it on push and PR | this fork, Actions minutes |
 
 Cherry-picked rather than merged: PR #41 branched before upstream's #40 graph fix, so merging the
@@ -540,11 +541,12 @@ has never executed on this box.
   `Store::list_files` takes a `TagFilter { all, any, none }` of terms — every `all` term, at least one
   `any` term, none of the `none` terms, ANDed together and with `folder`/`created_by` — as
   `--all/--any/--none` on the CLI, each comma-separated (`--tags` the older spelling of `--all`), as
-  `all`/`any`/`none` on MCP's `list` tool (`tags` the same alias), and as the `tags` query parameter on
-  `/api/list`, read through the same term grammar. `Store::tags_under` answers the whole vocabulary or
+  `all`/`any`/`none` on MCP's `list` tool (`tags` the same alias), and as the `tags`/`all`/`any`/`none`
+  query parameters on `/api/list`, each one comma-separated value, read through the same term grammar.
+  `Store::tags_under` answers the whole vocabulary or
   one subtree, ordered by path, as `TagCount { path, display, note_count }`, the count always the
-  exact tag's notes and never a subtree total, through `context tags [--under <term>]` and MCP's
-  `tag_list`. An `all` or `any` term matching no tag in the vault is an error naming the nearest one,
+  exact tag's notes and never a subtree total, through `context tags [--under <term>]`, MCP's `tags`
+  tool and `GET /api/tags?under=<term>` (#61). An `all` or `any` term matching no tag in the vault is an error naming the nearest one,
   from `resolve_tag` — except that an over-deep term answers with its longest existing ancestor,
   because `resolve_tag`'s `Extension` variant echoes the proposed tag back rather than naming the tag
   it extends. A `none` term is not checked, and `tags_under` validates no prefix at all: an empty

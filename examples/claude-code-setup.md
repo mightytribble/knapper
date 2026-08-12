@@ -28,12 +28,13 @@ Add to `~/.claude/settings.json`:
 
 ### 3. Start using
 
-Claude Code now has access to 13 vault tools:
+Claude Code now has access to 14 vault tools:
 
 **Read tools:**
 - `search` — hybrid search across the vault
 - `read` — read a full note with metadata
-- `list` — filtered note listing (by folder, tags, creator)
+- `list` — filtered note listing (by folder, tag terms, creator)
+- `tags` — the vault's tag vocabulary, whole or under one term
 - `vault_map` — vault structure overview
 - `who` — person context bundle (note + mentions + connections)
 - `project` — project context bundle
