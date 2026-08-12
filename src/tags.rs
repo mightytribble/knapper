@@ -355,30 +355,44 @@ pub fn predicate(term: &TagTerm) -> (String, Vec<String>) {
     }
 }
 
+/// Whether the vault holds a tag matching `term`'s own predicate.
+fn tag_exists(conn: &Connection, term: &TagTerm) -> Result<bool> {
+    let (pred, args) = predicate(term);
+    Ok(conn.query_row(
+        &format!("SELECT EXISTS (SELECT 1 FROM tags t WHERE {pred})"),
+        rusqlite::params_from_iter(args.iter()),
+        |row| row.get(0),
+    )?)
+}
+
 /// Reject a term the vault holds no tag for, naming the nearest tag it holds.
 ///
 /// A silent empty result leaves a caller unable to tell a typo from an empty
 /// set, and an agent retries the call unchanged. The error carries the repair.
 pub fn check_terms(conn: &Connection, terms: &[&TagTerm]) -> Result<()> {
     for term in terms {
-        let (pred, args) = predicate(term);
-        let found: bool = conn.query_row(
-            &format!("SELECT EXISTS (SELECT 1 FROM tags t WHERE {pred})"),
-            rusqlite::params_from_iter(args.iter()),
-            |row| row.get(0),
-        )?;
-        if found {
+        if tag_exists(conn, term)? {
             continue;
         }
-        let nearest = match resolve_tag(conn, term.path())? {
-            // `found` above is already true whenever `resolve_tag` would
-            // return `Exact` for this path, so this arm cannot fire.
-            TagResolution::Exact(display) => Some(display),
-            TagResolution::Fuzzy { resolved, .. } => Some(resolved),
-            // `Extension` echoes the proposed path back, not an existing
-            // one — the term runs past a real tag, so name that ancestor.
-            TagResolution::Extension(_) => longest_existing_ancestor(conn, term.path())?,
-            TagResolution::New(_) => None,
+        // Naming an ancestor and forgetting the subtree marker is the
+        // likeliest mistake, so an `Exact` term gets a second chance: its own
+        // subtree may match even though the exact tag does not. A `Subtree`
+        // term that matched nothing has no such chance, because its subtree
+        // is what already failed.
+        let nearest = match term {
+            TagTerm::Exact(p) if tag_exists(conn, &TagTerm::Subtree(p.clone()))? => {
+                Some(TagTerm::Subtree(p.clone()).to_string())
+            }
+            _ => match resolve_tag(conn, term.path())? {
+                // `tag_exists` above is already true whenever `resolve_tag`
+                // would return `Exact` for this path, so this arm cannot fire.
+                TagResolution::Exact(display) => Some(display),
+                TagResolution::Fuzzy { resolved, .. } => Some(resolved),
+                // `Extension` echoes the proposed path back, not an existing
+                // one — the term runs past a real tag, so name that ancestor.
+                TagResolution::Extension(_) => longest_existing_ancestor(conn, term.path())?,
+                TagResolution::New(_) => None,
+            },
         };
         match nearest {
             Some(near) => anyhow::bail!("no such tag '{term}'; nearest: '{near}'"),

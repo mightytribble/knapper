@@ -5574,14 +5574,29 @@ mod tests {
     fn an_exact_term_errors_on_a_bare_axis_and_a_subtree_term_matches_below_it() {
         let store = operator_fixture();
         // The fixture holds `type/undead` and `type/beast`, never bare `type`.
+        // The likeliest mistake is forgetting the subtree marker, so the
+        // suggestion is the term with it added, not an unrelated fuzzy match.
         let exact = crate::tags::TagFilter::parse(&["type".to_string()], &[], &[]);
         let err = store.list_files(None, &exact, None, 20).unwrap_err();
-        assert_eq!(err.to_string(), "no such tag 'type'");
+        assert_eq!(err.to_string(), "no such tag 'type'; nearest: 'type/'");
 
         let subtree = crate::tags::TagFilter::parse(&["type/".to_string()], &[], &[]);
         assert_eq!(
             listed_paths(&store, &subtree),
             vec!["draft.md", "wight.md", "wolf.md"]
+        );
+    }
+
+    #[test]
+    fn a_bare_axis_with_one_child_still_gets_the_subtree_suggestion() {
+        let store = operator_fixture();
+        // `habitat/swamp` is the fixture's only `habitat` tag, one segment
+        // under an axis no fuzzy match would reach.
+        let filter = crate::tags::TagFilter::parse(&["habitat".to_string()], &[], &[]);
+        let err = store.list_files(None, &filter, None, 20).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "no such tag 'habitat'; nearest: 'habitat/'"
         );
     }
 
