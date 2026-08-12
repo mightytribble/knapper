@@ -315,7 +315,7 @@ pub fn search_with_intelligence(
     // seed probes and left this lane empty for every multi-word query (#22).
     let fts_raw = config
         .store
-        .fts_search_any(query, lane_width, &config.fts.weights())
+        .fts_search_any(query, lane_width, &config.fts.weights(), None)
         .unwrap_or_default();
 
     for fr in fts_raw {

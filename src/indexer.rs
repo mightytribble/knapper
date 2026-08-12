@@ -2357,13 +2357,15 @@ mod tests {
 
         let shipped = crate::config::FtsConfig::default();
         for term in ["Abjuration", "spells"] {
-            let hits = store.fts_search_any(term, 10, &shipped.weights()).unwrap();
+            let hits = store
+                .fts_search_any(term, 10, &shipped.weights(), None)
+                .unwrap();
             assert_eq!(hits.len(), 1, "no keyword hit for {term:?}");
             assert_eq!(hits[0].file_id, file.id);
         }
         assert!(
             store
-                .fts_search_any("grimoire", 10, &shipped.weights())
+                .fts_search_any("grimoire", 10, &shipped.weights(), None)
                 .unwrap()
                 .is_empty(),
             "the tags column ships undeclared"
@@ -2376,7 +2378,7 @@ mod tests {
         store.rebuild_fts(&with_tags).unwrap();
         assert_eq!(
             store
-                .fts_search_any("grimoire", 10, &with_tags.weights())
+                .fts_search_any("grimoire", 10, &with_tags.weights(), None)
                 .unwrap()
                 .len(),
             1,
@@ -2411,7 +2413,7 @@ mod tests {
             let mut embedder = crate::llm::MockLlm::new(256);
             run_index_shared(tmp.path(), &config, &store, &mut embedder, false, None).unwrap();
             store
-                .fts_search_any("casting", 10, &config.fts.weights())
+                .fts_search_any("casting", 10, &config.fts.weights(), None)
                 .unwrap()
                 .iter()
                 .map(|r| {

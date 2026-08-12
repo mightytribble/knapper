@@ -1418,7 +1418,7 @@ impl Store {
     /// Weighting a column changes the order among rows that already match, and
     /// no caller of this function ranks by that order.
     pub fn fts_search(&self, query: &str, limit: usize) -> Result<Vec<FtsResult>> {
-        self.fts_search_expr(&crate::fts::phrase_expr(query), limit, &[])
+        self.fts_search_expr(&crate::fts::phrase_expr(query), limit, &[], None)
     }
 
     /// Keyword search matching **any** token of `query`, each taken literally.
@@ -1433,14 +1433,18 @@ impl Store {
     /// its columns — [`FtsConfig::weights`](crate::config::FtsConfig::weights)
     /// builds them from the same config the declaration came from. An empty
     /// slice is plain `bm25()`, every column at 1.0.
+    ///
+    /// `scope` is the tag scope's file ids, or `None` for the whole vault
+    /// (#60). See [`fts_search_expr`](Self::fts_search_expr) for how it binds.
     pub fn fts_search_any(
         &self,
         query: &str,
         limit: usize,
         weights: &[f64],
+        scope: Option<&[i64]>,
     ) -> Result<Vec<FtsResult>> {
         match crate::fts::any_term_expr(query) {
-            Some(expr) => self.fts_search_expr(&expr, limit, weights),
+            Some(expr) => self.fts_search_expr(&expr, limit, weights, scope),
             None => Ok(Vec::new()),
         }
     }
@@ -1451,11 +1455,16 @@ impl Store {
     /// `file_id` and `chunk_seq` come from a join and not from the index: since
     /// issue #37 `chunks_fts` is external content over `chunks`, and it is
     /// keyed on the chunk's rowid rather than carrying a copy of the pair.
+    ///
+    /// `scope` narrows the match to a set of file ids, pre-filtering the FTS5
+    /// query rather than cutting its answer — the same property `vecstore::
+    /// search_vec` holds for the semantic lane (#60).
     fn fts_search_expr(
         &self,
         fts_query: &str,
         limit: usize,
         weights: &[f64],
+        scope: Option<&[i64]>,
     ) -> Result<Vec<FtsResult>> {
         // More weights than the table has columns is an error in SQLite, and a
         // caller that holds a different `[fts]` from the one the store was built
@@ -1481,17 +1490,34 @@ impl Store {
                     .join(", ")
             ),
         };
+        // The scope binds as `?3`, so the two parameters that were here keep
+        // their positions and the `LIMIT` stays where it reads (#60).
+        let mut binds: Vec<Box<dyn rusqlite::types::ToSql>> =
+            vec![Box::new(fts_query.to_string()), Box::new(limit as i64)];
+        let scope_clause = match scope {
+            None => "",
+            Some(ids) => {
+                let array: rusqlite::vtab::array::Array = std::rc::Rc::new(
+                    ids.iter()
+                        .copied()
+                        .map(rusqlite::types::Value::from)
+                        .collect::<Vec<_>>(),
+                );
+                binds.push(Box::new(array));
+                " AND c.file_id IN rarray(?3)"
+            }
+        };
         let mut stmt = self.conn.prepare(&format!(
             "SELECT c.file_id, c.seq, {bm25} as score,
                     snippet(chunks_fts, 0, '<b>', '</b>', '...', 64)
              FROM chunks_fts
              JOIN chunks c ON c.id = chunks_fts.rowid
-             WHERE chunks_fts MATCH ?1
+             WHERE chunks_fts MATCH ?1{scope_clause}
              ORDER BY score
              LIMIT ?2",
         ))?;
 
-        let rows = stmt.query_map(params![fts_query, limit as i64], |row| {
+        let rows = stmt.query_map(rusqlite::params_from_iter(binds.iter()), |row| {
             Ok(FtsResult {
                 file_id: row.get(0)?,
                 chunk_seq: row.get(1)?,
@@ -2916,6 +2942,7 @@ mod tests {
                     "counterspell cloth grimoire Abjuration",
                     10,
                     &[1.0, 3.0, 4.0],
+                    None,
                 )
                 .unwrap()
                 .iter()
