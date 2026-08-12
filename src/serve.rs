@@ -31,17 +31,16 @@ pub struct SearchParams {
     pub query: String,
     /// Number of results (default 10).
     pub top_n: Option<usize>,
-    /// Scope the search to notes with all listed tags. Alias of `all`.
+    /// Filter to notes with all listed tags. Alias of `all`.
     pub tags: Option<Vec<String>>,
-    /// Scope to notes carrying every term. A term is a tag path; a trailing
-    /// `/` or `/*` matches the tag and its descendants. An unknown term is an
-    /// error naming the nearest tag the vault holds.
+    /// Notes carrying every term. A term is a tag path; a trailing `/` or
+    /// `/*` matches the tag and its descendants. An unknown term is an error
+    /// naming the nearest tag the vault holds.
     pub all: Option<Vec<String>>,
-    /// Scope to notes carrying at least one of these terms. An unknown term is
-    /// an error naming the nearest tag the vault holds.
+    /// Notes carrying at least one of these terms. An unknown term is an
+    /// error naming the nearest tag the vault holds.
     pub any: Option<Vec<String>>,
-    /// Scope out notes carrying any of these terms. An unknown term here is
-    /// ignored.
+    /// Notes carrying none of these terms. An unknown term here is ignored.
     pub none: Option<Vec<String>>,
 }
 
