@@ -1160,12 +1160,14 @@ fn merge_seeds(semantic: &[RankedResult], fts: &[RankedResult]) -> Vec<RankedRes
 /// Performs both semantic (sqlite-vec) and keyword (FTS5) search, then fuses
 /// results using Reciprocal Rank Fusion. When `explain` is true, each
 /// result includes per-lane score breakdown.
+#[allow(clippy::too_many_arguments)]
 pub fn run_search(
     query: &str,
     top_n: usize,
     json: bool,
     explain: bool,
     group_by: GroupBy,
+    scope: &crate::tags::TagFilter,
     data_dir: &Path,
     config: &crate::config::Config,
 ) -> Result<()> {
@@ -1208,6 +1210,7 @@ pub fn run_search(
                 .as_mut()
                 .map(|r| r.as_mut() as &mut dyn llm::RerankModel),
             group_by,
+            scope: scope.clone(),
             ..SearchConfig::new(&store, config)
         };
         search_with_intelligence(query, top_n, &mut embedder, &mut search_config)?
