@@ -38,7 +38,13 @@ use crate::store::Store;
 
 /// Bump when the markdown parser changes what it extracts from a file:
 /// frontmatter splitting, heading detection, tag parsing.
-pub const PARSER_VERSION: u32 = 1;
+///
+/// Version 2 is issue #60: a note's tags are read from the `tags` property and
+/// from the `#tags` the body holds, which are peers, and each tag is keyed by
+/// its folded path in the `tags` and `file_tags` rows. A store built before the
+/// rule holds the property tags alone, in a column the branch removes, so the
+/// re-index this version declares is what adopts the new rows.
+pub const PARSER_VERSION: u32 = 2;
 
 /// Bump when the chunker's *rules* change — break-point scoring, section
 /// structuring, sentence splitting, overlap construction.

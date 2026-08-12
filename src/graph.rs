@@ -456,7 +456,7 @@ mod tests {
 
     fn file(store: &Store, path: &str) -> i64 {
         store
-            .insert_file(path, "h", 100, &[], &generate_docid(path), None, None)
+            .insert_file(path, "h", 100, &generate_docid(path), None, None)
             .unwrap()
     }
 

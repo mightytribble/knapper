@@ -726,7 +726,6 @@ mod tests {
                 "03-Resources/People/Steve Barbera.md",
                 "h1",
                 0,
-                &[],
                 "aaa111",
                 None,
                 None,
@@ -737,7 +736,6 @@ mod tests {
                 "03-Resources/Code-Snippets/Reciprocal Rank Fusion.md",
                 "h2",
                 0,
-                &[],
                 "bbb222",
                 None,
                 None,
@@ -1040,7 +1038,7 @@ mod tests {
         let (store, vault_dir) = setup_store_and_vault();
         // Add a note named "Drift" so it can be matched
         store
-            .insert_file("01-Projects/Drift.md", "h", 0, &[], "ccc333", None, None)
+            .insert_file("01-Projects/Drift.md", "h", 0, "ccc333", None, None)
             .unwrap();
         let projects = vault_dir.path().join("01-Projects");
         std::fs::create_dir_all(&projects).unwrap();
@@ -1058,7 +1056,7 @@ mod tests {
     fn test_skip_inline_code_in_discover() {
         let (store, vault_dir) = setup_store_and_vault();
         store
-            .insert_file("01-Projects/Drift.md", "h", 0, &[], "ccc333", None, None)
+            .insert_file("01-Projects/Drift.md", "h", 0, "ccc333", None, None)
             .unwrap();
         let projects = vault_dir.path().join("01-Projects");
         std::fs::create_dir_all(&projects).unwrap();
@@ -1075,7 +1073,7 @@ mod tests {
     fn test_skip_frontmatter_in_discover() {
         let (store, vault_dir) = setup_store_and_vault();
         store
-            .insert_file("01-Projects/Drift.md", "h", 0, &[], "ccc333", None, None)
+            .insert_file("01-Projects/Drift.md", "h", 0, "ccc333", None, None)
             .unwrap();
         let projects = vault_dir.path().join("01-Projects");
         std::fs::create_dir_all(&projects).unwrap();
@@ -1093,15 +1091,7 @@ mod tests {
         let (store, vault_dir) = setup_store_and_vault();
         // Add a note called "image-url" that could match
         store
-            .insert_file(
-                "03-Resources/image-url.md",
-                "h",
-                0,
-                &[],
-                "ddd444",
-                None,
-                None,
-            )
+            .insert_file("03-Resources/image-url.md", "h", 0, "ddd444", None, None)
             .unwrap();
         let resources = vault_dir.path().join("03-Resources");
         std::fs::create_dir_all(&resources).unwrap();
@@ -1118,7 +1108,7 @@ mod tests {
     fn test_apply_links_skips_protected_regions() {
         let (store, vault_dir) = setup_store_and_vault();
         store
-            .insert_file("01-Projects/Drift.md", "h", 0, &[], "ccc333", None, None)
+            .insert_file("01-Projects/Drift.md", "h", 0, "ccc333", None, None)
             .unwrap();
         let projects = vault_dir.path().join("01-Projects");
         std::fs::create_dir_all(&projects).unwrap();

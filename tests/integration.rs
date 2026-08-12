@@ -98,12 +98,11 @@ fn index_vault(vault_path: &Path, data_dir: &Path, config: &Config, rebuild: boo
         let hash = compute_file_hash(file_path).unwrap();
 
         let parsed = chunk_markdown(&content);
-        let tags = parsed.tags;
         let chunks = parsed.chunks;
 
         let docid = generate_docid(&rel_str);
         let file_id = store
-            .insert_file(&rel_str, &hash, 0, &tags, &docid, None, None)
+            .insert_file(&rel_str, &hash, 0, &docid, None, None)
             .unwrap();
 
         for chunk in &chunks {

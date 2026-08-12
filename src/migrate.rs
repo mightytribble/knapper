@@ -865,7 +865,7 @@ mod tests {
         // Create a file at root level
         std::fs::write(root.join("todo.md"), "# Todo\n- [ ] task\n").unwrap();
         store
-            .insert_file("todo.md", "hash1", 100, &[], "tod123", None, None)
+            .insert_file("todo.md", "hash1", 100, "tod123", None, None)
             .unwrap();
 
         // Build a preview manually

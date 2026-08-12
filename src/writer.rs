@@ -695,7 +695,6 @@ pub fn create_note(
             &rel_path,
             &content_hash,
             mtime,
-            &resolved_tags,
             &docid,
             Some(&input.created_by),
             None,
@@ -710,10 +709,11 @@ pub fn create_note(
 
         build_edges_for_file(store, file_id, &full_content)?;
 
-        // Register new tags
-        for tag in &resolved_tags {
-            store.register_tag(tag, &input.created_by)?;
-        }
+        // The writer is not an author of the vocabulary (#60). It writes the
+        // file; the reconciler owns the rows, and reads the tags back out of
+        // the content that was written, so the property and the body are peers
+        // here exactly as they are on the index path.
+        store.reconcile_file_tags(file_id, &crate::tags::extract(&full_content))?;
 
         Ok(file_id)
     })();
@@ -731,7 +731,6 @@ pub fn create_note(
                 &rel_path,
                 &content_hash,
                 actual_mtime,
-                &resolved_tags,
                 &docid,
                 Some(&input.created_by),
                 None,
@@ -846,7 +845,6 @@ pub fn append_to_note(
             &file_record.path,
             &content_hash,
             mtime,
-            &file_record.tags,
             &docid,
             file_record.created_by.as_deref(),
             None,
@@ -858,6 +856,8 @@ pub fn append_to_note(
             store.insert_chunk_with_vector(&c.record(file_id, chunk_seq as i64, vid), &c.vector)?;
             store.insert_vec(vid, &c.vector)?;
         }
+
+        store.reconcile_file_tags(file_id, &crate::tags::extract(&new_content))?;
 
         build_edges_for_file(store, file_id, &new_content)?;
         Ok(file_id)
@@ -874,7 +874,6 @@ pub fn append_to_note(
                 &file_record.path,
                 &content_hash,
                 actual_mtime,
-                &file_record.tags,
                 &docid,
                 file_record.created_by.as_deref(),
                 None,
@@ -931,9 +930,14 @@ pub fn update_metadata(
 
     // Step 3: Parse existing frontmatter and build new
     let existing_content = std::fs::read_to_string(&full_path)?;
-    let (_old_fm, body) = split_frontmatter(&existing_content);
+    let (old_fm, body) = split_frontmatter(&existing_content);
 
-    let tags = input.tags.unwrap_or_else(|| file_record.tags.clone());
+    // The note's own `tags:` property, not `FileRecord.tags`. The junction
+    // holds the property tags and the body hashtags together (#60), and a
+    // hashtag must stay in the body: this write rebuilds a property of the
+    // user's file.
+    let (_, property_tags, _) = parse_frontmatter_fields(&old_fm);
+    let tags = input.tags.unwrap_or(property_tags);
     let aliases_vec = input.aliases.unwrap_or_default();
     let aliases_ref: Option<&[String]> = if aliases_vec.is_empty() {
         None
@@ -955,20 +959,18 @@ pub fn update_metadata(
 
     // Step 5: Update store record (metadata-only, no re-chunking)
     let mtime = file_mtime(&full_path)?;
-    store.insert_file(
+    let file_id = store.insert_file(
         &file_record.path,
         &content_hash,
         mtime,
-        &tags,
         &docid,
         file_record.created_by.as_deref(),
         None,
     )?;
 
-    // Register tags
-    for tag in &tags {
-        store.register_tag(tag, &input.modified_by)?;
-    }
+    // A frontmatter edit changes a note's tags and no chunk boundary, so it
+    // reconciles the rows and does not re-index (#60).
+    store.reconcile_file_tags(file_id, &crate::tags::extract(&new_content))?;
 
     let folder = file_record
         .path
@@ -1205,23 +1207,15 @@ pub fn edit_frontmatter(
         .clone()
         .unwrap_or_else(|| generate_docid(&file_record.path));
 
-    // Extract updated tags from the written content for store update
-    let (updated_fm, _) = crate::markdown::split_frontmatter(&new_content);
-    let updated_tags: Vec<String> = if let Some(ref fm) = updated_fm {
-        extract_yaml_sequence(fm, "tags")
-    } else {
-        vec![]
-    };
-
-    store.insert_file(
+    let file_id = store.insert_file(
         &file_record.path,
         &content_hash,
         mtime,
-        &updated_tags,
         &docid,
         file_record.created_by.as_deref(),
         None,
     )?;
+    store.reconcile_file_tags(file_id, &crate::tags::extract(&new_content))?;
 
     Ok(EditResult {
         path: file_record.path,
@@ -1254,30 +1248,6 @@ fn apply_remove_from_sequence(mapping: &mut serde_yaml::Mapping, key: &str, valu
     if let Some(serde_yaml::Value::Sequence(items)) = mapping.get_mut(&key_val) {
         items.retain(|item| item != &remove_item);
     }
-}
-
-/// Helper: extract string values from a YAML sequence field.
-fn extract_yaml_sequence(yaml_str: &str, key: &str) -> Vec<String> {
-    let val: serde_yaml::Value = match serde_yaml::from_str(yaml_str) {
-        Ok(v) => v,
-        Err(_) => return vec![],
-    };
-    if let serde_yaml::Value::Mapping(ref m) = val
-        && let Some(serde_yaml::Value::Sequence(items)) =
-            m.get(serde_yaml::Value::String(key.to_string()))
-    {
-        return items
-            .iter()
-            .filter_map(|v| {
-                if let serde_yaml::Value::String(s) = v {
-                    Some(s.clone())
-                } else {
-                    None
-                }
-            })
-            .collect();
-    }
-    vec![]
 }
 
 /// Move a note to a new folder.
@@ -1409,7 +1379,6 @@ pub fn delete_note(
             std::fs::rename(&old_path, &new_full_path)?;
 
             // Update store: remove old record, insert under new path
-            let tags = file_record.tags.clone();
             let docid = file_record.docid.as_deref().unwrap_or("").to_string();
             let created_by = file_record.created_by.clone();
             let mtime = file_record.mtime;
@@ -1417,23 +1386,29 @@ pub fn delete_note(
             let content = std::fs::read_to_string(&new_full_path)?;
             let content_hash = compute_content_hash(&content);
 
+            // The row is replaced, so the new id holds no links: read the ids
+            // the old row releases, write the new row's rows, then prune (#60).
+            let released_tags = store.file_tag_ids(file_record.id)?;
             store.delete_file(file_record.id)?;
-            store.insert_file(
+            let file_id = store.insert_file(
                 &new_rel_path,
                 &content_hash,
                 mtime,
-                &tags,
                 &docid,
                 created_by.as_deref(),
                 None,
             )?;
+            store.reconcile_file_tags(file_id, &crate::tags::extract(&content))?;
+            store.prune_unused_tags(&released_tags)?;
 
             Ok(())
         }
         DeleteMode::Hard => {
             // Delete disk file first, then purge store
+            let released_tags = store.file_tag_ids(file_record.id)?;
             std::fs::remove_file(&old_path)?;
             store.delete_file_hard(&file_record.path)?;
+            store.prune_unused_tags(&released_tags)?;
             Ok(())
         }
     }
@@ -1468,10 +1443,12 @@ pub fn archive_note(
 
     // Read content and inject archive frontmatter
     let content = std::fs::read_to_string(&old_path)?;
-    let (_old_fm, body) = split_frontmatter(&content);
+    let (old_fm, body) = split_frontmatter(&content);
 
-    // Preserve existing tags, add archived metadata
-    let mut tags = file_record.tags.clone();
+    // Keep the note's own `tags:` property and add the archive tag. The source
+    // is the property, not `FileRecord.tags`: the junction also holds the body
+    // hashtags (#60), which stay in the body.
+    let (_, mut tags, _) = parse_frontmatter_fields(&old_fm);
     if !tags.contains(&"archived".to_string()) {
         tags.push("archived".to_string());
     }
@@ -1504,8 +1481,10 @@ pub fn archive_note(
     for vid in &old_vids {
         store.delete_vec(*vid)?;
     }
+    let released_tags = store.file_tag_ids(file_record.id)?;
     store.delete_edges_for_file(file_record.id)?;
     store.delete_file(file_record.id)?;
+    store.prune_unused_tags(&released_tags)?;
 
     // Remove original file
     std::fs::remove_file(&old_path)?;
@@ -1615,7 +1594,6 @@ pub fn unarchive_note(
             &original_path,
             &content_hash,
             mtime,
-            &tags,
             &docid,
             Some("unarchive"),
             None,
@@ -1630,9 +1608,7 @@ pub fn unarchive_note(
 
         build_edges_for_file(store, file_id, &restored_content)?;
 
-        for tag in &tags {
-            store.register_tag(tag, "unarchive")?;
-        }
+        store.reconcile_file_tags(file_id, &crate::tags::extract(&restored_content))?;
 
         Ok(())
     })();
@@ -1678,13 +1654,19 @@ pub fn verify_index_integrity(store: &Store, vault_path: &Path) -> Result<usize>
         let full_path = vault_path.join(&file.path);
         if !full_path.exists() {
             // Clean up orphan: vectors, edges, file record. The chunks and
-            // their keyword index go with the `files` row (issue #37).
+            // their keyword index go with the `files` row (issue #37), and
+            // so do the file's `file_tags` rows. The tag ids are read
+            // before the cascade takes the links away, and each id no
+            // other note holds is deleted after it, the way every other
+            // removal path does it (#60).
+            let released = store.file_tag_ids(file.id)?;
             let vids = store.get_vector_ids_for_file(file.id)?;
             for vid in &vids {
                 store.delete_vec(*vid)?;
             }
             store.delete_edges_for_file(file.id)?;
             store.delete_file(file.id)?;
+            store.prune_unused_tags(&released)?;
             orphans += 1;
         }
     }
@@ -1818,7 +1800,6 @@ mod tests {
                 "notes/existing.md",
                 "hash1",
                 100,
-                &[],
                 &crate::docid::generate_docid("notes/existing.md"),
                 None,
                 None,
@@ -1829,7 +1810,6 @@ mod tests {
                 "notes/gone.md",
                 "hash2",
                 100,
-                &[],
                 &crate::docid::generate_docid("notes/gone.md"),
                 None,
                 None,
@@ -1843,6 +1823,72 @@ mod tests {
         assert!(store.get_file("notes/gone.md").unwrap().is_none());
         // The existing file should still be there
         assert!(store.get_file("notes/existing.md").unwrap().is_some());
+    }
+
+    /// A note removed from disk releases its tags, and a tag no other note
+    /// carries leaves the vocabulary with it (#60). `resolve_tag` reads
+    /// `tags` with no join, so a row left behind keeps being offered as a
+    /// match for a tag the vault no longer holds.
+    #[test]
+    fn verify_index_integrity_prunes_the_tags_the_removed_note_released() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let vault = dir.path();
+        std::fs::write(vault.join("kept.md"), "---\ntags: [shared]\n---\nbody\n").unwrap();
+
+        let store = crate::store::Store::open_memory().unwrap();
+        let kept = store
+            .insert_file(
+                "kept.md",
+                "hash1",
+                100,
+                &crate::docid::generate_docid("kept.md"),
+                None,
+                None,
+            )
+            .unwrap();
+        let gone = store
+            .insert_file(
+                "gone.md",
+                "hash2",
+                100,
+                &crate::docid::generate_docid("gone.md"),
+                None,
+                None,
+            )
+            .unwrap();
+        store
+            .reconcile_file_tags(
+                kept,
+                &crate::tags::extract("---\ntags: [shared]\n---\nbody\n"),
+            )
+            .unwrap();
+        store
+            .reconcile_file_tags(
+                gone,
+                &crate::tags::extract("---\ntags: [shared, solitary]\n---\nbody\n"),
+            )
+            .unwrap();
+        assert!(matches!(
+            store.resolve_tag("solitary").unwrap(),
+            crate::tags::TagResolution::Exact(_)
+        ));
+
+        assert_eq!(verify_index_integrity(&store, vault).unwrap(), 1);
+
+        // The tag only the removed note carried is gone from the vocabulary.
+        assert!(
+            matches!(
+                store.resolve_tag("solitary").unwrap(),
+                crate::tags::TagResolution::New(_)
+            ),
+            "a tag whose only note was removed must not stay in the vocabulary"
+        );
+        // The tag the surviving note carries stays.
+        assert!(matches!(
+            store.resolve_tag("shared").unwrap(),
+            crate::tags::TagResolution::Exact(_)
+        ));
+        assert_eq!(store.top_tags(10).unwrap(), vec![("shared".to_string(), 1)]);
     }
 
     #[test]
@@ -1911,7 +1957,7 @@ mod tests {
         let content = "# Person\n\n## Interactions\n\nOld entry\n\n## Links\n\nSome links\n";
         std::fs::write(root.join("person.md"), content).unwrap();
         store
-            .insert_file("person.md", "hash", 100, &[], "per123", None, None)
+            .insert_file("person.md", "hash", 100, "per123", None, None)
             .unwrap();
 
         let input = EditInput {
@@ -1940,7 +1986,7 @@ mod tests {
         let content = "# Note\n\n## Tasks\n\n- [x] Old task\n\n## Notes\n\nText\n";
         std::fs::write(root.join("note.md"), content).unwrap();
         store
-            .insert_file("note.md", "hash", 100, &[], "not123", None, None)
+            .insert_file("note.md", "hash", 100, "not123", None, None)
             .unwrap();
 
         let input = EditInput {
@@ -1964,7 +2010,7 @@ mod tests {
         let content = "# Doc\n\n## Log\n\nExisting line\n\n## Footer\n\nEnd\n";
         std::fs::write(root.join("doc.md"), content).unwrap();
         store
-            .insert_file("doc.md", "hash", 100, &[], "doc123", None, None)
+            .insert_file("doc.md", "hash", 100, "doc123", None, None)
             .unwrap();
 
         let input = EditInput {
@@ -1991,7 +2037,7 @@ mod tests {
         let content = "# Note\n\n## Existing\n\nContent\n";
         std::fs::write(root.join("note.md"), content).unwrap();
         store
-            .insert_file("note.md", "hash", 100, &[], "not123", None, None)
+            .insert_file("note.md", "hash", 100, "not123", None, None)
             .unwrap();
 
         let input = EditInput {
@@ -2033,15 +2079,7 @@ mod tests {
         let content = "---\ntags:\n  - project\nstatus: active\n---\n\n# Old Content\n\nOld body\n";
         std::fs::write(root.join("note.md"), content).unwrap();
         store
-            .insert_file(
-                "note.md",
-                "hash",
-                100,
-                &["project".to_string()],
-                "rew123",
-                None,
-                None,
-            )
+            .insert_file("note.md", "hash", 100, "rew123", None, None)
             .unwrap();
 
         let input = RewriteInput {
@@ -2065,15 +2103,7 @@ mod tests {
         let content = "---\ntags:\n  - project\n---\n\n# Content\n";
         std::fs::write(root.join("note.md"), content).unwrap();
         store
-            .insert_file(
-                "note.md",
-                "hash",
-                100,
-                &["project".to_string()],
-                "efm123",
-                None,
-                None,
-            )
+            .insert_file("note.md", "hash", 100, "efm123", None, None)
             .unwrap();
 
         let input = EditFrontmatterInput {
@@ -2094,15 +2124,7 @@ mod tests {
         let content = "---\ntags:\n  - project\n  - old\n---\n\n# Content\n";
         std::fs::write(root.join("note.md"), content).unwrap();
         store
-            .insert_file(
-                "note.md",
-                "hash",
-                100,
-                &["project".to_string(), "old".to_string()],
-                "efm456",
-                None,
-                None,
-            )
+            .insert_file("note.md", "hash", 100, "efm456", None, None)
             .unwrap();
 
         let input = EditFrontmatterInput {
@@ -2123,7 +2145,7 @@ mod tests {
         let content = "---\nstatus: draft\n---\n\n# Content\n";
         std::fs::write(root.join("note.md"), content).unwrap();
         store
-            .insert_file("note.md", "hash", 100, &[], "efm789", None, None)
+            .insert_file("note.md", "hash", 100, "efm789", None, None)
             .unwrap();
 
         let input = EditFrontmatterInput {
@@ -2144,7 +2166,7 @@ mod tests {
         let content = "---\nstatus: draft\ntitle: Test\n---\n\n# Content\n";
         std::fs::write(root.join("note.md"), content).unwrap();
         store
-            .insert_file("note.md", "hash", 100, &[], "efmrm1", None, None)
+            .insert_file("note.md", "hash", 100, "efmrm1", None, None)
             .unwrap();
 
         let input = EditFrontmatterInput {
@@ -2165,15 +2187,7 @@ mod tests {
         let content = "---\ntags:\n  - test\n---\n\n# Content\n";
         std::fs::write(root.join("note.md"), content).unwrap();
         store
-            .insert_file(
-                "note.md",
-                "hash",
-                100,
-                &["test".to_string()],
-                "efmal1",
-                None,
-                None,
-            )
+            .insert_file("note.md", "hash", 100, "efmal1", None, None)
             .unwrap();
 
         let input = EditFrontmatterInput {
@@ -2194,7 +2208,7 @@ mod tests {
         let content = "# Content\n\nJust body, no frontmatter.\n";
         std::fs::write(root.join("note.md"), content).unwrap();
         store
-            .insert_file("note.md", "hash", 100, &[], "efmnf1", None, None)
+            .insert_file("note.md", "hash", 100, "efmnf1", None, None)
             .unwrap();
 
         let input = EditFrontmatterInput {
@@ -2220,15 +2234,7 @@ mod tests {
         let content = "---\ntags:\n  - old-tag\nstatus: draft\n---\n\n# Content\n";
         std::fs::write(root.join("note.md"), content).unwrap();
         store
-            .insert_file(
-                "note.md",
-                "hash",
-                100,
-                &["old-tag".to_string()],
-                "efmmo1",
-                None,
-                None,
-            )
+            .insert_file("note.md", "hash", 100, "efmmo1", None, None)
             .unwrap();
 
         let input = EditFrontmatterInput {
@@ -2257,7 +2263,7 @@ mod tests {
         std::fs::create_dir_all(root.join("04-Archive")).unwrap();
         std::fs::write(root.join("deleteme.md"), "# Delete me").unwrap();
         store
-            .insert_file("deleteme.md", "hash", 100, &[], "del123", None, None)
+            .insert_file("deleteme.md", "hash", 100, "del123", None, None)
             .unwrap();
 
         delete_note(
@@ -2279,7 +2285,7 @@ mod tests {
         let (tmp, store, root) = setup_vault();
         std::fs::write(root.join("gone.md"), "# Gone forever").unwrap();
         store
-            .insert_file("gone.md", "hash", 100, &[], "gon123", None, None)
+            .insert_file("gone.md", "hash", 100, "gon123", None, None)
             .unwrap();
 
         delete_note(&store, &root, "gone.md", DeleteMode::Hard, "").unwrap();
@@ -2486,7 +2492,7 @@ mod tests {
         // derives the display snippet from it (issue #14).
         let store = Store::open_memory().unwrap();
         let file_id = store
-            .insert_file("places/coast.md", "h", 0, &[], "d", None, None)
+            .insert_file("places/coast.md", "h", 0, "d", None, None)
             .unwrap();
         store.insert_chunk(&c.record(file_id, 0, 1)).unwrap();
 
@@ -2516,7 +2522,7 @@ mod tests {
         std::fs::write(&file_path, "# Coast\n\n## The Coast Road\n\nOriginal.\n").unwrap();
         let mtime = file_mtime(&file_path).unwrap();
         store
-            .insert_file("coast.md", "hash", mtime, &[], "co123", None, None)
+            .insert_file("coast.md", "hash", mtime, "co123", None, None)
             .unwrap();
 
         append_to_note(
@@ -2561,7 +2567,7 @@ mod tests {
         // Register in store with the ACTUAL mtime from disk
         let mtime = file_mtime(&file_path).unwrap();
         store
-            .insert_file("mtime-test.md", "hash", mtime, &[], "mt123", None, None)
+            .insert_file("mtime-test.md", "hash", mtime, "mt123", None, None)
             .unwrap();
 
         // Step 1: edit_note modifies the file
@@ -2618,15 +2624,7 @@ mod tests {
         // Register with actual mtime
         let mtime = file_mtime(&file_path).unwrap();
         store
-            .insert_file(
-                "rewrite-mtime.md",
-                "hash",
-                mtime,
-                &["test".to_string()],
-                "rwmt1",
-                None,
-                None,
-            )
+            .insert_file("rewrite-mtime.md", "hash", mtime, "rwmt1", None, None)
             .unwrap();
 
         // Step 1: rewrite_note modifies the file
@@ -2681,15 +2679,7 @@ mod tests {
         // Register with actual mtime
         let mtime = file_mtime(&file_path).unwrap();
         store
-            .insert_file(
-                "fm-mtime.md",
-                "hash",
-                mtime,
-                &["original".to_string()],
-                "fmmt1",
-                None,
-                None,
-            )
+            .insert_file("fm-mtime.md", "hash", mtime, "fmmt1", None, None)
             .unwrap();
 
         // Step 1: edit_frontmatter modifies the file
@@ -2722,5 +2712,165 @@ mod tests {
             "append after edit_frontmatter should not fail with mtime conflict, got: {:?}",
             result.err()
         );
+    }
+
+    // ── The tag store (#60) ──────────────────────────────────────
+
+    fn stored_tags(store: &Store, path: &str) -> Vec<String> {
+        let file = store.get_file(path).unwrap().unwrap();
+        store.file_tags(file.id).unwrap()
+    }
+
+    fn test_chunk_opts() -> ChunkOptions {
+        ChunkOptions {
+            min_chars: 0,
+            promote_bold: false,
+        }
+    }
+
+    #[test]
+    fn a_created_note_writes_its_tag_rows() {
+        use crate::llm::MockLlm;
+
+        let (_tmp, store, root) = setup_vault();
+        let mut embedder = MockLlm::new(256);
+        let result = create_note(
+            CreateNoteInput {
+                content: "# Swamp\n\nA #type/undead lives here.\n".to_string(),
+                filename: Some("swamp.md".to_string()),
+                type_hint: None,
+                tags: vec!["habitat/swamp".to_string()],
+                folder: None,
+                created_by: "test".to_string(),
+                auto_link: Some(false),
+            },
+            &store,
+            &mut embedder,
+            EmbedComposition::default(),
+            test_chunk_opts(),
+            &root,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            stored_tags(&store, &result.path),
+            vec!["habitat/swamp", "type/undead"],
+            "the property and the body are peers"
+        );
+    }
+
+    #[test]
+    fn editing_frontmatter_moves_the_tag_rows_with_it() {
+        let (_tmp, store, root) = setup_vault();
+        let content = "---\ntags:\n  - habitat/swamp\n---\n\nBody.\n";
+        let file_path = root.join("n.md");
+        std::fs::write(&file_path, content).unwrap();
+        let mtime = file_mtime(&file_path).unwrap();
+        let id = store
+            .insert_file("n.md", "hash", mtime, "fmtag1", None, None)
+            .unwrap();
+        store
+            .reconcile_file_tags(id, &crate::tags::extract(content))
+            .unwrap();
+
+        edit_frontmatter(
+            &store,
+            &root,
+            &EditFrontmatterInput {
+                file: "n.md".to_string(),
+                operations: vec![FrontmatterOp::AddTag("type/undead".to_string())],
+                modified_by: "test".to_string(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            stored_tags(&store, "n.md"),
+            vec!["habitat/swamp", "type/undead"]
+        );
+    }
+
+    #[test]
+    fn archiving_a_note_takes_the_tags_that_go_unused_with_it() {
+        let (_tmp, store, root) = setup_vault();
+        let content = "---\ntags:\n  - solo\n---\n\nBody.\n";
+        let file_path = root.join("n.md");
+        std::fs::write(&file_path, content).unwrap();
+        let mtime = file_mtime(&file_path).unwrap();
+        let id = store
+            .insert_file("n.md", "hash", mtime, "arctag", None, None)
+            .unwrap();
+        store
+            .reconcile_file_tags(id, &crate::tags::extract(content))
+            .unwrap();
+
+        archive_note("n.md", &store, &root, None).unwrap();
+
+        let remaining: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM tags", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, 0, "the note was the tag's only carrier");
+    }
+
+    /// A note whose property holds one tag and whose body holds another.
+    ///
+    /// The junction holds both, because the property and the body are peers
+    /// (#60). A write to the user's frontmatter must carry the property alone.
+    fn note_with_a_body_hashtag(store: &Store, root: &std::path::Path) {
+        let content = "---\ntags:\n  - work\n---\n\nBlocked on #todo today.\n";
+        let file_path = root.join("n.md");
+        std::fs::write(&file_path, content).unwrap();
+        let mtime = file_mtime(&file_path).unwrap();
+        let id = store
+            .insert_file("n.md", "hash", mtime, "bodytg", None, None)
+            .unwrap();
+        store
+            .reconcile_file_tags(id, &crate::tags::extract(content))
+            .unwrap();
+        assert_eq!(
+            stored_tags(store, "n.md"),
+            vec!["todo", "work"],
+            "the junction holds the property tag and the body tag"
+        );
+    }
+
+    #[test]
+    fn update_metadata_keeps_a_body_hashtag_out_of_the_property() {
+        let (_tmp, store, root) = setup_vault();
+        note_with_a_body_hashtag(&store, &root);
+
+        update_metadata(
+            UpdateMetadataInput {
+                file: "n.md".to_string(),
+                tags: None,
+                aliases: None,
+                modified_by: "test".to_string(),
+            },
+            &store,
+            &root,
+        )
+        .unwrap();
+
+        let written = std::fs::read_to_string(root.join("n.md")).unwrap();
+        let (fm, _) = split_frontmatter(&written);
+        let (_, property_tags, _) = parse_frontmatter_fields(&fm);
+        assert_eq!(property_tags, vec!["work"]);
+        assert!(written.contains("#todo"), "the body tag stays in the body");
+    }
+
+    #[test]
+    fn archiving_keeps_a_body_hashtag_out_of_the_property() {
+        let (_tmp, store, root) = setup_vault();
+        note_with_a_body_hashtag(&store, &root);
+
+        archive_note("n.md", &store, &root, None).unwrap();
+
+        let written = std::fs::read_to_string(root.join("04-Archive/n.md")).unwrap();
+        let (fm, _) = split_frontmatter(&written);
+        let (_, property_tags, _) = parse_frontmatter_fields(&fm);
+        assert_eq!(property_tags, vec!["work", "archived"]);
+        assert!(written.contains("#todo"), "the body tag stays in the body");
     }
 }
