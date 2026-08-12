@@ -63,7 +63,10 @@ engraph context project "Project Name"
 engraph context vault-map                 # Collection structure overview
 engraph context read "path/to/note.md"    # Full content + metadata
 engraph context list --tags architecture  # Filter by tags, folder, created_by, etc.
+engraph context tags --under type/        # The tag vocabulary, whole or under one term
 ```
+
+> One capability, three surfaces: `context tags` is the MCP `tags` tool and `GET /api/tags`; `context list` is the MCP `list` tool and `GET /api/list`. The tag operators are `--all`/`--any`/`--none` on the CLI, spelled `all`/`any`/`none` on both other surfaces, with `tags` an alias of `all`.
 
 > Health diagnostics (orphans, broken links, stale notes, tag hygiene) are exposed through the MCP `health` tool and the HTTP `GET /api/health` endpoint — see `references/http-rest-api.md`.
 

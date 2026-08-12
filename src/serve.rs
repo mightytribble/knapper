@@ -62,7 +62,7 @@ pub struct ListParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct TagListParams {
+pub struct TagsParams {
     /// Limit to one tag and its descendants, as `type/` or `type/*`. Omit
     /// for the whole vocabulary.
     pub under: Option<String>,
@@ -505,13 +505,10 @@ impl EngraphServer {
     }
 
     #[tool(
-        name = "tag_list",
+        name = "tags",
         description = "The vault's tag vocabulary: every tag, or the subtree under one term, each with the notes carrying it. Call before filtering with list."
     )]
-    async fn tag_list(
-        &self,
-        params: Parameters<TagListParams>,
-    ) -> Result<CallToolResult, McpError> {
+    async fn tags(&self, params: Parameters<TagsParams>) -> Result<CallToolResult, McpError> {
         let store = self.store.lock().await;
         let prefix = params.0.under.as_deref().and_then(crate::tags::parse_term);
         let rows = store.tags_under(prefix.as_ref()).map_err(|e| mcp_err(&e))?;
@@ -1046,7 +1043,7 @@ impl rmcp::handler::server::ServerHandler for EngraphServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "engraph: vault intelligence for Obsidian. \
-                 Read: vault_map to orient, tag_list for the tag vocabulary, search to find, read/read_section for content, who/project for context bundles, health for vault diagnostics. \
+                 Read: vault_map to orient, tags for the tag vocabulary, search to find, read/read_section for content, who/project for context bundles, health for vault diagnostics. \
                  Write: create for new notes, append to add content, edit to modify a section, rewrite to replace body, \
                  edit_frontmatter for tags/properties, update_metadata for bulk tag/alias replacement. \
                  Lifecycle: move_note to relocate, archive to soft-delete, unarchive to restore, delete for permanent removal. \

@@ -265,10 +265,24 @@ struct ListQuery {
     folder: Option<String>,
     /// One comma-separated string, per the OpenAPI description: `serde_urlencoded`
     /// has no sequence support, so a repeated `tags=` key is never read here.
+    /// The same encoding carries `all`, `any` and `none` (#61); `tags` is the
+    /// alias of `all` that the CLI and MCP also take.
     #[serde(default, deserialize_with = "deserialize_comma_separated")]
     tags: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_comma_separated")]
+    all: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_comma_separated")]
+    any: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_comma_separated")]
+    none: Vec<String>,
     limit: Option<usize>,
     created_by: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TagsQuery {
+    /// One tag term. Omit for the whole vocabulary.
+    under: Option<String>,
 }
 
 /// `?tags=a,b` split on commas. An absent parameter stays empty; the split
@@ -410,6 +424,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/api/read/{*file}", get(handle_read))
         .route("/api/read-section", get(handle_read_section))
         .route("/api/list", get(handle_list))
+        .route("/api/tags", get(handle_tags))
         .route("/api/vault-map", get(handle_vault_map))
         .route("/api/who/{name}", get(handle_who))
         .route("/api/project/{name}", get(handle_project))
@@ -556,7 +571,8 @@ async fn handle_list(
         profile: state.profile.as_ref().as_ref(),
     };
     let limit = params.limit.unwrap_or(20);
-    let filter = crate::tags::TagFilter::parse(&params.tags, &[], &[])
+    let all_terms = crate::tags::merge_all_alias(params.tags, params.all);
+    let filter = crate::tags::TagFilter::parse(&all_terms, &params.any, &params.none)
         .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
     let items = context::context_list(
         &ctx,
@@ -576,6 +592,22 @@ async fn handle_list(
         }
     })?;
     Ok(Json(serde_json::json!(items)))
+}
+
+/// The vault's tag vocabulary, whole or under one term — the call to make
+/// before filtering with `/api/list` (#61).
+async fn handle_tags(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(params): Query<TagsQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    authorize(&headers, &state, false)?;
+    let store = state.store.lock().await;
+    let prefix = params.under.as_deref().and_then(crate::tags::parse_term);
+    let rows = store
+        .tags_under(prefix.as_ref())
+        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    Ok(Json(serde_json::json!(rows)))
 }
 
 async fn handle_vault_map(
@@ -1419,6 +1451,149 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// Three notes over four tags, written through the calls the indexer
+    /// makes, so the tag endpoints answer against rows a vault could hold.
+    async fn seed_tags(state: &ApiState) {
+        let tag = |p: &str| crate::tags::Tag {
+            path: p.to_string(),
+            display: p.to_string(),
+        };
+        let store = state.store.lock().await;
+        let wight = store
+            .insert_file("wight.md", "h1", 100, "aaa111", None, None)
+            .unwrap();
+        let wolf = store
+            .insert_file("wolf.md", "h2", 200, "bbb222", None, None)
+            .unwrap();
+        let draft = store
+            .insert_file("draft.md", "h3", 300, "ccc333", None, None)
+            .unwrap();
+        store
+            .reconcile_file_tags(wight, &[tag("type/undead"), tag("habitat/swamp")])
+            .unwrap();
+        store
+            .reconcile_file_tags(wolf, &[tag("type/beast")])
+            .unwrap();
+        store
+            .reconcile_file_tags(draft, &[tag("type/beast"), tag("status/draft")])
+            .unwrap();
+    }
+
+    /// The response body as JSON, for the tests that read rows rather than
+    /// a status code.
+    async fn json_body(response: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn get(state: ApiState, uri: &str) -> axum::response::Response {
+        build_router(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(uri)
+                    .header("authorization", "Bearer eg_readkey")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// The paths of an `/api/list` response, in the order it returned them.
+    fn paths(items: &serde_json::Value) -> Vec<String> {
+        items
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["path"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_tags_unauthorized() {
+        let state = test_api_state();
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/tags")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_tags_returns_the_whole_vocabulary() {
+        let state = test_api_state();
+        seed_tags(&state).await;
+        let response = get(state, "/api/tags").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let rows = json_body(response).await;
+        let listed: Vec<&str> = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            listed,
+            vec!["habitat/swamp", "status/draft", "type/beast", "type/undead"]
+        );
+        assert_eq!(rows[2]["note_count"], 2);
+    }
+
+    #[tokio::test]
+    async fn test_tags_under_reads_a_bare_term_as_its_subtree() {
+        let state = test_api_state();
+        seed_tags(&state).await;
+        let slash = json_body(get(state.clone(), "/api/tags?under=type/").await).await;
+        let bare = json_body(get(state, "/api/tags?under=type").await).await;
+        let listed: Vec<&str> = slash
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(listed, vec!["type/beast", "type/undead"]);
+        assert_eq!(bare, slash);
+    }
+
+    #[tokio::test]
+    async fn test_list_any_matches_either_term() {
+        let state = test_api_state();
+        seed_tags(&state).await;
+        let response = get(state, "/api/list?any=type/undead,status/draft").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut listed = paths(&json_body(response).await);
+        listed.sort();
+        assert_eq!(listed, vec!["draft.md", "wight.md"]);
+    }
+
+    #[tokio::test]
+    async fn test_list_none_excludes_its_terms() {
+        let state = test_api_state();
+        seed_tags(&state).await;
+        let response = get(state, "/api/list?all=type/&none=status/draft").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut listed = paths(&json_body(response).await);
+        listed.sort();
+        assert_eq!(listed, vec!["wight.md", "wolf.md"]);
+    }
+
+    #[tokio::test]
+    async fn test_list_merges_tags_into_all() {
+        let state = test_api_state();
+        seed_tags(&state).await;
+        let response = get(state, "/api/list?tags=type/beast&all=status/draft").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(paths(&json_body(response).await), vec!["draft.md"]);
     }
 
     #[tokio::test]
