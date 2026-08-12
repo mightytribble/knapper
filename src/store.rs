@@ -1814,12 +1814,16 @@ impl Store {
 
     /// The vault's vocabulary, whole or under one term (#60).
     ///
+    /// A prefix names a subtree whether or not it carries the `/` marker,
+    /// because `--under` has only the subtree reading to give.
+    ///
     /// A tag with no notes does not exist: `prune_unused_tags` deletes the row
     /// the last note released.
     pub fn tags_under(&self, prefix: Option<&crate::tags::TagTerm>) -> Result<Vec<TagCount>> {
         let (clause, args) = match prefix {
             Some(term) => {
-                let (pred, args) = crate::tags::predicate(term);
+                let subtree = crate::tags::TagTerm::Subtree(term.path().to_string());
+                let (pred, args) = crate::tags::predicate(&subtree);
                 (format!("WHERE {pred}"), args)
             }
             None => (String::new(), Vec::new()),
@@ -5725,6 +5729,21 @@ mod tests {
                 ("type/undead".to_string(), 1)
             ]
         );
+    }
+
+    #[test]
+    fn a_bare_exact_prefix_answers_the_same_subtree() {
+        let store = operator_fixture();
+        let bare = store
+            .tags_under(Some(&crate::tags::parse_term("type").unwrap()))
+            .unwrap();
+        let slash = store
+            .tags_under(Some(&crate::tags::parse_term("type/").unwrap()))
+            .unwrap();
+        let paths = |rows: Vec<TagCount>| -> Vec<(String, usize)> {
+            rows.into_iter().map(|t| (t.path, t.note_count)).collect()
+        };
+        assert_eq!(paths(bare), paths(slash));
     }
 
     #[test]
