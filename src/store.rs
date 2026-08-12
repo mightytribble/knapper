@@ -1704,6 +1704,10 @@ impl Store {
         created_by: Option<&str>,
         limit: usize,
     ) -> Result<Vec<FileRecord>> {
+        // `none` is not checked: excluding a tag no note carries is a no-op.
+        let checked: Vec<&crate::tags::TagTerm> = tags.all.iter().chain(tags.any.iter()).collect();
+        crate::tags::check_terms(&self.conn, &checked)?;
+
         let mut sql = format!("SELECT {FILE_COLUMNS} FROM files f WHERE 1=1");
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         if let Some(folder) = folder {
@@ -5509,10 +5513,50 @@ mod tests {
     }
 
     #[test]
-    fn an_exact_term_matches_the_tag_alone_and_a_subtree_term_matches_below_it() {
+    fn an_unknown_all_term_errors_and_names_the_nearest_tag() {
         let store = operator_fixture();
+        let filter = crate::tags::TagFilter::parse(&["type/undeed".to_string()], &[], &[]);
+        let err = store.list_files(None, &filter, None, 20).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "no such tag 'type/undeed'; nearest: 'type/undead'"
+        );
+    }
+
+    #[test]
+    fn an_unknown_term_with_no_near_neighbour_errors_without_a_suggestion() {
+        let store = operator_fixture();
+        let filter = crate::tags::TagFilter::parse(&[], &["zzzzz".to_string()], &[]);
+        let err = store.list_files(None, &filter, None, 20).unwrap_err();
+        assert_eq!(err.to_string(), "no such tag 'zzzzz'");
+    }
+
+    #[test]
+    fn an_unknown_subtree_term_prints_its_marker() {
+        let store = operator_fixture();
+        let filter = crate::tags::TagFilter::parse(&["nowhere/".to_string()], &[], &[]);
+        let err = store.list_files(None, &filter, None, 20).unwrap_err();
+        assert_eq!(err.to_string(), "no such tag 'nowhere/'");
+    }
+
+    #[test]
+    fn an_unknown_none_term_is_not_an_error() {
+        let store = operator_fixture();
+        let filter =
+            crate::tags::TagFilter::parse(&["type/".to_string()], &[], &["nowhere".to_string()]);
+        assert_eq!(
+            listed_paths(&store, &filter),
+            vec!["draft.md", "wight.md", "wolf.md"]
+        );
+    }
+
+    #[test]
+    fn an_exact_term_errors_on_a_bare_axis_and_a_subtree_term_matches_below_it() {
+        let store = operator_fixture();
+        // The fixture holds `type/undead` and `type/beast`, never bare `type`.
         let exact = crate::tags::TagFilter::parse(&["type".to_string()], &[], &[]);
-        assert!(listed_paths(&store, &exact).is_empty());
+        let err = store.list_files(None, &exact, None, 20).unwrap_err();
+        assert_eq!(err.to_string(), "no such tag 'type'");
 
         let subtree = crate::tags::TagFilter::parse(&["type/".to_string()], &[], &[]);
         assert_eq!(

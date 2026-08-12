@@ -355,6 +355,35 @@ pub fn predicate(term: &TagTerm) -> (String, Vec<String>) {
     }
 }
 
+/// Reject a term the vault holds no tag for, naming the nearest tag it holds.
+///
+/// A silent empty result leaves a caller unable to tell a typo from an empty
+/// set, and an agent retries the call unchanged. The error carries the repair.
+pub fn check_terms(conn: &Connection, terms: &[&TagTerm]) -> Result<()> {
+    for term in terms {
+        let (pred, args) = predicate(term);
+        let found: bool = conn.query_row(
+            &format!("SELECT EXISTS (SELECT 1 FROM tags t WHERE {pred})"),
+            rusqlite::params_from_iter(args.iter()),
+            |row| row.get(0),
+        )?;
+        if found {
+            continue;
+        }
+        let nearest = match resolve_tag(conn, term.path())? {
+            TagResolution::Exact(display) => Some(display),
+            TagResolution::Fuzzy { resolved, .. } => Some(resolved),
+            TagResolution::Extension(existing) => Some(existing),
+            TagResolution::New(_) => None,
+        };
+        match nearest {
+            Some(near) => anyhow::bail!("no such tag '{term}'; nearest: '{near}'"),
+            None => anyhow::bail!("no such tag '{term}'"),
+        }
+    }
+    Ok(())
+}
+
 /// The tag side of a note query: three fields that combine with AND.
 ///
 /// A note is returned when it carries every `all` term, at least one `any`
