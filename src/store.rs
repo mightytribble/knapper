@@ -246,6 +246,17 @@ pub struct IdentityFact {
     pub updated_at: String,
 }
 
+/// A row of the vault's tag vocabulary (#60).
+///
+/// `note_count` is the notes carrying this exact tag. The listing is flat, so a
+/// caller wanting a subtree total adds the rows it asked for.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TagCount {
+    pub path: String,
+    pub display: String,
+    pub note_count: usize,
+}
+
 /// Summary statistics for the store.
 #[derive(Debug)]
 pub struct StoreStats {
@@ -1801,6 +1812,38 @@ impl Store {
         Ok(results)
     }
 
+    /// The vault's vocabulary, whole or under one term (#60).
+    ///
+    /// A tag with no notes does not exist: `prune_unused_tags` deletes the row
+    /// the last note released.
+    pub fn tags_under(&self, prefix: Option<&crate::tags::TagTerm>) -> Result<Vec<TagCount>> {
+        let (clause, args) = match prefix {
+            Some(term) => {
+                let (pred, args) = crate::tags::predicate(term);
+                (format!("WHERE {pred}"), args)
+            }
+            None => (String::new(), Vec::new()),
+        };
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT t.path, t.display, COUNT(ft.file_id) AS notes
+               FROM tags t JOIN file_tags ft ON ft.tag_id = t.id
+               {clause}
+              GROUP BY t.id ORDER BY t.path"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |row| {
+            Ok(TagCount {
+                path: row.get(0)?,
+                display: row.get(1)?,
+                note_count: row.get::<_, i64>(2)? as usize,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     /// Most recently indexed files.
     pub fn recent_files(&self, limit: usize) -> Result<Vec<FileRecord>> {
         let mut stmt = self.conn.prepare(&format!(
@@ -2497,9 +2540,10 @@ impl Store {
     /// The store folds what it is given: `tags.path` is the identity and
     /// Obsidian matches a tag without regard to case, so the path is written
     /// folded here rather than trusted from the caller. `Type/Undead` and
-    /// `type/undead` are one row whichever spelling arrives, and every query
-    /// that folds its own argument — `files_with_tag`, `files_under_tag`, the
-    /// `list_files` tag filter — meets a folded column.
+    /// `type/undead` are one row whichever spelling arrives, and every reader
+    /// of a `tags::TagTerm` — the `list_files` tag filter, `tags_under` —
+    /// meets a folded column, because `parse_term` folds before the term
+    /// exists.
     pub fn reconcile_file_tags(&self, file_id: i64, tags: &[crate::tags::Tag]) -> Result<()> {
         let released = self.file_tag_ids(file_id)?;
         self.conn
@@ -2549,56 +2593,6 @@ impl Store {
               WHERE ft.file_id = ?1 ORDER BY t.path",
         )?;
         let rows = stmt.query_map(params![file_id], |row| row.get::<_, String>(0))?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
-        }
-        Ok(out)
-    }
-
-    /// The notes tagged exactly `path`.
-    ///
-    /// The joins are aliased `ftag` and `tg`, because `FILE_COLUMNS` carries a
-    /// subquery of its own that uses `ft` and `t`.
-    pub fn files_with_tag(&self, path: &str) -> Result<Vec<FileRecord>> {
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT {FILE_COLUMNS} FROM files f
-               JOIN file_tags ftag ON ftag.file_id = f.id
-               JOIN tags tg ON tg.id = ftag.tag_id
-              WHERE tg.path = ?1 ORDER BY f.path"
-        ))?;
-        let rows = stmt.query_map(params![path.to_lowercase()], file_from_row)?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
-        }
-        Ok(out)
-    }
-
-    /// The notes Obsidian's `tag:<path>` returns: the tag and every descendant.
-    ///
-    /// Left-anchored, so the unique index on `path` serves it. The descendant
-    /// arm is a range, not a `LIKE` pattern: `_` is a legal tag-path character
-    /// and is also `LIKE`'s single-character wildcard, and an `ESCAPE` clause
-    /// would turn off SQLite's `LIKE` optimisation. `?3` is `?2` with the
-    /// slash's next ASCII character in place of the slash, so the range holds
-    /// every path that starts with `<path>/` and nothing else. `DISTINCT`
-    /// because one note may carry several descendants of one tag.
-    ///
-    /// The joins are aliased `ftag` and `tg`, because `FILE_COLUMNS` carries a
-    /// subquery of its own that uses `ft` and `t`.
-    pub fn files_under_tag(&self, path: &str) -> Result<Vec<FileRecord>> {
-        let folded = path.to_lowercase();
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT DISTINCT {FILE_COLUMNS} FROM files f
-               JOIN file_tags ftag ON ftag.file_id = f.id
-               JOIN tags tg ON tg.id = ftag.tag_id
-              WHERE tg.path = ?1 OR (tg.path >= ?2 AND tg.path < ?3) ORDER BY f.path"
-        ))?;
-        let rows = stmt.query_map(
-            params![folded, format!("{folded}/"), format!("{folded}0")],
-            file_from_row,
-        )?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
@@ -5350,9 +5344,20 @@ mod tests {
         // One row, so the two spellings are one tag and one axis value.
         assert_eq!(tag_row_count(&store), 1);
         assert_eq!(store.tag_axes().unwrap(), vec![("type".to_string(), 2)]);
-        // And the folded query side meets a folded column.
-        assert_eq!(store.files_with_tag("Type/Undead").unwrap().len(), 2);
-        assert_eq!(store.files_under_tag("type").unwrap().len(), 2);
+        // And the folded query side meets a folded column: the subtree arm,
+        assert_eq!(
+            store
+                .list_files(
+                    None,
+                    &crate::tags::TagFilter::parse(&["type/".to_string()], &[], &[]),
+                    None,
+                    10,
+                )
+                .unwrap()
+                .len(),
+            2
+        );
+        // and the exact arm.
         assert_eq!(
             store
                 .list_files(
@@ -5673,6 +5678,78 @@ mod tests {
         assert_eq!(top[0], ("Shared".to_string(), 2));
     }
 
+    #[test]
+    fn the_whole_vocabulary_comes_back_in_path_order() {
+        let store = operator_fixture();
+        let paths: Vec<String> = store
+            .tags_under(None)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.path)
+            .collect();
+        assert_eq!(
+            paths,
+            vec!["habitat/swamp", "status/draft", "type/beast", "type/undead"]
+        );
+    }
+
+    #[test]
+    fn a_subtree_prefix_returns_the_subtree_and_counts_each_exact_tag() {
+        let store = operator_fixture();
+        let rows = store
+            .tags_under(Some(&crate::tags::parse_term("type/").unwrap()))
+            .unwrap();
+        let counted: Vec<(String, usize)> =
+            rows.into_iter().map(|t| (t.path, t.note_count)).collect();
+        // `type/beast` is on two notes; the count is per exact tag, not a
+        // subtree total.
+        assert_eq!(
+            counted,
+            vec![
+                ("type/beast".to_string(), 2),
+                ("type/undead".to_string(), 1)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_prefix_that_names_a_tag_returns_that_tag_too() {
+        let store = Store::open_memory().unwrap();
+        let one = store
+            .insert_file("one.md", "h", 1, "d000001", None, None)
+            .unwrap();
+        store
+            .reconcile_file_tags(
+                one,
+                &[
+                    crate::tags::Tag {
+                        path: "type".into(),
+                        display: "Type".into(),
+                    },
+                    crate::tags::Tag {
+                        path: "type/undead".into(),
+                        display: "Type/Undead".into(),
+                    },
+                ],
+            )
+            .unwrap();
+        let rows = store
+            .tags_under(Some(&crate::tags::parse_term("type/").unwrap()))
+            .unwrap();
+        let displays: Vec<String> = rows.into_iter().map(|t| t.display).collect();
+        // The vault's own spelling comes back, not the folded path.
+        assert_eq!(displays, vec!["Type", "Type/Undead"]);
+    }
+
+    #[test]
+    fn a_prefix_matching_nothing_returns_no_rows() {
+        let store = operator_fixture();
+        let rows = store
+            .tags_under(Some(&crate::tags::parse_term("nowhere/").unwrap()))
+            .unwrap();
+        assert!(rows.is_empty());
+    }
+
     fn axis_fixture() -> Store {
         let store = Store::open_memory().unwrap();
         let tag = |p: &str| crate::tags::Tag {
@@ -5706,23 +5783,15 @@ mod tests {
     fn the_descendant_query_returns_what_obsidians_tag_search_returns() {
         let store = axis_fixture();
         // `tag:type` matches `type` and every descendant of it.
-        let mut paths: Vec<String> = store
-            .files_under_tag("type")
-            .unwrap()
-            .into_iter()
-            .map(|f| f.path)
-            .collect();
-        paths.sort();
-        assert_eq!(paths, ["beast.md", "plain.md", "undead.md"]);
+        let subtree = crate::tags::TagFilter::parse(&["type/".to_string()], &[], &[]);
+        assert_eq!(
+            listed_paths(&store, &subtree),
+            vec!["beast.md", "plain.md", "undead.md"]
+        );
 
         // The exact query is the tag a note carries and no descendant.
-        let exact: Vec<String> = store
-            .files_with_tag("type")
-            .unwrap()
-            .into_iter()
-            .map(|f| f.path)
-            .collect();
-        assert_eq!(exact, ["plain.md"]);
+        let exact = crate::tags::TagFilter::parse(&["type".to_string()], &[], &[]);
+        assert_eq!(listed_paths(&store, &exact), vec!["plain.md"]);
     }
 
     #[test]
@@ -5753,23 +5822,12 @@ mod tests {
             .reconcile_file_tags(exact_note, &[tag("type_a")])
             .unwrap();
 
-        let mut paths: Vec<String> = store
-            .files_under_tag("type_a")
-            .unwrap()
-            .into_iter()
-            .map(|f| f.path)
-            .collect();
-        paths.sort();
-        assert_eq!(paths, ["exact.md", "one.md"]);
+        let subtree = crate::tags::TagFilter::parse(&["type_a/".to_string()], &[], &[]);
+        assert_eq!(listed_paths(&store, &subtree), vec!["exact.md", "one.md"]);
 
         // The exact arm still answers for the tag itself.
-        let exact: Vec<String> = store
-            .files_with_tag("type_a")
-            .unwrap()
-            .into_iter()
-            .map(|f| f.path)
-            .collect();
-        assert_eq!(exact, ["exact.md"]);
+        let exact = crate::tags::TagFilter::parse(&["type_a".to_string()], &[], &[]);
+        assert_eq!(listed_paths(&store, &exact), vec!["exact.md"]);
     }
 
     #[test]
