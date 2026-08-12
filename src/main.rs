@@ -245,10 +245,12 @@ enum ContextAction {
         /// `/` or `/*` matches the tag and its descendants.
         #[arg(long, value_delimiter = ',')]
         all: Vec<String>,
-        /// Filter to notes carrying at least one term (comma-separated).
+        /// Filter to notes carrying at least one term (comma-separated). An
+        /// unknown term is an error naming the nearest tag the vault holds.
         #[arg(long, value_delimiter = ',')]
         any: Vec<String>,
         /// Filter out notes carrying any of these terms (comma-separated).
+        /// An unknown term here is ignored.
         #[arg(long, value_delimiter = ',')]
         none: Vec<String>,
         /// Filter to notes created by a specific agent.
