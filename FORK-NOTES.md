@@ -537,11 +537,12 @@ has never executed on this box.
 - **A term is a tag path, and a trailing `/` — or its synonym `/*` — asks for its subtree.**
   `tags::parse_term` drops one leading `#` and folds case; `tags::predicate` compiles the subtree
   form to a range over `tags.path` rather than a `LIKE` pattern, so the unique index serves it too.
-  `Store::list_files` takes a `TagFilter { all, any, none }` of terms in place of the old exact-match
-  list — every `all` term, at least one `any` term, none of the `none` terms, ANDed together and with
-  `folder`/`created_by` — as `--all/--any/--none` on the CLI (`--tags` the older spelling of `--all`)
-  and `all`/`any`/`none` on MCP's `list` tool (`tags` the same alias). `Store::tags_under` answers the
-  whole vocabulary or one subtree as `TagCount { path, display, note_count }`, the count always the
+  `Store::list_files` takes a `TagFilter { all, any, none }` of terms — every `all` term, at least one
+  `any` term, none of the `none` terms, ANDed together and with `folder`/`created_by` — as
+  `--all/--any/--none` on the CLI, each comma-separated (`--tags` the older spelling of `--all`), as
+  `all`/`any`/`none` on MCP's `list` tool (`tags` the same alias), and as the `tags` query parameter on
+  `/api/list`, read through the same term grammar. `Store::tags_under` answers the whole vocabulary or
+  one subtree, ordered by path, as `TagCount { path, display, note_count }`, the count always the
   exact tag's notes and never a subtree total, through `context tags [--under <term>]` and MCP's
   `tag_list`. An `all` or `any` term matching no tag in the vault is an error naming the nearest one,
   from `resolve_tag` — except that an over-deep term answers with its longest existing ancestor,
