@@ -86,7 +86,11 @@ fn build_search() -> serde_json::Value {
                     "required": ["query"],
                     "properties": {
                         "query": { "type": "string", "description": "Search query text" },
-                        "top_n": { "type": "integer", "description": "Number of results (default 10)" }
+                        "top_n": { "type": "integer", "description": "Number of results (default 10)" },
+                        "tags": { "type": "array", "items": { "type": "string" }, "description": "Scope to notes carrying every tag term; a trailing / matches the tag and its descendants. Alias of all" },
+                        "all": { "type": "array", "items": { "type": "string" }, "description": "Scope to notes carrying every one of these tag terms" },
+                        "any": { "type": "array", "items": { "type": "string" }, "description": "Scope to notes carrying at least one of these tag terms" },
+                        "none": { "type": "array", "items": { "type": "string" }, "description": "Scope out notes carrying any of these tag terms" }
                     }
                 }}}
             },

@@ -252,6 +252,17 @@ pub fn generate_api_key() -> String {
 struct SearchBody {
     query: String,
     top_n: Option<usize>,
+    /// The tag scope (#60). A JSON body reads an array, unlike `/api/list`,
+    /// whose query string reads one comma-separated value because
+    /// `serde_urlencoded` has no sequence support.
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    all: Vec<String>,
+    #[serde(default)]
+    any: Vec<String>,
+    #[serde(default)]
+    none: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -502,6 +513,9 @@ async fn handle_search(
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, false)?;
     let top_n = body.top_n.unwrap_or(10);
+    let all_terms = crate::tags::merge_all_alias(body.tags, body.all);
+    let scope = crate::tags::TagFilter::parse(&all_terms, &body.any, &body.none)
+        .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
     let store = state.store.lock().await;
     let mut embedder = state.embedder.lock().await;
 
@@ -522,11 +536,20 @@ async fn handle_search(
         ranking: state.ranking,
         lane_weights: state.lane_weights,
         fts: state.fts,
-        scope: crate::tags::TagFilter::default(),
+        scope,
     };
 
     let output = search::search_with_intelligence(&body.query, top_n, &mut *embedder, &mut config)
-        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+        .map_err(|e| {
+            // An unknown tag is a caller's typo, not a server fault. The
+            // message text is the cheapest honest signal check_terms gives a
+            // caller this far from the error's construction (#60).
+            if e.to_string().starts_with("no such tag") {
+                ApiError::bad_request(&format!("{e:#}"))
+            } else {
+                ApiError::internal(&format!("{e:#}"))
+            }
+        })?;
     Ok(Json(serde_json::json!(output.results)))
 }
 
@@ -1435,6 +1458,27 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_search_scope_naming_no_tag_is_a_bad_request() {
+        // #60. The caller's own text named nothing, so this is a 400 and not
+        // the 500 every error on this route used to answer.
+        let state = test_api_state();
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/search")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer eg_readkey")
+                    .body(Body::from(r#"{"query":"warding","all":["type/undead"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

@@ -31,6 +31,18 @@ pub struct SearchParams {
     pub query: String,
     /// Number of results (default 10).
     pub top_n: Option<usize>,
+    /// Scope the search to notes with all listed tags. Alias of `all`.
+    pub tags: Option<Vec<String>>,
+    /// Scope to notes carrying every term. A term is a tag path; a trailing
+    /// `/` or `/*` matches the tag and its descendants. An unknown term is an
+    /// error naming the nearest tag the vault holds.
+    pub all: Option<Vec<String>>,
+    /// Scope to notes carrying at least one of these terms. An unknown term is
+    /// an error naming the nearest tag the vault holds.
+    pub any: Option<Vec<String>>,
+    /// Scope out notes carrying any of these terms. An unknown term here is
+    /// ignored.
+    pub none: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -413,6 +425,16 @@ impl EngraphServer {
     )]
     async fn search(&self, params: Parameters<SearchParams>) -> Result<CallToolResult, McpError> {
         let top_n = params.0.top_n.unwrap_or(10);
+        let all_terms = crate::tags::merge_all_alias(
+            params.0.tags.unwrap_or_default(),
+            params.0.all.unwrap_or_default(),
+        );
+        let scope = crate::tags::TagFilter::parse(
+            &all_terms,
+            &params.0.any.unwrap_or_default(),
+            &params.0.none.unwrap_or_default(),
+        )
+        .map_err(|e| mcp_err(&e))?;
         let store = self.store.lock().await;
         let mut embedder = self.embedder.lock().await;
 
@@ -434,7 +456,7 @@ impl EngraphServer {
             ranking: self.ranking,
             lane_weights: self.lane_weights,
             fts: self.fts,
-            scope: crate::tags::TagFilter::default(),
+            scope,
         };
 
         let output =
