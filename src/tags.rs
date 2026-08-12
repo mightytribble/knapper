@@ -155,23 +155,42 @@ fn property_tags(frontmatter: &str) -> Vec<String> {
 /// Cut a trailing YAML comment from a property value that carries no
 /// brackets: the scalar form and one block-sequence item.
 ///
-/// A `#` is a comment mark when it opens the text or follows whitespace,
-/// **and** the character after it is whitespace or the end of the line. The
-/// character after the `#` is what tells a comment from a value: a YAML
-/// comment mark is followed by a space, and an Obsidian tag is followed by
-/// its first character. So `tags: #undead` keeps its tag, `tags: alpha  #
-/// todo` is cut to `alpha`, and `tags:  # the note's tags` is cut to
-/// nothing — which is what lets the block sequence under such a line be
-/// read. The flow-sequence form does not call this function: it reads only
-/// the text inside its brackets, where every `#` is a value's own hash by
+/// A `#` must follow whitespace or open the text to be a comment mark at
+/// all, which is YAML's own rule. Where it stands then decides the rest:
+///
+/// - **At the start of the value**, the character after the `#` decides. A
+///   space or the end of the line makes it a comment mark; any other
+///   character makes it the hash of the first tag. This position is the
+///   ambiguous one, because a value may open with a hash of its own: only
+///   the character after the mark tells `tags: #undead` from
+///   `tags:  # a note`.
+/// - **Anywhere later**, the `#` is a comment mark, whatever character
+///   comes after it. A tag at that position is already separated from the
+///   value before it, so nothing there is ambiguous, and YAML asks only
+///   that a comment mark have whitespace before it.
+///
+/// So `tags: #undead` keeps its tag, `tags: #undead #vampire` keeps
+/// `#undead`, `tags: alpha #todo` and `tags: alpha  # todo` are both cut to
+/// `alpha`, and `tags:  # the note's tags` is cut to nothing — which is
+/// what lets the block sequence under such a line be read. The
+/// flow-sequence form does not call this function: it reads only the text
+/// inside its brackets, where every `#` is a value's own hash by
 /// construction.
 fn strip_trailing_comment(s: &str) -> &str {
     let mut chars = s.char_indices().peekable();
     let mut prev_is_space = true;
+    // True until the first non-space character, so the leading `#` of a
+    // value is told apart from a `#` that follows one.
+    let mut at_value_start = true;
     while let Some((idx, c)) = chars.next() {
-        let next_is_space = chars.peek().is_none_or(|(_, next)| next.is_whitespace());
-        if c == '#' && prev_is_space && next_is_space {
-            return s[..idx].trim_end();
+        if c == '#' && prev_is_space {
+            let next_is_space = chars.peek().is_none_or(|(_, next)| next.is_whitespace());
+            if !at_value_start || next_is_space {
+                return s[..idx].trim_end();
+            }
+        }
+        if !c.is_whitespace() {
+            at_value_start = false;
         }
         prev_is_space = c.is_whitespace();
     }
@@ -502,6 +521,31 @@ mod tests {
         );
         // The value's own hash is not a comment mark, so the scalar holds.
         assert_eq!(paths("---\ntags: #undead\n---\nbody\n"), ["undead"]);
+    }
+
+    #[test]
+    fn a_comment_after_a_value_needs_no_space_after_its_mark() {
+        // The `#` follows a value, so it is a comment mark whatever comes
+        // after it. YAML and Obsidian both read the value `alpha` here.
+        assert_eq!(paths("---\ntags: alpha #todo\n---\nbody\n"), ["alpha"]);
+    }
+
+    #[test]
+    fn a_scalar_keeps_its_own_hash_and_drops_the_comment_after_it() {
+        // The first `#` opens the value, so it is the tag's hash. The
+        // second follows a value, so it opens a comment.
+        assert_eq!(
+            paths("---\ntags: #undead #vampire\n---\nbody\n"),
+            ["undead"]
+        );
+    }
+
+    #[test]
+    fn a_block_item_keeps_its_value_before_a_comment() {
+        assert_eq!(
+            paths("---\ntags:\n  - alpha #todo\n  - beta\n  - #gamma\n---\nbody\n"),
+            ["alpha", "beta", "gamma"]
+        );
     }
 
     #[test]
