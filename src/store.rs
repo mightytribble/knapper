@@ -5524,6 +5524,21 @@ mod tests {
     }
 
     #[test]
+    fn a_term_that_runs_past_an_existing_tag_names_that_ancestor() {
+        let store = operator_fixture();
+        // Two segments past `type/undead`, which the fixture holds — too far
+        // for the fuzzy tier, which compares one segment against tags that
+        // share a parent, to reach first.
+        let filter =
+            crate::tags::TagFilter::parse(&["type/undead/wight/banshee".to_string()], &[], &[]);
+        let err = store.list_files(None, &filter, None, 20).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "no such tag 'type/undead/wight/banshee'; nearest: 'type/undead'"
+        );
+    }
+
+    #[test]
     fn an_unknown_term_with_no_near_neighbour_errors_without_a_suggestion() {
         let store = operator_fixture();
         let filter = crate::tags::TagFilter::parse(&[], &["zzzzz".to_string()], &[]);

@@ -371,9 +371,13 @@ pub fn check_terms(conn: &Connection, terms: &[&TagTerm]) -> Result<()> {
             continue;
         }
         let nearest = match resolve_tag(conn, term.path())? {
+            // `found` above is already true whenever `resolve_tag` would
+            // return `Exact` for this path, so this arm cannot fire.
             TagResolution::Exact(display) => Some(display),
             TagResolution::Fuzzy { resolved, .. } => Some(resolved),
-            TagResolution::Extension(existing) => Some(existing),
+            // `Extension` echoes the proposed path back, not an existing
+            // one — the term runs past a real tag, so name that ancestor.
+            TagResolution::Extension(_) => longest_existing_ancestor(conn, term.path())?,
             TagResolution::New(_) => None,
         };
         match nearest {
@@ -382,6 +386,26 @@ pub fn check_terms(conn: &Connection, terms: &[&TagTerm]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The longest ancestor of `path` that has a row in `tags`, if any.
+///
+/// Each prefix is tested by equality, never `LIKE`: a tag may hold `_` or
+/// `%`, which `LIKE` reads as wildcards rather than literal characters.
+fn longest_existing_ancestor(conn: &Connection, path: &str) -> Result<Option<String>> {
+    let segments: Vec<&str> = path.split('/').collect();
+    for end in (1..segments.len()).rev() {
+        let prefix = segments[..end].join("/");
+        let display: Option<String> = conn
+            .prepare("SELECT display FROM tags WHERE path = ?1")?
+            .query_map(params![prefix], |row| row.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .next();
+        if display.is_some() {
+            return Ok(display);
+        }
+    }
+    Ok(None)
 }
 
 /// The tag side of a note query: three fields that combine with AND.
