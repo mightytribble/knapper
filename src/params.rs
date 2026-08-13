@@ -118,22 +118,13 @@ pub struct List {
     /// Filter to notes created by one agent.
     #[arg(long)]
     pub created_by: Option<String>,
-    /// Maximum results (default 20). Raising it adds results below the same
-    /// ranking; it does not change what the top of the ranking holds.
-    #[arg(long, default_value = "20")]
-    #[serde(default = "default_limit", deserialize_with = "deserialize_limit")]
-    pub limit: usize,
-}
-
-fn default_limit() -> usize {
-    20
-}
-
-fn deserialize_limit<'de, D>(deserializer: D) -> Result<usize, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    deserialize_number_or_default(deserializer, default_limit())
+    /// Maximum notes to answer. Absent, the listing holds every note the
+    /// scope admits — a caller that wants less names a scope or a limit,
+    /// and one cap on one surface would make this field mean two things
+    /// (#62, #68). `0` answers none, which is what the number says.
+    #[arg(long)]
+    #[serde(default)]
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Args, Deserialize, JsonSchema)]
@@ -737,13 +728,30 @@ mod tests {
         assert_eq!(list.all, vec!["a".to_string(), "b".to_string()]);
     }
 
-    /// A number field takes the same null-must-not-fail rule as the tag
-    /// lists (#60) — `#[serde(default = ...)]` alone only covers a field
-    /// that is missing, not one sent as an explicit `null`.
+    /// An absent limit is no limit: a bare listing answers every note the
+    /// scope admits, so an agent that scoped to a subtree gets that
+    /// subtree (#68).
     #[test]
-    fn limit_reads_null_as_the_default() {
+    fn limit_reads_absent_as_no_limit() {
+        let list: List = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(list.limit, None);
+    }
+
+    /// An explicit JSON `null` — what a JS or Python caller sends for an
+    /// absent optional — reads the same as absent and must not fail
+    /// deserialization (#60, #68).
+    #[test]
+    fn limit_reads_null_as_no_limit() {
         let list: List = serde_json::from_str(r#"{"limit":null}"#).unwrap();
-        assert_eq!(list.limit, 20);
+        assert_eq!(list.limit, None);
+    }
+
+    /// A GET query string carries the number as text; `serde_urlencoded`
+    /// reads it into the same field (#68).
+    #[test]
+    fn limit_reads_a_number_from_a_query_string() {
+        let list: List = serde_urlencoded::from_str("limit=5").unwrap();
+        assert_eq!(list.limit, Some(5));
     }
 
     /// `mode` is an enum, so a spelling outside the four is refused where the

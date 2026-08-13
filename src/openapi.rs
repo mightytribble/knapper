@@ -129,7 +129,7 @@ fn build_list() -> serde_json::Value {
                 { "name": "any", "in": "query", "required": false, "description": "Comma-separated tag terms a note carries at least one of, or directory terms (starting with /, case-sensitive, a trailing / its subtree) it lies under", "schema": { "type": "string" } },
                 { "name": "none", "in": "query", "required": false, "description": "Comma-separated tag terms a note carries none of, or directory terms (starting with /, case-sensitive, a trailing / its subtree) it does not lie under", "schema": { "type": "string" } },
                 { "name": "created_by", "in": "query", "required": false, "description": "Agent filter", "schema": { "type": "string" } },
-                { "name": "limit", "in": "query", "required": false, "description": "Max results (default 20)", "schema": { "type": "integer" } }
+                { "name": "limit", "in": "query", "required": false, "description": "Maximum notes to answer. Absent, every note the scope admits", "schema": { "type": "integer" } }
             ],
             "responses": { "200": { "description": "Array of note summaries" } }
         }

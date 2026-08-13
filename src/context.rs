@@ -324,7 +324,7 @@ pub fn context_list(
     folder: Option<&str>,
     tags: &crate::tags::Scope,
     created_by: Option<&str>,
-    limit: usize,
+    limit: Option<usize>,
 ) -> Result<Vec<NoteListItem>> {
     let files = params.store.list_files(folder, tags, created_by, limit)?;
     let file_ids: Vec<i64> = files.iter().map(|f| f.id).collect();
@@ -496,10 +496,12 @@ pub fn context_project(params: &ContextParams, name: &str) -> Result<ProjectCont
 
     // Files in same folder
     if let Some(folder) = &project_folder {
-        let folder_files =
-            params
-                .store
-                .list_files(Some(folder), &crate::tags::Scope::default(), None, 50)?;
+        let folder_files = params.store.list_files(
+            Some(folder),
+            &crate::tags::Scope::default(),
+            None,
+            Some(50),
+        )?;
         for f in folder_files {
             if Some(f.id) != project_id && child_ids.insert(f.id) {
                 child_records.push(f);
@@ -932,7 +934,14 @@ mod tests {
             vault_path: &root,
             profile: None,
         };
-        let items = context_list(&params, None, &crate::tags::Scope::default(), None, 20).unwrap();
+        let items = context_list(
+            &params,
+            None,
+            &crate::tags::Scope::default(),
+            None,
+            Some(20),
+        )
+        .unwrap();
         assert_eq!(items.len(), 2);
     }
 
@@ -949,7 +958,7 @@ mod tests {
             None,
             &crate::tags::Scope::parse(&["rust".into()], &[], &[]).unwrap(),
             None,
-            20,
+            Some(20),
         )
         .unwrap();
         assert_eq!(items.len(), 1);
