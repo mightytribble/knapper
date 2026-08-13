@@ -489,17 +489,23 @@ async fn handle_list(
     let all_terms = crate::tags::merge_scope_alias(params.scope, params.all);
     let filter = crate::tags::Scope::parse(&all_terms, &params.any, &params.none)
         .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
-    let items = context::context_list(&ctx, &filter, params.created_by.as_deref(), params.limit)
-        .map_err(|e| {
-            // An unknown tag or folder is a caller's typo, not a server fault.
-            // The message text is the cheapest honest signal check_terms gives a
-            // caller this far from the error's construction (#65).
-            if is_scope_typo(&e.to_string()) {
-                ApiError::bad_request(&format!("{e:#}"))
-            } else {
-                ApiError::internal(&format!("{e:#}"))
-            }
-        })?;
+    let items = context::context_list(
+        &ctx,
+        &filter,
+        params.created_by.as_deref(),
+        params.limit,
+        false,
+    )
+    .map_err(|e| {
+        // An unknown tag or folder is a caller's typo, not a server fault.
+        // The message text is the cheapest honest signal check_terms gives a
+        // caller this far from the error's construction (#65).
+        if is_scope_typo(&e.to_string()) {
+            ApiError::bad_request(&format!("{e:#}"))
+        } else {
+            ApiError::internal(&format!("{e:#}"))
+        }
+    })?;
     Ok(Json(serde_json::json!(items)))
 }
 

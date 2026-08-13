@@ -48,6 +48,19 @@ pub struct SectionSpan {
     pub line_end: usize,
 }
 
+/// One heading of a note's outline.
+///
+/// `line` is 1-based, because a caller reads it to open the file at that
+/// heading and every editor counts from one; `markdown::parse_headings`
+/// counts from zero, and one conversion in one place keeps the two
+/// conventions apart (#68).
+#[derive(Debug, Serialize)]
+pub struct Heading {
+    pub level: u8,
+    pub text: String,
+    pub line: usize,
+}
+
 #[derive(Debug, Serialize)]
 pub struct NoteListItem {
     pub path: String,
@@ -55,6 +68,11 @@ pub struct NoteListItem {
     pub tags: Vec<String>,
     pub indexed_at: String,
     pub edge_count: usize,
+    /// The note's ATX headings, when the caller asked for them. Absent
+    /// otherwise, so an undetailed listing serialises as it did before
+    /// this field existed (#68).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headings: Option<Vec<Heading>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -318,14 +336,49 @@ pub fn context_read(
     })
 }
 
+/// A note's ATX headings, read from disk.
+///
+/// The index cannot answer this. A section under `chunk_min_chars` merges
+/// into the chunk before it and keeps no heading row of its own, a heading
+/// whose own body is empty emits no chunk at all, `promote_bold_headings`
+/// puts bold-only lines into `chunks.heading` beside real headings, and an
+/// oversized section splits across rows that repeat their heading. The file
+/// is the only source that holds the outline (#68).
+///
+/// A file the store holds and the disk does not answers an empty outline
+/// and no error: the row is transient, and `writer::verify_index_integrity`
+/// drops it at the start of the next index.
+fn outline(vault_path: &Path, path: &str) -> Vec<Heading> {
+    let Ok(content) = std::fs::read_to_string(vault_path.join(path)) else {
+        return Vec::new();
+    };
+    // The frontmatter is stripped before parsing, because a YAML comment
+    // line reads as an H1 to a parser that sees it. The lines it removed
+    // are added back, so the numbers are the file's own.
+    let (_, body) = crate::markdown::split_frontmatter(&content);
+    let offset = content.lines().count().saturating_sub(body.lines().count());
+    crate::markdown::parse_headings(&body)
+        .into_iter()
+        .map(|h| Heading {
+            level: h.level,
+            text: h.text,
+            line: h.line + offset + 1,
+        })
+        .collect()
+}
+
 /// The notes a scope admits, in path order (#68). The `folder` filter the
 /// store still takes is `context_project`'s alone: a caller's own directory
 /// filter is a scope term, which is a case-sensitive range and not a `LIKE`.
+///
+/// `detailed` costs one file read per listed note, and only then; an
+/// undetailed listing touches no file.
 pub fn context_list(
     params: &ContextParams,
     tags: &crate::tags::Scope,
     created_by: Option<&str>,
     limit: Option<usize>,
+    detailed: bool,
 ) -> Result<Vec<NoteListItem>> {
     let files = params.store.list_files(None, tags, created_by, limit)?;
     let file_ids: Vec<i64> = files.iter().map(|f| f.id).collect();
@@ -336,12 +389,14 @@ pub fn context_list(
     let mut items = Vec::new();
     for f in files {
         let edge_count = edge_counts.get(&f.id).copied().unwrap_or(0);
+        let headings = detailed.then(|| outline(params.vault_path, &f.path));
         items.push(NoteListItem {
             path: f.path,
             docid: f.docid,
             tags: f.tags,
             indexed_at: f.indexed_at,
             edge_count,
+            headings,
         });
     }
     Ok(items)
@@ -538,6 +593,7 @@ pub fn context_project(params: &ContextParams, name: &str) -> Result<ProjectCont
                 tags: f.tags,
                 indexed_at: f.indexed_at,
                 edge_count: ec,
+                headings: None,
             }
         })
         .collect();
@@ -935,7 +991,14 @@ mod tests {
             vault_path: &root,
             profile: None,
         };
-        let items = context_list(&params, &crate::tags::Scope::default(), None, Some(20)).unwrap();
+        let items = context_list(
+            &params,
+            &crate::tags::Scope::default(),
+            None,
+            Some(20),
+            false,
+        )
+        .unwrap();
         assert_eq!(items.len(), 2);
     }
 
@@ -952,6 +1015,7 @@ mod tests {
             &crate::tags::Scope::parse(&["rust".into()], &[], &[]).unwrap(),
             None,
             Some(20),
+            false,
         )
         .unwrap();
         assert_eq!(items.len(), 1);
@@ -987,10 +1051,128 @@ mod tests {
             &crate::tags::Scope::parse(&["type/undead".into(), "/lore/".into()], &[], &[]).unwrap(),
             None,
             None,
+            false,
         )
         .unwrap();
         let paths: Vec<&str> = items.iter().map(|i| i.path.as_str()).collect();
         assert_eq!(paths, vec!["lore/wight.md"]);
+    }
+
+    /// One note on disk and one row in the store, listed with `detailed`.
+    fn outline_of(content: &str) -> Vec<Heading> {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::write(root.join("note.md"), content).unwrap();
+        let store = Store::open_memory().unwrap();
+        store
+            .insert_file("note.md", "h1", 100, "aaa111", None, None)
+            .unwrap();
+        let params = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+        let items =
+            context_list(&params, &crate::tags::Scope::default(), None, None, true).unwrap();
+        items
+            .into_iter()
+            .next()
+            .expect("the one note is listed")
+            .headings
+            .expect("a detailed listing carries an outline")
+    }
+
+    /// The outline is the file's ATX headings in file order, each with its
+    /// level and its 1-based line (#68).
+    #[test]
+    fn an_outline_holds_every_heading_in_file_order() {
+        let headings = outline_of(
+            "# About the Empire\n\n## History\n\n### The founding\n\nText.\n\n## Current Events\n",
+        );
+        let got: Vec<(u8, &str, usize)> = headings
+            .iter()
+            .map(|h| (h.level, h.text.as_str(), h.line))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (1, "About the Empire", 1),
+                (2, "History", 3),
+                (3, "The founding", 5),
+                (2, "Current Events", 9),
+            ]
+        );
+    }
+
+    /// `parse_headings` skips fenced blocks, so a `#` line inside one is a
+    /// comment in a code sample and not a heading (#68).
+    #[test]
+    fn a_hash_inside_a_fence_is_not_a_heading() {
+        let headings = outline_of("# Real\n\n```bash\n# not a heading\n```\n\n## Also real\n");
+        let got: Vec<&str> = headings.iter().map(|h| h.text.as_str()).collect();
+        assert_eq!(got, vec!["Real", "Also real"]);
+    }
+
+    /// The frontmatter is stripped before parsing, because a YAML comment
+    /// line reads as an H1 to the parser. The lines it removed are added
+    /// back, so the numbers are the file's own (#68).
+    #[test]
+    fn a_hash_inside_frontmatter_is_not_a_heading_and_the_lines_stay_the_files_own() {
+        let headings = outline_of("---\n# a yaml comment\ntags: [a]\n---\n# Real\n");
+        let got: Vec<(&str, usize)> = headings.iter().map(|h| (h.text.as_str(), h.line)).collect();
+        assert_eq!(got, vec![("Real", 5)]);
+    }
+
+    /// A note with no headings has an empty outline, which is a fact about
+    /// the note and not a failure (#68).
+    #[test]
+    fn a_note_with_no_headings_has_an_empty_outline() {
+        assert!(outline_of("Just a paragraph.\n").is_empty());
+    }
+
+    /// `list` reports the index. A row whose file is gone is transient —
+    /// `writer::verify_index_integrity` drops it at the start of the next
+    /// index — so it is listed with an empty outline and no error (#68).
+    #[test]
+    fn a_row_whose_file_is_missing_is_listed_with_an_empty_outline() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let store = Store::open_memory().unwrap();
+        store
+            .insert_file("ghost.md", "h1", 100, "ggg333", None, None)
+            .unwrap();
+        let params = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+        let items =
+            context_list(&params, &crate::tags::Scope::default(), None, None, true).unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(
+            items[0]
+                .headings
+                .as_ref()
+                .is_some_and(|headings| headings.is_empty()),
+            "a missing file is listed with an outline that is empty, not absent"
+        );
+    }
+
+    /// Without `detailed` the field is absent from the JSON, so an
+    /// undetailed listing serialises exactly as it did before, and
+    /// `project`, whose child notes are the same type, is untouched (#68).
+    #[test]
+    fn an_undetailed_listing_carries_no_headings_field() {
+        let (_tmp, store, root) = setup_vault();
+        let params = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+        let items =
+            context_list(&params, &crate::tags::Scope::default(), None, None, false).unwrap();
+        let json = serde_json::to_string(&items).unwrap();
+        assert!(!json.contains("headings"), "{json}");
     }
 
     #[test]

@@ -283,6 +283,7 @@ async fn main() -> Result<()> {
                 &filter,
                 args.created_by.as_deref(),
                 args.limit,
+                false,
             )?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&items)?);

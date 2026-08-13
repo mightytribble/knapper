@@ -209,9 +209,14 @@ impl EngraphServer {
         let all_terms = crate::tags::merge_scope_alias(params.0.scope, params.0.all);
         let tags = crate::tags::Scope::parse(&all_terms, &params.0.any, &params.0.none)
             .map_err(|e| mcp_err(&e))?;
-        let items =
-            context::context_list(&ctx, &tags, params.0.created_by.as_deref(), params.0.limit)
-                .map_err(|e| mcp_err(&e))?;
+        let items = context::context_list(
+            &ctx,
+            &tags,
+            params.0.created_by.as_deref(),
+            params.0.limit,
+            false,
+        )
+        .map_err(|e| mcp_err(&e))?;
         to_json_result(&items)
     }
 
