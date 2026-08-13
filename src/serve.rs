@@ -791,7 +791,7 @@ impl rmcp::handler::server::ServerHandler for EngraphServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "engraph: vault intelligence for Obsidian. \
-                 Read: vault_map to orient, tags for the tag vocabulary, search to find, read for content (a section parameter narrows it), list to filter notes by folder and tags, who/project for context bundles, topic for a budgeted bundle of the sections about one subject. \
+                 Read: vault_map to orient, tags for the tag vocabulary, search to find, read for content (a section parameter narrows it), list to filter notes by scope (tags or directory paths), who/project for context bundles, topic for a budgeted bundle of the sections about one subject. \
                  Write: create for new notes, update for every change to an existing one — a list of edits over the body, a section or a frontmatter property, applied in one write. \
                  Lifecycle: move to relocate, archive to soft-delete (`undo: true` to restore), delete for permanent removal. \
                  Index: reindex_file to refresh a single file after external edits, index to walk the whole vault (`rebuild: true` builds it again from nothing). \
