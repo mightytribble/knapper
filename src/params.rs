@@ -550,6 +550,24 @@ mod tests {
         assert_eq!(list.limit, 20);
     }
 
+    /// `mode` is an enum, so a spelling outside the four is refused where the
+    /// request is read and never reaches the writer. This is the successor to
+    /// the unknown-op test that went with `FrontmatterOpInput` (#62).
+    #[test]
+    fn edit_reads_the_four_modes_and_rejects_a_fifth() {
+        for mode in ["replace", "prepend", "append", "remove"] {
+            let json = format!(r#"{{"mode":"{mode}"}}"#);
+            serde_json::from_str::<Edit>(&json)
+                .unwrap_or_else(|e| panic!("mode {mode} must parse: {e}"));
+        }
+        let err = serde_json::from_str::<Edit>(r#"{"mode":"upsert"}"#).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("unknown variant") && message.contains("replace"),
+            "the error must name the legal values, got: {message}"
+        );
+    }
+
     #[test]
     fn an_edit_naming_a_section_and_a_property_is_an_error() {
         let u = Update {

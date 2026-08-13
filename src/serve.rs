@@ -372,7 +372,9 @@ impl EngraphServer {
              `mode` is `replace`, `append`, `prepend` or `remove`. `remove` is for a property alone. \
              `content` is a string, or a list of strings to set a list-valued property such as tags or aliases. A body edit and a section edit take a string. \
              A body edit always keeps the note's frontmatter: content that starts with its own `---` block gives the note two of them. Change the frontmatter with `property` edits in the same list. \
-             Two behaviours differ from the calls this replaces: a body append normalises the blank lines after a frontmatter block, and a note changed outside engraph and not yet re-indexed fails with an mtime conflict."
+             Three things differ from the calls this replaces. A note changed outside engraph and not yet re-indexed fails with an mtime conflict. \
+             Replacing a note's frontmatter wholesale has no spelling here — `rewrite`'s `preserve_frontmatter: false` is gone, not renamed, and write the new frontmatter with `property` edits instead. \
+             A whole-note tag or alias replacement no longer stamps a `modified_by` property on the note."
     )]
     async fn update(
         &self,
@@ -399,6 +401,20 @@ impl EngraphServer {
         };
         let result = crate::writer::update_note(&store, &self.vault_path, &input)
             .map_err(|e| mcp_err(&e))?;
+        // `update_note` stores the new content hash and writes no chunks, so
+        // nothing else will re-derive them: not `diff_vault`, which sees a
+        // hash that already matches disk, and not the watcher, which the
+        // `record_write` below tells to skip this file. Re-index here or the
+        // note stays searchable only as the text it held before the edit (#62).
+        let mut embedder = self.embedder.lock().await;
+        crate::indexer::reindex_written_file(
+            &result.path,
+            &store,
+            &mut *embedder,
+            &self.vault_path,
+            self.chunk_opts,
+        )
+        .map_err(|e| mcp_err(&e))?;
         // Record write so the watcher skips re-indexing
         let full_path = self.vault_path.join(&result.path);
         record_write(&self.recent_writes, &full_path).await;

@@ -649,6 +649,20 @@ async fn handle_update(
     };
     let result = writer::update_note(&store, &state.vault_path, &input)
         .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    // `update_note` stores the new content hash and writes no chunks, so
+    // nothing else will re-derive them: not `diff_vault`, which sees a hash
+    // that already matches disk, and not the watcher, which the `record_write`
+    // below tells to skip this file. Re-index here or the note stays
+    // searchable only as the text it held before the edit (#62).
+    let mut embedder = state.embedder.lock().await;
+    crate::indexer::reindex_written_file(
+        &result.path,
+        &store,
+        &mut *embedder,
+        &state.vault_path,
+        state.chunk_opts,
+    )
+    .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
     let full_path = state.vault_path.join(&result.path);
     record_write(&state.recent_writes, &full_path).await;
     Ok(Json(serde_json::json!(result)))

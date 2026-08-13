@@ -1172,6 +1172,13 @@ pub fn apply_body_edit(
     if preserve_frontmatter {
         let (maybe_frontmatter, old_body) = crate::markdown::split_frontmatter(content);
         if let Some(frontmatter) = maybe_frontmatter {
+            // `split_frontmatter` rejoins the body as `lines[i+1..].join("\n")`,
+            // so a note written `---\nfm\n---\n\nbody` hands back a body that
+            // still carries the break after the closing `---`. The reassembly
+            // below writes its own `\n\n`, so this break has to go: keeping it
+            // added one blank line to the note on every append, and they
+            // accumulated call after call (#62).
+            let old_body = old_body.trim_start_matches('\n');
             let new_body = match mode {
                 EditMode::Replace => new.to_string(),
                 EditMode::Append => format!("{}\n{}", old_body.trim_end(), new),
@@ -2003,6 +2010,34 @@ mod tests {
         assert!(out.contains("- b"));
         assert!(out.contains("status: done"));
         assert!(out.ends_with("body\n"));
+    }
+
+    /// `split_frontmatter` rejoins the body as `lines[i+1..].join("\n")`, so
+    /// the usual `---\nfm\n---\n\nbody` layout hands back a body that still
+    /// carries the line break after the closing `---`. The reassembly below
+    /// supplies its own `\n\n`, so adding both put one blank line into the
+    /// note per append and they accumulated. `append_to_note` added none, and
+    /// `update`'s body append has to be byte-identical to it (#62).
+    #[test]
+    fn successive_body_appends_add_no_blank_line_of_their_own() {
+        let doc = "---\ntags:\n  - a\n---\n\nbody line\n";
+
+        let once = apply_body_edit(doc, "first", EditMode::Append, true);
+        assert_eq!(once, "---\ntags:\n  - a\n---\n\nbody line\nfirst");
+
+        let twice = apply_body_edit(&once, "second", EditMode::Append, true);
+        assert_eq!(twice, "---\ntags:\n  - a\n---\n\nbody line\nfirst\nsecond");
+    }
+
+    /// The same text through `append_to_note`'s transform, which is the call
+    /// `update`'s body append replaces. The two must agree byte for byte (#62).
+    #[test]
+    fn a_body_append_matches_the_call_it_replaces() {
+        let doc = "---\ntags:\n  - a\n---\n\nbody line\n";
+        assert_eq!(
+            apply_body_edit(doc, "first", EditMode::Append, true),
+            apply_body_edit(doc, "first", EditMode::Append, false),
+        );
     }
 
     #[test]
