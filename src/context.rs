@@ -322,7 +322,7 @@ pub fn context_read(
 pub fn context_list(
     params: &ContextParams,
     folder: Option<&str>,
-    tags: &crate::tags::TagFilter,
+    tags: &crate::tags::Scope,
     created_by: Option<&str>,
     limit: usize,
 ) -> Result<Vec<NoteListItem>> {
@@ -499,7 +499,7 @@ pub fn context_project(params: &ContextParams, name: &str) -> Result<ProjectCont
         let folder_files =
             params
                 .store
-                .list_files(Some(folder), &crate::tags::TagFilter::default(), None, 50)?;
+                .list_files(Some(folder), &crate::tags::Scope::default(), None, 50)?;
         for f in folder_files {
             if Some(f.id) != project_id && child_ids.insert(f.id) {
                 child_records.push(f);
@@ -672,7 +672,7 @@ pub fn context_topic_from_results(
     topic: &str,
     search_results: &[crate::search::InternalSearchResult],
     max_chars: usize,
-    scope: &crate::tags::TagFilter,
+    scope: &crate::tags::Scope,
 ) -> Result<ContextBundle> {
     let budget = if max_chars == 0 {
         DEFAULT_BUDGET
@@ -797,7 +797,7 @@ pub fn context_topic_with_search(
     topic: &str,
     max_chars: usize,
     embedder: &mut impl crate::llm::EmbedModel,
-    scope: &crate::tags::TagFilter,
+    scope: &crate::tags::Scope,
 ) -> Result<ContextBundle> {
     // A context bundle is assembled from whole notes, so it wants one result per
     // note — several sections of the same file would read the file in twice.
@@ -932,8 +932,7 @@ mod tests {
             vault_path: &root,
             profile: None,
         };
-        let items =
-            context_list(&params, None, &crate::tags::TagFilter::default(), None, 20).unwrap();
+        let items = context_list(&params, None, &crate::tags::Scope::default(), None, 20).unwrap();
         assert_eq!(items.len(), 2);
     }
 
@@ -948,7 +947,7 @@ mod tests {
         let items = context_list(
             &params,
             None,
-            &crate::tags::TagFilter::parse(&["rust".into()], &[], &[]).unwrap(),
+            &crate::tags::Scope::parse(&["rust".into()], &[], &[]).unwrap(),
             None,
             20,
         )
@@ -1144,7 +1143,7 @@ mod tests {
             "topic",
             &search_results,
             32000,
-            &crate::tags::TagFilter::default(),
+            &crate::tags::Scope::default(),
         )
         .unwrap();
         assert!(!bundle.sections.is_empty());
@@ -1187,7 +1186,7 @@ mod tests {
             "words",
             &search_results,
             500,
-            &crate::tags::TagFilter::default(),
+            &crate::tags::Scope::default(),
         )
         .unwrap();
         assert!(!bundle.sections.is_empty());
@@ -1234,7 +1233,7 @@ mod tests {
             "main",
             &search_results,
             32000,
-            &crate::tags::TagFilter::default(),
+            &crate::tags::Scope::default(),
         )
         .unwrap();
         // Should have main as direct match + related as 1-hop
@@ -1269,7 +1268,7 @@ mod tests {
             "nothing",
             &[],
             32000,
-            &crate::tags::TagFilter::default(),
+            &crate::tags::Scope::default(),
         )
         .unwrap();
         assert!(bundle.sections.is_empty());
@@ -1333,14 +1332,14 @@ mod tests {
             vault_path: &root,
             profile: None,
         };
-        let filter = crate::tags::TagFilter::parse(&["type/undead".to_string()], &[], &[]).unwrap();
+        let filter = crate::tags::Scope::parse(&["type/undead".to_string()], &[], &[]).unwrap();
 
         let unscoped = context_topic_with_search(
             &params,
             "warding",
             32000,
             &mut embedder,
-            &crate::tags::TagFilter::default(),
+            &crate::tags::Scope::default(),
         )
         .unwrap();
         let paths: Vec<&str> = unscoped.sections.iter().map(|s| s.path.as_str()).collect();
@@ -1383,7 +1382,7 @@ mod tests {
             "the fixture's link did not reach the third note"
         );
 
-        let filter = crate::tags::TagFilter::parse(&["type/undead".to_string()], &[], &[]).unwrap();
+        let filter = crate::tags::Scope::parse(&["type/undead".to_string()], &[], &[]).unwrap();
         let scoped =
             context_topic_with_search(&params, "warding", 32000, &mut embedder, &filter).unwrap();
         assert!(
@@ -1413,7 +1412,7 @@ mod tests {
             "warding",
             32000,
             &mut embedder,
-            &crate::tags::TagFilter::default(),
+            &crate::tags::Scope::default(),
         )
         .unwrap();
         let results = crate::search::search_internal(
@@ -1422,7 +1421,7 @@ mod tests {
             &store,
             &mut embedder,
             crate::config::GroupBy::File,
-            &crate::tags::TagFilter::default(),
+            &crate::tags::Scope::default(),
         )
         .unwrap();
         let b = context_topic_from_results(
@@ -1430,7 +1429,7 @@ mod tests {
             "warding",
             &results.results,
             32000,
-            &crate::tags::TagFilter::default(),
+            &crate::tags::Scope::default(),
         )
         .unwrap();
 
@@ -1450,7 +1449,7 @@ mod tests {
             vault_path: &root,
             profile: None,
         };
-        let filter = crate::tags::TagFilter::parse(&["type/undeed".to_string()], &[], &[]).unwrap();
+        let filter = crate::tags::Scope::parse(&["type/undeed".to_string()], &[], &[]).unwrap();
 
         let err = context_topic_with_search(&params, "warding", 32000, &mut embedder, &filter)
             .expect_err("a scope naming no tag must fail the call");

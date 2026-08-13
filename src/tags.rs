@@ -431,13 +431,13 @@ fn longest_existing_ancestor(conn: &Connection, path: &str) -> Result<Option<Str
 /// A note is returned when it carries every `all` term, at least one `any`
 /// term, and no `none` term. An empty field constrains nothing.
 #[derive(Debug, Clone, Default)]
-pub struct TagFilter {
+pub struct Scope {
     pub all: Vec<TagTerm>,
     pub any: Vec<TagTerm>,
     pub none: Vec<TagTerm>,
 }
 
-impl TagFilter {
+impl Scope {
     /// Read each field's terms, dropping the ones with no path.
     ///
     /// A trailing comma leaves other terms standing and is not an error. A
@@ -452,7 +452,7 @@ impl TagFilter {
             }
             Ok(terms)
         };
-        Ok(TagFilter {
+        Ok(Scope {
             all: read("all", all)?,
             any: read("any", any)?,
             none: read("none", none)?,
@@ -861,43 +861,42 @@ mod tests {
 
     #[test]
     fn a_trailing_comma_drops_one_term_and_keeps_the_rest() {
-        let filter =
-            TagFilter::parse(&["type/undead".to_string(), "".to_string()], &[], &[]).unwrap();
+        let filter = Scope::parse(&["type/undead".to_string(), "".to_string()], &[], &[]).unwrap();
         assert_eq!(filter.all, vec![TagTerm::Exact("type/undead".into())]);
     }
 
     #[test]
     fn a_field_that_is_all_empty_terms_is_an_error() {
-        let err = TagFilter::parse(&["".to_string()], &[], &[]).unwrap_err();
+        let err = Scope::parse(&["".to_string()], &[], &[]).unwrap_err();
         assert_eq!(err.to_string(), "'all' names no tag");
 
-        let err = TagFilter::parse(&[], &["".to_string()], &[]).unwrap_err();
+        let err = Scope::parse(&[], &["".to_string()], &[]).unwrap_err();
         assert_eq!(err.to_string(), "'any' names no tag");
 
-        let err = TagFilter::parse(&[], &[], &["".to_string()]).unwrap_err();
+        let err = Scope::parse(&[], &[], &["".to_string()]).unwrap_err();
         assert_eq!(err.to_string(), "'none' names no tag");
     }
 
     #[test]
     fn an_absent_field_is_not_an_error() {
-        assert!(TagFilter::parse(&[], &[], &[]).unwrap().all.is_empty());
+        assert!(Scope::parse(&[], &[], &[]).unwrap().all.is_empty());
     }
 
     #[test]
     fn an_empty_filter_is_the_one_that_constrains_nothing() {
-        assert!(TagFilter::default().is_empty());
+        assert!(Scope::default().is_empty());
         assert!(
-            !TagFilter::parse(&["type/undead".into()], &[], &[])
+            !Scope::parse(&["type/undead".into()], &[], &[])
                 .unwrap()
                 .is_empty()
         );
         assert!(
-            !TagFilter::parse(&[], &["type/undead".into()], &[])
+            !Scope::parse(&[], &["type/undead".into()], &[])
                 .unwrap()
                 .is_empty()
         );
         assert!(
-            !TagFilter::parse(&[], &[], &["type/undead".into()])
+            !Scope::parse(&[], &[], &["type/undead".into()])
                 .unwrap()
                 .is_empty()
         );
@@ -905,17 +904,16 @@ mod tests {
 
     #[test]
     fn a_filter_describes_itself_by_the_fields_it_holds() {
-        let filter =
-            TagFilter::parse(&["type/undead".into()], &[], &["status/draft".into()]).unwrap();
+        let filter = Scope::parse(&["type/undead".into()], &[], &["status/draft".into()]).unwrap();
         assert_eq!(filter.describe(), "all=type/undead none=status/draft");
 
-        let subtree = TagFilter::parse(&["Type/".to_string()], &[], &[]).unwrap();
+        let subtree = Scope::parse(&["Type/".to_string()], &[], &[]).unwrap();
         assert_eq!(subtree.describe(), "all=type/");
 
-        let two = TagFilter::parse(&[], &["a".into(), "b".into()], &[]).unwrap();
+        let two = Scope::parse(&[], &["a".into(), "b".into()], &[]).unwrap();
         assert_eq!(two.describe(), "any=a,b");
 
-        assert_eq!(TagFilter::default().describe(), "");
+        assert_eq!(Scope::default().describe(), "");
     }
 
     #[test]

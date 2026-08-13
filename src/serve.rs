@@ -115,7 +115,7 @@ impl EngraphServer {
         // Per call, with the configured default behind it (#62).
         let top_n = params.0.top_n.unwrap_or(self.top_n);
         let all_terms = crate::tags::merge_all_alias(params.0.tags, params.0.all);
-        let scope = crate::tags::TagFilter::parse(&all_terms, &params.0.any, &params.0.none)
+        let scope = crate::tags::Scope::parse(&all_terms, &params.0.any, &params.0.none)
             .map_err(|e| mcp_err(&e))?;
         let store = self.store.lock().await;
         let mut embedder = self.embedder.lock().await;
@@ -207,7 +207,7 @@ impl EngraphServer {
             profile: self.profile.as_ref().as_ref(),
         };
         let all_terms = crate::tags::merge_all_alias(params.0.tags, params.0.all);
-        let tags = crate::tags::TagFilter::parse(&all_terms, &params.0.any, &params.0.none)
+        let tags = crate::tags::Scope::parse(&all_terms, &params.0.any, &params.0.none)
             .map_err(|e| mcp_err(&e))?;
         let items = context::context_list(
             &ctx,
@@ -294,7 +294,7 @@ impl EngraphServer {
         params: Parameters<crate::params::Topic>,
     ) -> Result<CallToolResult, McpError> {
         let all_terms = crate::tags::merge_all_alias(params.0.tags, params.0.all);
-        let scope = crate::tags::TagFilter::parse(&all_terms, &params.0.any, &params.0.none)
+        let scope = crate::tags::Scope::parse(&all_terms, &params.0.any, &params.0.none)
             .map_err(|e| mcp_err(&e))?;
         let store = self.store.lock().await;
         let mut embedder = self.embedder.lock().await;

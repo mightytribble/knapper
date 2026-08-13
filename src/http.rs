@@ -392,7 +392,7 @@ async fn handle_search(
     // Per call, with the configured default behind it (#62).
     let top_n = body.top_n.unwrap_or(state.top_n);
     let all_terms = crate::tags::merge_all_alias(body.tags, body.all);
-    let scope = crate::tags::TagFilter::parse(&all_terms, &body.any, &body.none)
+    let scope = crate::tags::Scope::parse(&all_terms, &body.any, &body.none)
         .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
     let store = state.store.lock().await;
     let mut embedder = state.embedder.lock().await;
@@ -478,7 +478,7 @@ async fn handle_list(
         profile: state.profile.as_ref().as_ref(),
     };
     let all_terms = crate::tags::merge_all_alias(params.tags, params.all);
-    let filter = crate::tags::TagFilter::parse(&all_terms, &params.any, &params.none)
+    let filter = crate::tags::Scope::parse(&all_terms, &params.any, &params.none)
         .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
     let items = context::context_list(
         &ctx,
@@ -572,7 +572,7 @@ async fn handle_topic(
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, false)?;
     let all_terms = crate::tags::merge_all_alias(body.tags, body.all);
-    let scope = crate::tags::TagFilter::parse(&all_terms, &body.any, &body.none)
+    let scope = crate::tags::Scope::parse(&all_terms, &body.any, &body.none)
         .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
     let store = state.store.lock().await;
     let mut embedder = state.embedder.lock().await;
