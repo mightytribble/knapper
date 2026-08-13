@@ -358,15 +358,25 @@ async fn handle_plugin_manifest(State(state): State<ApiState>) -> impl IntoRespo
 /// A search response is an envelope, because HTTP is the one surface with
 /// nowhere else to put the answer-floor signal — the CLI prints it and MCP
 /// sends a second content block (#34, #62). #35 owns what a result item
-/// holds; this owns the envelope around it.
-fn search_response(results: &[search::SearchResult]) -> serde_json::Value {
-    serde_json::json!({
+/// holds; this owns the envelope around it, all three of its keys.
+///
+/// `explain` is the per-lane detail, and it is absent when the caller did not
+/// ask for it: an agent that did not ask must not have to read past it.
+fn search_response(
+    results: &[search::InternalSearchResult],
+    explain: Option<String>,
+) -> serde_json::Value {
+    let mut envelope = serde_json::json!({
         "results": results,
         "message": match results.is_empty() {
             true => Some(crate::ranking::NO_RELEVANT_CONTENT),
             false => None,
         },
-    })
+    });
+    if let Some(detail) = explain {
+        envelope["explain"] = serde_json::Value::String(detail);
+    }
+    envelope
 }
 
 async fn handle_search(
@@ -416,19 +426,10 @@ async fn handle_search(
                 ApiError::internal(&format!("{e:#}"))
             }
         })?;
-    let results: Vec<search::SearchResult> = output
-        .results
-        .iter()
-        .map(search::SearchResult::from_internal)
-        .collect();
-    let mut response = search_response(&results);
     // The per-lane detail rides in the envelope, next to the results it
-    // explains. It is absent unless the caller asked, because an agent that
-    // did not ask must not have to read past it (#62).
-    if body.explain {
-        response["explain"] = serde_json::json!(search::explain_report(&output, top_n));
-    }
-    Ok(Json(response))
+    // explains, and is built only for the call that asked for it (#62).
+    let explain = body.explain.then(|| search::explain_report(&output, top_n));
+    Ok(Json(search_response(&output.results, explain)))
 }
 
 async fn handle_read(
@@ -1814,12 +1815,13 @@ mod tests {
 
     /// One result with every field filled. The envelope is what the test
     /// asserts on, so the values themselves carry no meaning (#62).
-    fn sample_result() -> search::SearchResult {
-        search::SearchResult {
+    fn sample_result() -> search::InternalSearchResult {
+        search::InternalSearchResult {
+            file_path: "Notes/Warding.md".to_string(),
+            file_id: 7,
+            chunk_seq: 2,
             score: 0.5,
             confidence: 0.75,
-            file_path: "Notes/Warding.md".to_string(),
-            chunk_seq: 2,
             heading: Some("Level 4 Silence".to_string()),
             snippet: "a snippet".to_string(),
             docid: Some("a1b2c3".to_string()),
@@ -1828,16 +1830,101 @@ mod tests {
 
     #[test]
     fn a_search_response_carries_its_results_and_its_message() {
-        let empty = search_response(&[]);
+        let empty = search_response(&[], None);
         assert_eq!(empty["results"].as_array().unwrap().len(), 0);
         assert_eq!(
             empty["message"].as_str().unwrap(),
             crate::ranking::NO_RELEVANT_CONTENT
         );
+        assert!(empty.get("explain").is_none());
 
-        let one = search_response(std::slice::from_ref(&sample_result()));
+        let one = search_response(std::slice::from_ref(&sample_result()), None);
         assert_eq!(one["results"].as_array().unwrap().len(), 1);
         assert!(one["message"].is_null());
+
+        let explained = search_response(&[], Some("--- Query run ---\n".to_string()));
+        assert_eq!(
+            explained["explain"].as_str().unwrap(),
+            "--- Query run ---\n"
+        );
+    }
+
+    /// A vault of two notes, indexed in memory. The mock's vectors are hashes,
+    /// so the keyword lane carries the meaning here — which is all a
+    /// granularity assertion needs.
+    fn indexed_state() -> (tempfile::TempDir, ApiState) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("rules")).unwrap();
+        std::fs::write(
+            root.join("rules/abjuration-spells.md"),
+            "# Abjuration\n\n\
+             ## Level 3 Counterspell\n\nA warding effect that stops a spell mid-cast. \
+             It interrupts the casting itself and does nothing to a spell already in effect.\n\n\
+             ## Level 5 Dispel Magic\n\nA warding effect that ends an ongoing spell. \
+             It reaches an effect already in place and cannot interrupt one \
+             that is still being cast, which is the whole of the difference.\n\n\
+             ## Level 9 Dimensional Anchor\n\nA warding effect that pins a creature. \
+             It closes every route out of the space the creature \
+             currently stands in, and it does not care how that route was opened.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("rules/evocation-spells.md"),
+            "# Evocation\n\n## Level 1 Firebolt\n\nA bolt of flame.\n",
+        )
+        .unwrap();
+
+        let store = Store::open_memory().unwrap();
+        let mut embedder = crate::llm::MockLlm::new(256);
+        crate::indexer::run_index_shared(
+            root,
+            &crate::config::Config::default(),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let mut state = test_api_state_at(root.to_path_buf());
+        state.store = Arc::new(Mutex::new(store));
+        state.embedder = Arc::new(Mutex::new(Box::new(embedder) as Box<dyn EmbedModel + Send>));
+        (tmp, state)
+    }
+
+    /// How many sections of the one file that holds three matching ones came
+    /// back.
+    fn sections_of_the_abjuration_note(body: &serde_json::Value) -> usize {
+        body["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["file_path"] == "rules/abjuration-spells.md")
+            .count()
+    }
+
+    #[tokio::test]
+    async fn a_search_takes_its_granularity_from_the_call() {
+        // `group_by` is per call, with the process setting as the default
+        // (#62). The server here is started on `file`, so a call that names
+        // `chunk` proves the override rather than the default.
+        let (_tmp, mut state) = indexed_state();
+        state.group_by = crate::config::GroupBy::File;
+
+        let (status, body) =
+            post_json(state.clone(), "/api/search", r#"{"query":"warding"}"#).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(sections_of_the_abjuration_note(&body), 1, "got {body}");
+
+        let (status, body) = post_json(
+            state,
+            "/api/search",
+            r#"{"query":"warding","group_by":"chunk"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(sections_of_the_abjuration_note(&body) > 1, "got {body}");
     }
 
     #[tokio::test]
@@ -1845,13 +1932,14 @@ mod tests {
         // `explain` is per call on all three surfaces (#62). A caller that did
         // not ask reads no explain field at all, so the detail costs the
         // callers who did not want it nothing.
+        let (_tmp, state) = indexed_state();
         let (status, body) =
-            post_json(test_api_state(), "/api/search", r#"{"query":"warding"}"#).await;
+            post_json(state.clone(), "/api/search", r#"{"query":"warding"}"#).await;
         assert_eq!(status, StatusCode::OK);
-        assert!(body["explain"].is_null());
+        assert!(body.get("explain").is_none());
 
         let (status, body) = post_json(
-            test_api_state(),
+            state,
             "/api/search",
             r#"{"query":"warding","explain":true}"#,
         )

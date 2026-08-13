@@ -12,10 +12,6 @@ use crate::ranking;
 use crate::store::{EdgeStats, Store, StoreStats};
 
 /// A single search result with metadata.
-///
-/// It serialises, because the HTTP envelope carries these items (#62). What a
-/// result item holds is issue #35's question, not this one's.
-#[derive(Debug, Clone, serde::Serialize)]
 pub struct SearchResult {
     pub score: f32,
     pub confidence: f64,
@@ -42,8 +38,8 @@ pub struct InternalSearchResult {
 }
 
 impl SearchResult {
-    /// The pipeline's row as a caller sees it. The three surfaces answer one
-    /// query with one item list, so the conversion has one home (#62).
+    /// The pipeline's row as the CLI formats it. What a result item holds on
+    /// each surface is issue #35's question, not this one's (#62).
     pub fn from_internal(r: &InternalSearchResult) -> Self {
         SearchResult {
             score: r.score as f32,

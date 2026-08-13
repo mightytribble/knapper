@@ -90,7 +90,7 @@ fn build_search() -> serde_json::Value {
                     }
                 }}}
             },
-            "responses": { "200": { "description": "An envelope: results, an array of {score, confidence, file_path, chunk_seq, heading, snippet, docid}; message, which holds the answer-floor text when the array is empty and is null otherwise; and explain, the per-lane breakdown, present when the request asked for it" } }
+            "responses": { "200": { "description": "An envelope: results, an array of {file_path, file_id, chunk_seq, score, confidence, heading, snippet, docid}; message, which holds the answer-floor text when the array is empty and is null otherwise; and explain, the per-lane breakdown, present when the request asked for it" } }
         }
     })
 }

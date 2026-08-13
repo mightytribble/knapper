@@ -1066,4 +1066,160 @@ mod tests {
             "the preview an apply acts on is not in the schema: {json}"
         );
     }
+
+    /// A server over a vault of two notes, indexed in memory. The mock's
+    /// vectors are hashes, so the keyword lane carries the meaning here —
+    /// which is all a granularity assertion needs.
+    fn indexed_server(
+        group_by: crate::config::GroupBy,
+    ) -> (tempfile::TempDir, super::EngraphServer) {
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("rules")).unwrap();
+        std::fs::write(
+            root.join("rules/abjuration-spells.md"),
+            "# Abjuration\n\n\
+             ## Level 3 Counterspell\n\nA warding effect that stops a spell mid-cast. \
+             It interrupts the casting itself and does nothing to a spell already in effect.\n\n\
+             ## Level 5 Dispel Magic\n\nA warding effect that ends an ongoing spell. \
+             It reaches an effect already in place and cannot interrupt one \
+             that is still being cast, which is the whole of the difference.\n\n\
+             ## Level 9 Dimensional Anchor\n\nA warding effect that pins a creature. \
+             It closes every route out of the space the creature \
+             currently stands in, and it does not care how that route was opened.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("rules/evocation-spells.md"),
+            "# Evocation\n\n## Level 1 Firebolt\n\nA bolt of flame.\n",
+        )
+        .unwrap();
+
+        let store = crate::store::Store::open_memory().unwrap();
+        let mut embedder = crate::llm::MockLlm::new(256);
+        crate::indexer::run_index_shared(
+            root,
+            &crate::config::Config::default(),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let server = super::EngraphServer {
+            store: Arc::new(Mutex::new(store)),
+            embedder: Arc::new(Mutex::new(
+                Box::new(embedder) as Box<dyn crate::llm::EmbedModel + Send>
+            )),
+            vault_path: Arc::new(root.to_path_buf()),
+            profile: Arc::new(None),
+            tool_router: super::EngraphServer::tool_router(),
+            reranker: None,
+            recent_writes: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            read_only: false,
+            max_chunks_per_file: crate::config::default_max_chunks_per_file(),
+            group_by,
+            rerank: crate::config::RerankConfig::default(),
+            ranking: crate::config::RankingConfig::default(),
+            lane_weights: crate::config::LaneWeights::default(),
+            fts: crate::config::FtsConfig::default(),
+            embed: crate::prefix::EmbedComposition::default(),
+            chunk_opts: crate::chunker::ChunkOptions {
+                min_chars: 0,
+                promote_bold: false,
+            },
+        };
+        (tmp, server)
+    }
+
+    /// A search asking for one query, with everything but the two per-call
+    /// settings left at its default.
+    fn search_params(
+        group_by: Option<crate::config::GroupBy>,
+        explain: bool,
+    ) -> crate::params::Search {
+        crate::params::Search {
+            query: "warding".to_string(),
+            top_n: None,
+            explain,
+            group_by,
+            tags: vec![],
+            all: vec![],
+            any: vec![],
+            none: vec![],
+        }
+    }
+
+    /// The first content block, read as the JSON array of results.
+    fn results(result: &rmcp::model::CallToolResult) -> serde_json::Value {
+        let text = result.content[0].as_text().unwrap().text.clone();
+        serde_json::from_str(&text).unwrap()
+    }
+
+    /// How many sections of the one file that holds three matching ones came
+    /// back.
+    fn sections_of_the_abjuration_note(results: &serde_json::Value) -> usize {
+        results
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["file_path"] == "rules/abjuration-spells.md")
+            .count()
+    }
+
+    #[tokio::test]
+    async fn a_search_takes_its_granularity_from_the_call() {
+        // `group_by` is per call, with the process setting as the default
+        // (#62). The server here is started on `file`, so a call that names
+        // `chunk` proves the override rather than the default.
+        let (_tmp, server) = indexed_server(crate::config::GroupBy::File);
+
+        let by_default = server
+            .search(super::Parameters(search_params(None, false)))
+            .await
+            .unwrap();
+        let rows = results(&by_default);
+        assert_eq!(sections_of_the_abjuration_note(&rows), 1, "got {rows}");
+
+        let by_call = server
+            .search(super::Parameters(search_params(
+                Some(crate::config::GroupBy::Chunk),
+                false,
+            )))
+            .await
+            .unwrap();
+        let rows = results(&by_call);
+        assert!(sections_of_the_abjuration_note(&rows) > 1, "got {rows}");
+    }
+
+    #[tokio::test]
+    async fn the_per_lane_detail_is_the_content_block_the_call_asked_for() {
+        // MCP carries the detail the way it carries the answer-floor message:
+        // a second content block, which leaves the JSON a client parses
+        // untouched. A caller that did not ask gets one block only (#62).
+        let (_tmp, server) = indexed_server(crate::config::GroupBy::Chunk);
+
+        let plain = server
+            .search(super::Parameters(search_params(None, false)))
+            .await
+            .unwrap();
+        assert_eq!(plain.content.len(), 1);
+
+        let explained = server
+            .search(super::Parameters(search_params(None, true)))
+            .await
+            .unwrap();
+        assert_eq!(explained.content.len(), 2);
+        assert!(
+            explained.content[1]
+                .as_text()
+                .unwrap()
+                .text
+                .contains("--- Query run ---")
+        );
+    }
 }
