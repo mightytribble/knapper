@@ -205,11 +205,16 @@ pub const CAPABILITIES: &[Capability] = &[
         mcp: Presence::On,
         http: Http::Post,
         cli_only_args: &[
+            ("path", "a running server is bound to its configured vault"),
             ("identity", "the interactive flow the CLI alone can run"),
             ("reindex", "the interactive flow the CLI alone can run"),
             (
                 "detect",
                 "the CLI spelling of mode=detect, kept for its own flow",
+            ),
+            (
+                "json",
+                "the CLI spelling of mode=apply, kept for its own flow",
             ),
             ("quiet", "suppresses prompts the other surfaces never show"),
         ],

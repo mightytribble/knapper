@@ -95,11 +95,10 @@ pub enum Command {
         /// alone.
         #[arg(long, value_enum, default_value = "replace")]
         mode: crate::params::EditMode,
-        /// The text to write, or a comma-separated list for a list-valued
-        /// property such as tags or aliases. A comma is how the command line
-        /// spells a sequence, as it does for `--tags`; a value that has to
-        /// hold a comma is written with `--edits`.
-        #[arg(long, value_delimiter = ',')]
+        /// The text to write. It is taken as written, commas included. Repeat
+        /// the flag to write a list-valued property such as tags or aliases.
+        /// Omit it, and the text is read from stdin.
+        #[arg(long)]
         content: Vec<String>,
         /// A JSON array of edits, applied in one write. It replaces the flags
         /// above, which are the one-edit form of the same grammar (#62).
@@ -336,6 +335,21 @@ mod tests {
         assert!(matches!(cli.command, Command::VaultMap(_)), "{cli:?}");
     }
 
+    /// `--explain` prints text and `--json` asks for none, so asking for both
+    /// is a usage error and not a flag silently dropped. The conflict lives on
+    /// the shared struct now that the command takes one (#62).
+    #[test]
+    fn search_refuses_explain_and_json_together() {
+        assert!(Cli::try_parse_from(["engraph", "search", "q", "--explain"]).is_ok());
+        assert!(Cli::try_parse_from(["engraph", "search", "q", "--json"]).is_ok());
+        let err = Cli::try_parse_from(["engraph", "search", "q", "--explain", "--json"])
+            .expect_err("the two together are a usage error");
+        assert!(
+            err.to_string().contains("--explain") && err.to_string().contains("--json"),
+            "the error must name both, got: {err}"
+        );
+    }
+
     /// `move` is a Rust keyword, so the variant carries the command name.
     #[test]
     fn move_is_spelled_the_way_the_table_spells_it() {
@@ -361,7 +375,9 @@ mod tests {
             "--property",
             "tags",
             "--content",
-            "a,b",
+            "a",
+            "--content",
+            "b",
         ])
         .expect("the one-edit form parses");
         match cli.command {
@@ -376,6 +392,25 @@ mod tests {
                 assert_eq!(property.as_deref(), Some("tags"));
                 assert_eq!(content, vec!["a".to_string(), "b".to_string()]);
                 assert!(matches!(mode, crate::params::EditMode::Replace));
+            }
+            other => panic!("got {other:?}"),
+        }
+
+        // One `--content` is one value, commas and all. Splitting it would
+        // make ordinary prose unwritable through the flag form (#62).
+        let cli = Cli::try_parse_from([
+            "engraph",
+            "update",
+            "note.md",
+            "--section",
+            "Notes",
+            "--content",
+            "Hello, world",
+        ])
+        .expect("a comma-bearing content parses");
+        match cli.command {
+            Command::Update { content, .. } => {
+                assert_eq!(content, vec!["Hello, world".to_string()])
             }
             other => panic!("got {other:?}"),
         }

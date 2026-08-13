@@ -1268,15 +1268,20 @@ struct StatusInputs {
     date_count: usize,
 }
 
-fn collect_status(data_dir: &Path) -> Result<StatusInputs> {
-    let db_path = data_dir.join("engraph.db");
-    let store = Store::open(&db_path).context("opening store")?;
+/// The status fields, read from a store the caller supplies.
+///
+/// The three reads are separate statements, so a writer that commits between
+/// them would give an answer mixing two snapshots. A server passes the store
+/// it already holds the lock on, which is what stops that (#62).
+fn collect_status(store: &Store, data_dir: &Path) -> Result<StatusInputs> {
     let stats = store.stats()?;
     let edges = store.get_edge_stats()?;
     let date_count = store.count_files_with_dates().unwrap_or(0);
 
     // Compute index size on disk (sqlite db file).
-    let index_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+    let index_size = std::fs::metadata(data_dir.join("engraph.db"))
+        .map(|m| m.len())
+        .unwrap_or(0);
 
     let config = crate::config::Config::load().unwrap_or_default();
     Ok(StatusInputs {
@@ -1293,9 +1298,11 @@ fn collect_status(data_dir: &Path) -> Result<StatusInputs> {
     })
 }
 
-/// Run the status command and print index information.
+/// Run the status command and print index information. The CLI holds no
+/// store, so this opens one.
 pub fn run_status(json: bool, data_dir: &Path) -> Result<()> {
-    let s = collect_status(data_dir)?;
+    let store = Store::open(&data_dir.join("engraph.db")).context("opening store")?;
+    let s = collect_status(&store, data_dir)?;
     let output = format_status(
         &s.stats,
         &s.edges,
@@ -1311,11 +1318,14 @@ pub fn run_status(json: bool, data_dir: &Path) -> Result<()> {
 
 /// What `status` reports, as the object the JSON channel names.
 ///
-/// `run_status` prints; this is what a server answers with. Both compose the
-/// fields through `status_object`, so the three surfaces report the same ones
-/// and cannot drift apart (#62).
-pub fn status_json(data_dir: &Path) -> Result<serde_json::Value> {
-    let s = collect_status(data_dir)?;
+/// `run_status` prints; this is what the two servers answer with, and they
+/// pass the store they already hold rather than opening a second connection:
+/// `Store::open` runs the schema batch and the migrations again, which would
+/// wait out the busy timeout against the server's own writer and then fail
+/// the call. Both routes compose the fields through `status_object`, so the
+/// three surfaces report the same ones and cannot drift apart (#62).
+pub fn status_json(store: &Store, data_dir: &Path) -> Result<serde_json::Value> {
+    let s = collect_status(store, data_dir)?;
     Ok(status_object(
         &s.stats,
         &s.edges,

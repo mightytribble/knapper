@@ -23,7 +23,12 @@ pub struct Search {
     #[arg(short = 'n', long)]
     pub top_n: Option<usize>,
     /// Show the per-lane score breakdown for each result.
-    #[arg(long)]
+    ///
+    /// The breakdown is text, and `run_search` prints it only when the output
+    /// is not JSON. Asking for both is a usage error rather than a flag that
+    /// is silently dropped, which is what the CLI answered before the command
+    /// took this struct (#62).
+    #[arg(long, conflicts_with = "json")]
     #[serde(default)]
     pub explain: bool,
     /// Return one result per matching section, or one per document.
@@ -361,6 +366,42 @@ impl Update {
     pub fn to_writer_edits(&self) -> anyhow::Result<Vec<crate::writer::NoteEdit>> {
         self.edits.iter().map(Edit::to_writer_edit).collect()
     }
+
+    /// The request `engraph update`'s one-edit form names.
+    ///
+    /// MCP and HTTP send this struct as JSON, where a string and an array are
+    /// two different things a caller writes. A command line has no such
+    /// distinction, so `--content` decides it by how many times it appears:
+    /// one occurrence is one string, whatever characters it holds, and
+    /// repeating the flag is the list a list-valued property reads. The value
+    /// is never split, because prose holds commas and there would be no way
+    /// to write one (#62).
+    pub fn from_cli_edit(
+        file: String,
+        section: Option<String>,
+        property: Option<String>,
+        mode: EditMode,
+        content: Vec<String>,
+    ) -> Self {
+        let content = match content.len() {
+            0 => None,
+            1 => Some(serde_json::Value::String(
+                content.into_iter().next().expect("one element"),
+            )),
+            _ => Some(serde_json::Value::Array(
+                content.into_iter().map(serde_json::Value::String).collect(),
+            )),
+        };
+        Update {
+            file,
+            edits: vec![Edit {
+                section,
+                property,
+                mode,
+                content,
+            }],
+        }
+    }
 }
 
 #[derive(Debug, Args, Deserialize, JsonSchema)]
@@ -596,6 +637,65 @@ mod tests {
             message.contains("unknown field") && message.contains("previews"),
             "the error must name the key it refused, got: {message}"
         );
+    }
+
+    /// One `--content` is one string, commas and all. Splitting it would make
+    /// ordinary prose unwritable through the flag form, and would turn a
+    /// scalar property's value into a two-item list with no error (#62).
+    #[test]
+    fn one_cli_content_reaches_the_writer_as_one_string() {
+        let u = Update::from_cli_edit(
+            "n.md".into(),
+            Some("Notes".into()),
+            None,
+            EditMode::Replace,
+            vec!["Hello, world".into()],
+        );
+        let edits = u.to_writer_edits().unwrap();
+        assert!(
+            matches!(
+                edits[0].content,
+                Some(crate::writer::EditContent::Text(ref t)) if t == "Hello, world"
+            ),
+            "got {:?}",
+            edits[0].content
+        );
+    }
+
+    /// Repeating the flag is how the command line spells a sequence.
+    #[test]
+    fn a_repeated_cli_content_reaches_the_writer_as_a_list() {
+        let u = Update::from_cli_edit(
+            "n.md".into(),
+            None,
+            Some("tags".into()),
+            EditMode::Replace,
+            vec!["a".into(), "b".into()],
+        );
+        let edits = u.to_writer_edits().unwrap();
+        assert!(
+            matches!(
+                edits[0].content,
+                Some(crate::writer::EditContent::List(ref v)) if v == &["a".to_string(), "b".to_string()]
+            ),
+            "got {:?}",
+            edits[0].content
+        );
+    }
+
+    /// No `--content` at all is no content, which is what a property `remove`
+    /// takes.
+    #[test]
+    fn no_cli_content_is_no_content() {
+        let u = Update::from_cli_edit(
+            "n.md".into(),
+            None,
+            Some("status".into()),
+            EditMode::Remove,
+            vec![],
+        );
+        let edits = u.to_writer_edits().unwrap();
+        assert!(edits[0].content.is_none());
     }
 
     #[test]

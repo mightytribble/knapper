@@ -125,6 +125,11 @@ fn content_or_stdin(content: Option<String>) -> Result<String> {
 /// caller used. `--edits` is the whole grammar; the flags beside it are the
 /// one-edit form of the same thing, so both build one `params::Update` and
 /// `to_writer_edits` stays the one converter (#62).
+///
+/// An edit that needs content and was given none reads it from stdin, which
+/// is how `write append` took a body before `update` absorbed it. `--edits`
+/// carries its own content, and a `remove` of a property needs none, so
+/// neither of those reads stdin.
 fn update_request(
     file: String,
     section: Option<String>,
@@ -133,31 +138,19 @@ fn update_request(
     content: Vec<String>,
     edits: Option<String>,
 ) -> Result<engraph::params::Update> {
-    let edits = match edits {
-        Some(json) => serde_json::from_str::<Vec<engraph::params::Edit>>(&json)
-            .map_err(|e| anyhow::anyhow!("--edits is not a JSON array of edits: {e}"))?,
-        None => {
-            // A command line has no JSON, so a comma is how it spells a
-            // sequence — one value is a string and two or more is a list,
-            // which is the distinction a list-valued property reads.
-            let content = match content.len() {
-                0 => None,
-                1 => Some(serde_json::Value::String(
-                    content.into_iter().next().unwrap(),
-                )),
-                _ => Some(serde_json::Value::Array(
-                    content.into_iter().map(serde_json::Value::String).collect(),
-                )),
-            };
-            vec![engraph::params::Edit {
-                section,
-                property,
-                mode,
-                content,
-            }]
-        }
+    if let Some(json) = edits {
+        let edits = serde_json::from_str::<Vec<engraph::params::Edit>>(&json)
+            .map_err(|e| anyhow::anyhow!("--edits is not a JSON array of edits: {e}"))?;
+        return Ok(engraph::params::Update { file, edits });
+    }
+    let content = if content.is_empty() && !matches!(mode, engraph::params::EditMode::Remove) {
+        vec![content_or_stdin(None)?]
+    } else {
+        content
     };
-    Ok(engraph::params::Update { file, edits })
+    Ok(engraph::params::Update::from_cli_edit(
+        file, section, property, mode, content,
+    ))
 }
 
 #[tokio::main]

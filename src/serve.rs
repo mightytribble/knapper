@@ -646,6 +646,13 @@ impl EngraphServer {
     ) -> Result<CallToolResult, McpError> {
         // An agent that writes a batch of notes needs a way to rebuild the whole
         // index, and a multi-minute call is acceptable for that (#62).
+        //
+        // A read-only server refuses it like any other write: `rebuild: true`
+        // discards the index before it builds one again, so this destroys
+        // derived state and stalls every other tool while it runs.
+        if self.read_only {
+            return Err(read_only_err());
+        }
         let store = self.store.lock().await;
         let mut embedder = self.embedder.lock().await;
         let mut config = crate::config::Config::load().unwrap_or_default();
@@ -685,8 +692,11 @@ impl EngraphServer {
     ) -> Result<CallToolResult, McpError> {
         let data_dir = crate::config::Config::data_dir().map_err(|e| mcp_err(&e))?;
         // The same fields the CLI's `status --json` prints: one composer, so
-        // the three surfaces cannot report different ones (#62).
-        let report = search::status_json(&data_dir).map_err(|e| mcp_err(&e))?;
+        // the three surfaces cannot report different ones (#62). The store is
+        // this server's own, so the reads see one snapshot and no second
+        // connection runs the schema batch against the writer.
+        let store = self.store.lock().await;
+        let report = search::status_json(&store, &data_dir).map_err(|e| mcp_err(&e))?;
         to_json_result(&report)
     }
 

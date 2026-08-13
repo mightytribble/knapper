@@ -563,8 +563,11 @@ async fn handle_status(
     authorize(&headers, &state, false)?;
     let data_dir =
         crate::config::Config::data_dir().map_err(|e| ApiError::internal(&format!("{e:#}")))?;
-    let report =
-        search::status_json(&data_dir).map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    // The store is this server's own, so the reads see one snapshot and no
+    // second connection runs the schema batch against the writer.
+    let store = state.store.lock().await;
+    let report = search::status_json(&store, &data_dir)
+        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
     Ok(Json(report))
 }
 

@@ -354,9 +354,9 @@ fn build_index() -> serde_json::Value {
         "post": {
             "operationId": "indexVault",
             "summary": "Index the server's vault: walk it, diff it against the store, and re-embed what changed.",
-            "description": "The vault is the one the server was started on; no path is taken here. A single file is cheaper through /api/reindex-file.",
+            "description": "The vault is the one the server was started on; no path is taken here. Send {} to index with no options. A single file is cheaper through /api/reindex-file.",
             "requestBody": {
-                "required": false,
+                "required": true,
                 "content": { "application/json": { "schema": {
                     "type": "object",
                     "properties": {
