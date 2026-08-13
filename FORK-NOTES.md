@@ -1,19 +1,28 @@
 # Fork notes
 
 Private fork of [devwhodevs/engraph](https://github.com/devwhodevs/engraph) v1.7.2, maintained at
-`mightytribble/engraph`. Evaluated 2026-08-06 as a knowledge-lookup layer for Obsidian-format
-world stores (`cc-isekai`, `cc-pluribus`).
+`mightytribble/engraph`. Evaluated as a knowledge-lookup layer to make for Obsidian-format vaults visible
+within Claude Code, instead of relying on filesystem tools. Also wanted viable hybrid search across
+vaults of arbitrary size, again to work around limitations of Claude Code grepping for information.
 
 ## Why this fork exists
 
 Upstream is dormant — last commit 2026-05-27, seven PRs open and unmerged, several of which fix
-real defects. Rather than wait, this fork carries the fixes we need.
+real defects.
 
-**Divergence from upstream is deliberately minimal.** Track it with:
+Upstream over-promised - several features either didn't work, or were implemented
+contrary to how they were described.
+
+Upstream search was sub-optimal; both FTS and Graph lanes required significant re-working.
+
+Divergence from upstream can be tracked with:
 
 ```bash
 git fetch upstream && git diff --stat upstream/main main
 ```
+
+The divergence is significant and likely to get worse.
+
 
 | commit | what | origin |
 |---|---|---|
