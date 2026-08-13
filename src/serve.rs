@@ -416,7 +416,7 @@ fn parse_frontmatter_ops(
     Ok(ops)
 }
 
-#[tool_router]
+#[tool_router(vis = "pub(crate)")]
 impl EngraphServer {
     #[tool(
         name = "search",

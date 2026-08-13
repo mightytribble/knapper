@@ -26,6 +26,7 @@ pub mod ranking;
 pub mod search;
 pub mod serve;
 pub mod store;
+pub mod surface;
 pub mod tags;
 pub mod temporal;
 pub mod vecstore;
