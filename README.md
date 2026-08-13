@@ -301,9 +301,9 @@ Every capability is one route, and the route is the CLI command's name under `/a
 | POST | `/api/delete` | write | Delete note (soft or hard) |
 | POST | `/api/index` | write | Index the configured vault |
 | POST | `/api/reindex-file` | write | Re-index a single file after external edits |
-| GET | `/api/identity` | read | User identity (L0) and current context (L1) |
+| GET | `/api/identity` | read | User identity (L0) and current context (L1). `?refresh=true` re-extracts the L1 facts and takes a write key |
 | POST | `/api/init` | write | First-time onboarding setup (`mode`: detect or apply) |
-| POST | `/api/migrate` | write | PARA migration (`mode`: preview, apply or undo) |
+| POST | `/api/migrate` | write | PARA migration (`mode`: preview, apply or undo). `apply` requires the `preview` that `preview` returned |
 
 **Authentication:**
 
@@ -393,7 +393,7 @@ Notes that don't match any signal with sufficient confidence stay in place. Dail
 
 **MCP tool:** `migrate`, with the same `mode` — available in `engraph serve` for AI-assisted migration.
 
-**HTTP endpoint:** `POST /api/migrate`, with the same `mode` — available via `engraph serve --http`.
+**HTTP endpoint:** `POST /api/migrate`, with the same `mode` — available via `engraph serve --http`. On both servers `mode: apply` takes the `preview` that `mode: preview` returned; only the CLI reads the copy saved on disk.
 
 ## ChatGPT Actions
 

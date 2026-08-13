@@ -911,10 +911,11 @@ See issues on this repo:
   **`CHUNKER_VERSION` is 2 because of the carry rule**, so every store built by an earlier binary
   re-chunks once on its next open, whatever its settings. The final review filed **#53**, **#54** and
   **#55**, and #51 is the fourth defect of the same pass
-- **#53** a promoted heading is not addressable by `read_section` or `edit` — `chunks.heading` holds
-  the raw promoted line, so a result prints `lore/bestiary/archdragon.md > **Spells**` and
-  `markdown::find_section` reads ATX headings only. `**Spells**` and `Spells` both answer "Section not
-  found", and `writer::edit_note` fails the same way. **107 of the shipped arm's 1559 chunks** carry a
+- **#53** a promoted heading is not addressable by `read --section` or by `update --section` —
+  `chunks.heading` holds the raw promoted line, so a result prints
+  `lore/bestiary/archdragon.md > **Spells**` and `markdown::find_section` reads ATX headings only.
+  `**Spells**` and `Spells` both answer "Section not
+  found", and `writer::update_note` fails the same way. **107 of the shipped arm's 1559 chunks** carry a
   promoted heading, `**Abilities**` 67 times and `**Spells**` 22, so 7% of the corpus breaks the
   search-then-read path that is the main route through the MCP server. Three treatments are on the
   issue: teach `find_section` the promoted form, which would then address a construct the writer
