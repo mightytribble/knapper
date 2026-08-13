@@ -20,12 +20,9 @@ use crate::health;
 use crate::llm::{EmbedModel, RerankModel};
 use crate::profile::VaultProfile;
 use crate::search;
-use crate::serve::{FrontmatterOpInput, FrontmatterOpKind, RecentWrites};
+use crate::serve::RecentWrites;
 use crate::store::Store;
-use crate::writer::{
-    self, AppendInput, CreateNoteInput, DeleteMode, EditFrontmatterInput, EditInput, EditMode,
-    FrontmatterOp, RewriteInput, UpdateMetadataInput,
-};
+use crate::writer::{self, CreateNoteInput, DeleteMode, UpdateInput};
 
 // ---------------------------------------------------------------------------
 // Shared state
@@ -251,42 +248,8 @@ pub fn generate_api_key() -> String {
 // -- Write request bodies --
 
 #[derive(Debug, Deserialize)]
-struct AppendBody {
-    file: String,
-    content: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct EditBody {
-    file: String,
-    heading: String,
-    content: String,
-    mode: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RewriteBody {
-    file: String,
-    content: String,
-    preserve_frontmatter: Option<bool>,
-}
-
-#[derive(Debug, Deserialize)]
-struct EditFrontmatterBody {
-    file: String,
-    operations: Vec<FrontmatterOpInput>,
-}
-
-#[derive(Debug, Deserialize)]
 struct UnarchiveBody {
     file: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct UpdateMetadataBody {
-    file: String,
-    tags: Option<Vec<String>>,
-    aliases: Option<Vec<String>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -337,14 +300,10 @@ pub fn routes() -> Vec<(&'static str, MethodRouter<ApiState>)> {
         ("/api/health", get(handle_health)),
         // Write endpoints
         ("/api/create", post(handle_create)),
-        ("/api/append", post(handle_append)),
-        ("/api/edit", post(handle_edit)),
-        ("/api/rewrite", post(handle_rewrite)),
-        ("/api/edit-frontmatter", post(handle_edit_frontmatter)),
+        ("/api/update", post(handle_update)),
         ("/api/move", post(handle_move)),
         ("/api/archive", post(handle_archive)),
         ("/api/unarchive", post(handle_unarchive)),
-        ("/api/update-metadata", post(handle_update_metadata)),
         ("/api/delete", post(handle_delete)),
         // Index maintenance
         ("/api/reindex-file", post(handle_reindex_file)),
@@ -619,58 +578,6 @@ async fn record_write(recent_writes: &RecentWrites, path: &std::path::Path) {
     }
 }
 
-/// Convert typed operation inputs into `Vec<FrontmatterOp>`.
-fn parse_frontmatter_ops(
-    operations: &[FrontmatterOpInput],
-) -> Result<Vec<FrontmatterOp>, ApiError> {
-    let mut ops = Vec::with_capacity(operations.len());
-    for input in operations {
-        let op = match input.op {
-            FrontmatterOpKind::Set => {
-                let key = input.key.as_deref().ok_or_else(|| {
-                    ApiError::bad_request("\"set\" operation requires a \"key\" field")
-                })?;
-                let value = input.value.as_deref().ok_or_else(|| {
-                    ApiError::bad_request("\"set\" operation requires a \"value\" field")
-                })?;
-                FrontmatterOp::Set(key.to_string(), value.to_string())
-            }
-            FrontmatterOpKind::Remove => {
-                let key = input.key.as_deref().ok_or_else(|| {
-                    ApiError::bad_request("\"remove\" operation requires a \"key\" field")
-                })?;
-                FrontmatterOp::Remove(key.to_string())
-            }
-            FrontmatterOpKind::AddTag => {
-                let value = input.value.as_deref().ok_or_else(|| {
-                    ApiError::bad_request("\"add_tag\" operation requires a \"value\" field")
-                })?;
-                FrontmatterOp::AddTag(value.to_string())
-            }
-            FrontmatterOpKind::RemoveTag => {
-                let value = input.value.as_deref().ok_or_else(|| {
-                    ApiError::bad_request("\"remove_tag\" operation requires a \"value\" field")
-                })?;
-                FrontmatterOp::RemoveTag(value.to_string())
-            }
-            FrontmatterOpKind::AddAlias => {
-                let value = input.value.as_deref().ok_or_else(|| {
-                    ApiError::bad_request("\"add_alias\" operation requires a \"value\" field")
-                })?;
-                FrontmatterOp::AddAlias(value.to_string())
-            }
-            FrontmatterOpKind::RemoveAlias => {
-                let value = input.value.as_deref().ok_or_else(|| {
-                    ApiError::bad_request("\"remove_alias\" operation requires a \"value\" field")
-                })?;
-                FrontmatterOp::RemoveAlias(value.to_string())
-            }
-        };
-        ops.push(op);
-    }
-    Ok(ops)
-}
-
 // ---------------------------------------------------------------------------
 // Write endpoint handlers
 // ---------------------------------------------------------------------------
@@ -717,10 +624,13 @@ async fn handle_create(
     Ok(Json(serde_json::json!(result)))
 }
 
-async fn handle_append(
+/// One capability for every change to an existing note (#62). The whole
+/// edit list is read before anything is written, so a request that names an
+/// impossible target answers 400 and writes nothing.
+async fn handle_update(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(body): Json<AppendBody>,
+    Json(body): Json<crate::params::Update>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
     if state.read_only {
@@ -728,102 +638,16 @@ async fn handle_append(
             "Write operations disabled in read-only mode",
         ));
     }
+    let edits = body
+        .to_writer_edits()
+        .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
     let store = state.store.lock().await;
-    let mut embedder = state.embedder.lock().await;
-    let input = AppendInput {
+    let input = UpdateInput {
         file: body.file,
-        content: body.content,
+        edits,
         modified_by: "http-api".into(),
     };
-    let result = writer::append_to_note(
-        input,
-        &store,
-        &mut *embedder,
-        state.embed,
-        state.chunk_opts,
-        &state.vault_path,
-    )
-    .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
-    let full_path = state.vault_path.join(&result.path);
-    record_write(&state.recent_writes, &full_path).await;
-    Ok(Json(serde_json::json!(result)))
-}
-
-async fn handle_edit(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Json(body): Json<EditBody>,
-) -> Result<impl IntoResponse, ApiError> {
-    authorize(&headers, &state, true)?;
-    if state.read_only {
-        return Err(ApiError::forbidden(
-            "Write operations disabled in read-only mode",
-        ));
-    }
-    let store = state.store.lock().await;
-    let mode = match body.mode.as_deref().unwrap_or("append") {
-        "replace" => EditMode::Replace,
-        "prepend" => EditMode::Prepend,
-        _ => EditMode::Append,
-    };
-    let input = EditInput {
-        file: body.file,
-        heading: body.heading,
-        content: body.content,
-        mode,
-        modified_by: "http-api".into(),
-    };
-    let result = writer::edit_note(&store, &state.vault_path, &input, None)
-        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
-    let full_path = state.vault_path.join(&result.path);
-    record_write(&state.recent_writes, &full_path).await;
-    Ok(Json(serde_json::json!(result)))
-}
-
-async fn handle_rewrite(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Json(body): Json<RewriteBody>,
-) -> Result<impl IntoResponse, ApiError> {
-    authorize(&headers, &state, true)?;
-    if state.read_only {
-        return Err(ApiError::forbidden(
-            "Write operations disabled in read-only mode",
-        ));
-    }
-    let store = state.store.lock().await;
-    let input = RewriteInput {
-        file: body.file,
-        content: body.content,
-        preserve_frontmatter: body.preserve_frontmatter.unwrap_or(true),
-        modified_by: "http-api".into(),
-    };
-    let result = writer::rewrite_note(&store, &state.vault_path, &input)
-        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
-    let full_path = state.vault_path.join(&result.path);
-    record_write(&state.recent_writes, &full_path).await;
-    Ok(Json(serde_json::json!(result)))
-}
-
-async fn handle_edit_frontmatter(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Json(body): Json<EditFrontmatterBody>,
-) -> Result<impl IntoResponse, ApiError> {
-    authorize(&headers, &state, true)?;
-    if state.read_only {
-        return Err(ApiError::forbidden(
-            "Write operations disabled in read-only mode",
-        ));
-    }
-    let ops = parse_frontmatter_ops(&body.operations)?;
-    let store = state.store.lock().await;
-    let input = EditFrontmatterInput {
-        file: body.file,
-        operations: ops,
-        modified_by: "http-api".into(),
-    };
-    let result = writer::edit_frontmatter(&store, &state.vault_path, &input)
+    let result = writer::update_note(&store, &state.vault_path, &input)
         .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
     let full_path = state.vault_path.join(&result.path);
     record_write(&state.recent_writes, &full_path).await;
@@ -903,31 +727,6 @@ async fn handle_unarchive(
         &state.vault_path,
     )
     .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
-    let full_path = state.vault_path.join(&result.path);
-    record_write(&state.recent_writes, &full_path).await;
-    Ok(Json(serde_json::json!(result)))
-}
-
-async fn handle_update_metadata(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Json(body): Json<UpdateMetadataBody>,
-) -> Result<impl IntoResponse, ApiError> {
-    authorize(&headers, &state, true)?;
-    if state.read_only {
-        return Err(ApiError::forbidden(
-            "Write operations disabled in read-only mode",
-        ));
-    }
-    let store = state.store.lock().await;
-    let input = UpdateMetadataInput {
-        file: body.file,
-        tags: body.tags,
-        aliases: body.aliases,
-        modified_by: "http-api".into(),
-    };
-    let result = writer::update_metadata(input, &store, &state.vault_path)
-        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
     let full_path = state.vault_path.join(&result.path);
     record_write(&state.recent_writes, &full_path).await;
     Ok(Json(serde_json::json!(result)))
@@ -1620,11 +1419,11 @@ mod tests {
             .oneshot(
                 axum::http::Request::builder()
                     .method("POST")
-                    .uri("/api/edit")
+                    .uri("/api/update")
                     .header("content-type", "application/json")
                     .header("authorization", "Bearer eg_writekey")
                     .body(Body::from(
-                        r#"{"file":"nonexistent","heading":"Test","content":"new"}"#,
+                        r#"{"file":"nonexistent","edits":[{"section":"Test","mode":"append","content":"new"}]}"#,
                     ))
                     .unwrap(),
             )

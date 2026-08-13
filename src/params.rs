@@ -239,6 +239,130 @@ pub struct Create {
     pub auto_link: Option<bool>,
 }
 
+/// What one edit does to what it names. An enum and not a string, because
+/// this is what publishes the four legal values to an MCP client and to the
+/// OpenAPI spec: a wrong spelling is refused at the boundary (#62).
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum EditMode {
+    Replace,
+    Prepend,
+    Append,
+    Remove,
+}
+
+impl From<EditMode> for crate::writer::EditMode {
+    fn from(mode: EditMode) -> Self {
+        match mode {
+            EditMode::Replace => crate::writer::EditMode::Replace,
+            EditMode::Prepend => crate::writer::EditMode::Prepend,
+            EditMode::Append => crate::writer::EditMode::Append,
+            EditMode::Remove => crate::writer::EditMode::Remove,
+        }
+    }
+}
+
+/// One edit, as a caller writes it. `section` and `property` are the two
+/// ways to name a target and an edit names at most one; naming neither is
+/// the note's body (#62).
+///
+/// The struct is closed: an unknown key is an error and not a key serde
+/// drops. `rewrite` took a `preserve_frontmatter` flag and a body edit here
+/// always keeps the frontmatter, so a caller that still sends the flag has
+/// to read the error rather than get a write it did not ask for.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Edit {
+    /// The heading of the section to edit.
+    pub section: Option<String>,
+    /// The frontmatter property to edit.
+    pub property: Option<String>,
+    /// `replace`, `append`, `prepend` or `remove`.
+    pub mode: EditMode,
+    /// A string, or a list of strings for a list-valued property.
+    ///
+    /// The field is a `Value` because either shape is legal and which one a
+    /// caller sends is what it means. `EditContent` is the schema that says
+    /// so, so a client reading the schema is told the two shapes rather
+    /// than being told nothing (#62).
+    #[schemars(with = "Option<EditContent>")]
+    pub content: Option<serde_json::Value>,
+}
+
+/// The two shapes `Edit::content` takes. It exists for the schema alone:
+/// deserialization reads the raw `Value`, and `content_of` is what refuses a
+/// third shape with a message a caller can act on (#62).
+#[derive(Debug, JsonSchema)]
+#[serde(untagged)]
+pub enum EditContent {
+    /// One value, for a body, a section or a scalar property.
+    Text(String),
+    /// A sequence, for a list-valued property such as tags or aliases.
+    List(Vec<String>),
+}
+
+/// Every edit one note takes in one write (#62).
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Update {
+    /// File path, basename, or #docid.
+    pub file: String,
+    /// The edits to apply, in order, in one write.
+    pub edits: Vec<Edit>,
+}
+
+impl Edit {
+    /// The writer's edit this one means.
+    fn to_writer_edit(&self) -> anyhow::Result<crate::writer::NoteEdit> {
+        let target = match (&self.section, &self.property) {
+            (Some(_), Some(_)) => {
+                anyhow::bail!("an edit names one of section or property, not both")
+            }
+            (Some(section), None) => crate::writer::EditTarget::Section(section.clone()),
+            (None, Some(property)) => crate::writer::EditTarget::Property(property.clone()),
+            (None, None) => crate::writer::EditTarget::Body,
+        };
+        Ok(crate::writer::NoteEdit {
+            target,
+            mode: self.mode.into(),
+            content: content_of(self.content.as_ref())?,
+        })
+    }
+}
+
+/// A string is one value and a list of strings is a sequence. Which one a
+/// caller sends is what separates setting a scalar property from setting a
+/// list-valued one, so the two shapes are the whole grammar and any third
+/// shape is an error (#62).
+fn content_of(
+    value: Option<&serde_json::Value>,
+) -> anyhow::Result<Option<crate::writer::EditContent>> {
+    Ok(match value {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) => Some(crate::writer::EditContent::Text(s.clone())),
+        Some(serde_json::Value::Array(items)) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    serde_json::Value::String(s) => out.push(s.clone()),
+                    other => anyhow::bail!("content is a string or a list of strings, not {other}"),
+                }
+            }
+            Some(crate::writer::EditContent::List(out))
+        }
+        Some(other) => anyhow::bail!("content is a string or a list of strings, not {other}"),
+    })
+}
+
+impl Update {
+    /// The writer's edit list this request means. Every edit is read before
+    /// any of them is applied, so a request that names an impossible target
+    /// writes nothing (#62).
+    pub fn to_writer_edits(&self) -> anyhow::Result<Vec<crate::writer::NoteEdit>> {
+        self.edits.iter().map(Edit::to_writer_edit).collect()
+    }
+}
+
 #[derive(Debug, Args, Deserialize, JsonSchema)]
 pub struct Delete {
     /// File path, basename, or #docid.
@@ -424,5 +548,53 @@ mod tests {
     fn limit_reads_null_as_the_default() {
         let list: List = serde_json::from_str(r#"{"limit":null}"#).unwrap();
         assert_eq!(list.limit, 20);
+    }
+
+    #[test]
+    fn an_edit_naming_a_section_and_a_property_is_an_error() {
+        let u = Update {
+            file: "n.md".into(),
+            edits: vec![Edit {
+                section: Some("H".into()),
+                property: Some("tags".into()),
+                mode: EditMode::Replace,
+                content: None,
+            }],
+        };
+        let err = u.to_writer_edits().unwrap_err();
+        assert!(format!("{err}").contains("one of"));
+    }
+
+    #[test]
+    fn an_edit_naming_neither_targets_the_body() {
+        let u = Update {
+            file: "n.md".into(),
+            edits: vec![Edit {
+                section: None,
+                property: None,
+                mode: EditMode::Append,
+                content: Some(serde_json::json!("line")),
+            }],
+        };
+        let edits = u.to_writer_edits().unwrap();
+        assert!(matches!(edits[0].target, crate::writer::EditTarget::Body));
+    }
+
+    #[test]
+    fn a_list_valued_content_reaches_the_writer_as_a_list() {
+        let u = Update {
+            file: "n.md".into(),
+            edits: vec![Edit {
+                section: None,
+                property: Some("tags".into()),
+                mode: EditMode::Replace,
+                content: Some(serde_json::json!(["a", "b"])),
+            }],
+        };
+        let edits = u.to_writer_edits().unwrap();
+        assert!(matches!(
+            edits[0].content,
+            Some(crate::writer::EditContent::List(ref v)) if v == &["a".to_string(), "b".to_string()]
+        ));
     }
 }

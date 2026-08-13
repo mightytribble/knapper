@@ -19,29 +19,10 @@ use crate::llm::{EmbedModel, RerankModel};
 use crate::profile::VaultProfile;
 use crate::search;
 use crate::store::Store;
-use crate::writer::FrontmatterOp;
 
 // ---------------------------------------------------------------------------
 // Parameter structs
 // ---------------------------------------------------------------------------
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct AppendParams {
-    /// Target note: file path, basename, or #docid.
-    pub file: String,
-    /// Content to append to the note.
-    pub content: String,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct UpdateMetadataParams {
-    /// Target note: file path, basename, or #docid.
-    pub file: String,
-    /// New tags (replaces existing).
-    pub tags: Option<Vec<String>>,
-    /// New aliases.
-    pub aliases: Option<Vec<String>>,
-}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct UnarchiveParams {
@@ -63,59 +44,6 @@ pub struct MigrateApplyParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct MigrateUndoParams {}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct EditParams {
-    /// Target note: file path, basename, or #docid.
-    pub file: String,
-    /// Section heading to edit (case-insensitive).
-    pub heading: String,
-    /// Content to add/replace in the section.
-    pub content: String,
-    /// Edit mode: "replace", "prepend", or "append" (default: "append").
-    pub mode: Option<String>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct RewriteParams {
-    /// Target note: file path, basename, or #docid.
-    pub file: String,
-    /// New body content (replaces everything below frontmatter).
-    pub content: String,
-    /// Whether to preserve existing frontmatter (default: true).
-    pub preserve_frontmatter: Option<bool>,
-}
-
-/// Operation kind for frontmatter edits.
-#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum FrontmatterOpKind {
-    Set,
-    Remove,
-    AddTag,
-    RemoveTag,
-    AddAlias,
-    RemoveAlias,
-}
-
-/// A single frontmatter operation.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct FrontmatterOpInput {
-    /// Operation type.
-    pub op: FrontmatterOpKind,
-    /// Property key (required for "set" and "remove").
-    pub key: Option<String>,
-    /// Value (required for "set", "add_tag", "remove_tag", "add_alias", "remove_alias").
-    pub value: Option<String>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct EditFrontmatterParams {
-    /// Target note: file path, basename, or #docid.
-    pub file: String,
-    /// Operations to apply. Array of objects like {"op": "add_tag", "value": "rust"} or {"op": "set", "key": "status", "value": "done"} or {"op": "remove", "key": "status"} or {"op": "remove_tag", "value": "old"}.
-    pub operations: Vec<FrontmatterOpInput>,
-}
 
 // ---------------------------------------------------------------------------
 // Server
@@ -196,86 +124,6 @@ async fn record_write(recent_writes: &RecentWrites, path: &Path) {
     {
         recent_writes.lock().await.insert(path.to_path_buf(), mtime);
     }
-}
-
-/// Convert typed operation inputs into `Vec<FrontmatterOp>`.
-fn parse_frontmatter_ops(
-    operations: &[FrontmatterOpInput],
-) -> Result<Vec<FrontmatterOp>, McpError> {
-    let mut ops = Vec::with_capacity(operations.len());
-    for input in operations {
-        let op = match input.op {
-            FrontmatterOpKind::Set => {
-                let key = input.key.as_deref().ok_or_else(|| {
-                    McpError::new(
-                        rmcp::model::ErrorCode::INVALID_PARAMS,
-                        "\"set\" operation requires a \"key\" field",
-                        None::<serde_json::Value>,
-                    )
-                })?;
-                let value = input.value.as_deref().ok_or_else(|| {
-                    McpError::new(
-                        rmcp::model::ErrorCode::INVALID_PARAMS,
-                        "\"set\" operation requires a \"value\" field",
-                        None::<serde_json::Value>,
-                    )
-                })?;
-                FrontmatterOp::Set(key.to_string(), value.to_string())
-            }
-            FrontmatterOpKind::Remove => {
-                let key = input.key.as_deref().ok_or_else(|| {
-                    McpError::new(
-                        rmcp::model::ErrorCode::INVALID_PARAMS,
-                        "\"remove\" operation requires a \"key\" field",
-                        None::<serde_json::Value>,
-                    )
-                })?;
-                FrontmatterOp::Remove(key.to_string())
-            }
-            FrontmatterOpKind::AddTag => {
-                let value = input.value.as_deref().ok_or_else(|| {
-                    McpError::new(
-                        rmcp::model::ErrorCode::INVALID_PARAMS,
-                        "\"add_tag\" operation requires a \"value\" field",
-                        None::<serde_json::Value>,
-                    )
-                })?;
-                FrontmatterOp::AddTag(value.to_string())
-            }
-            FrontmatterOpKind::RemoveTag => {
-                let value = input.value.as_deref().ok_or_else(|| {
-                    McpError::new(
-                        rmcp::model::ErrorCode::INVALID_PARAMS,
-                        "\"remove_tag\" operation requires a \"value\" field",
-                        None::<serde_json::Value>,
-                    )
-                })?;
-                FrontmatterOp::RemoveTag(value.to_string())
-            }
-            FrontmatterOpKind::AddAlias => {
-                let value = input.value.as_deref().ok_or_else(|| {
-                    McpError::new(
-                        rmcp::model::ErrorCode::INVALID_PARAMS,
-                        "\"add_alias\" operation requires a \"value\" field",
-                        None::<serde_json::Value>,
-                    )
-                })?;
-                FrontmatterOp::AddAlias(value.to_string())
-            }
-            FrontmatterOpKind::RemoveAlias => {
-                let value = input.value.as_deref().ok_or_else(|| {
-                    McpError::new(
-                        rmcp::model::ErrorCode::INVALID_PARAMS,
-                        "\"remove_alias\" operation requires a \"value\" field",
-                        None::<serde_json::Value>,
-                    )
-                })?;
-                FrontmatterOp::RemoveAlias(value.to_string())
-            }
-        };
-        ops.push(op);
-    }
-    Ok(ops)
 }
 
 #[tool_router(vis = "pub(crate)")]
@@ -518,52 +366,42 @@ impl EngraphServer {
     }
 
     #[tool(
-        name = "append",
-        description = "Append content to an existing note. Safe: only adds content, never overwrites. Detects conflicts via mtime checking."
+        name = "update",
+        description = "Change an existing note. Takes a list of edits and applies them in order, in one write: one conflict check, one file write. \
+             Each edit names its target. `section` is one heading. `property` is one frontmatter key. An edit that names neither targets the note's body, and an edit that names both is an error. \
+             `mode` is `replace`, `append`, `prepend` or `remove`. `remove` is for a property alone. \
+             `content` is a string, or a list of strings to set a list-valued property such as tags or aliases. A body edit and a section edit take a string. \
+             A body edit always keeps the note's frontmatter: content that starts with its own `---` block gives the note two of them. Change the frontmatter with `property` edits in the same list. \
+             Two behaviours differ from the calls this replaces: a body append normalises the blank lines after a frontmatter block, and a note changed outside engraph and not yet re-indexed fails with an mtime conflict."
     )]
-    async fn append(&self, params: Parameters<AppendParams>) -> Result<CallToolResult, McpError> {
-        if self.read_only {
-            return Err(read_only_err());
-        }
-        let store = self.store.lock().await;
-        let mut embedder = self.embedder.lock().await;
-        let input = crate::writer::AppendInput {
-            file: params.0.file,
-            content: params.0.content,
-            modified_by: "claude-code".into(),
-        };
-        let result = crate::writer::append_to_note(
-            input,
-            &store,
-            &mut *embedder,
-            self.embed,
-            self.chunk_opts,
-            &self.vault_path,
-        )
-        .map_err(|e| mcp_err(&e))?;
-        to_json_result(&result)
-    }
-
-    #[tool(
-        name = "update_metadata",
-        description = "Update a note's tags or aliases. Uses mtime conflict detection."
-    )]
-    async fn update_metadata(
+    async fn update(
         &self,
-        params: Parameters<UpdateMetadataParams>,
+        params: Parameters<crate::params::Update>,
     ) -> Result<CallToolResult, McpError> {
         if self.read_only {
             return Err(read_only_err());
         }
+        // The whole list is read before anything is written, so a request
+        // that names an impossible target is a parameter error and not a
+        // half-applied write (#62).
+        let edits = params.0.to_writer_edits().map_err(|e| {
+            McpError::new(
+                rmcp::model::ErrorCode::INVALID_PARAMS,
+                format!("{e:#}"),
+                None::<serde_json::Value>,
+            )
+        })?;
         let store = self.store.lock().await;
-        let input = crate::writer::UpdateMetadataInput {
+        let input = crate::writer::UpdateInput {
             file: params.0.file,
-            tags: params.0.tags,
-            aliases: params.0.aliases,
+            edits,
             modified_by: "claude-code".into(),
         };
-        let result = crate::writer::update_metadata(input, &store, &self.vault_path)
+        let result = crate::writer::update_note(&store, &self.vault_path, &input)
             .map_err(|e| mcp_err(&e))?;
+        // Record write so the watcher skips re-indexing
+        let full_path = self.vault_path.join(&result.path);
+        record_write(&self.recent_writes, &full_path).await;
         to_json_result(&result)
     }
 
@@ -660,82 +498,6 @@ impl EngraphServer {
         let report =
             crate::health::generate_health_report(&store, &config).map_err(|e| mcp_err(&e))?;
         to_json_result(&report)
-    }
-
-    #[tool(
-        name = "edit",
-        description = "Edit a specific section of a note. Supports replace, prepend, or append modes. Targets sections by heading name."
-    )]
-    async fn edit(&self, params: Parameters<EditParams>) -> Result<CallToolResult, McpError> {
-        if self.read_only {
-            return Err(read_only_err());
-        }
-        let store = self.store.lock().await;
-        let mode = match params.0.mode.as_deref().unwrap_or("append") {
-            "replace" => crate::writer::EditMode::Replace,
-            "prepend" => crate::writer::EditMode::Prepend,
-            _ => crate::writer::EditMode::Append,
-        };
-        let input = crate::writer::EditInput {
-            file: params.0.file,
-            heading: params.0.heading,
-            content: params.0.content,
-            mode,
-            modified_by: "claude-code".into(),
-        };
-        let result = crate::writer::edit_note(&store, &self.vault_path, &input, None)
-            .map_err(|e| mcp_err(&e))?;
-        // Record write so the watcher skips re-indexing
-        let full_path = self.vault_path.join(&result.path);
-        record_write(&self.recent_writes, &full_path).await;
-        to_json_result(&result)
-    }
-
-    #[tool(
-        name = "rewrite",
-        description = "Replace the entire body of a note. Optionally preserves existing frontmatter. Use for major content overhauls."
-    )]
-    async fn rewrite(&self, params: Parameters<RewriteParams>) -> Result<CallToolResult, McpError> {
-        if self.read_only {
-            return Err(read_only_err());
-        }
-        let store = self.store.lock().await;
-        let input = crate::writer::RewriteInput {
-            file: params.0.file,
-            content: params.0.content,
-            preserve_frontmatter: params.0.preserve_frontmatter.unwrap_or(true),
-            modified_by: "claude-code".into(),
-        };
-        let result = crate::writer::rewrite_note(&store, &self.vault_path, &input)
-            .map_err(|e| mcp_err(&e))?;
-        let full_path = self.vault_path.join(&result.path);
-        record_write(&self.recent_writes, &full_path).await;
-        to_json_result(&result)
-    }
-
-    #[tool(
-        name = "edit_frontmatter",
-        description = "Edit frontmatter fields with granular operations: set/remove properties, add/remove tags, add/remove aliases."
-    )]
-    async fn edit_frontmatter(
-        &self,
-        params: Parameters<EditFrontmatterParams>,
-    ) -> Result<CallToolResult, McpError> {
-        if self.read_only {
-            return Err(read_only_err());
-        }
-        let ops = parse_frontmatter_ops(&params.0.operations)?;
-        let store = self.store.lock().await;
-        let input = crate::writer::EditFrontmatterInput {
-            file: params.0.file,
-            operations: ops,
-            modified_by: "claude-code".into(),
-        };
-        let result = crate::writer::edit_frontmatter(&store, &self.vault_path, &input)
-            .map_err(|e| mcp_err(&e))?;
-        let full_path = self.vault_path.join(&result.path);
-        record_write(&self.recent_writes, &full_path).await;
-        to_json_result(&result)
     }
 
     #[tool(
@@ -958,8 +720,7 @@ impl rmcp::handler::server::ServerHandler for EngraphServer {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "engraph: vault intelligence for Obsidian. \
                  Read: vault_map to orient, tags for the tag vocabulary, search to find, read for content (a section parameter narrows it), who/project for context bundles, health for vault diagnostics. \
-                 Write: create for new notes, append to add content, edit to modify a section, rewrite to replace body, \
-                 edit_frontmatter for tags/properties, update_metadata for bulk tag/alias replacement. \
+                 Write: create for new notes, update for every change to an existing one — a list of edits over the body, a section or a frontmatter property, applied in one write. \
                  Lifecycle: move_note to relocate, archive to soft-delete, unarchive to restore, delete for permanent removal. \
                  Index: reindex_file to refresh a single file's index after external edits. \
                  Identity: identity for user context at session start, setup to run first-time onboarding (detect/apply). \
@@ -1201,16 +962,19 @@ pub async fn run_serve(
 mod tests {
     use super::*;
 
-    /// Regression test for <https://github.com/devwhodevs/engraph/issues/32>.
+    /// Regression test for <https://github.com/devwhodevs/engraph/issues/32>,
+    /// carried onto `update`'s edit list (#62). `edits` is the one array of
+    /// objects an MCP tool takes, so it is the one place the schema can
+    /// publish an `items` that OpenAI refuses.
     #[test]
-    fn edit_frontmatter_operations_schema_has_object_items() {
-        let schema = schemars::schema_for!(EditFrontmatterParams);
+    fn update_edits_schema_has_object_items() {
+        let schema = schemars::schema_for!(crate::params::Update);
         let json = serde_json::to_value(&schema).unwrap();
 
-        let items = &json["properties"]["operations"]["items"];
+        let items = &json["properties"]["edits"]["items"];
         assert!(
             items.is_object(),
-            "operations.items must be an object schema, got: {items}"
+            "edits.items must be an object schema, got: {items}"
         );
 
         // schemars may inline properties or use a $ref to $defs; both are
@@ -1219,36 +983,7 @@ mod tests {
         let has_ref = items.get("$ref").is_some();
         assert!(
             has_properties || has_ref,
-            "operations.items must define properties or $ref, got: {items}"
-        );
-    }
-
-    #[test]
-    fn frontmatter_op_input_deserializes_all_variants() {
-        let cases = [
-            (r#"{"op":"set","key":"status","value":"done"}"#, "set"),
-            (r#"{"op":"remove","key":"status"}"#, "remove"),
-            (r#"{"op":"add_tag","value":"rust"}"#, "add_tag"),
-            (r#"{"op":"remove_tag","value":"old"}"#, "remove_tag"),
-            (r#"{"op":"add_alias","value":"eng"}"#, "add_alias"),
-            (r#"{"op":"remove_alias","value":"eng"}"#, "remove_alias"),
-        ];
-        for (json, label) in cases {
-            let input: FrontmatterOpInput = serde_json::from_str(json)
-                .unwrap_or_else(|e| panic!("failed to deserialize {label}: {e}"));
-            // Verify the parsed input converts to a valid FrontmatterOp.
-            let ops = parse_frontmatter_ops(&[input]);
-            assert!(ops.is_ok(), "{label} should produce a valid op: {:?}", ops);
-        }
-    }
-
-    #[test]
-    fn frontmatter_op_input_rejects_unknown_variant() {
-        let json = r#"{"op":"unknown_op","value":"x"}"#;
-        let result: Result<FrontmatterOpInput, _> = serde_json::from_str(json);
-        assert!(
-            result.is_err(),
-            "unknown op variant should fail deserialization"
+            "edits.items must define properties or $ref, got: {items}"
         );
     }
 }

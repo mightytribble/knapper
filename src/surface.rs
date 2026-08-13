@@ -248,16 +248,10 @@ pub const PENDING_MCP: &[Pending] = &[
     Pending::NotYetAdded("index"),
     Pending::NotYetAdded("status"),
     Pending::NotYetAdded("topic"),
-    Pending::NotYetAdded("update"),
     Pending::NotYetAdded("move"),
     Pending::NotYetAdded("init"),
     Pending::NotYetAdded("migrate"),
     Pending::NotYetRemoved("context"),
-    Pending::NotYetRemoved("append"),
-    Pending::NotYetRemoved("edit"),
-    Pending::NotYetRemoved("rewrite"),
-    Pending::NotYetRemoved("edit_frontmatter"),
-    Pending::NotYetRemoved("update_metadata"),
     Pending::NotYetRemoved("unarchive"),
     Pending::NotYetRemoved("move_note"),
     Pending::NotYetRemoved("setup"),
@@ -272,15 +266,9 @@ pub const PENDING_HTTP: &[Pending] = &[
     Pending::NotYetAdded("/api/index"),
     Pending::NotYetAdded("/api/status"),
     Pending::NotYetAdded("/api/topic"),
-    Pending::NotYetAdded("/api/update"),
     Pending::NotYetAdded("/api/init"),
     Pending::NotYetAdded("/api/migrate"),
     Pending::NotYetRemoved("/api/context"),
-    Pending::NotYetRemoved("/api/append"),
-    Pending::NotYetRemoved("/api/edit"),
-    Pending::NotYetRemoved("/api/rewrite"),
-    Pending::NotYetRemoved("/api/edit-frontmatter"),
-    Pending::NotYetRemoved("/api/update-metadata"),
     Pending::NotYetRemoved("/api/unarchive"),
     Pending::NotYetRemoved("/api/setup"),
     Pending::NotYetRemoved("/api/migrate/preview"),
@@ -291,7 +279,8 @@ pub const PENDING_HTTP: &[Pending] = &[
 /// Capabilities whose CLI arguments are declared apart from the shared
 /// parameter struct, and why. The parity test checks these by name,
 /// because they are the only ones where two declarations can drift.
-pub const PARAMS_NOT_SHARED: &[(&str, &str)] = &[];
+pub const PARAMS_NOT_SHARED: &[(&str, &str)] =
+    &[("update", "a list of edits is not a clap-parsable type")];
 
 /// Routes the transport serves for itself. They name no capability.
 pub const HTTP_TRANSPORT_ROUTES: &[(&str, &str)] = &[

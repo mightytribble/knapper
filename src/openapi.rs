@@ -18,14 +18,10 @@ pub fn build_openapi_spec(server_url: &str) -> serde_json::Value {
 
     // Write endpoints
     paths.insert("/api/create".into(), build_create());
-    paths.insert("/api/append".into(), build_append());
-    paths.insert("/api/edit".into(), build_edit());
-    paths.insert("/api/rewrite".into(), build_rewrite());
-    paths.insert("/api/edit-frontmatter".into(), build_edit_frontmatter());
+    paths.insert("/api/update".into(), build_update());
     paths.insert("/api/move".into(), build_move());
     paths.insert("/api/archive".into(), build_archive());
     paths.insert("/api/unarchive".into(), build_unarchive());
-    paths.insert("/api/update-metadata".into(), build_update_metadata());
     paths.insert("/api/delete".into(), build_delete());
     paths.insert("/api/reindex-file".into(), build_reindex_file());
 
@@ -248,97 +244,45 @@ fn build_create() -> serde_json::Value {
     })
 }
 
-fn build_append() -> serde_json::Value {
+fn build_update() -> serde_json::Value {
     serde_json::json!({
         "post": {
-            "operationId": "appendToNote",
-            "summary": "Append content to the end of an existing note.",
+            "operationId": "updateNote",
+            "summary": "Change an existing note. Applies a list of edits in order, in one write.",
+            "description": "Each edit names its target: `section` for one heading, `property` for one frontmatter key, and neither for the note's body. An edit naming both is an error. `content` is a string, or a list of strings for a list-valued property such as tags or aliases; a body edit and a section edit take a string. A body edit always keeps the note's frontmatter, so change the frontmatter with `property` edits in the same list. Two behaviours differ from the append/edit/rewrite/edit-frontmatter/update-metadata calls this replaces: a body append normalises the blank lines after a frontmatter block, and a note changed outside engraph and not yet re-indexed fails with an mtime conflict.",
             "requestBody": {
                 "required": true,
                 "content": { "application/json": { "schema": {
                     "type": "object",
-                    "required": ["file", "content"],
+                    "required": ["file", "edits"],
+                    "additionalProperties": false,
                     "properties": {
                         "file": { "type": "string", "description": "Target note (path, basename, or #docid)" },
-                        "content": { "type": "string", "description": "Content to append" }
-                    }
-                }}}
-            },
-            "responses": { "200": { "description": "Updated note path and metadata" } }
-        }
-    })
-}
-
-fn build_edit() -> serde_json::Value {
-    serde_json::json!({
-        "post": {
-            "operationId": "editNote",
-            "summary": "Edit a specific section of a note by heading. Supports replace, prepend, append modes.",
-            "requestBody": {
-                "required": true,
-                "content": { "application/json": { "schema": {
-                    "type": "object",
-                    "required": ["file", "heading", "content"],
-                    "properties": {
-                        "file": { "type": "string", "description": "Target note (path, basename, or #docid)" },
-                        "heading": { "type": "string", "description": "Section heading (case-insensitive)" },
-                        "content": { "type": "string", "description": "Content to add or replace" },
-                        "mode": { "type": "string", "description": "'replace', 'prepend', or 'append' (default)" }
-                    }
-                }}}
-            },
-            "responses": { "200": { "description": "Updated note path and metadata" } }
-        }
-    })
-}
-
-fn build_rewrite() -> serde_json::Value {
-    serde_json::json!({
-        "post": {
-            "operationId": "rewriteNote",
-            "summary": "Rewrite a note's body content. Preserves frontmatter by default.",
-            "requestBody": {
-                "required": true,
-                "content": { "application/json": { "schema": {
-                    "type": "object",
-                    "required": ["file", "content"],
-                    "properties": {
-                        "file": { "type": "string", "description": "Target note (path, basename, or #docid)" },
-                        "content": { "type": "string", "description": "New body content" },
-                        "preserve_frontmatter": { "type": "boolean", "description": "Preserve frontmatter (default true)" }
-                    }
-                }}}
-            },
-            "responses": { "200": { "description": "Updated note path and metadata" } }
-        }
-    })
-}
-
-fn build_edit_frontmatter() -> serde_json::Value {
-    serde_json::json!({
-        "post": {
-            "operationId": "editFrontmatter",
-            "summary": "Edit a note's frontmatter with structured operations (set, remove, add_tag, etc.).",
-            "requestBody": {
-                "required": true,
-                "content": { "application/json": { "schema": {
-                    "type": "object",
-                    "required": ["file", "operations"],
-                    "properties": {
-                        "file": { "type": "string", "description": "Target note (path, basename, or #docid)" },
-                        "operations": {
+                        "edits": {
                             "type": "array",
-                            "description": "Frontmatter operations",
-                            "items": { "type": "object", "properties": {
-                                "op": { "type": "string", "description": "set/remove/add_tag/remove_tag/add_alias/remove_alias" },
-                                "key": { "type": "string", "description": "Property key (for set/remove)" },
-                                "value": { "type": "string", "description": "Value" }
-                            }}
+                            "description": "Edits to apply, in order, in one write",
+                            "items": {
+                                "type": "object",
+                                "required": ["mode"],
+                                "additionalProperties": false,
+                                "properties": {
+                                    "section": { "type": "string", "description": "Heading of the section to edit. Omit this and property to edit the body" },
+                                    "property": { "type": "string", "description": "Frontmatter property to edit. Naming a section as well is an error" },
+                                    "mode": { "type": "string", "enum": ["replace", "prepend", "append", "remove"], "description": "What the edit does. remove is for a property alone" },
+                                    "content": {
+                                        "description": "A string, or a list of strings to set a list-valued property",
+                                        "oneOf": [
+                                            { "type": "string" },
+                                            { "type": "array", "items": { "type": "string" } }
+                                        ]
+                                    }
+                                }
+                            }
                         }
                     }
                 }}}
             },
-            "responses": { "200": { "description": "Updated note path and metadata" } }
+            "responses": { "200": { "description": "Updated note path" } }
         }
     })
 }
@@ -400,28 +344,6 @@ fn build_unarchive() -> serde_json::Value {
                 }}}
             },
             "responses": { "200": { "description": "Restored note path" } }
-        }
-    })
-}
-
-fn build_update_metadata() -> serde_json::Value {
-    serde_json::json!({
-        "post": {
-            "operationId": "updateMetadata",
-            "summary": "Update a note's tags and aliases in bulk.",
-            "requestBody": {
-                "required": true,
-                "content": { "application/json": { "schema": {
-                    "type": "object",
-                    "required": ["file"],
-                    "properties": {
-                        "file": { "type": "string", "description": "Target note (path, basename, or #docid)" },
-                        "tags": { "type": "array", "items": { "type": "string" }, "description": "New tags (replaces existing)" },
-                        "aliases": { "type": "array", "items": { "type": "string" }, "description": "New aliases (replaces existing)" }
-                    }
-                }}}
-            },
-            "responses": { "200": { "description": "Updated note metadata" } }
         }
     })
 }
@@ -669,14 +591,10 @@ mod tests {
             "getContext",
             "getHealth",
             "createNote",
-            "appendToNote",
-            "editNote",
-            "rewriteNote",
-            "editFrontmatter",
+            "updateNote",
             "moveNote",
             "archiveNote",
             "unarchiveNote",
-            "updateMetadata",
             "deleteNote",
             "migratePreview",
             "migrateApply",
