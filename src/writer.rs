@@ -1081,7 +1081,8 @@ pub fn edit_note(
 
     // Step 3: Apply the section edit
     let new_content =
-        apply_section_edit(&content, &input.heading, &input.content, input.mode.clone())?;
+        apply_section_edit(&content, &input.heading, &input.content, input.mode.clone())
+            .map_err(|e| anyhow::anyhow!("{e} in {}", input.file))?;
 
     // Step 4: Write atomically (overwrite = true)
     atomic_write(&full_path, &new_content, true)?;
@@ -1113,22 +1114,21 @@ pub fn apply_body_edit(
 ) -> String {
     if preserve_frontmatter {
         let (maybe_frontmatter, old_body) = crate::markdown::split_frontmatter(content);
-        let Some(frontmatter) = maybe_frontmatter else {
-            // No existing frontmatter — just use new content as-is
-            return new.to_string();
-        };
-        let new_body = match mode {
-            EditMode::Replace => new.to_string(),
-            EditMode::Append => format!("{}\n{}", old_body.trim_end(), new),
-            EditMode::Prepend => format!("{}\n{}", new.trim_end(), old_body),
-        };
-        format!("---\n{}\n---\n\n{}", frontmatter, new_body)
-    } else {
-        match mode {
-            EditMode::Replace => new.to_string(),
-            EditMode::Append => format!("{}\n{}", content.trim_end(), new),
-            EditMode::Prepend => format!("{}\n{}", new.trim_end(), content),
+        if let Some(frontmatter) = maybe_frontmatter {
+            let new_body = match mode {
+                EditMode::Replace => new.to_string(),
+                EditMode::Append => format!("{}\n{}", old_body.trim_end(), new),
+                EditMode::Prepend => format!("{}\n{}", new.trim_end(), old_body),
+            };
+            return format!("---\n{}\n---\n\n{}", frontmatter, new_body);
         }
+        // No existing frontmatter to preserve — fall through to the whole-text
+        // join below, so Append and Prepend still keep the note's own body.
+    }
+    match mode {
+        EditMode::Replace => new.to_string(),
+        EditMode::Append => format!("{}\n{}", content.trim_end(), new),
+        EditMode::Prepend => format!("{}\n{}", new.trim_end(), content),
     }
 }
 
@@ -1773,6 +1773,22 @@ mod tests {
         assert!(out.contains("- b"));
         assert!(out.contains("status: done"));
         assert!(out.ends_with("body\n"));
+    }
+
+    #[test]
+    fn appending_with_preserve_frontmatter_on_a_note_with_none_keeps_the_body() {
+        let doc = "old body\n";
+        let out = apply_body_edit(doc, "new stuff", EditMode::Append, true);
+        assert!(out.contains("old body"), "the existing body must survive");
+        assert!(out.contains("new stuff"));
+    }
+
+    #[test]
+    fn prepending_with_preserve_frontmatter_on_a_note_with_none_keeps_the_body() {
+        let doc = "old body\n";
+        let out = apply_body_edit(doc, "new stuff", EditMode::Prepend, true);
+        assert!(out.contains("old body"), "the existing body must survive");
+        assert!(out.contains("new stuff"));
     }
 
     #[test]
