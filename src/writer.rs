@@ -109,6 +109,10 @@ pub struct EditFrontmatterInput {
 /// them, so two targets are unrepresentable rather than rejected (#62).
 #[derive(Debug, Clone)]
 pub enum EditTarget {
+    /// The note's body. The content is the body **alone**: a body edit always
+    /// keeps the note's frontmatter, so content that starts with its own
+    /// `---` block gives the note two frontmatter blocks. Edit the
+    /// frontmatter with `Property` edits in the same list (#62).
     Body,
     Section(String),
     Property(String),
@@ -1429,25 +1433,50 @@ fn property_ops(
 /// Apply every edit to a note's text, in order. Pure, so `update_note` can
 /// write the result once — one file write, one conflict check and one
 /// re-index for a whole batch (#62).
+///
+/// A run of property edits becomes one `apply_frontmatter_ops` call. The ops
+/// already apply in order over one YAML mapping, so the result is the same,
+/// but each call reassembles the note and each reassembly adds a line break
+/// between the frontmatter and the body. One call per edit therefore pushes
+/// the body one line down for every property edit in the list.
 pub fn apply_note_edits(content: &str, edits: &[NoteEdit]) -> Result<String> {
     let mut text = content.to_string();
-    for edit in edits {
-        text = match (&edit.target, edit.mode) {
-            (EditTarget::Body | EditTarget::Section(_), EditMode::Remove) => {
-                bail!("Remove has no meaning for a section")
+    let mut rest = edits;
+    while let Some(edit) = rest.first() {
+        match &edit.target {
+            EditTarget::Property(_) => {
+                let run = rest
+                    .iter()
+                    .position(|e| !matches!(e.target, EditTarget::Property(_)))
+                    .unwrap_or(rest.len());
+                let (properties, tail) = rest.split_at(run);
+                let mut ops = Vec::new();
+                for property in properties {
+                    let EditTarget::Property(key) = &property.target else {
+                        bail!("a run of property edits holds property edits alone");
+                    };
+                    ops.extend(property_ops(key, property.mode, property.content.as_ref())?);
+                }
+                text = apply_frontmatter_ops(&text, &ops)?;
+                rest = tail;
             }
-            (EditTarget::Body, mode) => {
+            EditTarget::Body => {
+                if edit.mode == EditMode::Remove {
+                    bail!("Remove has no meaning for a body");
+                }
                 let new = text_of(edit)?;
-                apply_body_edit(&text, &new, mode, true)
+                text = apply_body_edit(&text, &new, edit.mode, true);
+                rest = &rest[1..];
             }
-            (EditTarget::Section(h), mode) => {
+            EditTarget::Section(heading) => {
+                if edit.mode == EditMode::Remove {
+                    bail!("Remove has no meaning for a section");
+                }
                 let new = text_of(edit)?;
-                apply_section_edit(&text, h, &new, mode)?
+                text = apply_section_edit(&text, heading, &new, edit.mode)?;
+                rest = &rest[1..];
             }
-            (EditTarget::Property(key), mode) => {
-                apply_frontmatter_ops(&text, &property_ops(key, mode, edit.content.as_ref())?)?
-            }
-        };
+        }
     }
     Ok(text)
 }
@@ -3273,6 +3302,28 @@ mod tests {
                 "- a",
                 false,
             ),
+            // An append to a property that is not `tags` goes to that
+            // property. Routing appends by name, with `tags` as the
+            // fallback, writes this value into the note's tag list instead
+            // (#62).
+            (
+                NoteEdit {
+                    target: EditTarget::Property("status".into()),
+                    mode: EditMode::Append,
+                    content: Some(EditContent::Text("wip".into())),
+                },
+                "status:\n- wip",
+                true,
+            ),
+            (
+                NoteEdit {
+                    target: EditTarget::Property("status".into()),
+                    mode: EditMode::Append,
+                    content: Some(EditContent::Text("wip".into())),
+                },
+                "- a\n- wip",
+                false,
+            ),
         ];
 
         for (edit, needle, present) in cases {
@@ -3280,5 +3331,48 @@ mod tests {
             let out = apply_note_edits(doc, std::slice::from_ref(&edit)).unwrap();
             assert_eq!(out.contains(needle), present, "edit {edit:?} on {doc:?}");
         }
+    }
+
+    #[test]
+    fn a_list_of_property_edits_reassembles_the_note_once() {
+        // Each reassembly puts a line break between the frontmatter and the
+        // body, and `split_frontmatter` hands the body back with the one it
+        // already had. One reassembly per edit therefore pushes the body one
+        // line further down for every edit in the list, so a two-edit call
+        // must give the same bytes as a one-edit call gives, plus the tag.
+        // A `contains` assertion cannot see this, so pin the bytes (#62).
+        let doc = "---\ntags:\n  - a\n---\n\n## Spells\n\nold\n";
+
+        let one = apply_note_edits(
+            doc,
+            &[NoteEdit {
+                target: EditTarget::Property("tags".into()),
+                mode: EditMode::Append,
+                content: Some(EditContent::Text("b".into())),
+            }],
+        )
+        .unwrap();
+        assert_eq!(one, "---\ntags:\n- a\n- b\n---\n\n\n## Spells\n\nold\n");
+
+        let two = apply_note_edits(
+            doc,
+            &[
+                NoteEdit {
+                    target: EditTarget::Property("tags".into()),
+                    mode: EditMode::Append,
+                    content: Some(EditContent::Text("b".into())),
+                },
+                NoteEdit {
+                    target: EditTarget::Property("status".into()),
+                    mode: EditMode::Replace,
+                    content: Some(EditContent::Text("done".into())),
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            two,
+            "---\ntags:\n- a\n- b\nstatus: done\n---\n\n\n## Spells\n\nold\n"
+        );
     }
 }
