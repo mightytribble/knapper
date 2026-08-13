@@ -209,9 +209,9 @@ fn build_context() -> serde_json::Value {
                 "required": true,
                 "content": { "application/json": { "schema": {
                     "type": "object",
-                    "required": ["topic"],
+                    "required": ["query"],
                     "properties": {
-                        "topic": { "type": "string", "description": "Topic or question" },
+                        "query": { "type": "string", "description": "Topic or question" },
                         "budget": { "type": "integer", "description": "Character budget (default 32000)" }
                     }
                 }}}

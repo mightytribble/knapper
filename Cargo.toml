@@ -59,3 +59,7 @@ cuda = ["llama-cpp-2/cuda"]
 
 [dev-dependencies]
 tempfile = "3"
+# Already in the dependency graph via axum's `Query` extractor (see
+# Cargo.lock); declared directly so `params.rs` can test its GET-query-string
+# shape without going through a live axum router (#62).
+serde_urlencoded = "0.7"

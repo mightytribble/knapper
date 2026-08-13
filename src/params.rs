@@ -19,7 +19,7 @@ use serde::Deserialize;
 pub struct Search {
     /// The search query.
     pub query: String,
-    /// Number of results to return.
+    /// Number of results to return (default 10).
     #[arg(short = 'n', long)]
     pub top_n: Option<usize>,
     /// Show the per-lane score breakdown for each result.
@@ -65,8 +65,9 @@ pub struct List {
     /// Filter to a folder path prefix.
     #[arg(long)]
     pub folder: Option<String>,
-    /// Filter to notes carrying every term. A trailing `/` or `/*` matches
-    /// the tag and its descendants.
+    /// Filter to notes carrying every term. A term is a tag path; a trailing
+    /// `/` or `/*` matches the tag and its descendants. An unknown term is
+    /// an error naming the nearest tag the vault holds (#60).
     #[arg(long, value_delimiter = ',')]
     #[serde(default, deserialize_with = "deserialize_tag_list")]
     pub all: Vec<String>,
@@ -74,20 +75,23 @@ pub struct List {
     #[arg(long, value_delimiter = ',')]
     #[serde(default, deserialize_with = "deserialize_tag_list")]
     pub tags: Vec<String>,
-    /// Filter to notes carrying at least one term.
+    /// Filter to notes carrying at least one of these terms. An unknown
+    /// term is an error naming the nearest tag the vault holds (#60).
     #[arg(long, value_delimiter = ',')]
     #[serde(default, deserialize_with = "deserialize_tag_list")]
     pub any: Vec<String>,
-    /// Filter out notes carrying any of these terms.
+    /// Filter out notes carrying any of these terms. An unknown term here
+    /// is ignored (#60).
     #[arg(long, value_delimiter = ',')]
     #[serde(default, deserialize_with = "deserialize_tag_list")]
     pub none: Vec<String>,
     /// Filter to notes created by one agent.
     #[arg(long)]
     pub created_by: Option<String>,
-    /// Maximum results.
+    /// Maximum results (default 20). Raising it adds results below the same
+    /// ranking; it does not change what the top of the ranking holds.
     #[arg(long, default_value = "20")]
-    #[serde(default = "default_limit")]
+    #[serde(default = "default_limit", deserialize_with = "deserialize_limit")]
     pub limit: usize,
 }
 
@@ -95,9 +99,17 @@ fn default_limit() -> usize {
     20
 }
 
+fn deserialize_limit<'de, D>(deserializer: D) -> Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_number_or_default(deserializer, default_limit())
+}
+
 #[derive(Debug, Args, Deserialize, JsonSchema)]
 pub struct Tags {
-    /// Limit to one tag and its descendants, as `type/` or `type/*`.
+    /// Limit to one tag and its descendants, as `type/` or `type/*`. Omit
+    /// for the whole vocabulary.
     #[arg(long)]
     pub under: Option<String>,
 }
@@ -123,12 +135,31 @@ pub struct Topic {
     pub query: String,
     /// Character budget. 32000 is about 8000 tokens.
     #[arg(long, default_value = "32000")]
-    #[serde(default = "default_budget")]
+    #[serde(default = "default_budget", deserialize_with = "deserialize_budget")]
     pub budget: usize,
 }
 
 fn default_budget() -> usize {
     32000
+}
+
+fn deserialize_budget<'de, D>(deserializer: D) -> Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_number_or_default(deserializer, default_budget())
+}
+
+/// A number that falls back to `default` when the field is absent, and also
+/// when a caller sends an explicit JSON `null` — `#[serde(default = ...)]`
+/// alone only covers the absent case; a present `null` still reaches
+/// `usize::deserialize` and fails there (#60, the same lesson as
+/// `deserialize_tag_list`).
+fn deserialize_number_or_default<'de, D>(deserializer: D, default: usize) -> Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<usize>::deserialize(deserializer)?.unwrap_or(default))
 }
 
 /// One field, three shapes: a JSON array of strings, one comma-separated
@@ -216,5 +247,45 @@ mod tests {
             .collect();
 
         assert_eq!(clap_names, schema_names);
+    }
+
+    /// A JSON array of strings is the MCP and HTTP-JSON shape.
+    #[test]
+    fn tag_list_reads_a_json_array() {
+        let list: List = serde_json::from_str(r#"{"all":["a","b"]}"#).unwrap();
+        assert_eq!(list.all, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    /// One comma-separated string is what a GET query string sends, but a
+    /// JSON caller may send it too (#61); the split trims and drops empties.
+    #[test]
+    fn tag_list_reads_a_comma_separated_string() {
+        let list: List = serde_json::from_str(r#"{"all":"a, b"}"#).unwrap();
+        assert_eq!(list.all, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    /// An explicit JSON `null` — what a JS/Python caller sends for an absent
+    /// optional — must not fail deserialization (#60).
+    #[test]
+    fn tag_list_reads_null_as_empty() {
+        let list: List = serde_json::from_str(r#"{"all":null}"#).unwrap();
+        assert!(list.all.is_empty());
+    }
+
+    /// `serde_urlencoded` has no sequence support, so `GET /api/list` reads
+    /// the comma-separated shape through the same helper (#61).
+    #[test]
+    fn tag_list_reads_from_a_query_string() {
+        let list: List = serde_urlencoded::from_str("all=a,b").unwrap();
+        assert_eq!(list.all, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    /// A number field takes the same null-must-not-fail rule as the tag
+    /// lists (#60) — `#[serde(default = ...)]` alone only covers a field
+    /// that is missing, not one sent as an explicit `null`.
+    #[test]
+    fn limit_reads_null_as_the_default() {
+        let list: List = serde_json::from_str(r#"{"limit":null}"#).unwrap();
+        assert_eq!(list.limit, 20);
     }
 }
