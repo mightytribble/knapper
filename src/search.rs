@@ -2237,6 +2237,50 @@ mod tests {
         );
     }
 
+    /// Two notes on one subject in two folders, so a directory scope has one
+    /// to include and one to exclude.
+    fn foldered_vault() -> (tempfile::TempDir, Store, llm::MockLlm) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("Locations")).unwrap();
+        std::fs::create_dir_all(root.join("People")).unwrap();
+        std::fs::write(
+            root.join("Locations/wight.md"),
+            "# Wight\n\n## Warding\n\nA warding effect that pins an undead creature \
+             in the space it stands in.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("People/wolf.md"),
+            "# Wolf\n\n## Warding\n\nA warding effect that pins a beast in the space \
+             it stands in.\n",
+        )
+        .unwrap();
+        let store = Store::open_memory().unwrap();
+        let mut embedder = llm::MockLlm::new(256);
+        let config = crate::config::Config::default();
+        crate::indexer::run_index_shared(root, &config, &store, &mut embedder, false, None)
+            .unwrap();
+        (tmp, store, embedder)
+    }
+
+    #[test]
+    fn a_directory_scope_keeps_the_search_results_inside_the_folder() {
+        // #65. Reach test: `search_scoped` is #60's wiring, unchanged here.
+        // This proves it already carries a directory term with no production
+        // change.
+        let (_tmp, store, mut embedder) = foldered_vault();
+        let scope = crate::tags::Scope::parse(&["/Locations/".to_string()], &[], &[]).unwrap();
+        let out = search_scoped("warding", scope, &store, &mut embedder).unwrap();
+        assert!(!out.results.is_empty(), "the in-folder note answers");
+        for r in &out.results {
+            assert_eq!(
+                r.file_path, "Locations/wight.md",
+                "an out-of-folder note answered a directory-scoped search"
+            );
+        }
+    }
+
     #[test]
     fn lane_width_is_the_setting_and_not_top_n() {
         // #49. Each content lane fetched `top_n * 3`, so the size of the

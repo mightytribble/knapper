@@ -5667,6 +5667,18 @@ mod tests {
     }
 
     #[test]
+    fn list_files_filters_by_a_directory_scope() {
+        // #65. Reach test: `list_files` already takes a `Scope` (Task 3), so
+        // this proves the wiring carries a directory term with no
+        // production change.
+        let store = folder_fixture();
+        assert_eq!(
+            listed_paths(&store, &folder_scope(&["/People/"], &[], &[])),
+            vec!["People/marcus.md"]
+        );
+    }
+
+    #[test]
     fn a_directory_scope_is_case_sensitive() {
         // Two folders differ only in case, so both validate; the range on
         // files.path keeps case, so /Locations/ resolves to the capitalized

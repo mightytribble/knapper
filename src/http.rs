@@ -383,6 +383,14 @@ fn search_response(
     envelope
 }
 
+/// Whether an error message is a caller's own scope typo, which is a bad
+/// request rather than a server fault. `check_terms` gives the caller the
+/// nearest tag or folder in the message, the cheapest honest signal this far
+/// from where the error is built (#60, #65).
+fn is_scope_typo(message: &str) -> bool {
+    message.starts_with("no such tag") || message.starts_with("no such folder")
+}
+
 async fn handle_search(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -422,10 +430,11 @@ async fn handle_search(
 
     let output = search::search_with_intelligence(&body.query, top_n, &mut *embedder, &mut config)
         .map_err(|e| {
-            // An unknown tag is a caller's typo, not a server fault. The
-            // message text is the cheapest honest signal check_terms gives a
-            // caller this far from the error's construction (#60).
-            if e.to_string().starts_with("no such tag") {
+            // An unknown tag or folder is a caller's typo, not a server
+            // fault. The message text is the cheapest honest signal
+            // check_terms gives a caller this far from the error's
+            // construction (#60, #65).
+            if is_scope_typo(&e.to_string()) {
                 ApiError::bad_request(&format!("{e:#}"))
             } else {
                 ApiError::internal(&format!("{e:#}"))
@@ -488,10 +497,10 @@ async fn handle_list(
         params.limit,
     )
     .map_err(|e| {
-        // An unknown tag is a caller's typo, not a server fault. The message
-        // text is the cheapest honest signal check_terms gives a caller this
-        // far from the error's construction.
-        if e.to_string().starts_with("no such tag") {
+        // An unknown tag or folder is a caller's typo, not a server fault.
+        // The message text is the cheapest honest signal check_terms gives a
+        // caller this far from the error's construction (#65).
+        if is_scope_typo(&e.to_string()) {
             ApiError::bad_request(&format!("{e:#}"))
         } else {
             ApiError::internal(&format!("{e:#}"))
@@ -584,9 +593,10 @@ async fn handle_topic(
     let bundle =
         context::context_topic_with_search(&ctx, &body.query, body.budget, &mut *embedder, &scope)
             .map_err(|e| {
-                // An unknown tag is a caller's typo, not a server fault, which
-                // is the reading the search route already takes (#60, #64).
-                if e.to_string().starts_with("no such tag") {
+                // An unknown tag or folder is a caller's typo, not a server
+                // fault, which is the reading the search route already takes
+                // (#60, #64, #65).
+                if is_scope_typo(&e.to_string()) {
                     ApiError::bad_request(&format!("{e:#}"))
                 } else {
                     ApiError::internal(&format!("{e:#}"))
@@ -1341,6 +1351,27 @@ mod tests {
                     .header("content-type", "application/json")
                     .header("authorization", "Bearer eg_readkey")
                     .body(Body::from(r#"{"query":"warding","all":["type/undead"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn a_search_scope_naming_no_folder_is_a_bad_request() {
+        // #65. The caller's own text named a folder no note lives under, so
+        // this is a 400, the same as an unknown tag.
+        let state = test_api_state();
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/search")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer eg_readkey")
+                    .body(Body::from(r#"{"query":"warding","all":["/Nowhere/"]}"#))
                     .unwrap(),
             )
             .await

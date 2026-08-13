@@ -1461,6 +1461,79 @@ mod tests {
         );
     }
 
+    // --- the directory scope on `topic` (#65) ---
+
+    /// Two notes on one subject in two folders, so a directory scope has one
+    /// to admit and one to exclude. Mirrors `scoped_topic_vault`, substituting
+    /// folder placement for the tags.
+    fn foldered_topic_vault() -> (TempDir, Store, crate::llm::MockLlm, std::path::PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(root.join("Locations")).unwrap();
+        std::fs::create_dir_all(root.join("People")).unwrap();
+        std::fs::write(
+            root.join("Locations/wight.md"),
+            "# Wight\n\n## Warding\n\nA warding effect that pins an undead creature \
+             in the space it stands in, and does not care how it got there.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("People/wolf.md"),
+            "# Wolf\n\n## Warding\n\nA warding effect that pins a beast in the space \
+             it stands in, and does not care how it got there.\n",
+        )
+        .unwrap();
+
+        let store = Store::open_memory().unwrap();
+        let mut embedder = crate::llm::MockLlm::new(256);
+        let config = crate::config::Config::default();
+        crate::indexer::run_index_shared(&root, &config, &store, &mut embedder, false, None)
+            .unwrap();
+        (tmp, store, embedder, root)
+    }
+
+    #[test]
+    fn a_directory_scope_keeps_the_topic_bundle_inside_the_folder() {
+        // #65. Reach test: `context_topic_with_search` already takes a
+        // `Scope` (#64), so this proves the wiring carries a directory term
+        // with no production change.
+        let (_tmp, store, mut embedder, root) = foldered_topic_vault();
+        let params = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+        let filter = crate::tags::Scope::parse(&["/Locations/".to_string()], &[], &[]).unwrap();
+
+        let unscoped = context_topic_with_search(
+            &params,
+            "warding",
+            32000,
+            &mut embedder,
+            &crate::tags::Scope::default(),
+        )
+        .unwrap();
+        let paths: Vec<&str> = unscoped.sections.iter().map(|s| s.path.as_str()).collect();
+        assert!(
+            paths.iter().any(|p| p.starts_with("People/")),
+            "unscoped, both notes answer"
+        );
+
+        let scoped =
+            context_topic_with_search(&params, "warding", 32000, &mut embedder, &filter).unwrap();
+        assert!(
+            !scoped.sections.is_empty(),
+            "the in-folder note still answers"
+        );
+        for s in &scoped.sections {
+            assert!(
+                s.path.starts_with("Locations/"),
+                "an out-of-folder note reached the bundle: {}",
+                s.path
+            );
+        }
+    }
+
     /// A vault of one person note, with a `person` tag, a `Role` and an
     /// `Interactions` section, and an outgoing wikilink to `colleague.md` —
     /// Task 9 reuses this fixture and needs that link on `person.md`.
