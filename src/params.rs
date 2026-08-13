@@ -122,6 +122,12 @@ pub struct List {
     #[arg(long)]
     #[serde(default)]
     pub limit: Option<usize>,
+    /// Answer each note's heading outline beneath its path. It reads every
+    /// listed note from disk, because the index does not hold the outline;
+    /// an undetailed listing touches no file (#68).
+    #[arg(long)]
+    #[serde(default)]
+    pub detailed: bool,
 }
 
 #[derive(Debug, Args, Deserialize, JsonSchema)]
@@ -741,6 +747,17 @@ mod tests {
     fn limit_reads_null_as_no_limit() {
         let list: List = serde_json::from_str(r#"{"limit":null}"#).unwrap();
         assert_eq!(list.limit, None);
+    }
+
+    /// `serde_urlencoded` reads `detailed=true` and not a bare `detailed`,
+    /// so the value is required on the query string; absent, the field is
+    /// false and the listing touches no file (#68).
+    #[test]
+    fn detailed_reads_from_a_query_string_and_defaults_to_false() {
+        let list: List = serde_urlencoded::from_str("detailed=true").unwrap();
+        assert!(list.detailed);
+        let bare: List = serde_urlencoded::from_str("all=type/").unwrap();
+        assert!(!bare.detailed);
     }
 
     /// A GET query string carries the number as text; `serde_urlencoded`

@@ -494,7 +494,7 @@ async fn handle_list(
         &filter,
         params.created_by.as_deref(),
         params.limit,
-        false,
+        params.detailed,
     )
     .map_err(|e| {
         // An unknown tag or folder is a caller's typo, not a server fault.

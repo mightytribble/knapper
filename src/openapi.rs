@@ -128,7 +128,8 @@ fn build_list() -> serde_json::Value {
                 { "name": "any", "in": "query", "required": false, "description": "Comma-separated tag terms a note carries at least one of, or directory terms (starting with /, case-sensitive, a trailing / its subtree) it lies under", "schema": { "type": "string" } },
                 { "name": "none", "in": "query", "required": false, "description": "Comma-separated tag terms a note carries none of, or directory terms (starting with /, case-sensitive, a trailing / its subtree) it does not lie under", "schema": { "type": "string" } },
                 { "name": "created_by", "in": "query", "required": false, "description": "Agent filter", "schema": { "type": "string" } },
-                { "name": "limit", "in": "query", "required": false, "description": "Maximum notes to answer. Absent, every note the scope admits", "schema": { "type": "integer" } }
+                { "name": "limit", "in": "query", "required": false, "description": "Maximum notes to answer. Absent, every note the scope admits", "schema": { "type": "integer" } },
+                { "name": "detailed", "in": "query", "required": false, "description": "detailed=true answers each note's heading outline beside its path. The value is required; a bare `detailed` does not parse", "schema": { "type": "boolean" } }
             ],
             "responses": { "200": { "description": "Array of note summaries" } }
         }
@@ -549,6 +550,20 @@ mod tests {
         for operator in ["scope", "all", "any", "none"] {
             assert!(named.contains(&operator), "missing parameter: {operator}");
         }
+    }
+
+    /// The outline is a documented parameter of the HTTP surface, not a
+    /// CLI-only flag (#68).
+    #[test]
+    fn test_list_documents_detailed() {
+        let spec = build_openapi_spec("http://localhost:3000");
+        let named: Vec<&str> = spec["paths"]["/api/list"]["get"]["parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["name"].as_str().unwrap())
+            .collect();
+        assert!(named.contains(&"detailed"), "missing parameter: detailed");
     }
 
     #[test]

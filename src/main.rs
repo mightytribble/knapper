@@ -283,28 +283,30 @@ async fn main() -> Result<()> {
                 &filter,
                 args.created_by.as_deref(),
                 args.limit,
-                false,
+                args.detailed,
             )?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&items)?);
-            } else {
-                for item in &items {
-                    let did = item
-                        .docid
-                        .as_deref()
-                        .map(|d| format!(" #{d}"))
-                        .unwrap_or_default();
-                    let tags_str = if item.tags.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" [{}]", item.tags.join(", "))
-                    };
-                    println!(
-                        "{}{}{} ({} edges)",
-                        item.path, did, tags_str, item.edge_count
-                    );
+            } else if args.detailed {
+                // The path, then the note's headings as their own `#`
+                // markers, with a blank line between notes (#68).
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        println!();
+                    }
+                    println!("{}", item.path);
+                    for h in item.headings.iter().flatten() {
+                        println!("{} {}", "#".repeat(h.level as usize), h.text);
+                    }
                 }
-                println!("\n{} notes", items.len());
+            } else {
+                // One path per line and nothing else: that is what makes
+                // the listing pipeable, and `wc -l` is the total. The path
+                // is as the store holds it, relative to the vault root, so
+                // it can be pasted into `read`, `update` or `move` (#68).
+                for item in &items {
+                    println!("{}", item.path);
+                }
             }
         }
 
