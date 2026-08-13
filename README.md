@@ -333,7 +333,7 @@ curl -X POST http://localhost:3000/api/search \
 curl -X POST http://localhost:3000/api/search \
   -H "Authorization: Bearer eg_..." \
   -H "Content-Type: application/json" \
-  -d '{"query": "authentication architecture", "top_n": 5, "scope": ["project/auth"], "all": ["type/decision"], "any": ["status/reviewed", "status/draft"], "none": ["status/archived"]}'
+  -d '{"query": "authentication architecture", "top_n": 5, "scope": ["project/auth", "/01-Projects/"], "all": ["type/decision"], "any": ["status/reviewed", "status/draft"], "none": ["status/archived"]}'
 
 # Read a note, or one of its sections
 curl "http://localhost:3000/api/read?file=01-Projects/API-Design.md" \
