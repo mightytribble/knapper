@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — One name per capability ([#62](https://github.com/devwhodevs/engraph/issues/62))
+## Unreleased — One name per capability ([#62](https://github.com/mightytribble/engraph/issues/62))
 
 Every capability now has one name and one parameter set on the CLI, the MCP server and the HTTP API. The name is one word in `kebab-case`, and each surface spells it its own way: the CLI command as written, the MCP tool with `-` as `_`, and the HTTP route under `/api/` and the name. One transform gets from any spelling to any other.
 
