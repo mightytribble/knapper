@@ -1231,4 +1231,99 @@ mod tests {
                 .contains("--- Query run ---")
         );
     }
+
+    /// A server over five notes that all answer one query, started at the
+    /// `top_n` given. Five is more than the `top_n` the R21 test configures,
+    /// so a truncation reads as a truncation and not as a corpus that had no
+    /// more to give (#62). Each body is well over `chunk_min_chars`, so each
+    /// note is one chunk of its own.
+    fn server_over_five_answering_notes(top_n: usize) -> (tempfile::TempDir, super::EngraphServer) {
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        for (i, subject) in ["counterspell", "dispel", "anchor", "ward", "seal"]
+            .iter()
+            .enumerate()
+        {
+            std::fs::write(
+                root.join(format!("{i}-{subject}.md")),
+                format!(
+                    "# The {subject} rule\n\nA warding effect. Every warding effect in this \
+                     ruleset states what it stops, when it may be cast, and what it leaves \
+                     alone, and the {subject} rule is one of them among several others.\n"
+                ),
+            )
+            .unwrap();
+        }
+
+        let store = crate::store::Store::open_memory().unwrap();
+        let mut embedder = crate::llm::MockLlm::new(256);
+        crate::indexer::run_index_shared(
+            root,
+            &crate::config::Config::default(),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let server = super::EngraphServer {
+            store: Arc::new(Mutex::new(store)),
+            embedder: Arc::new(Mutex::new(
+                Box::new(embedder) as Box<dyn crate::llm::EmbedModel + Send>
+            )),
+            vault_path: Arc::new(root.to_path_buf()),
+            profile: Arc::new(None),
+            tool_router: super::EngraphServer::tool_router(),
+            reranker: None,
+            recent_writes: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            read_only: false,
+            max_chunks_per_file: crate::config::default_max_chunks_per_file(),
+            group_by: crate::config::GroupBy::Chunk,
+            top_n,
+            rerank: crate::config::RerankConfig::default(),
+            ranking: crate::config::RankingConfig::default(),
+            lane_weights: crate::config::LaneWeights::default(),
+            fts: crate::config::FtsConfig::default(),
+            embed: crate::prefix::EmbedComposition::default(),
+            chunk_opts: crate::chunker::ChunkOptions {
+                min_chars: 0,
+                promote_bold: false,
+            },
+        };
+        (tmp, server)
+    }
+
+    /// R21 (#62): the number of results a call that names no `top_n` gets is
+    /// the configured one, and not a literal this server holds. A server
+    /// started at three answers three, and the same server answers more when
+    /// the call asks for more — which is what separates the configured default
+    /// from a corpus that ran out.
+    #[tokio::test]
+    async fn a_search_that_names_no_top_n_gets_the_configured_number() {
+        let (_tmp, server) = server_over_five_answering_notes(3);
+
+        let by_default = server
+            .search(super::Parameters(search_params(None, false)))
+            .await
+            .unwrap();
+        let rows = results(&by_default);
+        assert_eq!(
+            rows.as_array().unwrap().len(),
+            3,
+            "the configured top_n is 3, got {rows}"
+        );
+
+        let mut asked = search_params(None, false);
+        asked.top_n = Some(5);
+        let by_call = server.search(super::Parameters(asked)).await.unwrap();
+        let rows = results(&by_call);
+        assert!(
+            rows.as_array().unwrap().len() > 3,
+            "the corpus holds more than three answers, got {rows}"
+        );
+    }
 }

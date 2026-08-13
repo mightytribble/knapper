@@ -23,7 +23,7 @@ Plain vector search treats your notes as isolated documents. But knowledge isn't
 - **5-lane hybrid search** — semantic embeddings + BM25 full-text + graph expansion + cross-encoder reranking + temporal scoring, fused via [Reciprocal Rank Fusion](https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf). Lane weights are configurable. Time-aware queries like "what happened last week" or "March 2026 notes" activate the temporal lane automatically.
 - **MCP server for AI agents** — `engraph serve` exposes 20 tools (search, read, list, tags, vault_map, who, project, topic, create, update, delete, move, archive, index, reindex_file, status, health, identity, init, migrate) that Claude, Cursor, or any MCP client can call directly.
 - **HTTP REST API** — `engraph serve --http` adds an axum-based HTTP server alongside MCP with 21 REST endpoints, API key authentication, rate limiting, and CORS. Web-based agents and scripts can query your vault with simple `curl` calls.
-- **Section-level editing** — AI agents can read, replace, prepend, or append to specific sections by heading. Full note rewriting with frontmatter preservation. Granular frontmatter mutations (set/remove fields, add/remove tags and aliases).
+- **Section-level editing** — AI agents can read, replace, prepend, or append to a section by heading, to the note's body, or to a frontmatter property — every change is one `update` call carrying a list of edits.
 - **Vault health diagnostics** — detect orphan notes, broken wikilinks, stale content, and tag hygiene issues. Available as MCP tool and CLI command.
 - **Obsidian CLI integration** — auto-detects running Obsidian and delegates compatible operations. Circuit breaker (Closed/Degraded/Open) ensures graceful fallback.
 - **Real-time sync** — file watcher keeps the index fresh as you edit in Obsidian. No manual re-indexing needed.
@@ -240,7 +240,7 @@ engraph resolves tags against the registry (fuzzy matching), discovers potential
 engraph update "Meeting Notes" --section "Action Items" --mode append --content="- [ ] Follow up with Sarah"
 ```
 
-Targets the "Action Items" section by heading, appends content without touching the rest of the note. Write `--content=` with an equals sign when the value starts with a `-`, or the shell's argument parser reads it as a flag.
+Targets the "Action Items" section by heading, appends content without touching the rest of the note. Write `--content=` with an equals sign when the value starts with a `-`: the shell passes the text through untouched, and clap reads a leading `-` as a flag.
 
 **Rewrite a note (preserves frontmatter):**
 
@@ -256,7 +256,7 @@ Replaces the entire body while keeping existing frontmatter (tags, dates, metada
 engraph update "Meeting Notes" --property tags --mode append --content "actionable"
 ```
 
-Granular frontmatter mutations: `set`, `remove`, `add_tag`, `remove_tag`, `add_alias`, `remove_alias`.
+A property takes `--mode replace`, `append` or `remove`; a body or a section takes `replace`, `prepend` or `append`. Repeat `--content` to write a list-valued property such as tags or aliases.
 
 **Delete a note:**
 
@@ -563,7 +563,7 @@ engraph is not a replacement for Obsidian — it's the intelligence layer that s
 - User identity with L0/L1 tiered context for AI agent session starts
 - Section-level reading and editing: target specific headings with replace/prepend/append modes
 - Full note rewriting with automatic frontmatter preservation
-- Granular frontmatter mutations: set/remove fields, add/remove tags and aliases
+- Frontmatter property edits: replace, append to or remove a property, scalar or list-valued
 - Soft delete (archive) and hard delete (permanent) with audit logging
 - Vault health diagnostics: orphan notes, broken wikilinks, stale content, tag hygiene
 - Obsidian CLI integration with circuit breaker (Closed/Degraded/Open) for resilient delegation
@@ -576,7 +576,7 @@ engraph is not a replacement for Obsidian — it's the intelligence layer that s
 - Content-based folder role detection (people, daily, archive) by content patterns
 - PARA migration: AI-assisted vault restructuring into Projects/Areas/Resources/Archive with preview, apply, and undo workflow
 - Configurable model overrides for multilingual support
-- 844 unit tests, CI on macOS + Ubuntu
+- 846 unit tests, CI on macOS + Ubuntu
 
 ## Roadmap
 
@@ -660,7 +660,7 @@ All data stored in `~/.engraph/` — single SQLite database (~10MB typical), GGU
 ## Development
 
 ```bash
-cargo test --lib          # 844 unit tests, no network (requires CMake for llama.cpp)
+cargo test --lib          # 846 unit tests, no network (requires CMake for llama.cpp)
 cargo clippy -- -D warnings
 cargo fmt --check
 

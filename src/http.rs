@@ -1958,4 +1958,72 @@ mod tests {
                 .contains("--- Query run ---")
         );
     }
+
+    /// Five notes that all answer one query. Five is more than the `top_n` the
+    /// R21 test configures, so a truncation reads as a truncation and not as a
+    /// corpus that had no more to give (#62). Each body is well over
+    /// `chunk_min_chars`, so each note is one chunk of its own.
+    fn state_over_five_answering_notes() -> (tempfile::TempDir, ApiState) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        for (i, subject) in ["counterspell", "dispel", "anchor", "ward", "seal"]
+            .iter()
+            .enumerate()
+        {
+            std::fs::write(
+                root.join(format!("{i}-{subject}.md")),
+                format!(
+                    "# The {subject} rule\n\nA warding effect. Every warding effect in this \
+                     ruleset states what it stops, when it may be cast, and what it leaves \
+                     alone, and the {subject} rule is one of them among several others.\n"
+                ),
+            )
+            .unwrap();
+        }
+
+        let store = Store::open_memory().unwrap();
+        let mut embedder = crate::llm::MockLlm::new(256);
+        crate::indexer::run_index_shared(
+            root,
+            &crate::config::Config::default(),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let mut state = test_api_state_at(root.to_path_buf());
+        state.store = Arc::new(Mutex::new(store));
+        state.embedder = Arc::new(Mutex::new(Box::new(embedder) as Box<dyn EmbedModel + Send>));
+        (tmp, state)
+    }
+
+    /// R21 (#62): the number of results a call that names no `top_n` gets is
+    /// the configured one, and not a literal this server holds. A state built
+    /// at three answers three, and the same state answers more when the call
+    /// asks for more — which is what separates the configured default from a
+    /// corpus that ran out.
+    #[tokio::test]
+    async fn a_search_that_names_no_top_n_gets_the_configured_number() {
+        let (_tmp, mut state) = state_over_five_answering_notes();
+        state.top_n = 3;
+
+        let (status, body) =
+            post_json(state.clone(), "/api/search", r#"{"query":"warding"}"#).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["results"].as_array().unwrap().len(),
+            3,
+            "the configured top_n is 3, got {body}"
+        );
+
+        let (status, body) =
+            post_json(state, "/api/search", r#"{"query":"warding","top_n":5}"#).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body["results"].as_array().unwrap().len() > 3,
+            "the corpus holds more than three answers, got {body}"
+        );
+    }
 }
