@@ -571,6 +571,9 @@ async fn handle_topic(
     Json(body): Json<crate::params::Topic>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, false)?;
+    let all_terms = crate::tags::merge_all_alias(body.tags, body.all);
+    let scope = crate::tags::TagFilter::parse(&all_terms, &body.any, &body.none)
+        .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
     let store = state.store.lock().await;
     let mut embedder = state.embedder.lock().await;
     let ctx = ContextParams {
@@ -578,8 +581,17 @@ async fn handle_topic(
         vault_path: &state.vault_path,
         profile: state.profile.as_ref().as_ref(),
     };
-    let bundle = context::context_topic_with_search(&ctx, &body.query, body.budget, &mut *embedder)
-        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    let bundle =
+        context::context_topic_with_search(&ctx, &body.query, body.budget, &mut *embedder, &scope)
+            .map_err(|e| {
+                // An unknown tag is a caller's typo, not a server fault, which
+                // is the reading the search route already takes (#60, #64).
+                if e.to_string().starts_with("no such tag") {
+                    ApiError::bad_request(&format!("{e:#}"))
+                } else {
+                    ApiError::internal(&format!("{e:#}"))
+                }
+            })?;
     Ok(Json(serde_json::json!(bundle)))
 }
 
@@ -1334,6 +1346,53 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn a_topic_scope_naming_no_tag_is_a_bad_request() {
+        // #64. `topic` takes the scope `search` takes, so it answers an
+        // unknown term the same way: the caller's own text named nothing, and
+        // that is a 400 rather than the 500 this route answers for a fault of
+        // its own.
+        let state = test_api_state();
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/topic")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer eg_readkey")
+                    .body(Body::from(r#"{"query":"warding","all":["type/undead"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn a_topic_body_with_an_explicit_null_scope_field_is_not_rejected() {
+        // The same client behaviour the search route already covers: an absent
+        // optional serialised as JSON `null` must read as an unscoped call and
+        // not as a deserialization failure (#60, #64).
+        let state = test_api_state();
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/topic")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer eg_readkey")
+                    .body(Body::from(
+                        r#"{"query":"warding","all":null,"any":null,"none":null,"tags":null}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

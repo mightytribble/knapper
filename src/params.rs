@@ -149,6 +149,26 @@ pub struct Topic {
     #[arg(long, default_value = "32000")]
     #[serde(default = "default_budget", deserialize_with = "deserialize_budget")]
     pub budget: usize,
+    /// An alias of `all`.
+    #[arg(long, value_delimiter = ',')]
+    #[serde(default, deserialize_with = "deserialize_tag_list")]
+    pub tags: Vec<String>,
+    /// Gather context from notes carrying every term. A term is a tag path; a
+    /// trailing `/` or `/*` matches the tag and its descendants. An unknown
+    /// term is an error naming the nearest tag the vault holds (#64).
+    #[arg(long, value_delimiter = ',')]
+    #[serde(default, deserialize_with = "deserialize_tag_list")]
+    pub all: Vec<String>,
+    /// Gather context from notes carrying at least one of these terms. An
+    /// unknown term is an error naming the nearest tag the vault holds (#64).
+    #[arg(long, value_delimiter = ',')]
+    #[serde(default, deserialize_with = "deserialize_tag_list")]
+    pub any: Vec<String>,
+    /// Leave out notes carrying any of these terms. An unknown term here is
+    /// ignored (#64).
+    #[arg(long, value_delimiter = ',')]
+    #[serde(default, deserialize_with = "deserialize_tag_list")]
+    pub none: Vec<String>,
 }
 
 fn default_budget() -> usize {

@@ -159,6 +159,7 @@ pub fn search_internal(
     store: &Store,
     embedder: &mut impl EmbedModel,
     group_by: GroupBy,
+    scope: &crate::tags::TagFilter,
 ) -> Result<SearchOutput> {
     let mut config = SearchConfig {
         reranker: None,
@@ -173,9 +174,10 @@ pub fn search_internal(
         fts: crate::config::FtsConfig::default(),
         ranking: crate::config::RankingConfig::default(),
         lane_weights: crate::config::LaneWeights::default(),
-        // Defaults, like every other setting on this path: the context engine
-        // reads the whole vault (#60, #64).
-        scope: crate::tags::TagFilter::default(),
+        // The caller's, not a default: this is the one setting on this path a
+        // caller states per call, and an empty filter is the whole vault, so
+        // an unscoped call runs the pipeline it ran before #64.
+        scope: scope.clone(),
     };
     search_with_intelligence(query, top_n, embedder, &mut config)
 }
@@ -1897,7 +1899,15 @@ mod tests {
         // before chunk-level fusion only one of them could ever be returned.
         let (_tmp, store, mut embedder) = indexed_vault();
 
-        let output = search_internal("warding", 10, &store, &mut embedder, GroupBy::Chunk).unwrap();
+        let output = search_internal(
+            "warding",
+            10,
+            &store,
+            &mut embedder,
+            GroupBy::Chunk,
+            &crate::tags::TagFilter::default(),
+        )
+        .unwrap();
 
         let hits: Vec<&InternalSearchResult> = output
             .results
@@ -3003,7 +3013,15 @@ mod tests {
     fn group_by_file_returns_one_result_per_document() {
         let (_tmp, store, mut embedder) = indexed_vault();
 
-        let output = search_internal("warding", 10, &store, &mut embedder, GroupBy::File).unwrap();
+        let output = search_internal(
+            "warding",
+            10,
+            &store,
+            &mut embedder,
+            GroupBy::File,
+            &crate::tags::TagFilter::default(),
+        )
+        .unwrap();
 
         let mut seen = std::collections::HashSet::new();
         for r in &output.results {
@@ -3022,8 +3040,15 @@ mod tests {
         // no headings; `(file_id, chunk_seq)` is what recovers them.
         let (_tmp, store, mut embedder) = indexed_vault();
 
-        let output =
-            search_internal("mid-cast", 10, &store, &mut embedder, GroupBy::Chunk).unwrap();
+        let output = search_internal(
+            "mid-cast",
+            10,
+            &store,
+            &mut embedder,
+            GroupBy::Chunk,
+            &crate::tags::TagFilter::default(),
+        )
+        .unwrap();
         let hit = output
             .results
             .iter()

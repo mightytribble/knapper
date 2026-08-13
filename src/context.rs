@@ -657,12 +657,23 @@ pub fn context_topic_from_results(
     topic: &str,
     search_results: &[crate::search::InternalSearchResult],
     max_chars: usize,
+    scope: &crate::tags::TagFilter,
 ) -> Result<ContextBundle> {
     let budget = if max_chars == 0 {
         DEFAULT_BUDGET
     } else {
         max_chars
     };
+    // #60's rule for the graph lane, applied to both steps of the assembly: a
+    // note the filter does not admit cannot be an answer, so it is not carried
+    // into the bundle by a link either. Resolved once, and not at all when the
+    // filter is empty, which is the path this function took before #64 (#64).
+    let in_scope: Option<HashSet<i64>> = if scope.is_empty() {
+        None
+    } else {
+        Some(params.store.files_in_scope(scope)?.into_iter().collect())
+    };
+    let admits = |file_id: i64| in_scope.as_ref().is_none_or(|ids| ids.contains(&file_id));
     let mut sections = Vec::new();
     let mut used_chars = 0;
     let mut included_files: HashSet<String> = HashSet::new();
@@ -671,6 +682,9 @@ pub fn context_topic_from_results(
     for r in search_results.iter().take(5) {
         if used_chars >= budget {
             break;
+        }
+        if !admits(r.file_id) {
+            continue;
         }
         let full_path = params.vault_path.join(&r.file_path);
         let content = std::fs::read_to_string(&full_path).unwrap_or_default();
@@ -707,6 +721,9 @@ pub fn context_topic_from_results(
         for (nid, _hop) in neighbors {
             if used_chars >= budget {
                 break;
+            }
+            if !admits(nid) {
+                continue;
             }
             if let Some(nf) = params.store.get_file_by_id(nid).ok().flatten() {
                 if included_files.contains(&nf.path) {
@@ -759,6 +776,7 @@ pub fn context_topic_with_search(
     topic: &str,
     max_chars: usize,
     embedder: &mut impl crate::llm::EmbedModel,
+    scope: &crate::tags::TagFilter,
 ) -> Result<ContextBundle> {
     // A context bundle is assembled from whole notes, so it wants one result per
     // note — several sections of the same file would read the file in twice.
@@ -768,8 +786,9 @@ pub fn context_topic_with_search(
         params.store,
         embedder,
         crate::config::GroupBy::File,
+        scope,
     )?;
-    context_topic_from_results(params, topic, &search_output.results, max_chars)
+    context_topic_from_results(params, topic, &search_output.results, max_chars, scope)
 }
 
 // ---------------------------------------------------------------------------
@@ -1099,7 +1118,14 @@ mod tests {
             docid: Some("aaa111".into()),
         }];
 
-        let bundle = context_topic_from_results(&params, "topic", &search_results, 32000).unwrap();
+        let bundle = context_topic_from_results(
+            &params,
+            "topic",
+            &search_results,
+            32000,
+            &crate::tags::TagFilter::default(),
+        )
+        .unwrap();
         assert!(!bundle.sections.is_empty());
         assert!(bundle.sections[0].content.contains("relevant content"));
         assert!(bundle.total_chars <= bundle.budget_chars);
@@ -1135,7 +1161,14 @@ mod tests {
         }];
 
         // Very small budget — should truncate
-        let bundle = context_topic_from_results(&params, "words", &search_results, 500).unwrap();
+        let bundle = context_topic_from_results(
+            &params,
+            "words",
+            &search_results,
+            500,
+            &crate::tags::TagFilter::default(),
+        )
+        .unwrap();
         assert!(!bundle.sections.is_empty());
         assert!(bundle.sections[0].content.contains("[truncated"));
         assert!(bundle.truncated);
@@ -1175,7 +1208,14 @@ mod tests {
             docid: Some("aaa111".into()),
         }];
 
-        let bundle = context_topic_from_results(&params, "main", &search_results, 32000).unwrap();
+        let bundle = context_topic_from_results(
+            &params,
+            "main",
+            &search_results,
+            32000,
+            &crate::tags::TagFilter::default(),
+        )
+        .unwrap();
         // Should have main as direct match + related as 1-hop
         assert!(bundle.sections.len() >= 2);
         assert!(
@@ -1203,7 +1243,14 @@ mod tests {
             profile: None,
         };
 
-        let bundle = context_topic_from_results(&params, "nothing", &[], 32000).unwrap();
+        let bundle = context_topic_from_results(
+            &params,
+            "nothing",
+            &[],
+            32000,
+            &crate::tags::TagFilter::default(),
+        )
+        .unwrap();
         assert!(bundle.sections.is_empty());
         assert_eq!(bundle.total_chars, 0);
         assert!(!bundle.truncated);
@@ -1215,6 +1262,183 @@ mod tests {
         let snap = snap_to_char(s, 6); // lands inside the em dash
         assert!(s.is_char_boundary(snap));
         assert!(snap <= 6);
+    }
+
+    // --- the tag scope on `topic` (#64) ---
+
+    /// Two notes on one subject, tagged differently, so a scope has one note
+    /// to admit and one to exclude. The admitted one links to a third note
+    /// that answers the query itself and carries a third tag, which is what
+    /// the bundle's 1-hop step reaches.
+    fn scoped_topic_vault() -> (TempDir, Store, crate::llm::MockLlm, std::path::PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::write(
+            root.join("wight.md"),
+            "---\ntags: [type/undead]\n---\n\n\
+             # Wight\n\n## Warding\n\nA warding effect that pins an undead creature \
+             in the space it stands in, and does not care how it got there. \
+             It was raised in [[barrow]].\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("wolf.md"),
+            "---\ntags: [type/beast]\n---\n\n\
+             # Wolf\n\n## Warding\n\nA warding effect that pins a beast in the space \
+             it stands in, and does not care how it got there.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("barrow.md"),
+            "---\ntags: [type/location]\n---\n\n\
+             # Barrow\n\nA burial mound on the moor, its entrance sealed with \
+             a slab that three men could not lift.\n",
+        )
+        .unwrap();
+
+        let store = Store::open_memory().unwrap();
+        let mut embedder = crate::llm::MockLlm::new(256);
+        let config = crate::config::Config::default();
+        crate::indexer::run_index_shared(&root, &config, &store, &mut embedder, false, None)
+            .unwrap();
+        (tmp, store, embedder, root)
+    }
+
+    #[test]
+    fn a_tag_scope_keeps_the_topic_bundle_inside_the_tagged_notes() {
+        let (_tmp, store, mut embedder, root) = scoped_topic_vault();
+        let params = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+        let filter = crate::tags::TagFilter::parse(&["type/undead".to_string()], &[], &[]).unwrap();
+
+        let unscoped = context_topic_with_search(
+            &params,
+            "warding",
+            32000,
+            &mut embedder,
+            &crate::tags::TagFilter::default(),
+        )
+        .unwrap();
+        let paths: Vec<&str> = unscoped.sections.iter().map(|s| s.path.as_str()).collect();
+        assert!(paths.contains(&"wolf.md"), "unscoped, both notes answer");
+
+        let scoped =
+            context_topic_with_search(&params, "warding", 32000, &mut embedder, &filter).unwrap();
+        assert!(!scoped.sections.is_empty(), "the tagged note still answers");
+        for s in &scoped.sections {
+            assert_eq!(
+                s.path, "wight.md",
+                "an out-of-scope note reached the bundle"
+            );
+        }
+    }
+
+    #[test]
+    fn a_scope_drops_a_note_the_bundle_reached_by_link() {
+        // #60's rule for the graph lane, applied to the bundle's 1-hop step:
+        // a candidate that cannot be an answer is not carried into the output
+        // by a link either.
+        let (_tmp, store, mut embedder, root) = scoped_topic_vault();
+        let params = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+
+        // The link is live, and one hop off the note the scope admits. That is
+        // the only route `barrow.md` has into a scoped bundle, because the
+        // scope keeps the search itself from ever returning it.
+        let wight = store.get_file("wight.md").unwrap().unwrap();
+        let barrow = store.get_file("barrow.md").unwrap().unwrap();
+        assert!(
+            store
+                .get_neighbors(wight.id, 1)
+                .unwrap()
+                .iter()
+                .any(|(id, _)| *id == barrow.id),
+            "the fixture's link did not reach the third note"
+        );
+
+        let filter = crate::tags::TagFilter::parse(&["type/undead".to_string()], &[], &[]).unwrap();
+        let scoped =
+            context_topic_with_search(&params, "warding", 32000, &mut embedder, &filter).unwrap();
+        assert!(
+            !scoped.sections.iter().any(|s| s.path == "barrow.md"),
+            "an out-of-scope note reached the bundle by link: {:?}",
+            scoped
+                .sections
+                .iter()
+                .map(|s| &s.path)
+                .collect::<Vec<&String>>()
+        );
+    }
+
+    #[test]
+    fn an_empty_scope_reproduces_the_unscoped_topic_bundle() {
+        // The control: with no scope, `topic` assembles the bundle it
+        // assembled before #64, section for section.
+        let (_tmp, store, mut embedder, root) = scoped_topic_vault();
+        let params = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+
+        let a = context_topic_with_search(
+            &params,
+            "warding",
+            32000,
+            &mut embedder,
+            &crate::tags::TagFilter::default(),
+        )
+        .unwrap();
+        let results = crate::search::search_internal(
+            "warding",
+            5,
+            &store,
+            &mut embedder,
+            crate::config::GroupBy::File,
+            &crate::tags::TagFilter::default(),
+        )
+        .unwrap();
+        let b = context_topic_from_results(
+            &params,
+            "warding",
+            &results.results,
+            32000,
+            &crate::tags::TagFilter::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            serde_json::to_string(&a).unwrap(),
+            serde_json::to_string(&b).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_topic_scope_naming_no_tag_fails_the_call() {
+        // The caller's own text named nothing, so the call fails rather than
+        // answering from the whole vault. The surfaces map this to a 400.
+        let (_tmp, store, mut embedder, root) = scoped_topic_vault();
+        let params = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+        let filter = crate::tags::TagFilter::parse(&["type/undeed".to_string()], &[], &[]).unwrap();
+
+        let err = context_topic_with_search(&params, "warding", 32000, &mut embedder, &filter)
+            .expect_err("a scope naming no tag must fail the call");
+        let msg = format!("{err:#}");
+        assert!(msg.starts_with("no such tag"), "got: {msg}");
+        assert!(
+            msg.contains("type/undead"),
+            "the nearest tag is named: {msg}"
+        );
     }
 
     /// A vault of one person note, with a `person` tag, a `Role` and an

@@ -445,6 +445,8 @@ async fn main() -> Result<()> {
         }
 
         Command::Topic(args) => {
+            let all_terms = engraph::tags::merge_all_alias(args.tags, args.all);
+            let scope = engraph::tags::TagFilter::parse(&all_terms, &args.any, &args.none)?;
             let (store, vault_path, profile) = open_vault(&data_dir)?;
             let params = engraph::context::ContextParams {
                 store: &store,
@@ -459,6 +461,7 @@ async fn main() -> Result<()> {
                 &args.query,
                 args.budget,
                 &mut embedder,
+                &scope,
             )?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&bundle)?);
