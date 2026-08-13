@@ -29,21 +29,6 @@ pub struct CreateNoteInput {
     pub auto_link: Option<bool>,
 }
 
-#[derive(Debug, Clone)]
-pub struct AppendInput {
-    pub file: String,
-    pub content: String,
-    pub modified_by: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct UpdateMetadataInput {
-    pub file: String,
-    pub tags: Option<Vec<String>>,
-    pub aliases: Option<Vec<String>>,
-    pub modified_by: String,
-}
-
 /// How one edit changes what it addresses. `Remove` is only for a property:
 /// a section has no "remove" that is not a replace with nothing, so the body
 /// and section paths reject it (#62). The enum is fieldless, so it is `Copy`
@@ -56,15 +41,6 @@ pub enum EditMode {
     Remove,
 }
 
-#[derive(Debug, Clone)]
-pub struct EditInput {
-    pub file: String,
-    pub heading: String,
-    pub content: String,
-    pub mode: EditMode,
-    pub modified_by: String,
-}
-
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct EditResult {
     pub path: String,
@@ -72,36 +48,19 @@ pub struct EditResult {
     pub mode: String,
 }
 
-#[derive(Debug, Clone)]
-pub struct RewriteInput {
-    pub file: String,
-    pub content: String,
-    pub preserve_frontmatter: bool,
-    pub modified_by: String,
-}
-
 /// One change to a note's frontmatter. `AddTo` and `RemoveFrom` name the
-/// property they change, so an edit to `status` cannot reach the `tags` list:
-/// `AddTag` and `AddAlias` are the same operation with the key written into
-/// the variant, and a routing table that falls back to one of them writes to
-/// the wrong property whenever the key is a third one (#62).
+/// property they change, so an edit to `status` cannot reach the `tags` list.
+/// The four variants that wrote the key into their own name — `AddTag`,
+/// `RemoveTag`, `AddAlias`, `RemoveAlias` — were exact aliases of these two
+/// with `tags` or `aliases` inlined, and a routing table that falls back to
+/// one of them writes to the wrong property whenever the key is a third one
+/// (#62).
 #[derive(Debug, Clone)]
 pub enum FrontmatterOp {
     Set(String, String),
     Remove(String),
     AddTo(String, String),
     RemoveFrom(String, String),
-    AddTag(String),
-    RemoveTag(String),
-    AddAlias(String),
-    RemoveAlias(String),
-}
-
-#[derive(Debug, Clone)]
-pub struct EditFrontmatterInput {
-    pub file: String,
-    pub operations: Vec<FrontmatterOp>,
-    pub modified_by: String,
 }
 
 /// What one edit addresses. A note has three addressable things: its body,
@@ -137,7 +96,6 @@ pub struct NoteEdit {
 pub struct UpdateInput {
     pub file: String,
     pub edits: Vec<NoteEdit>,
-    pub modified_by: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -825,219 +783,6 @@ pub fn create_note(
     })
 }
 
-/// Append content to an existing note.
-pub fn append_to_note(
-    input: AppendInput,
-    store: &Store,
-    embedder: &mut impl EmbedModel,
-    embed: EmbedComposition,
-    chunk_opts: ChunkOptions,
-    vault_path: &Path,
-) -> Result<WriteResult> {
-    // Step 1: Resolve file
-    let file_record = store
-        .resolve_file(&input.file)?
-        .ok_or_else(|| anyhow::anyhow!("file not found: {}", input.file))?;
-
-    let full_path = vault_path.join(&file_record.path);
-
-    // Step 2: Mtime conflict check
-    let disk_mtime = file_mtime(&full_path)?;
-    if disk_mtime != file_record.mtime {
-        bail!(
-            "mtime conflict: file {} was modified outside engraph (disk={}, indexed={})",
-            file_record.path,
-            disk_mtime,
-            file_record.mtime
-        );
-    }
-
-    // Step 3: Append content
-    let existing_content = std::fs::read_to_string(&full_path)?;
-    let new_content = apply_body_edit(&existing_content, &input.content, EditMode::Append, false);
-
-    // Step 4: Pre-compute new chunks + embeddings
-    let chunk_data =
-        precompute_chunks(&file_record.path, &new_content, embedder, embed, chunk_opts)?;
-
-    let content_hash = compute_content_hash(&new_content);
-    let docid = file_record
-        .docid
-        .clone()
-        .unwrap_or_else(|| generate_docid(&file_record.path));
-
-    // Write to temp file
-    let temp_path = full_path.with_extension("md.tmp");
-    std::fs::write(&temp_path, &new_content)?;
-
-    // Step 5: Transaction — delete old data, re-insert
-    store.begin_transaction()?;
-    let result = (|| -> Result<i64> {
-        // Tombstone old vectors
-        let old_vids = store.get_vector_ids_for_file(file_record.id)?;
-
-        for vid in &old_vids {
-            store.delete_vec(*vid)?;
-        }
-
-        // Delete old chunks — the keyword index follows them (issue #37) —
-        // and the edges this file's own content owns. The `files` row stays so
-        // the id, and every backlink keyed on it, survives the rewrite;
-        // `insert_file` below upserts on `path` (#27).
-        store.delete_outgoing_edges_for_file(file_record.id)?;
-        store.delete_chunks_for_file(file_record.id)?;
-
-        // Re-insert file
-        let mtime = file_mtime(&temp_path).unwrap_or(0);
-        let file_id = store.insert_file(
-            &file_record.path,
-            &content_hash,
-            mtime,
-            &docid,
-            file_record.created_by.as_deref(),
-            None,
-        )?;
-
-        let start_vid = store.next_vector_id()?;
-        for (chunk_seq, c) in chunk_data.iter().enumerate() {
-            let vid = start_vid + chunk_seq as u64;
-            store.insert_chunk_with_vector(&c.record(file_id, chunk_seq as i64, vid), &c.vector)?;
-            store.insert_vec(vid, &c.vector)?;
-        }
-
-        store.reconcile_file_tags(file_id, &crate::tags::extract(&new_content))?;
-
-        build_edges_for_file(store, file_id, &new_content)?;
-        Ok(file_id)
-    })();
-
-    match result {
-        Ok(_) => {
-            store.commit()?;
-            // Step 6: Rename temp → final
-            std::fs::rename(&temp_path, &full_path)?;
-            // Update stored mtime to match actual file after rename
-            let actual_mtime = file_mtime(&full_path).unwrap_or(0);
-            store.insert_file(
-                &file_record.path,
-                &content_hash,
-                actual_mtime,
-                &docid,
-                file_record.created_by.as_deref(),
-                None,
-            )?;
-        }
-        Err(e) => {
-            let _ = store.rollback();
-            let _ = std::fs::remove_file(&temp_path);
-            return Err(e);
-        }
-    }
-
-    let folder = file_record
-        .path
-        .rsplit_once('/')
-        .map(|(f, _)| f.to_string())
-        .unwrap_or_default();
-
-    Ok(WriteResult {
-        path: file_record.path,
-        docid,
-        tags: file_record.tags,
-        links_added: vec![],
-        links_suggested: vec![],
-        folder,
-        confidence: 1.0,
-        strategy: "Append".to_string(),
-    })
-}
-
-/// Update frontmatter metadata only (tags, aliases).
-pub fn update_metadata(
-    input: UpdateMetadataInput,
-    store: &Store,
-    vault_path: &Path,
-) -> Result<WriteResult> {
-    // Step 1: Resolve file
-    let file_record = store
-        .resolve_file(&input.file)?
-        .ok_or_else(|| anyhow::anyhow!("file not found: {}", input.file))?;
-
-    let full_path = vault_path.join(&file_record.path);
-
-    // Step 2: Mtime conflict check
-    let disk_mtime = file_mtime(&full_path)?;
-    if disk_mtime != file_record.mtime {
-        bail!(
-            "mtime conflict: file {} was modified outside engraph (disk={}, indexed={})",
-            file_record.path,
-            disk_mtime,
-            file_record.mtime
-        );
-    }
-
-    // Step 3: Parse existing frontmatter and build new
-    let existing_content = std::fs::read_to_string(&full_path)?;
-    let (old_fm, body) = split_frontmatter(&existing_content);
-
-    // The note's own `tags:` property, not `FileRecord.tags`. The junction
-    // holds the property tags and the body hashtags together (#60), and a
-    // hashtag must stay in the body: this write rebuilds a property of the
-    // user's file.
-    let (_, property_tags, _) = parse_frontmatter_fields(&old_fm);
-    let tags = input.tags.unwrap_or(property_tags);
-    let aliases_vec = input.aliases.unwrap_or_default();
-    let aliases_ref: Option<&[String]> = if aliases_vec.is_empty() {
-        None
-    } else {
-        Some(&aliases_vec)
-    };
-
-    let new_fm = build_frontmatter(&tags, Some(&input.modified_by), aliases_ref, None);
-    let new_content = format!("{}{}", new_fm, body);
-
-    // Step 4: Write via temp + rename
-    let content_hash = compute_content_hash(&new_content);
-    let docid = file_record
-        .docid
-        .clone()
-        .unwrap_or_else(|| generate_docid(&file_record.path));
-
-    atomic_write(&full_path, &new_content, true)?;
-
-    // Step 5: Update store record (metadata-only, no re-chunking)
-    let mtime = file_mtime(&full_path)?;
-    let file_id = store.insert_file(
-        &file_record.path,
-        &content_hash,
-        mtime,
-        &docid,
-        file_record.created_by.as_deref(),
-        None,
-    )?;
-
-    // A frontmatter edit changes a note's tags and no chunk boundary, so it
-    // reconciles the rows and does not re-index (#60).
-    store.reconcile_file_tags(file_id, &crate::tags::extract(&new_content))?;
-
-    let folder = file_record
-        .path
-        .rsplit_once('/')
-        .map(|(f, _)| f.to_string())
-        .unwrap_or_default();
-
-    Ok(WriteResult {
-        path: file_record.path,
-        docid,
-        tags,
-        links_added: vec![],
-        links_suggested: vec![],
-        folder,
-        confidence: 1.0,
-        strategy: "UpdateMetadata".to_string(),
-    })
-}
-
 /// Apply one section edit to a note's text. The transform is separate from
 /// the I/O so that `update_note` can apply a list of them to one string and
 /// write once (#62).
@@ -1110,47 +855,9 @@ fn edit_mode_name(mode: &EditMode) -> &'static str {
     }
 }
 
-/// Edit a specific section within an existing note.
-///
-/// Does NOT re-index chunks — that's for the MCP layer.
-pub fn edit_note(
-    store: &Store,
-    vault_path: &Path,
-    input: &EditInput,
-    _obsidian: Option<&mut crate::obsidian::ObsidianCli>,
-) -> Result<EditResult> {
-    // Step 1: Resolve file via store
-    let file_record = store
-        .resolve_file(&input.file)?
-        .ok_or_else(|| anyhow::anyhow!("file not found: {}", input.file))?;
-
-    let full_path = vault_path.join(&file_record.path);
-
-    // Step 2: Read current content from disk
-    let content = std::fs::read_to_string(&full_path)?;
-
-    // Step 3: Apply the section edit
-    let new_content = apply_section_edit(&content, &input.heading, &input.content, input.mode)
-        .map_err(|e| anyhow::anyhow!("{e} in {}", input.file))?;
-
-    // Step 4: Write atomically (overwrite = true)
-    atomic_write(&full_path, &new_content, true)?;
-
-    // Step 5: Update stored mtime to match actual file after write
-    let actual_mtime = file_mtime(&full_path).unwrap_or(0);
-    store.update_file_mtime(&file_record.path, actual_mtime)?;
-
-    // Step 6: Return EditResult
-    Ok(EditResult {
-        path: file_record.path,
-        heading: input.heading.clone(),
-        mode: edit_mode_name(&input.mode).to_string(),
-    })
-}
-
-/// Apply a body edit to a note's text: `rewrite_note`'s and `append_to_note`'s
-/// transform. The transform is separate from the I/O so that `update_note`
-/// can apply a list of them to one string and write once (#62).
+/// Apply a body edit to a note's text. The transform is separate from the I/O
+/// so that `update_note` can apply a list of them to one string and write once
+/// (#62).
 ///
 /// With `preserve_frontmatter`, the frontmatter is split off, `mode` is
 /// applied to the body alone, and the two are reassembled. Without it,
@@ -1198,47 +905,6 @@ pub fn apply_body_edit(
     }
 }
 
-/// Rewrite the body of an existing note, optionally preserving existing frontmatter.
-///
-/// If `preserve_frontmatter` is true and the note has frontmatter, the existing
-/// YAML block is kept intact and only the body is replaced with `input.content`.
-/// If false, the file is replaced entirely with `input.content`.
-///
-/// Does NOT re-index — the MCP layer handles that.
-pub fn rewrite_note(store: &Store, vault_path: &Path, input: &RewriteInput) -> Result<EditResult> {
-    // Step 1: Resolve file via store
-    let file_record = store
-        .resolve_file(&input.file)?
-        .ok_or_else(|| anyhow::anyhow!("file not found: {}", input.file))?;
-
-    let full_path = vault_path.join(&file_record.path);
-
-    // Step 2: Read current content from disk
-    let existing_content = std::fs::read_to_string(&full_path)?;
-
-    // Step 3: Reconstruct content
-    let new_content = apply_body_edit(
-        &existing_content,
-        &input.content,
-        EditMode::Replace,
-        input.preserve_frontmatter,
-    );
-
-    // Step 4: Write atomically (overwrite = true)
-    atomic_write(&full_path, &new_content, true)?;
-
-    // Step 5: Update stored mtime to match actual file after write
-    let actual_mtime = file_mtime(&full_path).unwrap_or(0);
-    store.update_file_mtime(&file_record.path, actual_mtime)?;
-
-    // Step 6: Return EditResult (reusing existing result type)
-    Ok(EditResult {
-        path: file_record.path,
-        heading: String::new(),
-        mode: "Rewrite".to_string(),
-    })
-}
-
 /// Apply a list of frontmatter operations to a note's text. The transform is
 /// separate from the I/O so that `update_note` can apply a list of them to
 /// one string and write once (#62).
@@ -1279,18 +945,6 @@ pub fn apply_frontmatter_ops(content: &str, ops: &[FrontmatterOp]) -> Result<Str
             FrontmatterOp::RemoveFrom(key, value) => {
                 apply_remove_from_sequence(&mut mapping, key, value);
             }
-            FrontmatterOp::AddTag(tag) => {
-                apply_add_to_sequence(&mut mapping, "tags", tag);
-            }
-            FrontmatterOp::RemoveTag(tag) => {
-                apply_remove_from_sequence(&mut mapping, "tags", tag);
-            }
-            FrontmatterOp::AddAlias(alias) => {
-                apply_add_to_sequence(&mut mapping, "aliases", alias);
-            }
-            FrontmatterOp::RemoveAlias(alias) => {
-                apply_remove_from_sequence(&mut mapping, "aliases", alias);
-            }
         }
     }
 
@@ -1312,55 +966,6 @@ pub fn apply_frontmatter_ops(content: &str, ops: &[FrontmatterOp]) -> Result<Str
         format!("{}\n", body)
     };
     Ok(format!("---\n{}---\n\n{}", yaml_str, body))
-}
-
-/// Edit frontmatter fields with granular operations (add/remove tags, set/remove properties).
-///
-/// Does NOT re-index chunks.
-pub fn edit_frontmatter(
-    store: &Store,
-    vault_path: &Path,
-    input: &EditFrontmatterInput,
-) -> Result<EditResult> {
-    // Step 1: Resolve file via store
-    let file_record = store
-        .resolve_file(&input.file)?
-        .ok_or_else(|| anyhow::anyhow!("file not found: {}", input.file))?;
-
-    let full_path = vault_path.join(&file_record.path);
-
-    // Step 2: Read content from disk
-    let content = std::fs::read_to_string(&full_path)?;
-
-    // Step 3: Apply the frontmatter operations
-    let new_content = apply_frontmatter_ops(&content, &input.operations)?;
-
-    // Step 4: Write atomically
-    atomic_write(&full_path, &new_content, true)?;
-
-    // Update store with new content hash and mtime
-    let content_hash = compute_content_hash(&new_content);
-    let mtime = file_mtime(&full_path)?;
-    let docid = file_record
-        .docid
-        .clone()
-        .unwrap_or_else(|| generate_docid(&file_record.path));
-
-    let file_id = store.insert_file(
-        &file_record.path,
-        &content_hash,
-        mtime,
-        &docid,
-        file_record.created_by.as_deref(),
-        None,
-    )?;
-    store.reconcile_file_tags(file_id, &crate::tags::extract(&new_content))?;
-
-    Ok(EditResult {
-        path: file_record.path,
-        heading: String::new(),
-        mode: "EditFrontmatter".to_string(),
-    })
 }
 
 /// Helper: add a value to a YAML sequence field (create if missing, skip duplicates).
@@ -2005,7 +1610,7 @@ mod tests {
         let out = apply_frontmatter_ops(
             doc,
             &[
-                FrontmatterOp::AddTag("b".into()),
+                FrontmatterOp::AddTo("tags".into(), "b".into()),
                 FrontmatterOp::Set("status".into(), "done".into()),
             ],
         )
@@ -2020,8 +1625,9 @@ mod tests {
     /// the usual `---\nfm\n---\n\nbody` layout hands back a body that still
     /// carries the line break after the closing `---`. The reassembly below
     /// supplies its own `\n\n`, so adding both put one blank line into the
-    /// note per append and they accumulated. `append_to_note` added none, and
-    /// `update`'s body append has to be byte-identical to it (#62).
+    /// note per append and they accumulated. The `write append` call this
+    /// replaced added none, and `update`'s body append is byte-identical to it
+    /// (#62).
     #[test]
     fn successive_body_appends_add_no_blank_line_of_their_own() {
         let doc = "---\ntags:\n  - a\n---\n\nbody line\n";
@@ -2033,8 +1639,9 @@ mod tests {
         assert_eq!(twice, "---\ntags:\n  - a\n---\n\nbody line\nfirst\nsecond");
     }
 
-    /// The same text through `append_to_note`'s transform, which is the call
-    /// `update`'s body append replaces. The two must agree byte for byte (#62).
+    /// The same text with and without the frontmatter split, which is what
+    /// separated the two body calls `update` replaced. The two must agree byte
+    /// for byte (#62).
     #[test]
     fn a_body_append_matches_the_call_it_replaces() {
         let doc = "---\ntags:\n  - a\n---\n\nbody line\n";
@@ -2333,312 +1940,6 @@ mod tests {
     }
 
     #[test]
-    fn test_edit_note_append_to_section() {
-        let (_tmp, store, root) = setup_vault();
-        let content = "# Person\n\n## Interactions\n\nOld entry\n\n## Links\n\nSome links\n";
-        std::fs::write(root.join("person.md"), content).unwrap();
-        store
-            .insert_file("person.md", "hash", 100, "per123", None, None)
-            .unwrap();
-
-        let input = EditInput {
-            file: "person.md".into(),
-            heading: "Interactions".into(),
-            content: "New entry".into(),
-            mode: EditMode::Append,
-            modified_by: "test".into(),
-        };
-        let result = edit_note(&store, &root, &input, None).unwrap();
-        assert_eq!(result.heading, "Interactions");
-        assert_eq!(result.mode, "Append");
-
-        let updated = std::fs::read_to_string(root.join("person.md")).unwrap();
-        assert!(updated.contains("Old entry"));
-        assert!(updated.contains("New entry"));
-        // New entry should be before ## Links
-        let new_pos = updated.find("New entry").unwrap();
-        let links_pos = updated.find("## Links").unwrap();
-        assert!(new_pos < links_pos);
-    }
-
-    #[test]
-    fn test_edit_note_replace_section() {
-        let (_tmp, store, root) = setup_vault();
-        let content = "# Note\n\n## Tasks\n\n- [x] Old task\n\n## Notes\n\nText\n";
-        std::fs::write(root.join("note.md"), content).unwrap();
-        store
-            .insert_file("note.md", "hash", 100, "not123", None, None)
-            .unwrap();
-
-        let input = EditInput {
-            file: "note.md".into(),
-            heading: "Tasks".into(),
-            content: "- [ ] New task\n".into(),
-            mode: EditMode::Replace,
-            modified_by: "test".into(),
-        };
-        edit_note(&store, &root, &input, None).unwrap();
-
-        let updated = std::fs::read_to_string(root.join("note.md")).unwrap();
-        assert!(!updated.contains("Old task"));
-        assert!(updated.contains("New task"));
-        assert!(updated.contains("## Notes")); // Other sections untouched
-    }
-
-    #[test]
-    fn test_edit_note_prepend_to_section() {
-        let (_tmp, store, root) = setup_vault();
-        let content = "# Doc\n\n## Log\n\nExisting line\n\n## Footer\n\nEnd\n";
-        std::fs::write(root.join("doc.md"), content).unwrap();
-        store
-            .insert_file("doc.md", "hash", 100, "doc123", None, None)
-            .unwrap();
-
-        let input = EditInput {
-            file: "doc.md".into(),
-            heading: "Log".into(),
-            content: "Prepended line".into(),
-            mode: EditMode::Prepend,
-            modified_by: "test".into(),
-        };
-        edit_note(&store, &root, &input, None).unwrap();
-
-        let updated = std::fs::read_to_string(root.join("doc.md")).unwrap();
-        assert!(updated.contains("Prepended line"));
-        assert!(updated.contains("Existing line"));
-        // Prepended should come before existing
-        let prepend_pos = updated.find("Prepended line").unwrap();
-        let existing_pos = updated.find("Existing line").unwrap();
-        assert!(prepend_pos < existing_pos);
-    }
-
-    #[test]
-    fn test_edit_note_section_not_found() {
-        let (_tmp, store, root) = setup_vault();
-        let content = "# Note\n\n## Existing\n\nContent\n";
-        std::fs::write(root.join("note.md"), content).unwrap();
-        store
-            .insert_file("note.md", "hash", 100, "not123", None, None)
-            .unwrap();
-
-        let input = EditInput {
-            file: "note.md".into(),
-            heading: "Missing".into(),
-            content: "Stuff".into(),
-            mode: EditMode::Append,
-            modified_by: "test".into(),
-        };
-        let result = edit_note(&store, &root, &input, None);
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("section 'Missing' not found")
-        );
-    }
-
-    #[test]
-    fn test_edit_note_file_not_found() {
-        let (_tmp, store, root) = setup_vault();
-
-        let input = EditInput {
-            file: "nonexistent.md".into(),
-            heading: "Section".into(),
-            content: "Stuff".into(),
-            mode: EditMode::Append,
-            modified_by: "test".into(),
-        };
-        let result = edit_note(&store, &root, &input, None);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("file not found"));
-    }
-
-    #[test]
-    fn test_rewrite_preserves_frontmatter() {
-        let (tmp, store, root) = setup_vault();
-        let content = "---\ntags:\n  - project\nstatus: active\n---\n\n# Old Content\n\nOld body\n";
-        std::fs::write(root.join("note.md"), content).unwrap();
-        store
-            .insert_file("note.md", "hash", 100, "rew123", None, None)
-            .unwrap();
-
-        let input = RewriteInput {
-            file: "note.md".into(),
-            content: "# New Content\n\nNew body\n".into(),
-            preserve_frontmatter: true,
-            modified_by: "test".into(),
-        };
-        rewrite_note(&store, &root, &input).unwrap();
-
-        let updated = std::fs::read_to_string(root.join("note.md")).unwrap();
-        assert!(updated.contains("status: active"));
-        assert!(updated.contains("# New Content"));
-        assert!(!updated.contains("Old body"));
-        drop(tmp);
-    }
-
-    #[test]
-    fn test_edit_frontmatter_add_tag() {
-        let (_tmp, store, root) = setup_vault();
-        let content = "---\ntags:\n  - project\n---\n\n# Content\n";
-        std::fs::write(root.join("note.md"), content).unwrap();
-        store
-            .insert_file("note.md", "hash", 100, "efm123", None, None)
-            .unwrap();
-
-        let input = EditFrontmatterInput {
-            file: "note.md".into(),
-            operations: vec![FrontmatterOp::AddTag("rust".into())],
-            modified_by: "test".into(),
-        };
-        edit_frontmatter(&store, &root, &input).unwrap();
-
-        let updated = std::fs::read_to_string(root.join("note.md")).unwrap();
-        assert!(updated.contains("project"));
-        assert!(updated.contains("rust"));
-    }
-
-    #[test]
-    fn test_edit_frontmatter_remove_tag() {
-        let (_tmp, store, root) = setup_vault();
-        let content = "---\ntags:\n  - project\n  - old\n---\n\n# Content\n";
-        std::fs::write(root.join("note.md"), content).unwrap();
-        store
-            .insert_file("note.md", "hash", 100, "efm456", None, None)
-            .unwrap();
-
-        let input = EditFrontmatterInput {
-            file: "note.md".into(),
-            operations: vec![FrontmatterOp::RemoveTag("old".into())],
-            modified_by: "test".into(),
-        };
-        edit_frontmatter(&store, &root, &input).unwrap();
-
-        let updated = std::fs::read_to_string(root.join("note.md")).unwrap();
-        assert!(updated.contains("project"));
-        assert!(!updated.contains("old"));
-    }
-
-    #[test]
-    fn test_edit_frontmatter_set_property() {
-        let (_tmp, store, root) = setup_vault();
-        let content = "---\nstatus: draft\n---\n\n# Content\n";
-        std::fs::write(root.join("note.md"), content).unwrap();
-        store
-            .insert_file("note.md", "hash", 100, "efm789", None, None)
-            .unwrap();
-
-        let input = EditFrontmatterInput {
-            file: "note.md".into(),
-            operations: vec![FrontmatterOp::Set("status".into(), "active".into())],
-            modified_by: "test".into(),
-        };
-        edit_frontmatter(&store, &root, &input).unwrap();
-
-        let updated = std::fs::read_to_string(root.join("note.md")).unwrap();
-        assert!(updated.contains("status: active"));
-        assert!(!updated.contains("status: draft"));
-    }
-
-    #[test]
-    fn test_edit_frontmatter_remove_property() {
-        let (_tmp, store, root) = setup_vault();
-        let content = "---\nstatus: draft\ntitle: Test\n---\n\n# Content\n";
-        std::fs::write(root.join("note.md"), content).unwrap();
-        store
-            .insert_file("note.md", "hash", 100, "efmrm1", None, None)
-            .unwrap();
-
-        let input = EditFrontmatterInput {
-            file: "note.md".into(),
-            operations: vec![FrontmatterOp::Remove("status".into())],
-            modified_by: "test".into(),
-        };
-        edit_frontmatter(&store, &root, &input).unwrap();
-
-        let updated = std::fs::read_to_string(root.join("note.md")).unwrap();
-        assert!(!updated.contains("status"));
-        assert!(updated.contains("title: Test"));
-    }
-
-    #[test]
-    fn test_edit_frontmatter_add_alias() {
-        let (_tmp, store, root) = setup_vault();
-        let content = "---\ntags:\n  - test\n---\n\n# Content\n";
-        std::fs::write(root.join("note.md"), content).unwrap();
-        store
-            .insert_file("note.md", "hash", 100, "efmal1", None, None)
-            .unwrap();
-
-        let input = EditFrontmatterInput {
-            file: "note.md".into(),
-            operations: vec![FrontmatterOp::AddAlias("My Alias".into())],
-            modified_by: "test".into(),
-        };
-        edit_frontmatter(&store, &root, &input).unwrap();
-
-        let updated = std::fs::read_to_string(root.join("note.md")).unwrap();
-        assert!(updated.contains("aliases"));
-        assert!(updated.contains("My Alias"));
-    }
-
-    #[test]
-    fn test_edit_frontmatter_no_existing_frontmatter() {
-        let (_tmp, store, root) = setup_vault();
-        let content = "# Content\n\nJust body, no frontmatter.\n";
-        std::fs::write(root.join("note.md"), content).unwrap();
-        store
-            .insert_file("note.md", "hash", 100, "efmnf1", None, None)
-            .unwrap();
-
-        let input = EditFrontmatterInput {
-            file: "note.md".into(),
-            operations: vec![
-                FrontmatterOp::Set("status".into(), "active".into()),
-                FrontmatterOp::AddTag("new-tag".into()),
-            ],
-            modified_by: "test".into(),
-        };
-        edit_frontmatter(&store, &root, &input).unwrap();
-
-        let updated = std::fs::read_to_string(root.join("note.md")).unwrap();
-        assert!(updated.starts_with("---\n"));
-        assert!(updated.contains("status: active"));
-        assert!(updated.contains("new-tag"));
-        assert!(updated.contains("# Content"));
-    }
-
-    #[test]
-    fn test_edit_frontmatter_multiple_operations() {
-        let (_tmp, store, root) = setup_vault();
-        let content = "---\ntags:\n  - old-tag\nstatus: draft\n---\n\n# Content\n";
-        std::fs::write(root.join("note.md"), content).unwrap();
-        store
-            .insert_file("note.md", "hash", 100, "efmmo1", None, None)
-            .unwrap();
-
-        let input = EditFrontmatterInput {
-            file: "note.md".into(),
-            operations: vec![
-                FrontmatterOp::RemoveTag("old-tag".into()),
-                FrontmatterOp::AddTag("new-tag".into()),
-                FrontmatterOp::Set("status".into(), "active".into()),
-                FrontmatterOp::Set("priority".into(), "high".into()),
-            ],
-            modified_by: "test".into(),
-        };
-        edit_frontmatter(&store, &root, &input).unwrap();
-
-        let updated = std::fs::read_to_string(root.join("note.md")).unwrap();
-        assert!(!updated.contains("old-tag"));
-        assert!(updated.contains("new-tag"));
-        assert!(updated.contains("status: active"));
-        assert!(updated.contains("priority: high"));
-        assert!(!updated.contains("status: draft"));
-    }
-
-    #[test]
     fn test_delete_note_soft() {
         let (tmp, store, root) = setup_vault();
         std::fs::create_dir_all(root.join("04-Archive")).unwrap();
@@ -2844,8 +2145,8 @@ mod tests {
     }
 
     /// Issue #11, on the write path. `precompute_chunks` is shared by
-    /// `create_note`, `append_to_note` and `unarchive_note`, and all three hand
-    /// the same field to FTS — so this covers the wiring for all of them.
+    /// `create_note` and `unarchive_note`, and both hand the same field to
+    /// FTS — so this covers the wiring for both of them.
     #[test]
     fn precompute_keeps_the_whole_chunk_for_fts_and_truncates_only_the_snippet() {
         use crate::llm::MockLlm;
@@ -2887,212 +2188,6 @@ mod tests {
             "snippet should still stop at 200 characters"
         );
         assert!(stored.snippet.len() <= 203);
-    }
-
-    /// End-to-end through one of the three write paths: a term appended past
-    /// the 200-character mark must be findable by keyword afterwards.
-    #[test]
-    fn appended_text_past_the_snippet_boundary_is_searchable() {
-        use crate::llm::MockLlm;
-
-        let (_tmp, store, root) = setup_vault();
-        let mut embedder = MockLlm::new(256);
-
-        let filler = "The coast road runs north through salt marsh and low dune. ".repeat(8);
-        let file_path = root.join("coast.md");
-        std::fs::write(&file_path, "# Coast\n\n## The Coast Road\n\nOriginal.\n").unwrap();
-        let mtime = file_mtime(&file_path).unwrap();
-        store
-            .insert_file("coast.md", "hash", mtime, "co123", None, None)
-            .unwrap();
-
-        append_to_note(
-            AppendInput {
-                file: "coast.md".into(),
-                content: format!("\n{filler}\n\nIt ends at Saltmere.\n"),
-                modified_by: "test".into(),
-            },
-            &store,
-            &mut embedder,
-            EmbedComposition::default(),
-            ChunkOptions {
-                min_chars: 0,
-                promote_bold: false,
-            },
-            &root,
-        )
-        .unwrap();
-
-        let file = store.get_file("coast.md").unwrap().unwrap();
-        assert!(
-            store
-                .best_matching_chunk_seq(file.id, &["Saltmere".to_string()])
-                .unwrap()
-                .is_some(),
-            "a term past character 200 must still be searchable"
-        );
-    }
-
-    #[test]
-    fn test_edit_then_append_no_mtime_conflict() {
-        use crate::llm::MockLlm;
-
-        let (_tmp, store, root) = setup_vault();
-        let mut embedder = MockLlm::new(256);
-
-        // Create a note on disk
-        let content = "# Test Note\n\n## Section\n\nOriginal content\n";
-        let file_path = root.join("mtime-test.md");
-        std::fs::write(&file_path, content).unwrap();
-
-        // Register in store with the ACTUAL mtime from disk
-        let mtime = file_mtime(&file_path).unwrap();
-        store
-            .insert_file("mtime-test.md", "hash", mtime, "mt123", None, None)
-            .unwrap();
-
-        // Step 1: edit_note modifies the file
-        let edit_input = EditInput {
-            file: "mtime-test.md".into(),
-            heading: "Section".into(),
-            content: "Edited content".into(),
-            mode: EditMode::Replace,
-            modified_by: "test".into(),
-        };
-        edit_note(&store, &root, &edit_input, None).unwrap();
-
-        // Step 2: append_to_note immediately after — should NOT fail with mtime conflict
-        let append_input = AppendInput {
-            file: "mtime-test.md".into(),
-            content: "\n## Appended\n\nAppended content\n".into(),
-            modified_by: "test".into(),
-        };
-        let result = append_to_note(
-            append_input,
-            &store,
-            &mut embedder,
-            EmbedComposition::default(),
-            ChunkOptions {
-                min_chars: 0,
-                promote_bold: false,
-            },
-            &root,
-        );
-        assert!(
-            result.is_ok(),
-            "append after edit should not fail with mtime conflict, got: {:?}",
-            result.err()
-        );
-
-        // Verify both edits are present
-        let final_content = std::fs::read_to_string(&file_path).unwrap();
-        assert!(final_content.contains("Edited content"));
-        assert!(final_content.contains("Appended content"));
-    }
-
-    #[test]
-    fn test_rewrite_then_append_no_mtime_conflict() {
-        use crate::llm::MockLlm;
-
-        let (_tmp, store, root) = setup_vault();
-        let mut embedder = MockLlm::new(256);
-
-        // Create a note on disk with frontmatter
-        let content = "---\ntags:\n  - test\n---\n\n# Rewrite Test\n\nOriginal body\n";
-        let file_path = root.join("rewrite-mtime.md");
-        std::fs::write(&file_path, content).unwrap();
-
-        // Register with actual mtime
-        let mtime = file_mtime(&file_path).unwrap();
-        store
-            .insert_file("rewrite-mtime.md", "hash", mtime, "rwmt1", None, None)
-            .unwrap();
-
-        // Step 1: rewrite_note modifies the file
-        let rewrite_input = RewriteInput {
-            file: "rewrite-mtime.md".into(),
-            content: "# Rewritten\n\nNew body\n".into(),
-            preserve_frontmatter: true,
-            modified_by: "test".into(),
-        };
-        rewrite_note(&store, &root, &rewrite_input).unwrap();
-
-        // Step 2: append_to_note immediately after — should NOT fail with mtime conflict
-        let append_input = AppendInput {
-            file: "rewrite-mtime.md".into(),
-            content: "\n## Extra\n\nMore content\n".into(),
-            modified_by: "test".into(),
-        };
-        let result = append_to_note(
-            append_input,
-            &store,
-            &mut embedder,
-            EmbedComposition::default(),
-            ChunkOptions {
-                min_chars: 0,
-                promote_bold: false,
-            },
-            &root,
-        );
-        assert!(
-            result.is_ok(),
-            "append after rewrite should not fail with mtime conflict, got: {:?}",
-            result.err()
-        );
-
-        let final_content = std::fs::read_to_string(&file_path).unwrap();
-        assert!(final_content.contains("New body"));
-        assert!(final_content.contains("More content"));
-    }
-
-    #[test]
-    fn test_edit_frontmatter_then_append_no_mtime_conflict() {
-        use crate::llm::MockLlm;
-
-        let (_tmp, store, root) = setup_vault();
-        let mut embedder = MockLlm::new(256);
-
-        // Create a note on disk
-        let content = "---\ntags:\n  - original\n---\n\n# FM Test\n\nBody\n";
-        let file_path = root.join("fm-mtime.md");
-        std::fs::write(&file_path, content).unwrap();
-
-        // Register with actual mtime
-        let mtime = file_mtime(&file_path).unwrap();
-        store
-            .insert_file("fm-mtime.md", "hash", mtime, "fmmt1", None, None)
-            .unwrap();
-
-        // Step 1: edit_frontmatter modifies the file
-        let fm_input = EditFrontmatterInput {
-            file: "fm-mtime.md".into(),
-            operations: vec![FrontmatterOp::AddTag("added".into())],
-            modified_by: "test".into(),
-        };
-        edit_frontmatter(&store, &root, &fm_input).unwrap();
-
-        // Step 2: append_to_note immediately after — should NOT fail with mtime conflict
-        let append_input = AppendInput {
-            file: "fm-mtime.md".into(),
-            content: "\n## Appended\n\nMore\n".into(),
-            modified_by: "test".into(),
-        };
-        let result = append_to_note(
-            append_input,
-            &store,
-            &mut embedder,
-            EmbedComposition::default(),
-            ChunkOptions {
-                min_chars: 0,
-                promote_bold: false,
-            },
-            &root,
-        );
-        assert!(
-            result.is_ok(),
-            "append after edit_frontmatter should not fail with mtime conflict, got: {:?}",
-            result.err()
-        );
     }
 
     // ── The tag store (#60) ──────────────────────────────────────
@@ -3142,37 +2237,6 @@ mod tests {
     }
 
     #[test]
-    fn editing_frontmatter_moves_the_tag_rows_with_it() {
-        let (_tmp, store, root) = setup_vault();
-        let content = "---\ntags:\n  - habitat/swamp\n---\n\nBody.\n";
-        let file_path = root.join("n.md");
-        std::fs::write(&file_path, content).unwrap();
-        let mtime = file_mtime(&file_path).unwrap();
-        let id = store
-            .insert_file("n.md", "hash", mtime, "fmtag1", None, None)
-            .unwrap();
-        store
-            .reconcile_file_tags(id, &crate::tags::extract(content))
-            .unwrap();
-
-        edit_frontmatter(
-            &store,
-            &root,
-            &EditFrontmatterInput {
-                file: "n.md".to_string(),
-                operations: vec![FrontmatterOp::AddTag("type/undead".to_string())],
-                modified_by: "test".to_string(),
-            },
-        )
-        .unwrap();
-
-        assert_eq!(
-            stored_tags(&store, "n.md"),
-            vec!["habitat/swamp", "type/undead"]
-        );
-    }
-
-    #[test]
     fn archiving_a_note_takes_the_tags_that_go_unused_with_it() {
         let (_tmp, store, root) = setup_vault();
         let content = "---\ntags:\n  - solo\n---\n\nBody.\n";
@@ -3215,30 +2279,6 @@ mod tests {
             vec!["todo", "work"],
             "the junction holds the property tag and the body tag"
         );
-    }
-
-    #[test]
-    fn update_metadata_keeps_a_body_hashtag_out_of_the_property() {
-        let (_tmp, store, root) = setup_vault();
-        note_with_a_body_hashtag(&store, &root);
-
-        update_metadata(
-            UpdateMetadataInput {
-                file: "n.md".to_string(),
-                tags: None,
-                aliases: None,
-                modified_by: "test".to_string(),
-            },
-            &store,
-            &root,
-        )
-        .unwrap();
-
-        let written = std::fs::read_to_string(root.join("n.md")).unwrap();
-        let (fm, _) = split_frontmatter(&written);
-        let (_, property_tags, _) = parse_frontmatter_fields(&fm);
-        assert_eq!(property_tags, vec!["work"]);
-        assert!(written.contains("#todo"), "the body tag stays in the body");
     }
 
     #[test]
@@ -3288,6 +2328,245 @@ mod tests {
         assert!(!archived.exists());
     }
 
+    /// A vault of one note, indexed, ready for `update_note`.
+    fn indexed_note(body: &str) -> (tempfile::TempDir, Store, std::path::PathBuf) {
+        use crate::llm::MockLlm;
+
+        let (tmp, store, vault) = setup_vault();
+        std::fs::write(vault.join("note.md"), body).unwrap();
+        let mut embedder = MockLlm::new(256);
+        let config = crate::config::Config::default();
+        crate::indexer::run_index_shared(&vault, &config, &store, &mut embedder, false, None)
+            .unwrap();
+        (tmp, store, vault)
+    }
+
+    fn one_edit(target: EditTarget, mode: EditMode, content: Option<&str>) -> UpdateInput {
+        UpdateInput {
+            file: "note.md".into(),
+            edits: vec![NoteEdit {
+                target,
+                mode,
+                content: content.map(|c| EditContent::Text(c.to_string())),
+            }],
+        }
+    }
+
+    /// Ported from the three `edit_note` section tests that went with it (#62).
+    /// `update` is the one call that edits a section now, so the three modes
+    /// have to reach it through `update_note` and not only through
+    /// `apply_section_edit`.
+    #[test]
+    fn a_section_edit_reaches_the_section_it_names_in_every_mode() {
+        for (mode, wanted, unwanted) in [
+            (EditMode::Replace, "New entry", Some("Old entry")),
+            (EditMode::Append, "New entry", None),
+            (EditMode::Prepend, "New entry", None),
+        ] {
+            let (_tmp, store, vault) = indexed_note(
+                "# Person\n\n## Interactions\n\nOld entry\n\n## Links\n\nSome links\n",
+            );
+            update_note(
+                &store,
+                &vault,
+                &one_edit(
+                    EditTarget::Section("Interactions".into()),
+                    mode,
+                    Some("New entry"),
+                ),
+            )
+            .unwrap();
+
+            let out = std::fs::read_to_string(vault.join("note.md")).unwrap();
+            assert!(out.contains(wanted), "{mode:?} lost its content: {out}");
+            if let Some(gone) = unwanted {
+                assert!(!out.contains(gone), "{mode:?} kept the old body: {out}");
+            }
+            assert!(
+                out.contains("## Links") && out.contains("Some links"),
+                "{mode:?} disturbed the next section: {out}"
+            );
+            // Whatever the mode, the edit lands inside the section it named.
+            assert!(
+                out.find("New entry").unwrap() < out.find("## Links").unwrap(),
+                "{mode:?} wrote outside the section: {out}"
+            );
+        }
+    }
+
+    /// Ported from `test_edit_note_file_not_found` (#62).
+    #[test]
+    fn an_update_of_a_note_the_store_does_not_hold_is_an_error() {
+        let (_tmp, store, vault) = setup_vault();
+        let err = update_note(
+            &store,
+            &vault,
+            &UpdateInput {
+                file: "nonexistent.md".into(),
+                edits: vec![NoteEdit {
+                    target: EditTarget::Body,
+                    mode: EditMode::Append,
+                    content: Some(EditContent::Text("x".into())),
+                }],
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("file not found"), "got {err}");
+    }
+
+    /// Ported from `test_rewrite_preserves_frontmatter` (#62). A body edit is
+    /// the design's `rewrite` row, and it always keeps the note's frontmatter.
+    #[test]
+    fn a_body_replace_keeps_the_notes_frontmatter() {
+        let (_tmp, store, vault) = indexed_note(
+            "---\ntags:\n  - project\nstatus: active\n---\n\n# Old Content\n\nOld body\n",
+        );
+        update_note(
+            &store,
+            &vault,
+            &one_edit(
+                EditTarget::Body,
+                EditMode::Replace,
+                Some("# New Content\n\nNew body\n"),
+            ),
+        )
+        .unwrap();
+
+        let out = std::fs::read_to_string(vault.join("note.md")).unwrap();
+        assert!(out.contains("status: active"), "got {out}");
+        assert!(out.contains("# New Content"), "got {out}");
+        assert!(!out.contains("Old body"), "got {out}");
+    }
+
+    /// Ported from `test_edit_frontmatter_no_existing_frontmatter` (#62): the
+    /// one frontmatter case the pure-transform tests do not cover is a note
+    /// that has none at all.
+    #[test]
+    fn a_property_edit_on_a_note_with_no_frontmatter_writes_a_block() {
+        let (_tmp, store, vault) = indexed_note("# Content\n\nJust body, no frontmatter.\n");
+        update_note(
+            &store,
+            &vault,
+            &UpdateInput {
+                file: "note.md".into(),
+                edits: vec![
+                    NoteEdit {
+                        target: EditTarget::Property("status".into()),
+                        mode: EditMode::Replace,
+                        content: Some(EditContent::Text("active".into())),
+                    },
+                    NoteEdit {
+                        target: EditTarget::Property("tags".into()),
+                        mode: EditMode::Append,
+                        content: Some(EditContent::Text("new-tag".into())),
+                    },
+                ],
+            },
+        )
+        .unwrap();
+
+        let out = std::fs::read_to_string(vault.join("note.md")).unwrap();
+        assert!(out.starts_with("---\n"), "got {out}");
+        assert!(out.contains("status: active"), "got {out}");
+        assert!(out.contains("new-tag"), "got {out}");
+        assert!(out.contains("# Content"), "got {out}");
+    }
+
+    /// Ported from `editing_frontmatter_moves_the_tag_rows_with_it` (#62).
+    /// `update` is the one frontmatter write path now, and it reconciles the
+    /// junction the same way (#60).
+    #[test]
+    fn a_property_edit_moves_the_tag_rows_with_it() {
+        let (_tmp, store, vault) = indexed_note("---\ntags:\n  - habitat/swamp\n---\n\nBody.\n");
+        update_note(
+            &store,
+            &vault,
+            &one_edit(
+                EditTarget::Property("tags".into()),
+                EditMode::Append,
+                Some("type/undead"),
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            stored_tags(&store, "note.md"),
+            vec!["habitat/swamp", "type/undead"]
+        );
+    }
+
+    /// Ported from `update_metadata_keeps_a_body_hashtag_out_of_the_property`
+    /// (#62). The property and the body are peers (#60), so a write to the
+    /// user's frontmatter must carry the property alone.
+    #[test]
+    fn a_property_edit_keeps_a_body_hashtag_out_of_the_property() {
+        let (_tmp, store, vault) =
+            indexed_note("---\ntags:\n  - work\n---\n\nBlocked on #todo today.\n");
+        assert_eq!(
+            stored_tags(&store, "note.md"),
+            vec!["todo", "work"],
+            "the junction holds the property tag and the body tag"
+        );
+
+        update_note(
+            &store,
+            &vault,
+            &one_edit(
+                EditTarget::Property("status".into()),
+                EditMode::Replace,
+                Some("done"),
+            ),
+        )
+        .unwrap();
+
+        let written = std::fs::read_to_string(vault.join("note.md")).unwrap();
+        let (fm, _) = split_frontmatter(&written);
+        let (_, property_tags, _) = parse_frontmatter_fields(&fm);
+        assert_eq!(property_tags, vec!["work"]);
+        assert!(written.contains("#todo"), "the body tag stays in the body");
+    }
+
+    /// Ported from `appended_text_past_the_snippet_boundary_is_searchable`
+    /// (#62). The append reaches the index through `update_note` and then
+    /// `reindex_written_file`, which is the pair every surface calls.
+    #[test]
+    fn appended_text_past_the_snippet_boundary_is_searchable() {
+        use crate::llm::MockLlm;
+
+        let (_tmp, store, vault) = indexed_note("# Coast\n\n## The Coast Road\n\nOriginal.\n");
+        let mut embedder = MockLlm::new(256);
+
+        let filler = "The coast road runs north through salt marsh and low dune. ".repeat(8);
+        update_note(
+            &store,
+            &vault,
+            &one_edit(
+                EditTarget::Body,
+                EditMode::Append,
+                Some(&format!("\n{filler}\n\nIt ends at Saltmere.\n")),
+            ),
+        )
+        .unwrap();
+        crate::indexer::reindex_written_file(
+            "note.md",
+            &store,
+            &mut embedder,
+            &vault,
+            EmbedComposition::default(),
+            test_chunk_opts(),
+        )
+        .unwrap();
+
+        let file = store.get_file("note.md").unwrap().unwrap();
+        assert!(
+            store
+                .best_matching_chunk_seq(file.id, &["Saltmere".to_string()])
+                .unwrap()
+                .is_some(),
+            "a term past character 200 must still be searchable"
+        );
+    }
+
     #[test]
     fn one_call_applies_a_section_edit_and_a_property_edit_in_one_write() {
         use crate::llm::MockLlm;
@@ -3322,7 +2601,6 @@ mod tests {
                         content: Some(EditContent::Text("b".into())),
                     },
                 ],
-                modified_by: "test".into(),
             },
         )
         .unwrap();
@@ -3473,7 +2751,6 @@ mod tests {
                 mode: EditMode::Replace,
                 content: Some(EditContent::Text("active".into())),
             }],
-            modified_by: "test".into(),
         };
         update_note(&store, &vault, &input).unwrap();
         update_note(&store, &vault, &input).unwrap();
