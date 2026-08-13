@@ -89,7 +89,7 @@ export LIBCLANG_PATH="$HOME/.engraph-buildenv/lib/python3.12/site-packages/clang
 export BINDGEN_EXTRA_CLANG_ARGS="-I/usr/lib/gcc/x86_64-linux-gnu/13/include -I/usr/include -I/usr/include/x86_64-linux-gnu"
 
 cargo build --release        # ~10 min cold, ~20s incremental
-cargo test --lib             # 851 pass
+cargo test --lib             # 852 pass
 ```
 
 Each env var exists for a specific failure. Omit one and you get:
@@ -146,13 +146,18 @@ The CUDA binary is **701 MB** against 25 MB for the CPU one — statically linke
 two in separate target directories (`CARGO_TARGET_DIR`) if you want both, because a feature change
 relinks the same path and a rebuild each way costs the llama.cpp compile.
 
-### Known pre-existing test failures
+### There is no `tests/` directory
 
-`cargo test` (full) fails to compile `tests/integration.rs` and `tests/write_pipeline.rs`:
-`unresolved import engraph::embedder`, `engraph::hnsw`, and a `walk_vault` arity mismatch.
-**These are broken on pristine upstream** — verify with `git stash && cargo clippy --all-targets`.
-Upstream PR #47 addresses them. Use `cargo test --lib` (682 tests) as the working suite.
-`cargo clippy -- -D warnings`, which is what CI runs, is clean.
+This fork deleted `tests/integration.rs`, `tests/write_pipeline.rs` and `tests/fixtures/`. They had
+not compiled since upstream v1.0.0 — `unresolved import engraph::embedder`, `engraph::hnsw`, and a
+`walk_vault` arity mismatch — so `cargo test` (full) and `cargo clippy --all-targets` both failed on
+pristine upstream, and every test in them was `#[ignore]` behind a GGUF download. `integration.rs`
+also reimplemented the index and search pipeline in its own helpers, so repairing it would have
+asserted against a copy of the shipped code rather than against the code. The one behaviour with no
+twin in the lib suite, the mtime conflict, moved to `writer::tests` and runs on `MockLlm`.
+
+**A rebase onto upstream brings all three paths back.** Delete them again. Upstream PR #47 repairs
+them instead, if that is ever the better answer.
 
 ### CI is manual-only in this fork
 

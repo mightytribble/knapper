@@ -660,12 +660,9 @@ All data stored in `~/.engraph/` — single SQLite database (~10MB typical), GGU
 ## Development
 
 ```bash
-cargo test --lib          # 846 unit tests, no network (requires CMake for llama.cpp)
+cargo test --lib          # 852 unit tests, no network (requires CMake for llama.cpp)
 cargo clippy -- -D warnings
 cargo fmt --check
-
-# Integration tests (downloads GGUF model)
-cargo test --test integration -- --ignored
 ```
 
 ## Contributing

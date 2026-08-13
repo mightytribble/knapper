@@ -2437,6 +2437,45 @@ mod tests {
         assert!(err.to_string().contains("file not found"), "got {err}");
     }
 
+    /// Ported from `tests/write_pipeline.rs::test_conflict_detection`, which
+    /// was `#[ignore]` behind a model download and so never ran. The guard is
+    /// wider since #62: one check covers every call `update` absorbed, where
+    /// `edit`, `rewrite` and `edit_frontmatter` each made none.
+    ///
+    /// The disk mtime is stamped rather than slept for. `file_mtime` reads
+    /// whole seconds, so an outside write in the same second as the index
+    /// passes the check and the test would assert nothing.
+    #[test]
+    fn an_update_of_a_note_edited_outside_engraph_is_a_conflict() {
+        let (_tmp, store, vault) = indexed_note("# Note\n\nIndexed body\n");
+        let indexed_mtime = store.get_file("note.md").unwrap().unwrap().mtime;
+
+        let outside = "# Note\n\nWritten outside engraph\n";
+        std::fs::write(vault.join("note.md"), outside).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(vault.join("note.md"))
+            .unwrap()
+            .set_modified(
+                std::time::SystemTime::UNIX_EPOCH
+                    + std::time::Duration::from_secs(indexed_mtime as u64 + 2),
+            )
+            .unwrap();
+
+        let err = update_note(
+            &store,
+            &vault,
+            &one_edit(EditTarget::Body, EditMode::Append, Some("appended")),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("mtime conflict"), "got {err}");
+        assert_eq!(
+            std::fs::read_to_string(vault.join("note.md")).unwrap(),
+            outside,
+            "the update wrote over an edit made outside engraph"
+        );
+    }
+
     /// Ported from `test_rewrite_preserves_frontmatter` (#62). A body edit is
     /// the design's `rewrite` row, and it always keeps the note's frontmatter.
     #[test]
