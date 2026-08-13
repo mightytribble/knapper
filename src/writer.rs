@@ -806,7 +806,7 @@ pub fn append_to_note(
 
     // Step 3: Append content
     let existing_content = std::fs::read_to_string(&full_path)?;
-    let new_content = format!("{}\n{}", existing_content.trim_end(), input.content);
+    let new_content = apply_body_edit(&existing_content, &input.content, EditMode::Append, false);
 
     // Step 4: Pre-compute new chunks + embeddings
     let chunk_data =
@@ -990,12 +990,77 @@ pub fn update_metadata(
     })
 }
 
-/// Edit a specific section within an existing note.
+/// Apply one section edit to a note's text. The transform is separate from
+/// the I/O so that `update_note` can apply a list of them to one string and
+/// write once (#62).
 ///
 /// Finds the target section by heading name, then applies the edit based on mode:
 /// - Replace: replace the entire section body with new content
 /// - Append: add new content at the end of the section body
 /// - Prepend: add new content at the start of the section body
+pub fn apply_section_edit(
+    content: &str,
+    heading: &str,
+    new: &str,
+    mode: EditMode,
+) -> Result<String> {
+    // Find the target section
+    let section = crate::markdown::find_section(content, heading)
+        .ok_or_else(|| anyhow::anyhow!("section '{}' not found", heading))?;
+
+    // Apply the edit based on mode
+    let lines: Vec<&str> = content.lines().collect();
+    let before = &lines[..section.body_start];
+    let body = &lines[section.body_start..section.body_end];
+    let after = &lines[section.body_end..];
+
+    let new_body = match mode {
+        EditMode::Replace => {
+            format!("\n{}\n", new.trim_end())
+        }
+        EditMode::Append => {
+            let existing = body.join("\n");
+            let trimmed_existing = existing.trim_end();
+            if trimmed_existing.is_empty() {
+                format!("\n{}\n", new.trim_end())
+            } else {
+                format!("{}\n{}\n", trimmed_existing, new.trim_end())
+            }
+        }
+        EditMode::Prepend => {
+            let existing = body.join("\n");
+            let trimmed_existing = existing.trim_start();
+            if trimmed_existing.is_empty() {
+                format!("\n{}\n", new.trim_end())
+            } else {
+                format!("\n{}\n{}", new.trim_end(), trimmed_existing)
+            }
+        }
+    };
+
+    // Reconstruct the file
+    let mut result_parts: Vec<String> = Vec::new();
+    if !before.is_empty() {
+        result_parts.push(before.join("\n"));
+    }
+    result_parts.push(new_body);
+    if !after.is_empty() {
+        result_parts.push(after.join("\n"));
+    }
+    // Join with newlines, ensuring we don't double up
+    Ok(result_parts.join("\n"))
+}
+
+/// The display name of an edit mode, for `EditResult::mode`.
+fn edit_mode_name(mode: &EditMode) -> &'static str {
+    match mode {
+        EditMode::Replace => "Replace",
+        EditMode::Append => "Append",
+        EditMode::Prepend => "Prepend",
+    }
+}
+
+/// Edit a specific section within an existing note.
 ///
 /// Does NOT re-index chunks — that's for the MCP layer.
 pub fn edit_note(
@@ -1014,70 +1079,57 @@ pub fn edit_note(
     // Step 2: Read current content from disk
     let content = std::fs::read_to_string(&full_path)?;
 
-    // Step 3: Find the target section
-    let section = crate::markdown::find_section(&content, &input.heading).ok_or_else(|| {
-        anyhow::anyhow!("section '{}' not found in {}", input.heading, input.file)
-    })?;
+    // Step 3: Apply the section edit
+    let new_content =
+        apply_section_edit(&content, &input.heading, &input.content, input.mode.clone())?;
 
-    // Step 4: Apply the edit based on mode
-    let lines: Vec<&str> = content.lines().collect();
-    let before = &lines[..section.body_start];
-    let body = &lines[section.body_start..section.body_end];
-    let after = &lines[section.body_end..];
-
-    let mode_name;
-    let new_body = match input.mode {
-        EditMode::Replace => {
-            mode_name = "Replace";
-            format!("\n{}\n", input.content.trim_end())
-        }
-        EditMode::Append => {
-            mode_name = "Append";
-            let existing = body.join("\n");
-            let trimmed_existing = existing.trim_end();
-            if trimmed_existing.is_empty() {
-                format!("\n{}\n", input.content.trim_end())
-            } else {
-                format!("{}\n{}\n", trimmed_existing, input.content.trim_end())
-            }
-        }
-        EditMode::Prepend => {
-            mode_name = "Prepend";
-            let existing = body.join("\n");
-            let trimmed_existing = existing.trim_start();
-            if trimmed_existing.is_empty() {
-                format!("\n{}\n", input.content.trim_end())
-            } else {
-                format!("\n{}\n{}", input.content.trim_end(), trimmed_existing)
-            }
-        }
-    };
-
-    // Step 5: Reconstruct the file
-    let mut result_parts: Vec<String> = Vec::new();
-    if !before.is_empty() {
-        result_parts.push(before.join("\n"));
-    }
-    result_parts.push(new_body);
-    if !after.is_empty() {
-        result_parts.push(after.join("\n"));
-    }
-    // Join with newlines, ensuring we don't double up
-    let new_content = result_parts.join("\n");
-
-    // Step 6: Write atomically (overwrite = true)
+    // Step 4: Write atomically (overwrite = true)
     atomic_write(&full_path, &new_content, true)?;
 
-    // Step 7: Update stored mtime to match actual file after write
+    // Step 5: Update stored mtime to match actual file after write
     let actual_mtime = file_mtime(&full_path).unwrap_or(0);
     store.update_file_mtime(&file_record.path, actual_mtime)?;
 
-    // Step 8: Return EditResult
+    // Step 6: Return EditResult
     Ok(EditResult {
         path: file_record.path,
         heading: input.heading.clone(),
-        mode: mode_name.to_string(),
+        mode: edit_mode_name(&input.mode).to_string(),
     })
+}
+
+/// Apply a body edit to a note's text: `rewrite_note`'s and `append_to_note`'s
+/// transform. The transform is separate from the I/O so that `update_note`
+/// can apply a list of them to one string and write once (#62).
+///
+/// With `preserve_frontmatter`, the frontmatter is split off, `mode` is
+/// applied to the body alone, and the two are reassembled. Without it,
+/// `Replace` returns `new` and `Append`/`Prepend` join the whole text.
+pub fn apply_body_edit(
+    content: &str,
+    new: &str,
+    mode: EditMode,
+    preserve_frontmatter: bool,
+) -> String {
+    if preserve_frontmatter {
+        let (maybe_frontmatter, old_body) = crate::markdown::split_frontmatter(content);
+        let Some(frontmatter) = maybe_frontmatter else {
+            // No existing frontmatter — just use new content as-is
+            return new.to_string();
+        };
+        let new_body = match mode {
+            EditMode::Replace => new.to_string(),
+            EditMode::Append => format!("{}\n{}", old_body.trim_end(), new),
+            EditMode::Prepend => format!("{}\n{}", new.trim_end(), old_body),
+        };
+        format!("---\n{}\n---\n\n{}", frontmatter, new_body)
+    } else {
+        match mode {
+            EditMode::Replace => new.to_string(),
+            EditMode::Append => format!("{}\n{}", content.trim_end(), new),
+            EditMode::Prepend => format!("{}\n{}", new.trim_end(), content),
+        }
+    }
 }
 
 /// Rewrite the body of an existing note, optionally preserving existing frontmatter.
@@ -1098,29 +1150,22 @@ pub fn rewrite_note(store: &Store, vault_path: &Path, input: &RewriteInput) -> R
     // Step 2: Read current content from disk
     let existing_content = std::fs::read_to_string(&full_path)?;
 
-    // Step 3: Split frontmatter using crate::markdown::split_frontmatter
-    let (maybe_frontmatter, _old_body) = crate::markdown::split_frontmatter(&existing_content);
+    // Step 3: Reconstruct content
+    let new_content = apply_body_edit(
+        &existing_content,
+        &input.content,
+        EditMode::Replace,
+        input.preserve_frontmatter,
+    );
 
-    // Step 4: Reconstruct content
-    let new_content = if input.preserve_frontmatter {
-        if let Some(frontmatter) = maybe_frontmatter {
-            format!("---\n{}\n---\n\n{}", frontmatter, input.content)
-        } else {
-            // No existing frontmatter — just use new content as-is
-            input.content.clone()
-        }
-    } else {
-        input.content.clone()
-    };
-
-    // Step 5: Write atomically (overwrite = true)
+    // Step 4: Write atomically (overwrite = true)
     atomic_write(&full_path, &new_content, true)?;
 
-    // Step 6: Update stored mtime to match actual file after write
+    // Step 5: Update stored mtime to match actual file after write
     let actual_mtime = file_mtime(&full_path).unwrap_or(0);
     store.update_file_mtime(&file_record.path, actual_mtime)?;
 
-    // Step 7: Return EditResult (reusing existing result type)
+    // Step 6: Return EditResult (reusing existing result type)
     Ok(EditResult {
         path: file_record.path,
         heading: String::new(),
@@ -1128,29 +1173,17 @@ pub fn rewrite_note(store: &Store, vault_path: &Path, input: &RewriteInput) -> R
     })
 }
 
-/// Edit frontmatter fields with granular operations (add/remove tags, set/remove properties).
+/// Apply a list of frontmatter operations to a note's text. The transform is
+/// separate from the I/O so that `update_note` can apply a list of them to
+/// one string and write once (#62).
 ///
 /// Uses `crate::markdown::split_frontmatter()` to extract raw YAML, then applies
-/// operations sequentially using `serde_yaml`. Does NOT re-index chunks.
-pub fn edit_frontmatter(
-    store: &Store,
-    vault_path: &Path,
-    input: &EditFrontmatterInput,
-) -> Result<EditResult> {
-    // Step 1: Resolve file via store
-    let file_record = store
-        .resolve_file(&input.file)?
-        .ok_or_else(|| anyhow::anyhow!("file not found: {}", input.file))?;
+/// operations sequentially using `serde_yaml`.
+pub fn apply_frontmatter_ops(content: &str, ops: &[FrontmatterOp]) -> Result<String> {
+    // Split frontmatter using crate::markdown::split_frontmatter (returns raw YAML without delimiters)
+    let (maybe_fm, body) = crate::markdown::split_frontmatter(content);
 
-    let full_path = vault_path.join(&file_record.path);
-
-    // Step 2: Read content from disk
-    let content = std::fs::read_to_string(&full_path)?;
-
-    // Step 3: Split frontmatter using crate::markdown::split_frontmatter (returns raw YAML without delimiters)
-    let (maybe_fm, body) = crate::markdown::split_frontmatter(&content);
-
-    // Step 4: Parse YAML into a Mapping (create empty mapping if no frontmatter)
+    // Parse YAML into a Mapping (create empty mapping if no frontmatter)
     let mut mapping: serde_yaml::Mapping = if let Some(ref fm) = maybe_fm {
         let val: serde_yaml::Value = serde_yaml::from_str(fm)
             .unwrap_or(serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
@@ -1162,8 +1195,8 @@ pub fn edit_frontmatter(
         serde_yaml::Mapping::new()
     };
 
-    // Step 5: Apply operations sequentially
-    for op in &input.operations {
+    // Apply operations sequentially
+    for op in ops {
         match op {
             FrontmatterOp::Set(key, value) => {
                 mapping.insert(
@@ -1189,14 +1222,44 @@ pub fn edit_frontmatter(
         }
     }
 
-    // Step 6: Serialize back to YAML
+    // Serialize back to YAML
     let yaml_str = serde_yaml::to_string(&serde_yaml::Value::Mapping(mapping))?;
 
-    // Step 7: Reassemble: ---\n{yaml}---\n\n{body}
-    // serde_yaml::to_string adds a trailing newline, so we don't need an extra one before ---
-    let new_content = format!("---\n{}---\n\n{}", yaml_str, body);
+    // Reassemble: ---\n{yaml}---\n\n{body}
+    // serde_yaml::to_string adds a trailing newline, so we don't need an extra one before ---.
+    // `split_frontmatter`'s found-delimiter branch rejoins the body with `lines().join("\n")`,
+    // which drops the body's own final line break — restore it here so the file keeps ending
+    // in one, matching every other write path in this module.
+    let body = if body.is_empty() || body.ends_with('\n') {
+        body
+    } else {
+        format!("{}\n", body)
+    };
+    Ok(format!("---\n{}---\n\n{}", yaml_str, body))
+}
 
-    // Step 8: Write atomically
+/// Edit frontmatter fields with granular operations (add/remove tags, set/remove properties).
+///
+/// Does NOT re-index chunks.
+pub fn edit_frontmatter(
+    store: &Store,
+    vault_path: &Path,
+    input: &EditFrontmatterInput,
+) -> Result<EditResult> {
+    // Step 1: Resolve file via store
+    let file_record = store
+        .resolve_file(&input.file)?
+        .ok_or_else(|| anyhow::anyhow!("file not found: {}", input.file))?;
+
+    let full_path = vault_path.join(&file_record.path);
+
+    // Step 2: Read content from disk
+    let content = std::fs::read_to_string(&full_path)?;
+
+    // Step 3: Apply the frontmatter operations
+    let new_content = apply_frontmatter_ops(&content, &input.operations)?;
+
+    // Step 4: Write atomically
     atomic_write(&full_path, &new_content, true)?;
 
     // Update store with new content hash and mtime
@@ -1678,6 +1741,39 @@ pub fn verify_index_integrity(store: &Store, vault_path: &Path) -> Result<usize>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_section_edit_is_a_pure_transform_of_the_text() {
+        let doc = "# Note\n\n## Spells\n\nold body\n\n## Rank\n\nS\n";
+        let out = apply_section_edit(doc, "Spells", "new body", EditMode::Replace).unwrap();
+        assert!(out.contains("new body"));
+        assert!(!out.contains("old body"));
+        assert!(out.contains("## Rank"), "the rest of the note survives");
+    }
+
+    #[test]
+    fn a_missing_section_is_an_error_and_not_a_silent_append() {
+        let doc = "# Note\n\n## Spells\n\nbody\n";
+        let err = apply_section_edit(doc, "Nowhere", "x", EditMode::Replace).unwrap_err();
+        assert!(format!("{err}").contains("Nowhere"));
+    }
+
+    #[test]
+    fn frontmatter_ops_are_a_pure_transform_of_the_text() {
+        let doc = "---\ntags:\n  - a\n---\n\nbody\n";
+        let out = apply_frontmatter_ops(
+            doc,
+            &[
+                FrontmatterOp::AddTag("b".into()),
+                FrontmatterOp::Set("status".into(), "done".into()),
+            ],
+        )
+        .unwrap();
+        assert!(out.contains("- a"));
+        assert!(out.contains("- b"));
+        assert!(out.contains("status: done"));
+        assert!(out.ends_with("body\n"));
+    }
 
     #[test]
     fn test_generate_filename() {
