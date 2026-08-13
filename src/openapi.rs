@@ -7,13 +7,13 @@ pub fn build_openapi_spec(server_url: &str) -> serde_json::Value {
     // Read endpoints
     paths.insert("/api/health-check".into(), build_health_check());
     paths.insert("/api/search".into(), build_search());
-    paths.insert("/api/read/{file}".into(), build_read());
+    paths.insert("/api/read".into(), build_read());
     paths.insert("/api/read-section".into(), build_read_section());
     paths.insert("/api/list".into(), build_list());
     paths.insert("/api/tags".into(), build_tags());
     paths.insert("/api/vault-map".into(), build_vault_map());
-    paths.insert("/api/who/{name}".into(), build_who());
-    paths.insert("/api/project/{name}".into(), build_project());
+    paths.insert("/api/who".into(), build_who());
+    paths.insert("/api/project".into(), build_project());
     paths.insert("/api/context".into(), build_context());
     paths.insert("/api/health".into(), build_health());
 
@@ -105,7 +105,7 @@ fn build_read() -> serde_json::Value {
             "operationId": "readNote",
             "summary": "Read a note's full content with metadata and graph connections.",
             "parameters": [{
-                "name": "file", "in": "path", "required": true,
+                "name": "file", "in": "query", "required": true,
                 "description": "File path, basename, or #docid",
                 "schema": { "type": "string" }
             }],
@@ -176,7 +176,7 @@ fn build_who() -> serde_json::Value {
             "operationId": "getWho",
             "summary": "Get a person context bundle with note, related notes, and interaction history.",
             "parameters": [{
-                "name": "name", "in": "path", "required": true,
+                "name": "name", "in": "query", "required": true,
                 "description": "Person name (matches filename in People folder)",
                 "schema": { "type": "string" }
             }],
@@ -191,7 +191,7 @@ fn build_project() -> serde_json::Value {
             "operationId": "getProject",
             "summary": "Get a project context bundle with project note, related files, and graph connections.",
             "parameters": [{
-                "name": "name", "in": "path", "required": true,
+                "name": "name", "in": "query", "required": true,
                 "description": "Project name (matches filename)",
                 "schema": { "type": "string" }
             }],

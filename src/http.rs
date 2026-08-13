@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Query, State};
 use axum::http::{HeaderMap, HeaderValue, Method};
 use axum::{
     Json, Router,
@@ -333,15 +333,16 @@ pub fn routes() -> Vec<(&'static str, MethodRouter<ApiState>)> {
     vec![
         ("/api/health-check", get(health_check)),
         ("/api/search", post(handle_search)),
-        ("/api/read/{*file}", get(handle_read)),
+        ("/api/read", get(handle_read)),
         ("/api/read-section", get(handle_read_section)),
         ("/api/list", get(handle_list)),
         ("/api/tags", get(handle_tags)),
         ("/api/vault-map", get(handle_vault_map)),
-        ("/api/who/{name}", get(handle_who)),
-        ("/api/project/{name}", get(handle_project)),
+        ("/api/who", get(handle_who)),
+        ("/api/project", get(handle_project)),
         ("/api/context", post(handle_context)),
         ("/api/health", get(handle_health)),
+        // Write endpoints
         ("/api/create", post(handle_create)),
         ("/api/append", post(handle_append)),
         ("/api/edit", post(handle_edit)),
@@ -352,12 +353,16 @@ pub fn routes() -> Vec<(&'static str, MethodRouter<ApiState>)> {
         ("/api/unarchive", post(handle_unarchive)),
         ("/api/update-metadata", post(handle_update_metadata)),
         ("/api/delete", post(handle_delete)),
+        // Index maintenance
         ("/api/reindex-file", post(handle_reindex_file)),
+        // Identity endpoints
         ("/api/identity", get(handle_identity)),
         ("/api/setup", post(handle_setup)),
+        // Migration endpoints
         ("/api/migrate/preview", post(handle_migrate_preview)),
         ("/api/migrate/apply", post(handle_migrate_apply)),
         ("/api/migrate/undo", post(handle_migrate_undo)),
+        // OpenAPI / ChatGPT plugin discovery (no auth required)
         ("/openapi.json", get(handle_openapi)),
         ("/.well-known/ai-plugin.json", get(handle_plugin_manifest)),
     ]
@@ -460,7 +465,7 @@ async fn handle_search(
 async fn handle_read(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Path(file): Path<String>,
+    Query(p): Query<crate::params::Read>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, false)?;
     let store = state.store.lock().await;
@@ -470,7 +475,7 @@ async fn handle_read(
         profile: state.profile.as_ref().as_ref(),
     };
     let note =
-        context::context_read(&ctx, &file).map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+        context::context_read(&ctx, &p.file).map_err(|e| ApiError::internal(&format!("{e:#}")))?;
     Ok(Json(serde_json::json!(note)))
 }
 
@@ -555,7 +560,7 @@ async fn handle_vault_map(
 async fn handle_who(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Path(name): Path<String>,
+    Query(p): Query<crate::params::Who>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, false)?;
     let store = state.store.lock().await;
@@ -565,14 +570,14 @@ async fn handle_who(
         profile: state.profile.as_ref().as_ref(),
     };
     let person =
-        context::context_who(&ctx, &name).map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+        context::context_who(&ctx, &p.name).map_err(|e| ApiError::internal(&format!("{e:#}")))?;
     Ok(Json(serde_json::json!(person)))
 }
 
 async fn handle_project(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Path(name): Path<String>,
+    Query(p): Query<crate::params::Project>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, false)?;
     let store = state.store.lock().await;
@@ -581,8 +586,8 @@ async fn handle_project(
         vault_path: &state.vault_path,
         profile: state.profile.as_ref().as_ref(),
     };
-    let proj =
-        context::context_project(&ctx, &name).map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    let proj = context::context_project(&ctx, &p.name)
+        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
     Ok(Json(serde_json::json!(proj)))
 }
 
