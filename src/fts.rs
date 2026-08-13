@@ -241,7 +241,7 @@ mod tests {
         assert!(store.fts_search("guide to Rust", 10).unwrap().is_empty());
         assert_eq!(
             store
-                .fts_search_any("guide to Rust", 10, &[])
+                .fts_search_any("guide to Rust", 10, &[], None)
                 .unwrap()
                 .len(),
             1
@@ -250,20 +250,25 @@ mod tests {
         // Any one term is enough, which is what makes the lane a recall lane.
         assert_eq!(
             store
-                .fts_search_any("kubernetes Rust", 10, &[])
+                .fts_search_any("kubernetes Rust", 10, &[], None)
                 .unwrap()
                 .len(),
             1
         );
         assert!(
             store
-                .fts_search_any("kubernetes helm", 10, &[])
+                .fts_search_any("kubernetes helm", 10, &[], None)
                 .unwrap()
                 .is_empty()
         );
 
         // Nothing searchable: no rows, no error.
-        assert!(store.fts_search_any("-- ...", 10, &[]).unwrap().is_empty());
+        assert!(
+            store
+                .fts_search_any("-- ...", 10, &[], None)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -352,5 +357,78 @@ mod tests {
         store.delete_chunks_for_file(file_id).unwrap();
         let results = store.fts_search("chunk", 10).unwrap();
         assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn a_scope_keeps_the_keyword_lane_inside_the_tagged_notes() {
+        // #60. The out-of-scope note is the better BM25 match, so a scoped
+        // query returning it would mean the filter ran after the ranking.
+        let store = crate::store::Store::open_memory().unwrap();
+        let tag = |p: &str| crate::tags::Tag {
+            path: p.into(),
+            display: p.into(),
+        };
+
+        let wight = store
+            .insert_file("wight.md", "h", 1, "d000001", None, None)
+            .unwrap();
+        let wolf = store
+            .insert_file("wolf.md", "h", 2, "d000002", None, None)
+            .unwrap();
+        store
+            .reconcile_file_tags(wight, &[tag("type/undead")])
+            .unwrap();
+        store
+            .reconcile_file_tags(wolf, &[tag("type/beast")])
+            .unwrap();
+
+        store
+            .insert_chunk(&crate::store::NewChunk {
+                file_id: wight,
+                seq: 0,
+                heading: "## Wight",
+                text: "A wight lurks.",
+                vector_id: 1,
+                token_count: 5,
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .insert_chunk(&crate::store::NewChunk {
+                file_id: wolf,
+                seq: 0,
+                heading: "## Wolf",
+                text: "A wight, a wight, a wight and a wolf.",
+                vector_id: 2,
+                token_count: 12,
+                ..Default::default()
+            })
+            .unwrap();
+
+        // limit = 1, not some larger number: at a limit both rows fit under,
+        // a post-filter over the unscoped top-N would smuggle `wight` back in
+        // and this test would pass whether the SQL scoped the query or not.
+        // At limit 1 the unscoped top-1 is `wolf` alone, so a post-filter
+        // implementation has nothing left to filter `wight` into (#60).
+        let unscoped: Vec<i64> = store
+            .fts_search_any("wight", 1, &[], None)
+            .unwrap()
+            .iter()
+            .map(|r| r.file_id)
+            .collect();
+        assert_eq!(
+            unscoped.first(),
+            Some(&wolf),
+            "the fixture only tests anything if the out-of-scope note wins unscoped"
+        );
+
+        let scope = [wight];
+        let scoped: Vec<i64> = store
+            .fts_search_any("wight", 1, &[], Some(&scope))
+            .unwrap()
+            .iter()
+            .map(|r| r.file_id)
+            .collect();
+        assert_eq!(scoped, vec![wight]);
     }
 }

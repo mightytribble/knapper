@@ -458,6 +458,42 @@ impl TagFilter {
             none: read("none", none)?,
         })
     }
+
+    /// Whether the filter constrains nothing.
+    ///
+    /// The one test for "no scope", so a caller never decides that question by
+    /// inspecting the three fields itself and getting one of them wrong (#60).
+    pub fn is_empty(&self) -> bool {
+        self.all.is_empty() && self.any.is_empty() && self.none.is_empty()
+    }
+
+    /// The filter as one line, for `--explain` (#60).
+    ///
+    /// Folded, because the terms are, and only the fields that hold terms are
+    /// named — an empty field constrains nothing and printing it would read as
+    /// though it did.
+    pub fn describe(&self) -> String {
+        let field = |name: &str, terms: &[TagTerm]| -> Option<String> {
+            if terms.is_empty() {
+                return None;
+            }
+            let joined = terms
+                .iter()
+                .map(|t| t.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            Some(format!("{name}={joined}"))
+        };
+        [
+            field("all", &self.all),
+            field("any", &self.any),
+            field("none", &self.none),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ")
+    }
 }
 
 /// Fold the `tags` alias into `all`. `tags` is the older spelling of `--all`,
@@ -845,6 +881,41 @@ mod tests {
     #[test]
     fn an_absent_field_is_not_an_error() {
         assert!(TagFilter::parse(&[], &[], &[]).unwrap().all.is_empty());
+    }
+
+    #[test]
+    fn an_empty_filter_is_the_one_that_constrains_nothing() {
+        assert!(TagFilter::default().is_empty());
+        assert!(
+            !TagFilter::parse(&["type/undead".into()], &[], &[])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !TagFilter::parse(&[], &["type/undead".into()], &[])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !TagFilter::parse(&[], &[], &["type/undead".into()])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_filter_describes_itself_by_the_fields_it_holds() {
+        let filter =
+            TagFilter::parse(&["type/undead".into()], &[], &["status/draft".into()]).unwrap();
+        assert_eq!(filter.describe(), "all=type/undead none=status/draft");
+
+        let subtree = TagFilter::parse(&["Type/".to_string()], &[], &[]).unwrap();
+        assert_eq!(subtree.describe(), "all=type/");
+
+        let two = TagFilter::parse(&[], &["a".into(), "b".into()], &[]).unwrap();
+        assert_eq!(two.describe(), "any=a,b");
+
+        assert_eq!(TagFilter::default().describe(), "");
     }
 
     #[test]

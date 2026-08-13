@@ -61,6 +61,23 @@ enum Command {
         /// Return one result per matching section, or one per document.
         #[arg(long, value_enum)]
         group_by: Option<engraph::config::GroupBy>,
+
+        /// Filter to notes with all listed tags (comma-separated). A trailing
+        /// `/` or `/*` matches the tag and its descendants.
+        #[arg(long, value_delimiter = ',')]
+        tags: Vec<String>,
+        /// Filter to notes carrying every term (comma-separated). A trailing
+        /// `/` or `/*` matches the tag and its descendants.
+        #[arg(long, value_delimiter = ',')]
+        all: Vec<String>,
+        /// Filter to notes carrying at least one term (comma-separated). An
+        /// unknown term is an error naming the nearest tag the vault holds.
+        #[arg(long, value_delimiter = ',')]
+        any: Vec<String>,
+        /// Filter out notes carrying any of these terms (comma-separated).
+        /// An unknown term here is ignored.
+        #[arg(long, value_delimiter = ',')]
+        none: Vec<String>,
     },
 
     /// Show index status and statistics.
@@ -541,9 +558,15 @@ async fn main() -> Result<()> {
             top_n,
             explain,
             group_by,
+            tags,
+            all,
+            any,
+            none,
         } => {
             cfg.merge_top_n(top_n);
             let group_by = group_by.unwrap_or(cfg.group_by);
+            let all_terms = engraph::tags::merge_all_alias(tags, all);
+            let scope = engraph::tags::TagFilter::parse(&all_terms, &any, &none)?;
 
             if !index_exists(&data_dir) {
                 eprintln!("No index found. Run 'engraph index <path>' first.");
@@ -551,7 +574,7 @@ async fn main() -> Result<()> {
             }
 
             search::run_search(
-                &query, cfg.top_n, cli.json, explain, group_by, &data_dir, &cfg,
+                &query, cfg.top_n, cli.json, explain, group_by, &scope, &data_dir, &cfg,
             )?;
         }
 

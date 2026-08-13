@@ -53,25 +53,48 @@ pub fn delete_vec(conn: &Connection, vector_id: u64) -> Result<()> {
 ///
 /// Returns `(vector_id, distance)` pairs sorted by ascending distance.
 /// Cosine distance: 0.0 = identical, 2.0 = opposite.
+///
+/// `scope` is the tag scope's file ids, or `None` for the whole vault (#60).
+/// vec0 reads a `rowid IN` constraint as a pre-filter on the search, so a
+/// scoped call still returns `k` in-scope rows rather than the in-scope part of
+/// an unscoped top-k. The ids bind through `rarray`, one pointer rather than
+/// one parameter per file, which is why `Store::open` registers that module.
 pub fn search_vec(
     conn: &Connection,
     query: &[f32],
     k: usize,
     tombstones: &HashSet<u64>,
+    scope: Option<&[i64]>,
 ) -> Result<Vec<(u64, f32)>> {
+    use rusqlite::types::Value;
+    use std::rc::Rc;
     use zerocopy::AsBytes;
 
     // Request extra results to compensate for tombstone filtering.
     let fetch_k = if tombstones.is_empty() { k } else { k * 2 };
 
-    let mut stmt = conn.prepare(
+    let mut binds: Vec<Box<dyn rusqlite::types::ToSql>> = vec![
+        Box::new(query.as_bytes().to_vec()),
+        Box::new(fetch_k as i64),
+    ];
+    let scope_clause = match scope {
+        None => "",
+        Some(ids) => {
+            let array: rusqlite::vtab::array::Array =
+                Rc::new(ids.iter().copied().map(Value::from).collect::<Vec<Value>>());
+            binds.push(Box::new(array));
+            " AND rowid IN (SELECT vector_id FROM chunks WHERE file_id IN rarray(?3))"
+        }
+    };
+
+    let mut stmt = conn.prepare(&format!(
         "SELECT rowid, distance
          FROM chunks_vec
          WHERE embedding MATCH ?1
-           AND k = ?2",
-    )?;
+           AND k = ?2{scope_clause}"
+    ))?;
 
-    let rows = stmt.query_map(rusqlite::params![query.as_bytes(), fetch_k as i64], |row| {
+    let rows = stmt.query_map(rusqlite::params_from_iter(binds.iter()), |row| {
         let id: i64 = row.get(0)?;
         let dist: f32 = row.get(1)?;
         Ok((id as u64, dist))
@@ -142,7 +165,7 @@ mod tests {
             insert_vec(&conn, i as u64, v).unwrap();
         }
 
-        let results = search_vec(&conn, &vectors[0], 5, &HashSet::new()).unwrap();
+        let results = search_vec(&conn, &vectors[0], 5, &HashSet::new(), None).unwrap();
         assert!(!results.is_empty(), "search returned no results");
         assert_eq!(
             results[0].0, 0,
@@ -167,7 +190,7 @@ mod tests {
         let mut tombstones = HashSet::new();
         tombstones.insert(0u64);
 
-        let results = search_vec(&conn, &vectors[0], 5, &tombstones).unwrap();
+        let results = search_vec(&conn, &vectors[0], 5, &tombstones, None).unwrap();
         for (id, _) in &results {
             assert_ne!(*id, 0, "tombstoned ID should not appear in results");
         }
@@ -195,7 +218,7 @@ mod tests {
     fn test_empty_search() {
         let conn = setup_conn();
         let query = random_vector(999, 384);
-        let results = search_vec(&conn, &query, 5, &HashSet::new()).unwrap();
+        let results = search_vec(&conn, &query, 5, &HashSet::new(), None).unwrap();
         assert!(results.is_empty(), "empty table should return no results");
     }
 
@@ -217,8 +240,71 @@ mod tests {
         // Insert and search with 256-dim vector
         let vec256: Vec<f32> = (0..256).map(|i| (i as f32) / 256.0).collect();
         insert_vec(&conn, 1, &vec256).unwrap();
-        let results = search_vec(&conn, &vec256, 1, &HashSet::new()).unwrap();
+        let results = search_vec(&conn, &vec256, 1, &HashSet::new(), None).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, 1);
+    }
+
+    /// A `chunks` table holding only what the scope subquery reads.
+    fn chunks_for(conn: &Connection, rows: &[(i64, i64)]) {
+        conn.execute(
+            "CREATE TABLE chunks (id INTEGER PRIMARY KEY, file_id INTEGER, vector_id INTEGER)",
+            [],
+        )
+        .unwrap();
+        for (vector_id, file_id) in rows {
+            conn.execute(
+                "INSERT INTO chunks (file_id, vector_id) VALUES (?1, ?2)",
+                [file_id, vector_id],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn a_scope_pre_filters_the_knn_rather_than_cutting_its_answer() {
+        // #60. The claim the whole design rests on: vec0 reads `rowid IN` as a
+        // constraint on the search, so `k` still means k in-scope rows. A
+        // post-filter over the same top-k would return one row here, not three.
+        let conn = setup_conn();
+        rusqlite::vtab::array::load_module(&conn).unwrap();
+        let vectors: Vec<Vec<f32>> = (0..20).map(|i| random_vector(i, 384)).collect();
+        for (i, v) in vectors.iter().enumerate() {
+            insert_vec(&conn, i as u64, v).unwrap();
+        }
+        // Every third vector belongs to file 1; the rest to file 2.
+        let rows: Vec<(i64, i64)> = (0..20)
+            .map(|i| (i, if i % 3 == 0 { 1 } else { 2 }))
+            .collect();
+        chunks_for(&conn, &rows);
+
+        let scope = [1i64];
+        let scoped = search_vec(&conn, &vectors[0], 3, &HashSet::new(), Some(&scope)).unwrap();
+
+        assert_eq!(scoped.len(), 3, "k in-scope rows, not k rows then a filter");
+        for (id, _) in &scoped {
+            assert_eq!(id % 3, 0, "an out-of-scope vector reached the lane: {id}");
+        }
+    }
+
+    #[test]
+    fn an_empty_scope_returns_nothing_from_the_knn() {
+        let conn = setup_conn();
+        rusqlite::vtab::array::load_module(&conn).unwrap();
+        for i in 0..5u64 {
+            insert_vec(&conn, i, &random_vector(i, 384)).unwrap();
+        }
+        chunks_for(&conn, &(0..5).map(|i| (i, 1i64)).collect::<Vec<_>>());
+
+        let empty: [i64; 0] = [];
+        let out = search_vec(
+            &conn,
+            &random_vector(0, 384),
+            5,
+            &HashSet::new(),
+            Some(&empty),
+        )
+        .unwrap();
+        assert!(out.is_empty());
     }
 }

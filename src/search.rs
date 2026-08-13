@@ -56,6 +56,19 @@ pub struct SearchOutput {
     pub fts_columns: Vec<(&'static str, f64)>,
 }
 
+/// The tag scope a query ran under (#60).
+///
+/// Both halves are what `--explain` needs and nothing else knows: the filter
+/// as the caller wrote it, and how many notes it actually admitted. A thin
+/// result under a scope is explained by the second number more often than by
+/// anything the lanes report.
+pub struct ScopeTrace {
+    /// `all=type/undead none=status/draft`, folded, empty fields omitted.
+    pub filter: String,
+    /// How many notes the filter resolved to.
+    pub notes: usize,
+}
+
 /// The query as run, and what it brought back, per lane.
 ///
 /// This exists because three separate defects (#18, #22, #23) all lived in the
@@ -69,6 +82,8 @@ pub struct RetrievalTrace {
     /// The FTS5 MATCH expression this became, or `None` if it had no searchable
     /// token and the lane was skipped.
     pub fts_expr: Option<String>,
+    /// The tag scope, or `None` when the query ran over the whole vault (#60).
+    pub scope: Option<ScopeTrace>,
     pub semantic_hits: usize,
     pub fts_hits: usize,
 }
@@ -95,6 +110,8 @@ pub struct SearchConfig<'a> {
     /// weights are positional over the declared columns — and `fingerprint`
     /// blocks this path when they are not.
     pub fts: crate::config::FtsConfig,
+    /// The notes this query may answer from (#60). Empty means the whole vault.
+    pub scope: crate::tags::TagFilter,
 }
 
 impl<'a> SearchConfig<'a> {
@@ -110,6 +127,7 @@ impl<'a> SearchConfig<'a> {
             ranking: config.ranking,
             lane_weights: config.lane_weights,
             fts: config.fts,
+            scope: crate::tags::TagFilter::default(),
         }
     }
 }
@@ -139,6 +157,9 @@ pub fn search_internal(
         fts: crate::config::FtsConfig::default(),
         ranking: crate::config::RankingConfig::default(),
         lane_weights: crate::config::LaneWeights::default(),
+        // Defaults, like every other setting on this path: the context engine
+        // reads the whole vault (#60, #64).
+        scope: crate::tags::TagFilter::default(),
     };
     search_with_intelligence(query, top_n, embedder, &mut config)
 }
@@ -264,6 +285,36 @@ pub fn search_with_intelligence(
     let date_range = crate::temporal::parse_date_range_heuristic(query);
     let weights = config.lane_weights;
 
+    // The scope resolves before anything is embedded, so a filter that admits
+    // no note costs no model call, and a filter naming no tag fails with the
+    // repair rather than with an empty result (#60).
+    let scope_ids: Option<Vec<i64>> = match config.scope.is_empty() {
+        true => None,
+        false => Some(config.store.files_in_scope(&config.scope)?),
+    };
+    let scope_trace = scope_ids.as_ref().map(|ids| ScopeTrace {
+        filter: config.scope.describe(),
+        notes: ids.len(),
+    });
+    if scope_ids.as_ref().is_some_and(|ids| ids.is_empty()) {
+        return Ok(SearchOutput {
+            results: Vec::new(),
+            fused: Vec::new(),
+            degraded: false,
+            retrieval: RetrievalTrace {
+                query: query.to_string(),
+                fts_expr: crate::fts::any_term_expr(query),
+                semantic_hits: 0,
+                fts_hits: 0,
+                scope: scope_trace,
+            },
+            fts_columns: config.fts.columns(),
+        });
+    }
+    let scope_files: Option<&[i64]> = scope_ids.as_deref();
+    let scope_set: Option<std::collections::HashSet<i64>> =
+        scope_ids.as_ref().map(|ids| ids.iter().copied().collect());
+
     // --- Step 1: Run 3-lane retrieval ---
     //
     // Two pools per lane, holding the same hits with different score semantics:
@@ -284,7 +335,7 @@ pub fn search_with_intelligence(
     let tombstones = std::collections::HashSet::new();
     let raw_results = config
         .store
-        .search_vec(&query_vec, lane_width, &tombstones)?;
+        .search_vec(&query_vec, lane_width, &tombstones, scope_files)?;
 
     for (vector_id, distance) in raw_results {
         if let Some(chunk) = config.store.get_chunk_by_vector_id(vector_id)? {
@@ -315,7 +366,7 @@ pub fn search_with_intelligence(
     // seed probes and left this lane empty for every multi-word query (#22).
     let fts_raw = config
         .store
-        .fts_search_any(query, lane_width, &config.fts.weights())
+        .fts_search_any(query, lane_width, &config.fts.weights(), scope_files)
         .unwrap_or_default();
 
     for fr in fts_raw {
@@ -347,6 +398,7 @@ pub fn search_with_intelligence(
         fts_expr: crate::fts::any_term_expr(query),
         semantic_hits: semantic_hits.len(),
         fts_hits: fts_hits.len(),
+        scope: scope_trace,
     };
 
     // Rescale each lane against its own range on the way into the seed pool.
@@ -402,6 +454,10 @@ pub fn search_with_intelligence(
             .get_files_in_date_range(range.0, range.1)
             .unwrap_or_default()
             .iter()
+            // A restart point asserts the note is a candidate answer, which is
+            // not the same as being walked through, so the scope reaches these
+            // where it does not reach the walk (#60).
+            .filter(|f| scope_set.as_ref().is_none_or(|s| s.contains(&f.id)))
             .map(|f| RankedResult {
                 file_path: f.path.clone(),
                 file_id: f.id,
@@ -446,6 +502,7 @@ pub fn search_with_intelligence(
             },
             ..graph::PprParams::default()
         },
+        scope_set.as_ref(),
     )
     .unwrap_or_default();
     // The lane's cost was the second-largest stage in the query before #29 and
@@ -1034,6 +1091,12 @@ fn format_retrieval(trace: &RetrievalTrace, columns: &[(&str, f64)]) -> String {
         .collect::<Vec<_>>()
         .join(" ");
     let mut out = format!("--- Query run ---\nkeyword index: {declared}\n");
+    if let Some(scope) = &trace.scope {
+        out.push_str(&format!(
+            "scope: {} -> {} notes\n",
+            scope.filter, scope.notes
+        ));
+    }
     out.push_str(&format!(
         "{:?}\n   semantic {} · fts {}",
         trace.query, trace.semantic_hits, trace.fts_hits
@@ -1097,12 +1160,14 @@ fn merge_seeds(semantic: &[RankedResult], fts: &[RankedResult]) -> Vec<RankedRes
 /// Performs both semantic (sqlite-vec) and keyword (FTS5) search, then fuses
 /// results using Reciprocal Rank Fusion. When `explain` is true, each
 /// result includes per-lane score breakdown.
+#[allow(clippy::too_many_arguments)]
 pub fn run_search(
     query: &str,
     top_n: usize,
     json: bool,
     explain: bool,
     group_by: GroupBy,
+    scope: &crate::tags::TagFilter,
     data_dir: &Path,
     config: &crate::config::Config,
 ) -> Result<()> {
@@ -1145,6 +1210,7 @@ pub fn run_search(
                 .as_mut()
                 .map(|r| r.as_mut() as &mut dyn llm::RerankModel),
             group_by,
+            scope: scope.clone(),
             ..SearchConfig::new(&store, config)
         };
         search_with_intelligence(query, top_n, &mut embedder, &mut search_config)?
@@ -1716,8 +1782,275 @@ mod tests {
                 retrieval_width,
                 ..crate::config::RankingConfig::default()
             },
+            scope: crate::tags::TagFilter::default(),
         };
         search_with_intelligence(query, top_n, embedder, &mut config).unwrap()
+    }
+
+    /// Two notes on one subject, one tagged and one not, each with its own
+    /// distinctive section, so a scope has something to include and exclude.
+    fn tagged_vault() -> (tempfile::TempDir, Store, llm::MockLlm) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("wight.md"),
+            "---\ntags: [type/undead]\n---\n\n\
+             # Wight\n\n## Warding\n\nA warding effect that pins an undead creature \
+             in the space it stands in, and does not care how it got there.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("wolf.md"),
+            "---\ntags: [type/beast]\n---\n\n\
+             # Wolf\n\n## Warding\n\nA warding effect that pins a beast in the space \
+             it stands in, and does not care how it got there.\n",
+        )
+        .unwrap();
+
+        let store = Store::open_memory().unwrap();
+        let mut embedder = llm::MockLlm::new(256);
+        let config = crate::config::Config::default();
+        crate::indexer::run_index_shared(root, &config, &store, &mut embedder, false, None)
+            .unwrap();
+        (tmp, store, embedder)
+    }
+
+    /// Counts the embed calls a search makes, so the short-circuit is asserted
+    /// as "no model ran" and not merely as "no results".
+    struct CountingEmbed {
+        inner: llm::MockLlm,
+        calls: usize,
+    }
+
+    impl llm::EmbedModel for CountingEmbed {
+        fn embed_batch(&mut self, docs: &[llm::EmbedDoc<'_>]) -> anyhow::Result<Vec<Vec<f32>>> {
+            self.calls += 1;
+            self.inner.embed_batch(docs)
+        }
+        fn token_count(&self, text: &str) -> usize {
+            self.inner.token_count(text)
+        }
+        fn dim(&self) -> usize {
+            self.inner.dim()
+        }
+        fn fingerprint(&self) -> String {
+            // Disambiguated: `MockLlm` implements both model traits, and each
+            // declares a `fingerprint`.
+            llm::EmbedModel::fingerprint(&self.inner)
+        }
+    }
+
+    /// Run a search under one tag scope, at the shipped defaults.
+    fn search_scoped(
+        query: &str,
+        scope: crate::tags::TagFilter,
+        store: &Store,
+        embedder: &mut impl llm::EmbedModel,
+    ) -> Result<SearchOutput> {
+        let mut config = SearchConfig {
+            scope,
+            ..SearchConfig::new(store, &crate::config::Config::default())
+        };
+        search_with_intelligence(query, 20, embedder, &mut config)
+    }
+
+    #[test]
+    fn a_scope_keeps_the_results_inside_the_tagged_notes() {
+        let (_tmp, store, mut embedder) = tagged_vault();
+        let filter = crate::tags::TagFilter::parse(&["type/undead".to_string()], &[], &[]).unwrap();
+
+        let unscoped = search_scoped(
+            "warding",
+            crate::tags::TagFilter::default(),
+            &store,
+            &mut embedder,
+        )
+        .unwrap();
+        let paths: Vec<&str> = unscoped
+            .results
+            .iter()
+            .map(|r| r.file_path.as_str())
+            .collect();
+        assert!(paths.contains(&"wolf.md"), "unscoped, both notes answer");
+
+        let scoped = search_scoped("warding", filter, &store, &mut embedder).unwrap();
+        assert!(!scoped.results.is_empty(), "the tagged note still answers");
+        for r in &scoped.results {
+            assert_eq!(r.file_path, "wight.md", "an out-of-scope note answered");
+        }
+
+        // A hard scope, not a cut over the output: each content lane fetched
+        // fewer rows, so the excluded note never occupied a lane's width.
+        assert!(
+            scoped.retrieval.semantic_hits < unscoped.retrieval.semantic_hits
+                && scoped.retrieval.fts_hits < unscoped.retrieval.fts_hits,
+            "the lanes read the out-of-scope note and it was removed afterwards"
+        );
+        let trace = scoped
+            .retrieval
+            .scope
+            .as_ref()
+            .expect("the trace carries the scope");
+        assert_eq!(trace.filter, "all=type/undead");
+        assert_eq!(trace.notes, 1);
+    }
+
+    #[test]
+    fn an_empty_filter_reproduces_the_unscoped_search_exactly() {
+        // The control for the whole change: with no scope, the pipeline runs
+        // the queries it ran before #60 and returns the same rows in the same
+        // order.
+        let (_tmp, store, mut embedder) = tagged_vault();
+
+        let a = search_scoped(
+            "warding",
+            crate::tags::TagFilter::default(),
+            &store,
+            &mut embedder,
+        )
+        .unwrap();
+        let b = search_at("warding", 20, 60, &store, &mut embedder);
+
+        let keys = |o: &SearchOutput| -> Vec<(String, i64, String)> {
+            o.results
+                .iter()
+                .map(|r| (r.file_path.clone(), r.chunk_seq, format!("{:.9}", r.score)))
+                .collect()
+        };
+        assert_eq!(keys(&a), keys(&b));
+        assert!(a.retrieval.scope.is_none());
+    }
+
+    #[test]
+    fn a_scope_no_note_satisfies_answers_nothing_without_running_a_model() {
+        let (_tmp, store, embedder) = tagged_vault();
+        let mut counting = CountingEmbed {
+            inner: embedder,
+            calls: 0,
+        };
+        let filter = crate::tags::TagFilter::parse(
+            &["type/undead".to_string(), "type/beast".to_string()],
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        let out = search_scoped("warding", filter, &store, &mut counting).unwrap();
+
+        assert!(out.results.is_empty());
+        assert!(out.fused.is_empty());
+        assert_eq!(
+            counting.calls, 0,
+            "the query was embedded for an empty scope"
+        );
+        let trace = out.retrieval.scope.expect("the trace carries the scope");
+        assert_eq!(trace.filter, "all=type/undead,type/beast");
+        assert_eq!(trace.notes, 0);
+        assert_eq!(out.retrieval.fts_expr.as_deref(), Some("\"warding\""));
+    }
+
+    #[test]
+    fn a_scope_naming_no_tag_fails_the_search() {
+        let (_tmp, store, mut embedder) = tagged_vault();
+        let filter = crate::tags::TagFilter::parse(&["type/undeed".to_string()], &[], &[]).unwrap();
+        // Not `unwrap_err`: a `SearchOutput` is not `Debug`, and giving it one
+        // for a test would be the tail wagging the dog.
+        let err = match search_scoped("warding", filter, &store, &mut embedder) {
+            Ok(_) => panic!("a scope naming no tag must fail the search"),
+            Err(e) => e,
+        };
+        assert_eq!(
+            err.to_string(),
+            "no such tag 'type/undeed'; nearest: 'type/undead'"
+        );
+    }
+
+    /// A dated note outside the scope, linking to a note inside it, so the
+    /// only way the linked note can earn graph mass is through the dated
+    /// note's restart point.
+    fn dated_vault() -> (tempfile::TempDir, Store, llm::MockLlm) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("journal.md"),
+            "---\ndate: 2024-03-15\ntags: [type/beast]\n---\n\n\
+             # Journal\n\n## Entry\n\nThe day the pack was counted, written up in \
+             [[Ledger]] and nowhere else.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("ledger.md"),
+            "---\ntags: [type/undead]\n---\n\n\
+             # Ledger\n\n## Tally\n\nA tally of the counts, kept in a column of \
+             numbers with nothing else said about them.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("wight.md"),
+            "---\ntags: [type/undead]\n---\n\n\
+             # Wight\n\n## Warding\n\nA warding effect that pins an undead creature \
+             in the space it stands in.\n",
+        )
+        .unwrap();
+
+        let store = Store::open_memory().unwrap();
+        let mut embedder = llm::MockLlm::new(256);
+        let config = crate::config::Config::default();
+        crate::indexer::run_index_shared(root, &config, &store, &mut embedder, false, None)
+            .unwrap();
+        (tmp, store, embedder)
+    }
+
+    #[test]
+    fn a_dated_note_outside_the_scope_is_not_a_restart_point() {
+        // #60. A temporal seed asserts the note is a candidate answer, so the
+        // scope reaches it. `journal.md` is the only note linking to
+        // `ledger.md`, but unscoped it is already a graph seed through the
+        // content lanes too, so the scoped assertion is the one that proves
+        // the temporal path: out of scope, `journal.md` earns neither seed,
+        // and `ledger.md` loses its graph credit only because of that.
+        let (_tmp, store, mut embedder) = dated_vault();
+        let query = "warding 2024-03-15";
+
+        // The fixture drives the temporal path, or the test below proves
+        // nothing: the query parses to a range, and the dated note is in it.
+        let range = crate::temporal::parse_date_range_heuristic(query)
+            .expect("the query names a date range");
+        let dated: Vec<String> = store
+            .get_files_in_date_range(range.0, range.1)
+            .unwrap()
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+        assert_eq!(dated, vec!["journal.md".to_string()]);
+
+        let graph_credits = |out: &SearchOutput| -> Vec<String> {
+            out.fused
+                .iter()
+                .filter(|f| f.lane_contributions.iter().any(|l| l.lane_name == "graph"))
+                .map(|f| f.file_path.clone())
+                .collect()
+        };
+
+        let unscoped = search_scoped(
+            query,
+            crate::tags::TagFilter::default(),
+            &store,
+            &mut embedder,
+        )
+        .unwrap();
+        assert!(
+            graph_credits(&unscoped).contains(&"ledger.md".to_string()),
+            "unscoped, the dated note seeds the walk that credits its target"
+        );
+
+        let filter = crate::tags::TagFilter::parse(&["type/undead".to_string()], &[], &[]).unwrap();
+        let scoped = search_scoped(query, filter, &store, &mut embedder).unwrap();
+        assert!(
+            graph_credits(&scoped).is_empty(),
+            "an out-of-scope dated note restarted the walk: {:?}",
+            graph_credits(&scoped)
+        );
     }
 
     #[test]
@@ -1816,6 +2149,7 @@ mod tests {
         {
             let mut config = SearchConfig {
                 fts: crate::config::FtsConfig::default(),
+                scope: crate::tags::TagFilter::default(),
                 reranker: Some(&mut reranker),
                 store,
                 rerank_candidates: 30,
@@ -2039,6 +2373,7 @@ mod tests {
         {
             let mut config = SearchConfig {
                 fts: crate::config::FtsConfig::default(),
+                scope: crate::tags::TagFilter::default(),
                 reranker: Some(&mut reranker),
                 store: &store,
                 rerank_candidates: 30,
@@ -2071,6 +2406,7 @@ mod tests {
         for cap in [1, 2] {
             let mut config = SearchConfig {
                 fts: crate::config::FtsConfig::default(),
+                scope: crate::tags::TagFilter::default(),
                 reranker: None,
                 store: &store,
                 rerank_candidates: 30,
@@ -2158,6 +2494,7 @@ mod tests {
             let mut reranker = CountingReranker::new();
             let mut config = SearchConfig {
                 fts: crate::config::FtsConfig::default(),
+                scope: crate::tags::TagFilter::default(),
                 reranker: Some(&mut reranker),
                 store: &store,
                 rerank_candidates: 30,
@@ -2216,6 +2553,7 @@ mod tests {
             let mut reranker = CountingReranker::new();
             let mut config = SearchConfig {
                 fts: crate::config::FtsConfig::default(),
+                scope: crate::tags::TagFilter::default(),
                 reranker: Some(&mut reranker),
                 store: &store,
                 rerank_candidates: 30,
@@ -2262,6 +2600,7 @@ mod tests {
             let mut reranker = CountingReranker::new();
             let mut config = SearchConfig {
                 fts: crate::config::FtsConfig::default(),
+                scope: crate::tags::TagFilter::default(),
                 reranker: Some(&mut reranker),
                 store: &store,
                 rerank_candidates: 30,
@@ -2303,6 +2642,7 @@ mod tests {
         {
             let mut config = SearchConfig {
                 fts: crate::config::FtsConfig::default(),
+                scope: crate::tags::TagFilter::default(),
                 reranker: Some(&mut reranker),
                 store: &store,
                 rerank_candidates: 30,
@@ -2369,6 +2709,7 @@ mod tests {
         let mut reranker = BrokenReranker;
         let mut config = SearchConfig {
             fts: crate::config::FtsConfig::default(),
+            scope: crate::tags::TagFilter::default(),
             reranker: Some(&mut reranker),
             store: &store,
             rerank_candidates: 30,
@@ -2392,6 +2733,7 @@ mod tests {
 
         let mut config = SearchConfig {
             fts: crate::config::FtsConfig::default(),
+            scope: crate::tags::TagFilter::default(),
             reranker: None,
             store: &store,
             rerank_candidates: 30,
@@ -2427,6 +2769,7 @@ mod tests {
         let mut reranker = CountingReranker::new();
         let mut config = SearchConfig {
             fts: crate::config::FtsConfig::default(),
+            scope: crate::tags::TagFilter::default(),
             reranker: Some(&mut reranker),
             store: &store,
             rerank_candidates: 30,
@@ -2452,6 +2795,7 @@ mod tests {
 
         let mut config = SearchConfig {
             fts: crate::config::FtsConfig::default(),
+            scope: crate::tags::TagFilter::default(),
             reranker: None,
             store: &store,
             rerank_candidates: 30,
