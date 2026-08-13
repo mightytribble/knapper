@@ -121,9 +121,8 @@ fn build_list() -> serde_json::Value {
     serde_json::json!({
         "get": {
             "operationId": "listNotes",
-            "summary": "List notes filtered by folder, tags, creator, or limit.",
+            "summary": "List notes filtered by scope operators, creator, or limit.",
             "parameters": [
-                { "name": "folder", "in": "query", "required": false, "description": "Folder path prefix filter", "schema": { "type": "string" } },
                 { "name": "scope", "in": "query", "required": false, "description": "Comma-separated tag terms; a trailing / matches the tag and its descendants. A term starting with / is a directory path from the vault root instead, case-sensitive, with a trailing / its subtree. Alias of all", "schema": { "type": "string" } },
                 { "name": "all", "in": "query", "required": false, "description": "Comma-separated tag terms a note carries every one of, or directory terms (starting with /, case-sensitive, a trailing / its subtree) it lies under", "schema": { "type": "string" } },
                 { "name": "any", "in": "query", "required": false, "description": "Comma-separated tag terms a note carries at least one of, or directory terms (starting with /, case-sensitive, a trailing / its subtree) it lies under", "schema": { "type": "string" } },

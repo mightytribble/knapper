@@ -318,15 +318,16 @@ pub fn context_read(
     })
 }
 
-/// List notes with optional folder/tag filters and edge counts.
+/// The notes a scope admits, in path order (#68). The `folder` filter the
+/// store still takes is `context_project`'s alone: a caller's own directory
+/// filter is a scope term, which is a case-sensitive range and not a `LIKE`.
 pub fn context_list(
     params: &ContextParams,
-    folder: Option<&str>,
     tags: &crate::tags::Scope,
     created_by: Option<&str>,
     limit: Option<usize>,
 ) -> Result<Vec<NoteListItem>> {
-    let files = params.store.list_files(folder, tags, created_by, limit)?;
+    let files = params.store.list_files(None, tags, created_by, limit)?;
     let file_ids: Vec<i64> = files.iter().map(|f| f.id).collect();
     let edge_counts = params
         .store
@@ -934,14 +935,7 @@ mod tests {
             vault_path: &root,
             profile: None,
         };
-        let items = context_list(
-            &params,
-            None,
-            &crate::tags::Scope::default(),
-            None,
-            Some(20),
-        )
-        .unwrap();
+        let items = context_list(&params, &crate::tags::Scope::default(), None, Some(20)).unwrap();
         assert_eq!(items.len(), 2);
     }
 
@@ -955,7 +949,6 @@ mod tests {
         };
         let items = context_list(
             &params,
-            None,
             &crate::tags::Scope::parse(&["rust".into()], &[], &[]).unwrap(),
             None,
             Some(20),
@@ -963,6 +956,41 @@ mod tests {
         .unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].path, "note.md");
+    }
+
+    /// One scope operator carries a tag term and a directory term at once,
+    /// which is why `list` needs no second directory handle (#65, #68).
+    #[test]
+    fn a_scope_mixing_a_tag_and_a_directory_reaches_the_listing() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let store = Store::open_memory().unwrap();
+        let inside = store
+            .insert_file("lore/wight.md", "h1", 100, "aaa111", None, None)
+            .unwrap();
+        let outside = store
+            .insert_file("bestiary/wolf.md", "h2", 100, "bbb222", None, None)
+            .unwrap();
+        store
+            .reconcile_file_tags(inside, &[tag("type/undead")])
+            .unwrap();
+        store
+            .reconcile_file_tags(outside, &[tag("type/undead")])
+            .unwrap();
+        let params = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+        let items = context_list(
+            &params,
+            &crate::tags::Scope::parse(&["type/undead".into(), "/lore/".into()], &[], &[]).unwrap(),
+            None,
+            None,
+        )
+        .unwrap();
+        let paths: Vec<&str> = items.iter().map(|i| i.path.as_str()).collect();
+        assert_eq!(paths, vec!["lore/wight.md"]);
     }
 
     #[test]

@@ -609,6 +609,51 @@ mod tests {
         }
     }
 
+    /// `folder` was a second directory handle, and it disagreed with the
+    /// first: `LIKE 'lore%'` folds case, reads `_` in the argument as a
+    /// wildcard and matches `lorekeeper.md`, where a directory term is a
+    /// case-sensitive range anchored at the path boundary. The scope
+    /// operators are the one handle, on all three surfaces (#68).
+    #[test]
+    fn list_declares_no_folder_parameter() {
+        let cmd = crate::cli::Cli::command();
+        let list = cmd
+            .get_subcommands()
+            .find(|s| s.get_name() == "list")
+            .expect("list is a CLI command");
+        assert!(
+            !list.get_arguments().any(|a| a.get_id() == "folder"),
+            "the CLI still declares --folder"
+        );
+
+        let tool = crate::serve::EngraphServer::tool_router()
+            .list_all()
+            .into_iter()
+            .find(|t| t.name.to_string() == "list")
+            .expect("list is an MCP tool");
+        let properties = tool
+            .input_schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .expect("the list tool declares properties");
+        assert!(
+            !properties.contains_key("folder"),
+            "the list tool schema still declares folder"
+        );
+
+        let spec = crate::openapi::build_openapi_spec("http://localhost:3000");
+        let named: Vec<&str> = spec["paths"]["/api/list"]["get"]["parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            !named.contains(&"folder"),
+            "/api/list still documents a folder parameter"
+        );
+    }
+
     /// #62 is finished when no surface differs from the table.
     #[test]
     fn nothing_is_pending() {

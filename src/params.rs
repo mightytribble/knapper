@@ -83,9 +83,6 @@ pub struct Read {
 
 #[derive(Debug, Args, Deserialize, JsonSchema)]
 pub struct List {
-    /// Filter to a folder path prefix.
-    #[arg(long)]
-    pub folder: Option<String>,
     /// Filter to notes carrying every term. A term is a tag path; a trailing
     /// `/` or `/*` matches the tag and its descendants. A term starting with
     /// `/` is a directory path from the vault root instead, case-sensitive,

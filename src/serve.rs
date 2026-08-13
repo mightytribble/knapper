@@ -194,7 +194,7 @@ impl EngraphServer {
 
     #[tool(
         name = "list",
-        description = "List notes filtered by folder prefix and scope operators (all/any/none). A term is a tag path, or a directory path when it starts with `/`; a trailing `/` matches the tag's descendants or the directory's subtree. Returns paths, docids, tags, and edge counts."
+        description = "List notes filtered by scope operators (all/any/none). A term is a tag path, or a directory path when it starts with `/`; a trailing `/` matches the tag's descendants or the directory's subtree. Returns every note the scope admits, in path order, with paths, docids, tags and edge counts."
     )]
     async fn list(
         &self,
@@ -209,14 +209,9 @@ impl EngraphServer {
         let all_terms = crate::tags::merge_scope_alias(params.0.scope, params.0.all);
         let tags = crate::tags::Scope::parse(&all_terms, &params.0.any, &params.0.none)
             .map_err(|e| mcp_err(&e))?;
-        let items = context::context_list(
-            &ctx,
-            params.0.folder.as_deref(),
-            &tags,
-            params.0.created_by.as_deref(),
-            params.0.limit,
-        )
-        .map_err(|e| mcp_err(&e))?;
+        let items =
+            context::context_list(&ctx, &tags, params.0.created_by.as_deref(), params.0.limit)
+                .map_err(|e| mcp_err(&e))?;
         to_json_result(&items)
     }
 

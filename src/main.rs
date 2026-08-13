@@ -280,7 +280,6 @@ async fn main() -> Result<()> {
             let filter = engraph::tags::Scope::parse(&all_terms, &args.any, &args.none)?;
             let items = engraph::context::context_list(
                 &params,
-                args.folder.as_deref(),
                 &filter,
                 args.created_by.as_deref(),
                 args.limit,
