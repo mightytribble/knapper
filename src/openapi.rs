@@ -163,10 +163,10 @@ fn build_who() -> serde_json::Value {
     serde_json::json!({
         "get": {
             "operationId": "getWho",
-            "summary": "Get a person context bundle with note, related notes, and interaction history.",
+            "summary": "Person context bundle: the person's note, the notes that mention them, and their wikilinks in both directions.",
             "parameters": [{
                 "name": "name", "in": "query", "required": true,
-                "description": "Person name (matches filename in People folder)",
+                "description": "Person name. A docid, a path or a basename first, then a keyword search that prefers a hit under the People folder",
                 "schema": { "type": "string" }
             }],
             "responses": { "200": { "description": "Person context bundle" } }
@@ -193,7 +193,7 @@ fn build_topic() -> serde_json::Value {
     serde_json::json!({
         "post": {
             "operationId": "getTopic",
-            "summary": "Get rich topic context with semantic search, graph expansion, and budget-aware trimming.",
+            "summary": "Topic context bundle: the five notes that best match the query, read whole, plus the notes one wikilink hop from the top three, trimmed to a character budget.",
             "requestBody": {
                 "required": true,
                 "content": { "application/json": { "schema": {
@@ -201,7 +201,7 @@ fn build_topic() -> serde_json::Value {
                     "required": ["query"],
                     "properties": {
                         "query": { "type": "string", "description": "Topic or question" },
-                        "budget": { "type": "integer", "description": "Character budget (default 32000)" },
+                        "budget": { "type": "integer", "description": "Character budget (default 32000, about 8000 tokens)" },
                         "tags": { "type": "array", "items": { "type": "string" }, "description": "Tag terms; a trailing / matches the tag and its descendants. Alias of all" },
                         "all": { "type": "array", "items": { "type": "string" }, "description": "Gather context from notes carrying every one of these terms" },
                         "any": { "type": "array", "items": { "type": "string" }, "description": "Gather context from notes carrying at least one of these terms" },

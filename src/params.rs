@@ -131,7 +131,10 @@ pub struct VaultMap {}
 
 #[derive(Debug, Args, Deserialize, JsonSchema)]
 pub struct Who {
-    /// Person name. It matches a filename in the People folder.
+    /// Person name. It resolves as a `#docid`, a path or a basename first, and
+    /// then as a keyword search answered by the first hit that sits under the
+    /// profile's People folder, carries a `person` or `people` tag, or has the
+    /// name for its filename.
     pub name: String,
 }
 

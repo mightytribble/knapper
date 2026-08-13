@@ -208,7 +208,11 @@ The reranker scored each result for relevance as the 4th RRF lane.
 engraph topic "authentication" --budget 8000
 ```
 
-Returns a token-budgeted context bundle: relevant notes, connected people, related projects — ready to paste into a prompt or serve via MCP.
+Returns a context bundle to paste into a prompt or serve over MCP: the five notes that best match the query, each read whole, and then the notes one wikilink hop from the top three. The budget is characters, so 8000 of them are about 2000 tokens, and a note that overruns it is cut and marked. A bundle holds whole notes, so the query runs at one result per note, and no cross-encoder scores it: `engraph search` is the sharper ranking. Tag terms hold both steps to the notes they admit:
+
+```bash
+engraph topic "warding" --all type/undead --budget 8000
+```
 
 **Person context:**
 
@@ -216,7 +220,7 @@ Returns a token-budgeted context bundle: relevant notes, connected people, relat
 engraph who "Sarah Chen"
 ```
 
-Returns Sarah's note, all mentions across the vault, connected notes via wikilinks, and recent activity.
+Returns Sarah's note, the notes that mention her, and her wikilinks in both directions. The name resolves as a docid, a path or a basename, and then by keyword search, which prefers a hit under the People folder. The mention list comes from that folder: engraph writes a mention edge when a note's text holds a person note's filename or one of its frontmatter aliases. A vault whose `vault.toml` names no People folder has no mention edges, and `who` answers with the note and its links alone.
 
 **Vault structure overview:**
 
@@ -291,7 +295,7 @@ Every capability is one route, and the route is the CLI command's name under `/a
 | GET | `/api/vault-map` | read | Vault structure overview (folders, tags, recent files) |
 | GET | `/api/who` | read | Person context bundle (`name`) |
 | GET | `/api/project` | read | Project context bundle (`name`) |
-| POST | `/api/topic` | read | Rich topic context with a character budget |
+| POST | `/api/topic` | read | Topic context bundle: whole notes and their one-hop neighbours, within a character budget |
 | GET | `/api/status` | read | Index status and statistics |
 | GET | `/api/health` | read | Vault health diagnostics |
 | POST | `/api/create` | write | Create a new note |
@@ -569,7 +573,7 @@ engraph is not a replacement for Obsidian — it's the intelligence layer that s
 - Obsidian CLI integration with circuit breaker (Closed/Degraded/Open) for resilient delegation
 - Real-time file watching with 2s debounce, startup reconciliation, and watcher coordination to prevent double re-indexing
 - Write pipeline: tag resolution, fuzzy link discovery, semantic folder placement
-- Context engine: topic bundles, person bundles, project bundles with token budgets
+- Context engine: a topic bundle of whole notes within a character budget, plus person and project bundles
 - Vault graph: bidirectional wikilink + mention edges with multi-hop expansion
 - Placement correction learning from user file moves
 - Enhanced file resolution with fuzzy Levenshtein matching fallback

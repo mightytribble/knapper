@@ -133,8 +133,12 @@ fn resolve_file(
     params.store.find_file_by_basename(file_or_docid)
 }
 
-/// Find a person note using engraph's full search pipeline (FTS + semantic + graph).
-/// Picks the best match from the People folder, or any note tagged "person".
+/// Find a person note by keyword search alone: one FTS query over the name, no
+/// embedder and no graph lane, which is what lets `who` run with no model.
+///
+/// Its 20 hits are read in three passes, and the first hit any pass accepts is
+/// the answer: a hit under the profile's People folder, then a hit tagged
+/// `person` or `people`, then a hit whose filename folds to the name.
 fn find_person_by_search(
     params: &ContextParams,
     name: &str,
@@ -382,7 +386,12 @@ pub fn vault_map(params: &ContextParams) -> Result<VaultMap> {
     })
 }
 
-/// Build a person context bundle: note content, mentions, wikilink connections.
+/// Build a person context bundle: the person's note, the notes holding a
+/// `mention` edge to it, and its `wikilink` edges in both directions.
+///
+/// The mention list is `indexer::build_people_edges`'s work, so it exists only
+/// where the vault profile names a People folder. Without one the bundle holds
+/// the note and its links alone.
 pub fn context_who(params: &ContextParams, name: &str) -> Result<PersonContext> {
     // Try to find the person note: exact resolve first, then search People folder.
     let (note, person_id) = if let Some(pf) = resolve_file(params, name)? {
@@ -650,8 +659,14 @@ fn snap_to_char(s: &str, offset: usize) -> usize {
     pos
 }
 
-/// Assemble a context bundle from pre-computed search results.
-/// Testable without embedder.
+/// Assemble a context bundle from pre-computed search results, which is what
+/// makes the assembly testable with no embedder.
+///
+/// Two steps. Each of the first five results contributes its file's body from
+/// disk with the frontmatter stripped, and the note that overruns the budget is
+/// cut at a char boundary and marked with its docid. Then the top three
+/// results' 1-hop neighbours — `wikilink` edges in either direction, so a
+/// `mention` edge is not followed here — each capped at `budget / 8`.
 pub fn context_topic_from_results(
     params: &ContextParams,
     topic: &str,
@@ -769,8 +784,14 @@ pub fn context_topic_from_results(
     })
 }
 
-/// Full context topic function (requires embedder + sqlite-vec store).
-/// Called from CLI handler which provides the heavy resources.
+/// A topic bundle for a query, which is the one context call that retrieves.
+///
+/// It needs an embedder and a sqlite-vec store, and the caller supplies them.
+/// `search_internal` passes no reranker, so no cross-encoder scores a bundle:
+/// the pool is ordered by `ranking::degraded_interleave` and the answer floor
+/// removes nothing, because it skips a candidate that carries no rerank score.
+/// `search` therefore ranks a query more accurately than this selects notes
+/// for it.
 pub fn context_topic_with_search(
     params: &ContextParams,
     topic: &str,

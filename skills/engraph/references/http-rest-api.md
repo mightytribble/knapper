@@ -19,7 +19,7 @@ Every capability is one route, named after the CLI command it answers. The whole
 | GET    | `/api/list`             | List documents by folder and tag terms (`tags`/`all`, `any`, `none`) |
 | GET    | `/api/tags`             | The tag vocabulary, whole or under one term (`under`)            |
 | GET    | `/api/vault-map`        | Collection structure overview                                    |
-| POST   | `/api/topic`            | Rich topic context with a character budget, scoped by tag terms (`tags`/`all`, `any`, `none`) |
+| POST   | `/api/topic`            | Topic context bundle: whole documents and their one-hop neighbours within a character budget, scoped by tag terms (`tags`/`all`, `any`, `none`) |
 | GET    | `/api/health`           | Collection health diagnostics                                    |
 | POST   | `/api/create`           | Create new document                                              |
 | POST   | `/api/update`           | Apply a list of edits — body, sections and properties — in one write |

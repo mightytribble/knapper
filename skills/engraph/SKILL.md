@@ -70,6 +70,8 @@ engraph list --tags architecture  # Filter by tags, folder, created_by, etc.
 engraph tags --under type/        # The tag vocabulary, whole or under one term
 ```
 
+`topic` fills a character budget with whole documents: the five that best match the query, and then the documents one wikilink hop from the top three. It returns documents and not sections, and no cross-encoder scores them, so `search` ranks more accurately. `who` returns a person's document, the documents that mention them, and their wikilinks in both directions; the mention list needs a People folder in `vault.toml`, and without one the bundle holds the document and its links alone.
+
 ## Writing
 
 ```bash

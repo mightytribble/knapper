@@ -37,9 +37,11 @@ command it answers, with `-` written as `_`.
 - `list` — filtered note listing (by folder, tag terms, creator)
 - `tags` — the vault's tag vocabulary, whole or under one term
 - `vault_map` — vault structure overview
-- `who` — person context bundle (note + mentions + connections)
+- `who` — person context bundle (their note, the notes mentioning them, their
+  wikilinks both ways; the mention list needs a People folder in `vault.toml`)
 - `project` — project context bundle
-- `topic` — rich topic context with a character budget
+- `topic` — whole notes on a topic, and their one-hop neighbours, within a
+  character budget
 
 **Write tools:**
 - `create` — create a note with smart filing
@@ -76,7 +78,7 @@ The MCP server includes a file watcher. When you edit notes in Obsidian, engraph
 
 ## Tips
 
-- Use `topic` with a `budget` (for example 8000) for budgeted context bundles — great for feeding context into prompts
+- Use `topic` with a `budget` (for example 8000 characters, about 2000 tokens) to feed whole notes into a prompt; use `search` when you want the best-ranked passages instead
 - `vault_map` helps Claude understand your vault structure before searching
-- `who("Person Name")` is powerful for understanding someone's involvement across projects
+- `who("Person Name")` gathers a person's note with everything that names or links to it, which is one call for someone's involvement across the vault
 - The `--explain` flag on CLI search shows per-lane score breakdown — useful for debugging search quality

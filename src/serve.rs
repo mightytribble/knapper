@@ -251,7 +251,7 @@ impl EngraphServer {
 
     #[tool(
         name = "who",
-        description = "Person context bundle: their note, mentions across the vault, and graph connections."
+        description = "Person context bundle: the person's note, the notes that mention them, and their wikilinks in both directions. The name resolves as a docid, a path or a basename, and then by keyword search, which prefers a hit under the People folder. The mention list needs a People folder in the vault profile: a note mentions the person when its text holds the person note's filename or one of its frontmatter aliases. With no People folder the bundle holds the note and its links alone."
     )]
     async fn who(
         &self,
@@ -287,7 +287,7 @@ impl EngraphServer {
 
     #[tool(
         name = "topic",
-        description = "Rich topic context with search-driven section selection and character budget trimming. Returns the most relevant note sections for a topic."
+        description = "Topic context bundle to paste into a prompt: the five notes that best match the query, each read whole, and then the notes one wikilink hop from the top three, all trimmed to a character budget. It returns whole note bodies and not sections, and it runs no cross-encoder, so `search` ranks more accurately. Tag terms (all/any/none) hold both steps to the notes they admit."
     )]
     async fn topic(
         &self,
