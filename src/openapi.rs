@@ -115,7 +115,7 @@ fn build_read() -> serde_json::Value {
                     "schema": { "type": "string" }
                 }
             ],
-            "responses": { "200": { "description": "Note content with metadata" } }
+            "responses": { "200": { "description": "Note content with metadata; outgoing_links, incoming_links, mentions_people and mentioned_by are arrays of {path, docid}" } }
         }
     })
 }
@@ -628,6 +628,21 @@ mod tests {
             .map(|p| p["name"].as_str().unwrap())
             .collect();
         assert_eq!(named, vec!["under"]);
+    }
+
+    /// `read` absorbed `graph show`'s docid fact (#62). Every endpoint here
+    /// is description-only, with no per-field schema to keep it honest, so
+    /// the shape change has to be said in the one line that exists.
+    #[test]
+    fn test_read_documents_the_link_shape() {
+        let spec = build_openapi_spec("http://localhost:3000");
+        let description = spec["paths"]["/api/read"]["get"]["responses"]["200"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(
+            description.contains("docid"),
+            "the response description doesn't say what a link looks like: {description}"
+        );
     }
 
     #[test]
