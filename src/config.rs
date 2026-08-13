@@ -845,6 +845,21 @@ impl Config {
         self.promote_bold_headings = opts.promote_bold;
     }
 
+    /// Put the embedding composition of `cfg` back on this config.
+    ///
+    /// The inverse of [`crate::prefix::EmbedComposition::from_config`], and it
+    /// sits beside [`Config::set_chunk_options`] for the same reason: a
+    /// long-running session captures the composition once at startup, and a
+    /// path that hands a whole `Config` to the indexer uses this to carry the
+    /// session's settings rather than a fresh load's. The three keys travel as
+    /// one value, so no path can take one and forget another and write vectors
+    /// into a space the store does not share (issues #2, #36, #46).
+    pub fn set_embed_composition(&mut self, cfg: crate::prefix::EmbedComposition) {
+        self.embedding_prefix = cfg.prefix;
+        self.embedding_prompt.document_title = cfg.title;
+        self.breadcrumb_root = cfg.root;
+    }
+
     /// Merge CLI-provided top_n over the loaded config.
     pub fn merge_top_n(&mut self, n: Option<usize>) {
         if let Some(n) = n {

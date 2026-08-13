@@ -427,15 +427,22 @@ pub fn build_people_edges(
 /// event. Without this call the note's rows keep the text it held before the
 /// edit, and nothing later re-derives them (#62).
 ///
-/// The chunker settings come from the caller's session, not from the config
-/// this loads: a load that fails falls back to the defaults, and one file
-/// re-chunked at settings the rest of the store was not built at is a set of
-/// rows nothing downstream can tell apart.
+/// The chunker settings and the embedding composition both come from the
+/// caller's session, not from the config this loads: a load that fails falls
+/// back to the defaults, and one file re-chunked — or re-embedded — at settings
+/// the rest of the store was not built at is a set of rows nothing downstream
+/// can tell apart. `EmbedComposition` carries `[embedding_prefix]`,
+/// `[embedding_prompt] document_title` and `breadcrumb_root` together for that
+/// reason: a caller that threads one and forgets the others writes vectors into
+/// a space the store does not share, which is what `prefix::EmbedComposition`
+/// exists to prevent. It takes both beside each other, the way `create_note`
+/// and `unarchive_note` do.
 pub fn reindex_written_file(
     rel_path: &str,
     store: &Store,
     embedder: &mut impl EmbedModel,
     vault_path: &Path,
+    embed: crate::prefix::EmbedComposition,
     chunk_opts: crate::chunker::ChunkOptions,
 ) -> Result<IndexFileResult> {
     let full_path = vault_path.join(rel_path);
@@ -449,6 +456,7 @@ pub fn reindex_written_file(
 
     let mut config = Config::load().unwrap_or_default();
     config.set_chunk_options(chunk_opts);
+    config.set_embed_composition(embed);
 
     let result = index_file(
         rel_path,
@@ -1118,7 +1126,6 @@ mod tests {
                 mode: crate::writer::EditMode::Append,
                 content: Some(crate::writer::EditContent::Text("the new line".into())),
             }],
-            modified_by: "test".into(),
         };
         crate::writer::update_note(&store, root, &input).unwrap();
 
@@ -1136,6 +1143,7 @@ mod tests {
             &store,
             &mut embedder,
             root,
+            crate::prefix::EmbedComposition::from_config(&config),
             config.chunk_options(),
         )
         .unwrap();
