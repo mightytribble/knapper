@@ -44,11 +44,16 @@ pub struct UpdateMetadataInput {
     pub modified_by: String,
 }
 
-#[derive(Debug, Clone)]
+/// How one edit changes what it addresses. `Remove` is only for a property:
+/// a section has no "remove" that is not a replace with nothing, so the body
+/// and section paths reject it (#62). The enum is fieldless, so it is `Copy`
+/// and an edit can hand its mode to a transform without a clone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditMode {
     Replace,
     Prepend,
     Append,
+    Remove,
 }
 
 #[derive(Debug, Clone)]
@@ -75,10 +80,17 @@ pub struct RewriteInput {
     pub modified_by: String,
 }
 
+/// One change to a note's frontmatter. `AddTo` and `RemoveFrom` name the
+/// property they change, so an edit to `status` cannot reach the `tags` list:
+/// `AddTag` and `AddAlias` are the same operation with the key written into
+/// the variant, and a routing table that falls back to one of them writes to
+/// the wrong property whenever the key is a third one (#62).
 #[derive(Debug, Clone)]
 pub enum FrontmatterOp {
     Set(String, String),
     Remove(String),
+    AddTo(String, String),
+    RemoveFrom(String, String),
     AddTag(String),
     RemoveTag(String),
     AddAlias(String),
@@ -89,6 +101,38 @@ pub enum FrontmatterOp {
 pub struct EditFrontmatterInput {
     pub file: String,
     pub operations: Vec<FrontmatterOp>,
+    pub modified_by: String,
+}
+
+/// What one edit addresses. A note has three addressable things: its body,
+/// a section of its body, and a frontmatter property. One edit names one of
+/// them, so two targets are unrepresentable rather than rejected (#62).
+#[derive(Debug, Clone)]
+pub enum EditTarget {
+    Body,
+    Section(String),
+    Property(String),
+}
+
+/// What an edit writes. A property is scalar or list valued, and which one
+/// it is decides whether `Replace` sets a value or a whole sequence.
+#[derive(Debug, Clone)]
+pub enum EditContent {
+    Text(String),
+    List(Vec<String>),
+}
+
+#[derive(Debug, Clone)]
+pub struct NoteEdit {
+    pub target: EditTarget,
+    pub mode: EditMode,
+    pub content: Option<EditContent>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateInput {
+    pub file: String,
+    pub edits: Vec<NoteEdit>,
     pub modified_by: String,
 }
 
@@ -1036,6 +1080,7 @@ pub fn apply_section_edit(
                 format!("\n{}\n{}", new.trim_end(), trimmed_existing)
             }
         }
+        EditMode::Remove => bail!("Remove has no meaning for a section"),
     };
 
     // Reconstruct the file
@@ -1057,6 +1102,7 @@ fn edit_mode_name(mode: &EditMode) -> &'static str {
         EditMode::Replace => "Replace",
         EditMode::Append => "Append",
         EditMode::Prepend => "Prepend",
+        EditMode::Remove => "Remove",
     }
 }
 
@@ -1080,9 +1126,8 @@ pub fn edit_note(
     let content = std::fs::read_to_string(&full_path)?;
 
     // Step 3: Apply the section edit
-    let new_content =
-        apply_section_edit(&content, &input.heading, &input.content, input.mode.clone())
-            .map_err(|e| anyhow::anyhow!("{e} in {}", input.file))?;
+    let new_content = apply_section_edit(&content, &input.heading, &input.content, input.mode)
+        .map_err(|e| anyhow::anyhow!("{e} in {}", input.file))?;
 
     // Step 4: Write atomically (overwrite = true)
     atomic_write(&full_path, &new_content, true)?;
@@ -1106,12 +1151,20 @@ pub fn edit_note(
 /// With `preserve_frontmatter`, the frontmatter is split off, `mode` is
 /// applied to the body alone, and the two are reassembled. Without it,
 /// `Replace` returns `new` and `Append`/`Prepend` join the whole text.
+///
+/// `Remove` is a property mode and has no meaning for a body, so it returns
+/// the text unchanged. `apply_note_edits` rejects it before it reaches here
+/// and no other caller passes it, so the arm exists to keep a mode a body
+/// cannot express from deleting one (#62).
 pub fn apply_body_edit(
     content: &str,
     new: &str,
     mode: EditMode,
     preserve_frontmatter: bool,
 ) -> String {
+    if mode == EditMode::Remove {
+        return content.to_string();
+    }
     if preserve_frontmatter {
         let (maybe_frontmatter, old_body) = crate::markdown::split_frontmatter(content);
         if let Some(frontmatter) = maybe_frontmatter {
@@ -1119,6 +1172,7 @@ pub fn apply_body_edit(
                 EditMode::Replace => new.to_string(),
                 EditMode::Append => format!("{}\n{}", old_body.trim_end(), new),
                 EditMode::Prepend => format!("{}\n{}", new.trim_end(), old_body),
+                EditMode::Remove => old_body.to_string(),
             };
             return format!("---\n{}\n---\n\n{}", frontmatter, new_body);
         }
@@ -1129,6 +1183,7 @@ pub fn apply_body_edit(
         EditMode::Replace => new.to_string(),
         EditMode::Append => format!("{}\n{}", content.trim_end(), new),
         EditMode::Prepend => format!("{}\n{}", new.trim_end(), content),
+        EditMode::Remove => content.to_string(),
     }
 }
 
@@ -1206,6 +1261,12 @@ pub fn apply_frontmatter_ops(content: &str, ops: &[FrontmatterOp]) -> Result<Str
             }
             FrontmatterOp::Remove(key) => {
                 mapping.remove(serde_yaml::Value::String(key.clone()));
+            }
+            FrontmatterOp::AddTo(key, value) => {
+                apply_add_to_sequence(&mut mapping, key, value);
+            }
+            FrontmatterOp::RemoveFrom(key, value) => {
+                apply_remove_from_sequence(&mut mapping, key, value);
             }
             FrontmatterOp::AddTag(tag) => {
                 apply_add_to_sequence(&mut mapping, "tags", tag);
@@ -1311,6 +1372,146 @@ fn apply_remove_from_sequence(mapping: &mut serde_yaml::Mapping, key: &str, valu
     if let Some(serde_yaml::Value::Sequence(items)) = mapping.get_mut(&key_val) {
         items.retain(|item| item != &remove_item);
     }
+}
+
+/// The text one edit writes. A body and a section take one string, so a list
+/// is content for a property alone (#62).
+fn text_of(edit: &NoteEdit) -> Result<String> {
+    match &edit.content {
+        Some(EditContent::Text(t)) => Ok(t.clone()),
+        Some(EditContent::List(_)) => {
+            bail!("a list is content for a property and not for a body or a section")
+        }
+        None => bail!(
+            "a {} edit of a body or a section needs content",
+            edit_mode_name(&edit.mode)
+        ),
+    }
+}
+
+/// The frontmatter operations one property edit means. Every key routes
+/// through `AddTo` and `RemoveFrom`, which carry the key, so an append to
+/// `status` cannot reach the `tags` list (#62).
+fn property_ops(
+    key: &str,
+    mode: EditMode,
+    content: Option<&EditContent>,
+) -> Result<Vec<FrontmatterOp>> {
+    Ok(match (mode, content) {
+        (EditMode::Replace, Some(EditContent::Text(v))) => {
+            vec![FrontmatterOp::Set(key.to_string(), v.clone())]
+        }
+        // `Set` carries a scalar, so a whole sequence is a remove and then
+        // one add per item.
+        (EditMode::Replace, Some(EditContent::List(vs))) => {
+            let mut ops = vec![FrontmatterOp::Remove(key.to_string())];
+            ops.extend(
+                vs.iter()
+                    .map(|v| FrontmatterOp::AddTo(key.to_string(), v.clone())),
+            );
+            ops
+        }
+        (EditMode::Append, Some(EditContent::Text(v))) => {
+            vec![FrontmatterOp::AddTo(key.to_string(), v.clone())]
+        }
+        (EditMode::Remove, None) => vec![FrontmatterOp::Remove(key.to_string())],
+        (EditMode::Remove, Some(EditContent::Text(v))) => {
+            vec![FrontmatterOp::RemoveFrom(key.to_string(), v.clone())]
+        }
+        (mode, content) => anyhow::bail!(
+            "a {} on property '{key}' with {} content has no meaning",
+            edit_mode_name(&mode),
+            if content.is_some() { "this" } else { "no" }
+        ),
+    })
+}
+
+/// Apply every edit to a note's text, in order. Pure, so `update_note` can
+/// write the result once — one file write, one conflict check and one
+/// re-index for a whole batch (#62).
+pub fn apply_note_edits(content: &str, edits: &[NoteEdit]) -> Result<String> {
+    let mut text = content.to_string();
+    for edit in edits {
+        text = match (&edit.target, edit.mode) {
+            (EditTarget::Body | EditTarget::Section(_), EditMode::Remove) => {
+                bail!("Remove has no meaning for a section")
+            }
+            (EditTarget::Body, mode) => {
+                let new = text_of(edit)?;
+                apply_body_edit(&text, &new, mode, true)
+            }
+            (EditTarget::Section(h), mode) => {
+                let new = text_of(edit)?;
+                apply_section_edit(&text, h, &new, mode)?
+            }
+            (EditTarget::Property(key), mode) => {
+                apply_frontmatter_ops(&text, &property_ops(key, mode, edit.content.as_ref())?)?
+            }
+        };
+    }
+    Ok(text)
+}
+
+/// Apply a list of edits to one note in one write.
+///
+/// The list is one write however long it is: one conflict check, one
+/// `atomic_write` and one store update. `apply_note_edits` transforms the
+/// text in memory, so an edit that fails part way through the list leaves
+/// the file as it was — there is nothing to roll back, because nothing is
+/// written until every edit applied (#62).
+///
+/// Does NOT re-index chunks — that is for the MCP layer, as with the other
+/// edit calls.
+pub fn update_note(store: &Store, vault_path: &Path, input: &UpdateInput) -> Result<EditResult> {
+    // Step 1: Resolve file via store
+    let file_record = store
+        .resolve_file(&input.file)?
+        .ok_or_else(|| anyhow::anyhow!("file not found: {}", input.file))?;
+
+    let full_path = vault_path.join(&file_record.path);
+
+    // Step 2: Mtime conflict check — one check for the whole list
+    let disk_mtime = file_mtime(&full_path)?;
+    if disk_mtime != file_record.mtime {
+        bail!(
+            "mtime conflict: file {} was modified outside engraph (disk={}, indexed={})",
+            file_record.path,
+            disk_mtime,
+            file_record.mtime
+        );
+    }
+
+    // Step 3: Apply every edit to the text the file holds
+    let content = std::fs::read_to_string(&full_path)?;
+    let new_content = apply_note_edits(&content, &input.edits)
+        .map_err(|e| anyhow::anyhow!("{e} in {}", input.file))?;
+
+    // Step 4: Write atomically — once
+    atomic_write(&full_path, &new_content, true)?;
+
+    // Step 5: Update the store's content hash, mtime and tag rows
+    let content_hash = compute_content_hash(&new_content);
+    let mtime = file_mtime(&full_path)?;
+    let docid = file_record
+        .docid
+        .clone()
+        .unwrap_or_else(|| generate_docid(&file_record.path));
+
+    let file_id = store.insert_file(
+        &file_record.path,
+        &content_hash,
+        mtime,
+        &docid,
+        file_record.created_by.as_deref(),
+        None,
+    )?;
+    store.reconcile_file_tags(file_id, &crate::tags::extract(&new_content))?;
+
+    Ok(EditResult {
+        path: file_record.path,
+        heading: String::new(),
+        mode: "Update".to_string(),
+    })
 }
 
 /// Move a note to a new folder.
@@ -2984,5 +3185,100 @@ mod tests {
         let (_, property_tags, _) = parse_frontmatter_fields(&fm);
         assert_eq!(property_tags, vec!["work", "archived"]);
         assert!(written.contains("#todo"), "the body tag stays in the body");
+    }
+
+    #[test]
+    fn one_call_applies_a_section_edit_and_a_property_edit_in_one_write() {
+        use crate::llm::MockLlm;
+
+        let (_tmp, store, vault) = setup_vault();
+        std::fs::write(
+            vault.join("note.md"),
+            "---\ntags:\n  - a\n---\n\n## Spells\n\nold\n",
+        )
+        .unwrap();
+        let mut embedder = MockLlm::new(256);
+        let config = crate::config::Config::default();
+        crate::indexer::run_index_shared(&vault, &config, &store, &mut embedder, false, None)
+            .unwrap();
+
+        let before = std::fs::metadata(vault.join("note.md")).unwrap().len();
+
+        update_note(
+            &store,
+            &vault,
+            &UpdateInput {
+                file: "note.md".into(),
+                edits: vec![
+                    NoteEdit {
+                        target: EditTarget::Section("Spells".into()),
+                        mode: EditMode::Replace,
+                        content: Some(EditContent::Text("new".into())),
+                    },
+                    NoteEdit {
+                        target: EditTarget::Property("tags".into()),
+                        mode: EditMode::Append,
+                        content: Some(EditContent::Text("b".into())),
+                    },
+                ],
+                modified_by: "test".into(),
+            },
+        )
+        .unwrap();
+
+        let out = std::fs::read_to_string(vault.join("note.md")).unwrap();
+        assert!(out.contains("new"));
+        assert!(!out.contains("old"));
+        assert!(out.contains("- a") && out.contains("- b"));
+        assert_ne!(before, out.len() as u64);
+    }
+
+    #[test]
+    fn every_frontmatter_operation_has_an_edit_that_does_it() {
+        let cases: Vec<(NoteEdit, &str, bool)> = vec![
+            // (edit, substring, expected present after)
+            (
+                NoteEdit {
+                    target: EditTarget::Property("status".into()),
+                    mode: EditMode::Replace,
+                    content: Some(EditContent::Text("done".into())),
+                },
+                "status: done",
+                true,
+            ),
+            (
+                NoteEdit {
+                    target: EditTarget::Property("tags".into()),
+                    mode: EditMode::Replace,
+                    content: Some(EditContent::List(vec!["x".into(), "y".into()])),
+                },
+                "- x",
+                true,
+            ),
+            (
+                NoteEdit {
+                    target: EditTarget::Property("keep".into()),
+                    mode: EditMode::Remove,
+                    content: None,
+                },
+                "keep:",
+                false,
+            ),
+            (
+                NoteEdit {
+                    target: EditTarget::Property("tags".into()),
+                    mode: EditMode::Remove,
+                    content: Some(EditContent::Text("a".into())),
+                },
+                "- a",
+                false,
+            ),
+        ];
+
+        for (edit, needle, present) in cases {
+            let doc = "---\ntags:\n  - a\nkeep: yes\n---\n\nbody\n";
+            let out = apply_note_edits(doc, std::slice::from_ref(&edit)).unwrap();
+            assert_eq!(out.contains(needle), present, "edit {edit:?} on {doc:?}");
+        }
     }
 }
