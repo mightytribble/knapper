@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, ServerCapabilities, ServerInfo};
@@ -23,12 +23,6 @@ use crate::store::Store;
 // ---------------------------------------------------------------------------
 // Parameter structs
 // ---------------------------------------------------------------------------
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct UnarchiveParams {
-    /// Archived note path (e.g., "04-Archive/01-Projects/note.md").
-    pub file: String,
-}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct HealthParams {}
@@ -407,6 +401,11 @@ impl EngraphServer {
         // `record_write` below tells to skip this file. Re-index here or the
         // note stays searchable only as the text it held before the edit (#62).
         let mut embedder = self.embedder.lock().await;
+        // A failure here happens after the write, so a bare INTERNAL_ERROR
+        // would read as "nothing happened" — say what did. Returning early
+        // also skips `record_write` below, so the watcher's event on this
+        // file is not suppressed and it re-indexes it on its own; that
+        // recovery is deliberate, not accidental.
         crate::indexer::reindex_written_file(
             &result.path,
             &store,
@@ -414,6 +413,12 @@ impl EngraphServer {
             &self.vault_path,
             self.chunk_opts,
         )
+        .with_context(|| {
+            format!(
+                "the file was written; its index rows were not updated for {}",
+                result.path
+            )
+        })
         .map_err(|e| mcp_err(&e))?;
         // Record write so the watcher skips re-indexing
         let full_path = self.vault_path.join(&result.path);
@@ -445,7 +450,7 @@ impl EngraphServer {
 
     #[tool(
         name = "archive",
-        description = "Archive a note: moves it to the archive folder, removes from search index. The note is preserved on disk but invisible to search/context. Use unarchive to restore."
+        description = "Archive a note: moves it to the archive folder, removes from search index. The note is preserved on disk but invisible to search/context. `undo: true` reverses this: restores the note to its original location and re-indexes it."
     )]
     async fn archive(
         &self,
@@ -454,49 +459,29 @@ impl EngraphServer {
         if self.read_only {
             return Err(read_only_err());
         }
-        // Task 13 (#62) replaces this guard with the undo branch; until then
-        // a schema that advertises `undo` and silently ignores it would let
-        // a caller re-archive a note it meant to restore.
-        if params.0.undo {
-            return Err(McpError::new(
-                rmcp::model::ErrorCode::INVALID_PARAMS,
-                "undo is not implemented yet: use unarchive",
-                None::<serde_json::Value>,
-            ));
-        }
         let store = self.store.lock().await;
-        let result = crate::writer::archive_note(
-            &params.0.file,
-            &store,
-            &self.vault_path,
-            self.profile.as_ref().as_ref(),
-        )
-        .map_err(|e| mcp_err(&e))?;
-        to_json_result(&result)
-    }
-
-    #[tool(
-        name = "unarchive",
-        description = "Restore an archived note to its original location and re-index it for search."
-    )]
-    async fn unarchive(
-        &self,
-        params: Parameters<UnarchiveParams>,
-    ) -> Result<CallToolResult, McpError> {
-        if self.read_only {
-            return Err(read_only_err());
-        }
-        let store = self.store.lock().await;
-        let mut embedder = self.embedder.lock().await;
-        let result = crate::writer::unarchive_note(
-            &params.0.file,
-            &store,
-            &mut *embedder,
-            self.embed,
-            self.chunk_opts,
-            &self.vault_path,
-        )
-        .map_err(|e| mcp_err(&e))?;
+        // Archiving and restoring are one operation and its reverse, so they
+        // are one capability with a flag rather than two names (#62).
+        let result = if params.0.undo {
+            let mut embedder = self.embedder.lock().await;
+            crate::writer::unarchive_note(
+                &params.0.file,
+                &store,
+                &mut *embedder,
+                self.embed,
+                self.chunk_opts,
+                &self.vault_path,
+            )
+            .map_err(|e| mcp_err(&e))?
+        } else {
+            crate::writer::archive_note(
+                &params.0.file,
+                &store,
+                &self.vault_path,
+                self.profile.as_ref().as_ref(),
+            )
+            .map_err(|e| mcp_err(&e))?
+        };
         to_json_result(&result)
     }
 
@@ -737,7 +722,7 @@ impl rmcp::handler::server::ServerHandler for EngraphServer {
             "engraph: vault intelligence for Obsidian. \
                  Read: vault_map to orient, tags for the tag vocabulary, search to find, read for content (a section parameter narrows it), who/project for context bundles, health for vault diagnostics. \
                  Write: create for new notes, update for every change to an existing one — a list of edits over the body, a section or a frontmatter property, applied in one write. \
-                 Lifecycle: move_note to relocate, archive to soft-delete, unarchive to restore, delete for permanent removal. \
+                 Lifecycle: move_note to relocate, archive to soft-delete (`undo: true` to restore), delete for permanent removal. \
                  Index: reindex_file to refresh a single file's index after external edits. \
                  Identity: identity for user context at session start, setup to run first-time onboarding (detect/apply). \
                  Migration: migrate_preview to classify notes into PARA folders, migrate_apply to execute the migration, migrate_undo to revert.",

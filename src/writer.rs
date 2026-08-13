@@ -1301,9 +1301,13 @@ pub fn apply_frontmatter_ops(content: &str, ops: &[FrontmatterOp]) -> Result<Str
     // serde_yaml::to_string adds a trailing newline, so we don't need an extra one before ---.
     // `split_frontmatter`'s found-delimiter branch rejoins the body with `lines().join("\n")`,
     // which drops the body's own final line break — restore it here so the file keeps ending
-    // in one, matching every other write path in this module.
+    // in one, matching every other write path in this module. The same rejoin also leaves the
+    // body carrying the break after the closing `---` (the defect `apply_body_edit` fixes the
+    // same way for its own reassembly, #62); the line below writes its own `\n\n` separator, so
+    // that leading break has to go, or it pushes the body one line further down on every call.
+    let body = body.trim_start_matches('\n');
     let body = if body.is_empty() || body.ends_with('\n') {
-        body
+        body.to_string()
     } else {
         format!("{}\n", body)
     };
@@ -3251,6 +3255,39 @@ mod tests {
         assert!(written.contains("#todo"), "the body tag stays in the body");
     }
 
+    /// `archive` and `undo: true` are one capability and its reverse (#62):
+    /// this is the durable coverage for that round trip, now that the MCP
+    /// and HTTP handlers wire `undo` straight through instead of guarding it.
+    #[test]
+    fn archiving_and_undoing_it_return_the_note_to_its_folder() {
+        use crate::llm::MockLlm;
+
+        let (_tmp, store, vault) = setup_vault();
+        std::fs::create_dir_all(vault.join("Projects")).unwrap();
+        std::fs::write(vault.join("Projects/n.md"), "# N\n\nbody\n").unwrap();
+        let mut embedder = MockLlm::new(256);
+        let config = crate::config::Config::default();
+        crate::indexer::run_index_shared(&vault, &config, &store, &mut embedder, false, None)
+            .unwrap();
+
+        archive_note("Projects/n.md", &store, &vault, None).unwrap();
+        assert!(!vault.join("Projects/n.md").exists());
+        let archived = vault.join("04-Archive/Projects/n.md");
+        assert!(archived.exists());
+
+        unarchive_note(
+            "04-Archive/Projects/n.md",
+            &store,
+            &mut embedder,
+            EmbedComposition::default(),
+            test_chunk_opts(),
+            &vault,
+        )
+        .unwrap();
+        assert!(vault.join("Projects/n.md").exists());
+        assert!(!archived.exists());
+    }
+
     #[test]
     fn one_call_applies_a_section_edit_and_a_property_edit_in_one_write() {
         use crate::llm::MockLlm;
@@ -3370,12 +3407,10 @@ mod tests {
 
     #[test]
     fn a_list_of_property_edits_reassembles_the_note_once() {
-        // Each reassembly puts a line break between the frontmatter and the
-        // body, and `split_frontmatter` hands the body back with the one it
-        // already had. One reassembly per edit therefore pushes the body one
-        // line further down for every edit in the list, so a two-edit call
-        // must give the same bytes as a one-edit call gives, plus the tag.
-        // A `contains` assertion cannot see this, so pin the bytes (#62).
+        // A run of property edits becomes one `apply_frontmatter_ops` call
+        // (#62), so a two-edit call must give the same bytes as a one-edit
+        // call gives, plus the tag. A `contains` assertion cannot see this,
+        // so pin the bytes.
         let doc = "---\ntags:\n  - a\n---\n\n## Spells\n\nold\n";
 
         let one = apply_note_edits(
@@ -3387,7 +3422,7 @@ mod tests {
             }],
         )
         .unwrap();
-        assert_eq!(one, "---\ntags:\n- a\n- b\n---\n\n\n## Spells\n\nold\n");
+        assert_eq!(one, "---\ntags:\n- a\n- b\n---\n\n## Spells\n\nold\n");
 
         let two = apply_note_edits(
             doc,
@@ -3407,7 +3442,46 @@ mod tests {
         .unwrap();
         assert_eq!(
             two,
-            "---\ntags:\n- a\n- b\nstatus: done\n---\n\n\n## Spells\n\nold\n"
+            "---\ntags:\n- a\n- b\nstatus: done\n---\n\n## Spells\n\nold\n"
+        );
+    }
+
+    /// The Task 12 fix trimmed the leading break `split_frontmatter` leaves
+    /// on a body edit; `apply_frontmatter_ops` reassembles the same way and
+    /// carried the same defect (#62). `update` is the only frontmatter write
+    /// path, so it accumulates one blank line per call across successive
+    /// `update`s on the same note — pin the bytes across two of them.
+    #[test]
+    fn two_successive_property_updates_add_no_blank_line() {
+        use crate::llm::MockLlm;
+
+        let (_tmp, store, vault) = setup_vault();
+        std::fs::write(
+            vault.join("note.md"),
+            "---\nstatus: draft\n---\n\n# Content\nbody text\n",
+        )
+        .unwrap();
+        let mut embedder = MockLlm::new(256);
+        let config = crate::config::Config::default();
+        crate::indexer::run_index_shared(&vault, &config, &store, &mut embedder, false, None)
+            .unwrap();
+
+        let input = UpdateInput {
+            file: "note.md".into(),
+            edits: vec![NoteEdit {
+                target: EditTarget::Property("status".into()),
+                mode: EditMode::Replace,
+                content: Some(EditContent::Text("active".into())),
+            }],
+            modified_by: "test".into(),
+        };
+        update_note(&store, &vault, &input).unwrap();
+        update_note(&store, &vault, &input).unwrap();
+
+        let updated = std::fs::read_to_string(vault.join("note.md")).unwrap();
+        assert_eq!(
+            updated,
+            "---\nstatus: active\n---\n\n# Content\nbody text\n"
         );
     }
 }

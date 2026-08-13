@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use anyhow::Context;
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, HeaderValue, Method};
 use axum::{
@@ -242,17 +243,6 @@ pub fn generate_api_key() -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Request body / query structs
-// ---------------------------------------------------------------------------
-
-// -- Write request bodies --
-
-#[derive(Debug, Deserialize)]
-struct UnarchiveBody {
-    file: String,
-}
-
-// ---------------------------------------------------------------------------
 // CORS
 // ---------------------------------------------------------------------------
 
@@ -303,7 +293,6 @@ pub fn routes() -> Vec<(&'static str, MethodRouter<ApiState>)> {
         ("/api/update", post(handle_update)),
         ("/api/move", post(handle_move)),
         ("/api/archive", post(handle_archive)),
-        ("/api/unarchive", post(handle_unarchive)),
         ("/api/delete", post(handle_delete)),
         // Index maintenance
         ("/api/reindex-file", post(handle_reindex_file)),
@@ -655,6 +644,11 @@ async fn handle_update(
     // below tells to skip this file. Re-index here or the note stays
     // searchable only as the text it held before the edit (#62).
     let mut embedder = state.embedder.lock().await;
+    // A failure here happens after the write, so a bare 500 would read as
+    // "nothing happened" — say what did. Returning early also skips
+    // `record_write` below, so the watcher's event on this file is not
+    // suppressed and it re-indexes it on its own; that recovery is
+    // deliberate, not accidental.
     crate::indexer::reindex_written_file(
         &result.path,
         &store,
@@ -662,6 +656,12 @@ async fn handle_update(
         &state.vault_path,
         state.chunk_opts,
     )
+    .with_context(|| {
+        format!(
+            "the file was written; its index rows were not updated for {}",
+            result.path
+        )
+    })
     .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
     let full_path = state.vault_path.join(&result.path);
     record_write(&state.recent_writes, &full_path).await;
@@ -687,6 +687,9 @@ async fn handle_move(
     Ok(Json(serde_json::json!(result)))
 }
 
+/// Archive a note, or restore one previously archived with `undo: true`.
+/// Archiving and restoring are one operation and its reverse, so they are
+/// one capability with a flag rather than two routes (#62).
 async fn handle_archive(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -698,49 +701,27 @@ async fn handle_archive(
             "Write operations disabled in read-only mode",
         ));
     }
-    // Task 13 (#62) replaces this guard with the undo branch; until then a
-    // schema that advertises `undo` and silently ignores it would let a
-    // caller re-archive a note it meant to restore.
-    if body.undo {
-        return Err(ApiError::bad_request(
-            "undo is not implemented yet: use unarchive",
-        ));
-    }
     let store = state.store.lock().await;
-    let result = writer::archive_note(
-        &body.file,
-        &store,
-        &state.vault_path,
-        state.profile.as_ref().as_ref(),
-    )
-    .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
-    let full_path = state.vault_path.join(&result.path);
-    record_write(&state.recent_writes, &full_path).await;
-    Ok(Json(serde_json::json!(result)))
-}
-
-async fn handle_unarchive(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Json(body): Json<UnarchiveBody>,
-) -> Result<impl IntoResponse, ApiError> {
-    authorize(&headers, &state, true)?;
-    if state.read_only {
-        return Err(ApiError::forbidden(
-            "Write operations disabled in read-only mode",
-        ));
-    }
-    let store = state.store.lock().await;
-    let mut embedder = state.embedder.lock().await;
-    let result = writer::unarchive_note(
-        &body.file,
-        &store,
-        &mut *embedder,
-        state.embed,
-        state.chunk_opts,
-        &state.vault_path,
-    )
-    .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    let result = if body.undo {
+        let mut embedder = state.embedder.lock().await;
+        writer::unarchive_note(
+            &body.file,
+            &store,
+            &mut *embedder,
+            state.embed,
+            state.chunk_opts,
+            &state.vault_path,
+        )
+        .map_err(|e| ApiError::internal(&format!("{e:#}")))?
+    } else {
+        writer::archive_note(
+            &body.file,
+            &store,
+            &state.vault_path,
+            state.profile.as_ref().as_ref(),
+        )
+        .map_err(|e| ApiError::internal(&format!("{e:#}")))?
+    };
     let full_path = state.vault_path.join(&result.path);
     record_write(&state.recent_writes, &full_path).await;
     Ok(Json(serde_json::json!(result)))

@@ -21,7 +21,6 @@ pub fn build_openapi_spec(server_url: &str) -> serde_json::Value {
     paths.insert("/api/update".into(), build_update());
     paths.insert("/api/move".into(), build_move());
     paths.insert("/api/archive".into(), build_archive());
-    paths.insert("/api/unarchive".into(), build_unarchive());
     paths.insert("/api/delete".into(), build_delete());
     paths.insert("/api/reindex-file".into(), build_reindex_file());
 
@@ -312,38 +311,19 @@ fn build_archive() -> serde_json::Value {
     serde_json::json!({
         "post": {
             "operationId": "archiveNote",
-            "summary": "Archive a note (soft delete). Moves to archive folder and removes from index.",
+            "summary": "Archive a note (soft delete), or restore one previously archived with `undo: true`. Archiving moves the note to the archive folder and removes it from the index; `undo` reverses that and re-indexes it.",
             "requestBody": {
                 "required": true,
                 "content": { "application/json": { "schema": {
                     "type": "object",
                     "required": ["file"],
                     "properties": {
-                        "file": { "type": "string", "description": "Target note (path, basename, or #docid)" }
+                        "file": { "type": "string", "description": "Target note (path, basename, or #docid); an archived note's path when undoing" },
+                        "undo": { "type": "boolean", "description": "Restore the note instead of archiving it (default false)" }
                     }
                 }}}
             },
-            "responses": { "200": { "description": "Archived note path" } }
-        }
-    })
-}
-
-fn build_unarchive() -> serde_json::Value {
-    serde_json::json!({
-        "post": {
-            "operationId": "unarchiveNote",
-            "summary": "Restore an archived note to its original location and re-index it.",
-            "requestBody": {
-                "required": true,
-                "content": { "application/json": { "schema": {
-                    "type": "object",
-                    "required": ["file"],
-                    "properties": {
-                        "file": { "type": "string", "description": "Archived note path" }
-                    }
-                }}}
-            },
-            "responses": { "200": { "description": "Restored note path" } }
+            "responses": { "200": { "description": "Archived (or restored) note path" } }
         }
     })
 }
@@ -594,7 +574,6 @@ mod tests {
             "updateNote",
             "moveNote",
             "archiveNote",
-            "unarchiveNote",
             "deleteNote",
             "migratePreview",
             "migrateApply",
