@@ -2356,12 +2356,20 @@ mod tests {
     /// `update` is the one call that edits a section now, so the three modes
     /// have to reach it through `update_note` and not only through
     /// `apply_section_edit`.
+    ///
+    /// The second element is what the mode does to the body it found: `None`
+    /// for the mode that replaces it, and otherwise the side the new text
+    /// takes — `Greater` for the mode that writes after it. Both facts are
+    /// load-bearing: without them `append` and `prepend` can swap arms, or
+    /// either can discard the old body, with every test still green (#62).
     #[test]
     fn a_section_edit_reaches_the_section_it_names_in_every_mode() {
-        for (mode, wanted, unwanted) in [
-            (EditMode::Replace, "New entry", Some("Old entry")),
-            (EditMode::Append, "New entry", None),
-            (EditMode::Prepend, "New entry", None),
+        use std::cmp::Ordering;
+
+        for (mode, old_body) in [
+            (EditMode::Replace, None),
+            (EditMode::Append, Some(Ordering::Greater)),
+            (EditMode::Prepend, Some(Ordering::Less)),
         ] {
             let (_tmp, store, vault) = indexed_note(
                 "# Person\n\n## Interactions\n\nOld entry\n\n## Links\n\nSome links\n",
@@ -2378,9 +2386,24 @@ mod tests {
             .unwrap();
 
             let out = std::fs::read_to_string(vault.join("note.md")).unwrap();
-            assert!(out.contains(wanted), "{mode:?} lost its content: {out}");
-            if let Some(gone) = unwanted {
-                assert!(!out.contains(gone), "{mode:?} kept the old body: {out}");
+            let new_at = out
+                .find("New entry")
+                .unwrap_or_else(|| panic!("{mode:?} lost its content: {out}"));
+            match old_body {
+                None => assert!(
+                    !out.contains("Old entry"),
+                    "{mode:?} kept the old body: {out}"
+                ),
+                Some(side) => {
+                    let old_at = out
+                        .find("Old entry")
+                        .unwrap_or_else(|| panic!("{mode:?} discarded the old body: {out}"));
+                    assert_eq!(
+                        new_at.cmp(&old_at),
+                        side,
+                        "{mode:?} wrote the new text on the wrong side of the old body: {out}"
+                    );
+                }
             }
             assert!(
                 out.contains("## Links") && out.contains("Some links"),
@@ -2388,7 +2411,7 @@ mod tests {
             );
             // Whatever the mode, the edit lands inside the section it named.
             assert!(
-                out.find("New entry").unwrap() < out.find("## Links").unwrap(),
+                new_at < out.find("## Links").unwrap(),
                 "{mode:?} wrote outside the section: {out}"
             );
         }
