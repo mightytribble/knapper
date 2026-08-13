@@ -80,7 +80,7 @@ fn build_search() -> serde_json::Value {
                     "required": ["query"],
                     "properties": {
                         "query": { "type": "string", "description": "Search query text" },
-                        "top_n": { "type": "integer", "description": "Number of results (default 10)" },
+                        "top_n": { "type": "integer", "description": "Number of results. Defaults to the configured top_n, the same number on every surface" },
                         "explain": { "type": "boolean", "description": "Return the per-lane score breakdown in the response's explain field" },
                         "group_by": { "type": "string", "enum": ["chunk", "file"], "description": "One result per matching section, or one per document. Defaults to the server's setting" },
                         "tags": { "type": "array", "items": { "type": "string" }, "description": "Tag terms; a trailing / matches the tag and its descendants. Alias of all" },

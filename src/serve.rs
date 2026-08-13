@@ -43,6 +43,10 @@ pub struct EngraphServer {
     /// same result shape the CLI does.
     max_chunks_per_file: usize,
     group_by: crate::config::GroupBy,
+    /// How many results a call that names no `top_n` gets. It comes from
+    /// `config.toml`, the way the CLI's does: a default that differs per
+    /// surface is the last place one query answers two ways (#62).
+    top_n: usize,
     /// Rerank-lane settings from `config.toml`.
     rerank: crate::config::RerankConfig,
     /// Ranking-stage settings from `config.toml`.
@@ -108,7 +112,8 @@ impl EngraphServer {
         &self,
         params: Parameters<crate::params::Search>,
     ) -> Result<CallToolResult, McpError> {
-        let top_n = params.0.top_n.unwrap_or(10);
+        // Per call, with the configured default behind it (#62).
+        let top_n = params.0.top_n.unwrap_or(self.top_n);
         let all_terms = crate::tags::merge_all_alias(params.0.tags, params.0.all);
         let scope = crate::tags::TagFilter::parse(&all_terms, &params.0.any, &params.0.none)
             .map_err(|e| mcp_err(&e))?;
@@ -911,6 +916,7 @@ pub async fn run_serve(
     // Capture retrieval settings before the watcher takes ownership of `config`.
     let max_chunks_per_file = config.max_chunks_per_file;
     let group_by = config.group_by;
+    let top_n = config.top_n;
     let rerank = config.rerank;
     let ranking = config.ranking;
     let lane_weights = config.lane_weights;
@@ -943,6 +949,7 @@ pub async fn run_serve(
         read_only,
         max_chunks_per_file,
         group_by,
+        top_n,
         rerank,
         ranking,
         lane_weights,
@@ -970,6 +977,7 @@ pub async fn run_serve(
             read_only,
             max_chunks_per_file,
             group_by,
+            top_n,
             rerank,
             ranking,
             lane_weights,
@@ -1123,6 +1131,7 @@ mod tests {
             read_only: false,
             max_chunks_per_file: crate::config::default_max_chunks_per_file(),
             group_by,
+            top_n: crate::config::Config::default().top_n,
             rerank: crate::config::RerankConfig::default(),
             ranking: crate::config::RankingConfig::default(),
             lane_weights: crate::config::LaneWeights::default(),

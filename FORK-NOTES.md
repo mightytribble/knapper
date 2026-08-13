@@ -52,8 +52,9 @@ git fetch upstream && git diff --stat upstream/main main
 | `structure_headings` | a bold-only line opens a section, deeper than any `#` heading and an ancestor of nothing. Ships on — see #44 | this fork, issue #44 |
 | `tags` + `file_tags` | a tag is an attribute of a note, and it joins to the note. Usage and last use are derived, so neither can drift. Upstream keys its vocabulary in `tag_registry`, a flat table with no join to `files` whose `usage_count` counts index events | this fork, issue #60 |
 | `tags::predicate` / `TagFilter` / `tags_under` | notes filter by tag term (`all`/`any`/`none`) and the vocabulary lists whole or by subtree | this fork, issue #60 |
-| one tag vocabulary on three surfaces | the filter and the vocabulary each carry one name and one parameter set across `context list`/`context tags`, MCP `list`/`tags` and `GET /api/list`/`GET /api/tags`. A term is a tag path, a trailing `/` names the subtree, `tags` is the alias of `all`, and an unmatched `all`/`any` term is an error naming the nearest tag. Only the container encoding is per-surface: a JSON body reads an array, and a query string reads one comma-separated value, because `serde_urlencoded` reads no sequence | this fork, issue #61 |
+| one tag vocabulary on three surfaces | the filter and the vocabulary each carry one name and one parameter set across `engraph list`/`engraph tags`, MCP `list`/`tags` and `GET /api/list`/`GET /api/tags`. A term is a tag path, a trailing `/` names the subtree, `tags` is the alias of `all`, and an unmatched `all`/`any` term is an error naming the nearest tag. Only the container encoding is per-surface: a JSON body reads an array, and a query string reads one comma-separated value, because `serde_urlencoded` reads no sequence | this fork, issue #61 |
 | `Store::files_in_scope` / `rarray` scoping | a search can be scoped to the notes a tag filter admits. The scope resolves once to a set of file ids and every lane pre-filters on it: the KNN through vec0's `rowid IN`, the keyword lane through its own join, and the graph lane by dropping out-of-scope candidates before its quota truncation, so the walk still passes through untagged notes. An empty filter emits no clause and reproduces the unscoped pipeline exactly | this fork, issue #60 |
+| `src/surface.rs` | every capability has one name and one parameter set on all three surfaces, and a test fails when one does not | this fork, issue #62 |
 | `.github/workflows/ci.yml` | manual dispatch only — upstream runs it on push and PR | this fork, Actions minutes |
 
 Cherry-picked rather than merged: PR #41 branched before upstream's #40 graph fix, so merging the
@@ -183,19 +184,21 @@ has never executed on this box.
   at the previous branch's store.
 - **Re-index before you trust a tag reader (#60).** `PARSER_VERSION = 2` declares the re-index that
   fills `tags` and `file_tags`, and until that index runs the two tables are empty. The paths that
-  call `fingerprint::verify` refuse to run at all — `engraph search`, `engraph serve` and the
-  `engraph write` CLI all answer "Run 'engraph index'". `engraph context read/list/who/project` and
-  `engraph status` do not verify, so they answer from the empty tables with no warning: `who` finds
-  nobody through its tag pass, and `health` reports every note as missing its tags. Run
-  `engraph index` once on an upgraded store before reading any of them.
-- **A promoted heading is not addressable by `read_section` or `write edit`.** Promotion (#44) puts a
-  bold-only line in `chunks.heading`, so a search result prints
+  call `fingerprint::verify` refuse to run at all — `engraph search`, `engraph serve` and the write
+  commands (`engraph create/update/move/archive/delete`) all answer "Run 'engraph index'".
+  `engraph read/list/who/project` and `engraph status` do not verify, so they answer from the
+  empty tables with no warning: `who` finds nobody through its tag pass, and `health` reports every
+  note as missing its tags. Run `engraph index` once on an upgraded store before reading any of
+  them.
+- **A promoted heading is not addressable by `read --section` or `update --section`.** Promotion
+  (#44) puts a bold-only line in `chunks.heading`, so a search result prints
   `lore/bestiary/archdragon.md > **Spells**` — 107 of the shipped arm's 1559 chunks are labelled this
   way, `**Abilities**` 67 times and `**Spells**` 22. `markdown::find_section` reads ATX headings only,
-  which is deliberate and is what the section editor writes against, so `read_section` with
-  `**Spells**` and with `Spells` both answer "Section not found", and `writer::edit` cannot target the
-  passage either. Read the whole note instead, or name the enclosing `#` heading. The breadcrumb the
-  result prints is the way back: the ancestor before the bold line is an ATX heading and does resolve.
+  which is deliberate and is what the section editor writes against, so `engraph read --section` with
+  `**Spells**` and with `Spells` both answer "Section not found", and `engraph update --section`
+  cannot target the passage either. Read the whole note instead, or name the enclosing `#` heading.
+  The breadcrumb the result prints is the way back: the ancestor before the bold line is an ATX
+  heading and does resolve.
 - **Do not add a top-level config key with `>>`.** Every arm home's `config.toml` ends in a
   `[section]` table, so a line appended to the end of the file lands **inside that table**. TOML
   parses `promote_bold_headings = true` after `[memory]` as `memory.promote_bold_headings`, serde
@@ -454,7 +457,7 @@ has never executed on this box.
   a document's own sections, which is the ordering #6 made load-bearing. On the eval vault it moved
   probe 3 from @5 to @2 and knocked probe 4's answer out of the top 20. Full numbers and the
   mechanism are in `eval/probes.md`.
-- **Changing `[embedding_prefix]` needs `engraph index --reindex`.** Incremental indexing compares
+- **Changing `[embedding_prefix]` needs `engraph index --rebuild`.** Incremental indexing compares
   content hashes, so a config change alone leaves every existing vector as it was and silently mixes
   two embedding schemes in one vector space.
 - **`chunks_fts` is where a chunk's full text lives** (this fork, issue #11) — nowhere else does.
@@ -469,7 +472,7 @@ has never executed on this box.
 - **The graph lane depends on the FTS index too.** `graph.rs` picks which section a neighbour
   matched via `store.best_matching_chunk_seq`, which queries `chunks_fts`. Before #11 it was choosing
   sections while able to see the first 200 characters of each.
-- **Changing what goes into FTS needs `engraph index --reindex`**, for the same reason
+- **Changing what goes into FTS needs `engraph index --rebuild`**, for the same reason
   `[embedding_prefix]` does: incremental indexing compares content hashes and will not notice. There
   is no backfill possible here — the full text exists nowhere in the database to recover it from.
 - **RRF scores tie constantly**, since every lane hands out the same `weight/(k + rank)` values.

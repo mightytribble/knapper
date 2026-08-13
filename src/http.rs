@@ -43,6 +43,10 @@ pub struct ApiState {
     /// Retrieval granularity settings from `config.toml`.
     pub max_chunks_per_file: usize,
     pub group_by: crate::config::GroupBy,
+    /// How many results a call that names no `top_n` gets. It comes from
+    /// `config.toml`, the way the CLI's does: a default that differs per
+    /// surface is the last place one query answers two ways (#62).
+    pub top_n: usize,
     /// Rerank-lane settings from `config.toml`.
     pub rerank: crate::config::RerankConfig,
     /// Ranking-stage settings from `config.toml`.
@@ -385,7 +389,8 @@ async fn handle_search(
     Json(body): Json<crate::params::Search>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, false)?;
-    let top_n = body.top_n.unwrap_or(10);
+    // Per call, with the configured default behind it (#62).
+    let top_n = body.top_n.unwrap_or(state.top_n);
     let all_terms = crate::tags::merge_all_alias(body.tags, body.all);
     let scope = crate::tags::TagFilter::parse(&all_terms, &body.any, &body.none)
         .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
@@ -1087,6 +1092,7 @@ mod tests {
             read_only: false,
             max_chunks_per_file: crate::config::default_max_chunks_per_file(),
             group_by: crate::config::GroupBy::default(),
+            top_n: crate::config::Config::default().top_n,
             rerank: crate::config::RerankConfig::default(),
             ranking: crate::config::RankingConfig::default(),
             lane_weights: crate::config::LaneWeights::default(),

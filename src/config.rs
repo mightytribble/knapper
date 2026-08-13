@@ -681,7 +681,7 @@ pub struct Config {
     pub group_by: GroupBy,
     /// What document identity is prepended to a chunk's text before embedding.
     /// Affects the vector only — storage, snippets and FTS see the raw chunk.
-    /// Changing this needs `engraph index --reindex`; the incremental path
+    /// Changing this needs `engraph index --rebuild`; the incremental path
     /// compares content hashes and will not notice.
     #[serde(default)]
     pub embedding_prefix: PrefixConfig,

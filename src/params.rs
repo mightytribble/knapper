@@ -19,7 +19,9 @@ use serde::Deserialize;
 pub struct Search {
     /// The search query.
     pub query: String,
-    /// Number of results to return (default 10).
+    /// Number of results to return. Omit it for the configured default,
+    /// which is `top_n` in `config.toml` and is the same number on every
+    /// surface (#62).
     #[arg(short = 'n', long)]
     pub top_n: Option<usize>,
     /// Show the per-lane score breakdown for each result.

@@ -408,6 +408,19 @@ mod tests {
         }
     }
 
+    /// #62 is finished when no surface differs from the table.
+    #[test]
+    fn nothing_is_pending() {
+        assert!(PENDING_CLI.is_empty(), "{PENDING_CLI:?}");
+        assert!(PENDING_MCP.is_empty(), "{PENDING_MCP:?}");
+        assert!(PENDING_HTTP.is_empty(), "{PENDING_HTTP:?}");
+    }
+
+    #[test]
+    fn there_are_twenty_capabilities() {
+        assert_eq!(CAPABILITIES.len(), 20);
+    }
+
     #[test]
     fn the_committed_table_matches_the_rendered_one() {
         let want = render_table();
