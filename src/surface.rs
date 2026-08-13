@@ -297,6 +297,11 @@ pub const PENDING_HTTP: &[Pending] = &[
     Pending::NotYetRemoved("/api/migrate/undo"),
 ];
 
+/// Capabilities whose CLI arguments are declared apart from the shared
+/// parameter struct, and why. The parity test checks these by name,
+/// because they are the only ones where two declarations can drift.
+pub const PARAMS_NOT_SHARED: &[(&str, &str)] = &[];
+
 /// Routes the transport serves for itself. They name no capability.
 pub const HTTP_TRANSPORT_ROUTES: &[(&str, &str)] = &[
     ("/api/health-check", "a liveness probe for the transport"),
@@ -445,6 +450,18 @@ mod tests {
             actual.difference(&want).collect::<Vec<_>>(),
             want.difference(&actual).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn every_capability_with_a_split_declaration_is_named() {
+        // A capability may only opt out of the shared struct with a reason.
+        for (name, reason) in PARAMS_NOT_SHARED {
+            assert!(
+                CAPABILITIES.iter().any(|c| c.name == *name),
+                "{name} is not a capability"
+            );
+            assert!(!reason.is_empty(), "{name} opts out with no reason");
+        }
     }
 
     #[test]

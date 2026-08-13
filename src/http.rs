@@ -257,17 +257,6 @@ struct ReadSectionQuery {
 // -- Write request bodies --
 
 #[derive(Debug, Deserialize)]
-struct CreateBody {
-    content: String,
-    filename: Option<String>,
-    type_hint: Option<String>,
-    #[serde(default)]
-    tags: Vec<String>,
-    folder: Option<String>,
-    auto_link: Option<bool>,
-}
-
-#[derive(Debug, Deserialize)]
 struct AppendBody {
     file: String,
     content: String,
@@ -295,17 +284,6 @@ struct EditFrontmatterBody {
 }
 
 #[derive(Debug, Deserialize)]
-struct MoveBody {
-    file: String,
-    new_folder: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ArchiveBody {
-    file: String,
-}
-
-#[derive(Debug, Deserialize)]
 struct UnarchiveBody {
     file: String,
 }
@@ -315,25 +293,6 @@ struct UpdateMetadataBody {
     file: String,
     tags: Option<Vec<String>>,
     aliases: Option<Vec<String>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct DeleteBody {
-    file: String,
-    mode: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ReindexFileBody {
-    file: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct SetupBody {
-    mode: String,
-    name: Option<String>,
-    role: Option<String>,
-    purpose: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -733,7 +692,7 @@ fn parse_frontmatter_ops(
 async fn handle_create(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(body): Json<CreateBody>,
+    Json(body): Json<crate::params::Create>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
     if state.read_only {
@@ -741,16 +700,21 @@ async fn handle_create(
             "Write operations disabled in read-only mode",
         ));
     }
+    // No stdin exists on this surface, so an omitted content is an error
+    // here instead of the CLI's fallback read.
+    let content = body
+        .content
+        .ok_or_else(|| ApiError::bad_request("content is required"))?;
     let store = state.store.lock().await;
     let mut embedder = state.embedder.lock().await;
     let input = CreateNoteInput {
-        content: body.content,
+        content,
         filename: body.filename,
         type_hint: body.type_hint,
         tags: body.tags,
         folder: body.folder,
         created_by: "http-api".into(),
-        auto_link: body.auto_link,
+        auto_link: None,
     };
     let result = writer::create_note(
         input,
@@ -883,7 +847,7 @@ async fn handle_edit_frontmatter(
 async fn handle_move(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(body): Json<MoveBody>,
+    Json(body): Json<crate::params::Move>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
     if state.read_only {
@@ -902,7 +866,7 @@ async fn handle_move(
 async fn handle_archive(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(body): Json<ArchiveBody>,
+    Json(body): Json<crate::params::Archive>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
     if state.read_only {
@@ -1039,7 +1003,7 @@ async fn handle_migrate_undo(
 async fn handle_delete(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(body): Json<DeleteBody>,
+    Json(body): Json<crate::params::Delete>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
     if state.read_only {
@@ -1048,7 +1012,7 @@ async fn handle_delete(
         ));
     }
     let store = state.store.lock().await;
-    let mode = match body.mode.as_deref().unwrap_or("soft") {
+    let mode = match body.mode.as_str() {
         "hard" => DeleteMode::Hard,
         _ => DeleteMode::Soft,
     };
@@ -1062,14 +1026,14 @@ async fn handle_delete(
         .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
     Ok(Json(serde_json::json!({
         "deleted": body.file,
-        "mode": body.mode.as_deref().unwrap_or("soft"),
+        "mode": body.mode,
     })))
 }
 
 async fn handle_reindex_file(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(body): Json<ReindexFileBody>,
+    Json(body): Json<crate::params::ReindexFile>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
     let store = state.store.lock().await;
@@ -1138,16 +1102,16 @@ async fn handle_identity(
 async fn handle_setup(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(body): Json<SetupBody>,
+    Json(body): Json<crate::params::Init>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
-    match body.mode.as_str() {
-        "detect" => {
+    match body.mode.as_deref() {
+        Some("detect") => {
             let result = crate::onboarding::run_detect_json(&state.vault_path)
                 .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
             Ok(Json(result))
         }
-        "apply" => {
+        Some("apply") => {
             let mut config = crate::config::Config::load().unwrap_or_default();
             let data_dir = crate::config::Config::data_dir()
                 .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
@@ -1163,9 +1127,14 @@ async fn handle_setup(
                     .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
             Ok(Json(result))
         }
-        other => Err(ApiError::bad_request(&format!(
+        Some(other) => Err(ApiError::bad_request(&format!(
             "Unknown mode: {other}. Use 'detect' or 'apply'."
         ))),
+        // A server has no interactive flow to fall back to, so an omitted
+        // mode is an error here where the CLI would prompt.
+        None => Err(ApiError::bad_request(
+            "Unknown mode: use 'detect' or 'apply'",
+        )),
     }
 }
 

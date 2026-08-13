@@ -26,22 +26,6 @@ use crate::writer::FrontmatterOp;
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct CreateParams {
-    /// Note content (markdown body).
-    pub content: String,
-    /// Optional filename (without .md). Auto-generated if omitted.
-    pub filename: Option<String>,
-    /// Type hint for placement: "person", "daily", "meeting", "decision".
-    pub type_hint: Option<String>,
-    /// Proposed tags (auto-resolved against registry).
-    pub tags: Option<Vec<String>>,
-    /// Explicit folder path (skips placement engine).
-    pub folder: Option<String>,
-    /// Set to false to skip automatic wikilink resolution. Defaults to true.
-    pub auto_link: Option<bool>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
 pub struct AppendParams {
     /// Target note: file path, basename, or #docid.
     pub file: String,
@@ -57,20 +41,6 @@ pub struct UpdateMetadataParams {
     pub tags: Option<Vec<String>>,
     /// New aliases.
     pub aliases: Option<Vec<String>>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct MoveNoteParams {
-    /// Target note: file path, basename, or #docid.
-    pub file: String,
-    /// New folder path (relative to vault root).
-    pub new_folder: String,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct ArchiveParams {
-    /// Target note: file path, basename, or #docid.
-    pub file: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -153,32 +123,6 @@ pub struct EditFrontmatterParams {
     pub file: String,
     /// Operations to apply. Array of objects like {"op": "add_tag", "value": "rust"} or {"op": "set", "key": "status", "value": "done"} or {"op": "remove", "key": "status"} or {"op": "remove_tag", "value": "old"}.
     pub operations: Vec<FrontmatterOpInput>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct DeleteParams {
-    /// Target note: file path, basename, or #docid.
-    pub file: String,
-    /// Delete mode: "soft" (archive, default) or "hard" (permanent).
-    pub mode: Option<String>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct ReindexFileParams {
-    /// File path relative to vault root (e.g. "07-Daily/2026-04-10.md").
-    pub file: String,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct SetupParams {
-    /// Mode: "detect" to inspect vault, "apply" to configure identity and index.
-    pub mode: String,
-    /// User name (required for apply mode).
-    pub name: Option<String>,
-    /// User role (required for apply mode).
-    pub role: Option<String>,
-    /// Vault purpose (optional for apply mode).
-    pub purpose: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -540,20 +484,32 @@ impl EngraphServer {
         name = "create",
         description = "Create a new note with automatic tag resolution, link discovery, and folder placement. Returns the created file's path, docid, and what was auto-resolved."
     )]
-    async fn create(&self, params: Parameters<CreateParams>) -> Result<CallToolResult, McpError> {
+    async fn create(
+        &self,
+        params: Parameters<crate::params::Create>,
+    ) -> Result<CallToolResult, McpError> {
         if self.read_only {
             return Err(read_only_err());
         }
+        // No stdin exists on this surface, so an omitted content is an
+        // error here instead of the CLI's fallback read.
+        let content = params.0.content.ok_or_else(|| {
+            McpError::new(
+                rmcp::model::ErrorCode::INVALID_PARAMS,
+                "content is required",
+                None::<serde_json::Value>,
+            )
+        })?;
         let store = self.store.lock().await;
         let mut embedder = self.embedder.lock().await;
         let input = crate::writer::CreateNoteInput {
-            content: params.0.content,
+            content,
             filename: params.0.filename,
             type_hint: params.0.type_hint,
-            tags: params.0.tags.unwrap_or_default(),
+            tags: params.0.tags,
             folder: params.0.folder,
             created_by: "claude-code".into(),
-            auto_link: params.0.auto_link,
+            auto_link: None,
         };
         let result = crate::writer::create_note(
             input,
@@ -624,7 +580,7 @@ impl EngraphServer {
     )]
     async fn move_note(
         &self,
-        params: Parameters<MoveNoteParams>,
+        params: Parameters<crate::params::Move>,
     ) -> Result<CallToolResult, McpError> {
         if self.read_only {
             return Err(read_only_err());
@@ -644,7 +600,10 @@ impl EngraphServer {
         name = "archive",
         description = "Archive a note: moves it to the archive folder, removes from search index. The note is preserved on disk but invisible to search/context. Use unarchive to restore."
     )]
-    async fn archive(&self, params: Parameters<ArchiveParams>) -> Result<CallToolResult, McpError> {
+    async fn archive(
+        &self,
+        params: Parameters<crate::params::Archive>,
+    ) -> Result<CallToolResult, McpError> {
         if self.read_only {
             return Err(read_only_err());
         }
@@ -846,12 +805,15 @@ impl EngraphServer {
         name = "delete",
         description = "Delete a note. Soft mode (default) moves it to the archive folder. Hard mode permanently removes it from disk and index."
     )]
-    async fn delete(&self, params: Parameters<DeleteParams>) -> Result<CallToolResult, McpError> {
+    async fn delete(
+        &self,
+        params: Parameters<crate::params::Delete>,
+    ) -> Result<CallToolResult, McpError> {
         if self.read_only {
             return Err(read_only_err());
         }
         let store = self.store.lock().await;
-        let mode = match params.0.mode.as_deref().unwrap_or("soft") {
+        let mode = match params.0.mode.as_str() {
             "hard" => crate::writer::DeleteMode::Hard,
             _ => crate::writer::DeleteMode::Soft,
         };
@@ -871,7 +833,7 @@ impl EngraphServer {
         .map_err(|e| mcp_err(&e))?;
         let result = serde_json::json!({
             "deleted": params.0.file,
-            "mode": params.0.mode.as_deref().unwrap_or("soft"),
+            "mode": params.0.mode,
         });
         to_json_result(&result)
     }
@@ -882,7 +844,7 @@ impl EngraphServer {
     )]
     async fn reindex_file(
         &self,
-        params: Parameters<ReindexFileParams>,
+        params: Parameters<crate::params::ReindexFile>,
     ) -> Result<CallToolResult, McpError> {
         let store = self.store.lock().await;
         let mut embedder = self.embedder.lock().await;
@@ -957,14 +919,17 @@ impl EngraphServer {
         name = "setup",
         description = "Run first-time setup or update identity. Use 'detect' mode to inspect the vault without changes, 'apply' mode to configure identity and index. Returns JSON."
     )]
-    async fn setup(&self, params: Parameters<SetupParams>) -> Result<CallToolResult, McpError> {
-        match params.0.mode.as_str() {
-            "detect" => {
+    async fn setup(
+        &self,
+        params: Parameters<crate::params::Init>,
+    ) -> Result<CallToolResult, McpError> {
+        match params.0.mode.as_deref() {
+            Some("detect") => {
                 let result = crate::onboarding::run_detect_json(&self.vault_path)
                     .map_err(|e| mcp_err(&e))?;
                 to_json_result(&result)
             }
-            "apply" => {
+            Some("apply") => {
                 let mut config = crate::config::Config::load().unwrap_or_default();
                 let data_dir = crate::config::Config::data_dir().map_err(|e| mcp_err(&e))?;
                 let flags = crate::onboarding::ApplyFlags {
@@ -983,9 +948,16 @@ impl EngraphServer {
                 .map_err(|e| mcp_err(&e))?;
                 to_json_result(&result)
             }
-            other => Err(McpError::new(
+            Some(other) => Err(McpError::new(
                 rmcp::model::ErrorCode::INVALID_PARAMS,
                 format!("Unknown mode: {other}. Use 'detect' or 'apply'."),
+                None::<serde_json::Value>,
+            )),
+            // A server has no interactive flow to fall back to, so an
+            // omitted mode is an error here where the CLI would prompt.
+            None => Err(McpError::new(
+                rmcp::model::ErrorCode::INVALID_PARAMS,
+                "Unknown mode: use 'detect' or 'apply'",
                 None::<serde_json::Value>,
             )),
         }

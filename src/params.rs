@@ -216,6 +216,140 @@ where
     deserializer.deserialize_any(TagListVisitor)
 }
 
+#[derive(Debug, Args, Deserialize, JsonSchema)]
+pub struct Create {
+    /// Note content. The CLI reads stdin when this is omitted.
+    #[arg(long)]
+    pub content: Option<String>,
+    /// Filename, without `.md`.
+    #[arg(long)]
+    pub filename: Option<String>,
+    /// A hint at the note's kind, used for placement.
+    #[arg(long)]
+    pub type_hint: Option<String>,
+    /// Tags to resolve against the vault's vocabulary.
+    #[arg(long, value_delimiter = ',')]
+    #[serde(default, deserialize_with = "deserialize_tag_list")]
+    pub tags: Vec<String>,
+    /// Folder to place the note in. Placement chooses one when omitted.
+    #[arg(long)]
+    pub folder: Option<String>,
+}
+
+#[derive(Debug, Args, Deserialize, JsonSchema)]
+pub struct Delete {
+    /// File path, basename, or #docid.
+    pub file: String,
+    /// `soft` archives the note; `hard` removes it permanently.
+    #[arg(long, default_value = "soft")]
+    #[serde(
+        default = "default_delete_mode",
+        deserialize_with = "deserialize_delete_mode"
+    )]
+    pub mode: String,
+}
+
+fn default_delete_mode() -> String {
+    "soft".to_string()
+}
+
+fn deserialize_delete_mode<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_string_or_default(deserializer, default_delete_mode())
+}
+
+/// A string that falls back to `default` when the field is absent, and also
+/// when a caller sends an explicit JSON `null` — the same lesson as
+/// `deserialize_number_or_default` (#60): `#[serde(default = ...)]` alone
+/// only covers the absent case.
+fn deserialize_string_or_default<'de, D>(
+    deserializer: D,
+    default: String,
+) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or(default))
+}
+
+#[derive(Debug, Args, Deserialize, JsonSchema)]
+pub struct Move {
+    /// File path, basename, or #docid.
+    pub file: String,
+    /// New folder path, relative to the vault root.
+    #[arg(long)]
+    pub new_folder: String,
+}
+
+#[derive(Debug, Args, Deserialize, JsonSchema)]
+pub struct Archive {
+    /// File path, basename, or #docid.
+    pub file: String,
+    /// Restore a note the archive holds, instead of archiving one.
+    #[arg(long)]
+    #[serde(default)]
+    pub undo: bool,
+}
+
+#[derive(Debug, Args, Deserialize, JsonSchema)]
+pub struct Index {
+    /// Rebuild the index from scratch.
+    #[arg(long)]
+    #[serde(default)]
+    pub rebuild: bool,
+    /// Index files that `.gitignore` or `.ignore` would exclude.
+    #[arg(long)]
+    #[serde(default)]
+    pub no_gitignore: bool,
+}
+
+#[derive(Debug, Args, Deserialize, JsonSchema)]
+pub struct ReindexFile {
+    /// File path relative to the vault root.
+    pub file: String,
+}
+
+#[derive(Debug, Args, Deserialize, JsonSchema)]
+pub struct Status {}
+
+#[derive(Debug, Args, Deserialize, JsonSchema)]
+pub struct Health {}
+
+#[derive(Debug, Args, Deserialize, JsonSchema)]
+pub struct Identity {
+    /// Re-extract the L1 facts without a full re-index.
+    #[arg(long)]
+    #[serde(default)]
+    pub refresh: bool,
+}
+
+#[derive(Debug, Args, Deserialize, JsonSchema)]
+pub struct Init {
+    /// `detect` inspects the vault and writes nothing; `apply` configures
+    /// identity and indexes. The CLI runs its interactive flow when this is
+    /// omitted, which is the one thing the other surfaces cannot do.
+    #[arg(long)]
+    pub mode: Option<String>,
+    /// User name, for `apply`.
+    #[arg(long)]
+    pub name: Option<String>,
+    /// User role, for `apply`.
+    #[arg(long)]
+    pub role: Option<String>,
+    /// Vault purpose, for `apply`.
+    #[arg(long)]
+    pub purpose: Option<String>,
+}
+
+#[derive(Debug, Args, Deserialize, JsonSchema)]
+pub struct Migrate {
+    /// `preview`, `apply` or `undo`.
+    #[arg(long)]
+    pub mode: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
