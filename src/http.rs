@@ -2,15 +2,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use axum::extract::{Path, Query, State};
+use anyhow::Context;
+use axum::extract::{Query, State};
 use axum::http::{HeaderMap, HeaderValue, Method};
 use axum::{
     Json, Router,
     http::StatusCode,
     response::IntoResponse,
-    routing::{get, post},
+    routing::{MethodRouter, get, post},
 };
-use serde::Deserialize;
 use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
 
@@ -20,12 +20,9 @@ use crate::health;
 use crate::llm::{EmbedModel, RerankModel};
 use crate::profile::VaultProfile;
 use crate::search;
-use crate::serve::{FrontmatterOpInput, FrontmatterOpKind, RecentWrites};
+use crate::serve::RecentWrites;
 use crate::store::Store;
-use crate::writer::{
-    self, AppendInput, CreateNoteInput, DeleteMode, EditFrontmatterInput, EditInput, EditMode,
-    FrontmatterOp, RewriteInput, UpdateMetadataInput,
-};
+use crate::writer::{self, CreateNoteInput, DeleteMode, UpdateInput};
 
 // ---------------------------------------------------------------------------
 // Shared state
@@ -46,6 +43,10 @@ pub struct ApiState {
     /// Retrieval granularity settings from `config.toml`.
     pub max_chunks_per_file: usize,
     pub group_by: crate::config::GroupBy,
+    /// How many results a call that names no `top_n` gets. It comes from
+    /// `config.toml`, the way the CLI's does: a default that differs per
+    /// surface is the last place one query answers two ways (#62).
+    pub top_n: usize,
     /// Rerank-lane settings from `config.toml`.
     pub rerank: crate::config::RerankConfig,
     /// Ranking-stage settings from `config.toml`.
@@ -245,159 +246,6 @@ pub fn generate_api_key() -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Request body / query structs
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Deserialize)]
-struct SearchBody {
-    query: String,
-    top_n: Option<usize>,
-    /// The tag scope (#60). A JSON body reads an array, unlike `/api/list`,
-    /// whose query string reads one comma-separated value because
-    /// `serde_urlencoded` has no sequence support. `Option` rather than a
-    /// bare `Vec` with `#[serde(default)]`, because `#[serde(default)]`
-    /// covers a missing field only — a caller that serialises an absent
-    /// optional as an explicit JSON `null` (routine in JavaScript and
-    /// Python) would fail deserialization and never reach `handle_search`.
-    tags: Option<Vec<String>>,
-    all: Option<Vec<String>>,
-    any: Option<Vec<String>>,
-    none: Option<Vec<String>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ReadSectionQuery {
-    file: String,
-    heading: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ListQuery {
-    folder: Option<String>,
-    /// One comma-separated string, per the OpenAPI description: `serde_urlencoded`
-    /// has no sequence support, so a repeated `tags=` key is never read here.
-    /// The same encoding carries `all`, `any` and `none` (#61); `tags` is the
-    /// alias of `all` that the CLI and MCP also take.
-    #[serde(default, deserialize_with = "deserialize_comma_separated")]
-    tags: Vec<String>,
-    #[serde(default, deserialize_with = "deserialize_comma_separated")]
-    all: Vec<String>,
-    #[serde(default, deserialize_with = "deserialize_comma_separated")]
-    any: Vec<String>,
-    #[serde(default, deserialize_with = "deserialize_comma_separated")]
-    none: Vec<String>,
-    limit: Option<usize>,
-    created_by: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TagsQuery {
-    /// One tag term. Omit for the whole vocabulary.
-    under: Option<String>,
-}
-
-/// `?tags=a,b` split on commas. An absent parameter stays empty; the split
-/// terms reach `TagFilter::parse`, which drops the ones with no path.
-fn deserialize_comma_separated<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let raw: Option<String> = Option::deserialize(deserializer)?;
-    Ok(match raw {
-        Some(s) if !s.is_empty() => s.split(',').map(str::to_string).collect(),
-        _ => Vec::new(),
-    })
-}
-
-#[derive(Debug, Deserialize)]
-struct ContextBody {
-    topic: String,
-    budget: Option<usize>,
-}
-
-// -- Write request bodies --
-
-#[derive(Debug, Deserialize)]
-struct CreateBody {
-    content: String,
-    filename: Option<String>,
-    type_hint: Option<String>,
-    #[serde(default)]
-    tags: Vec<String>,
-    folder: Option<String>,
-    auto_link: Option<bool>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AppendBody {
-    file: String,
-    content: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct EditBody {
-    file: String,
-    heading: String,
-    content: String,
-    mode: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RewriteBody {
-    file: String,
-    content: String,
-    preserve_frontmatter: Option<bool>,
-}
-
-#[derive(Debug, Deserialize)]
-struct EditFrontmatterBody {
-    file: String,
-    operations: Vec<FrontmatterOpInput>,
-}
-
-#[derive(Debug, Deserialize)]
-struct MoveBody {
-    file: String,
-    new_folder: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ArchiveBody {
-    file: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct UnarchiveBody {
-    file: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct UpdateMetadataBody {
-    file: String,
-    tags: Option<Vec<String>>,
-    aliases: Option<Vec<String>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct DeleteBody {
-    file: String,
-    mode: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ReindexFileBody {
-    file: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct SetupBody {
-    mode: String,
-    name: Option<String>,
-    role: Option<String>,
-    purpose: Option<String>,
-}
-
-// ---------------------------------------------------------------------------
 // CORS
 // ---------------------------------------------------------------------------
 
@@ -426,46 +274,51 @@ fn cors_layer(origins: &[String]) -> CorsLayer {
 // Router
 // ---------------------------------------------------------------------------
 
-/// Build the axum router with all API endpoints.
+/// Every route the API serves, as data. `build_router` folds this list into
+/// the `Router`, and `surface.rs`'s parity test reads it — an axum `Router`
+/// cannot be inspected once built, so the list is the only way the test can
+/// see what is served (#62). `openapi.rs` reads it too, so the spec and the
+/// router cannot describe different APIs.
+pub fn routes() -> Vec<(&'static str, MethodRouter<ApiState>)> {
+    vec![
+        ("/api/health-check", get(health_check)),
+        ("/api/search", post(handle_search)),
+        ("/api/read", get(handle_read)),
+        ("/api/list", get(handle_list)),
+        ("/api/tags", get(handle_tags)),
+        ("/api/vault-map", get(handle_vault_map)),
+        ("/api/who", get(handle_who)),
+        ("/api/project", get(handle_project)),
+        ("/api/topic", post(handle_topic)),
+        ("/api/health", get(handle_health)),
+        ("/api/status", get(handle_status)),
+        // Write endpoints
+        ("/api/create", post(handle_create)),
+        ("/api/update", post(handle_update)),
+        ("/api/move", post(handle_move)),
+        ("/api/archive", post(handle_archive)),
+        ("/api/delete", post(handle_delete)),
+        // Index maintenance
+        ("/api/index", post(handle_index)),
+        ("/api/reindex-file", post(handle_reindex_file)),
+        // Identity endpoints
+        ("/api/identity", get(handle_identity)),
+        ("/api/init", post(handle_init)),
+        // Migration endpoints
+        ("/api/migrate", post(handle_migrate)),
+        // OpenAPI / ChatGPT plugin discovery (no auth required)
+        ("/openapi.json", get(handle_openapi)),
+        ("/.well-known/ai-plugin.json", get(handle_plugin_manifest)),
+    ]
+}
+
 pub fn build_router(state: ApiState) -> Router {
     let cors = cors_layer(&state.http_config.cors_origins);
-    Router::new()
-        .route("/api/health-check", get(health_check))
-        .route("/api/search", post(handle_search))
-        .route("/api/read/{*file}", get(handle_read))
-        .route("/api/read-section", get(handle_read_section))
-        .route("/api/list", get(handle_list))
-        .route("/api/tags", get(handle_tags))
-        .route("/api/vault-map", get(handle_vault_map))
-        .route("/api/who/{name}", get(handle_who))
-        .route("/api/project/{name}", get(handle_project))
-        .route("/api/context", post(handle_context))
-        .route("/api/health", get(handle_health))
-        // Write endpoints
-        .route("/api/create", post(handle_create))
-        .route("/api/append", post(handle_append))
-        .route("/api/edit", post(handle_edit))
-        .route("/api/rewrite", post(handle_rewrite))
-        .route("/api/edit-frontmatter", post(handle_edit_frontmatter))
-        .route("/api/move", post(handle_move))
-        .route("/api/archive", post(handle_archive))
-        .route("/api/unarchive", post(handle_unarchive))
-        .route("/api/update-metadata", post(handle_update_metadata))
-        .route("/api/delete", post(handle_delete))
-        // Index maintenance
-        .route("/api/reindex-file", post(handle_reindex_file))
-        // Identity endpoints
-        .route("/api/identity", get(handle_identity))
-        .route("/api/setup", post(handle_setup))
-        // Migration endpoints
-        .route("/api/migrate/preview", post(handle_migrate_preview))
-        .route("/api/migrate/apply", post(handle_migrate_apply))
-        .route("/api/migrate/undo", post(handle_migrate_undo))
-        // OpenAPI / ChatGPT plugin discovery (no auth required)
-        .route("/openapi.json", get(handle_openapi))
-        .route("/.well-known/ai-plugin.json", get(handle_plugin_manifest))
-        .layer(cors)
-        .with_state(state)
+    let mut router = Router::new();
+    for (path, handler) in routes() {
+        router = router.route(path, handler);
+    }
+    router.layer(cors).with_state(state)
 }
 
 async fn health_check() -> &'static str {
@@ -506,21 +359,41 @@ async fn handle_plugin_manifest(State(state): State<ApiState>) -> impl IntoRespo
 // Read endpoint handlers
 // ---------------------------------------------------------------------------
 
+/// A search response is an envelope, because HTTP is the one surface with
+/// nowhere else to put the answer-floor signal — the CLI prints it and MCP
+/// sends a second content block (#34, #62). #35 owns what a result item
+/// holds; this owns the envelope around it, all three of its keys.
+///
+/// `explain` is the per-lane detail, and it is absent when the caller did not
+/// ask for it: an agent that did not ask must not have to read past it.
+fn search_response(
+    results: &[search::InternalSearchResult],
+    explain: Option<String>,
+) -> serde_json::Value {
+    let mut envelope = serde_json::json!({
+        "results": results,
+        "message": match results.is_empty() {
+            true => Some(crate::ranking::NO_RELEVANT_CONTENT),
+            false => None,
+        },
+    });
+    if let Some(detail) = explain {
+        envelope["explain"] = serde_json::Value::String(detail);
+    }
+    envelope
+}
+
 async fn handle_search(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(body): Json<SearchBody>,
+    Json(body): Json<crate::params::Search>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, false)?;
-    let top_n = body.top_n.unwrap_or(10);
-    let all_terms =
-        crate::tags::merge_all_alias(body.tags.unwrap_or_default(), body.all.unwrap_or_default());
-    let scope = crate::tags::TagFilter::parse(
-        &all_terms,
-        &body.any.unwrap_or_default(),
-        &body.none.unwrap_or_default(),
-    )
-    .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
+    // Per call, with the configured default behind it (#62).
+    let top_n = body.top_n.unwrap_or(state.top_n);
+    let all_terms = crate::tags::merge_all_alias(body.tags, body.all);
+    let scope = crate::tags::TagFilter::parse(&all_terms, &body.any, &body.none)
+        .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
     let store = state.store.lock().await;
     let mut embedder = state.embedder.lock().await;
 
@@ -537,7 +410,10 @@ async fn handle_search(
         rerank_candidates: 30,
         rerank: state.rerank,
         max_chunks_per_file: state.max_chunks_per_file,
-        group_by: state.group_by,
+        // Per call, with the process setting as the default: one query answers
+        // the same way whoever asks it, and the granularity is part of the
+        // question rather than of how the server was started (#62).
+        group_by: body.group_by.unwrap_or(state.group_by),
         ranking: state.ranking,
         lane_weights: state.lane_weights,
         fts: state.fts,
@@ -555,13 +431,16 @@ async fn handle_search(
                 ApiError::internal(&format!("{e:#}"))
             }
         })?;
-    Ok(Json(serde_json::json!(output.results)))
+    // The per-lane detail rides in the envelope, next to the results it
+    // explains, and is built only for the call that asked for it (#62).
+    let explain = body.explain.then(|| search::explain_report(&output, top_n));
+    Ok(Json(search_response(&output.results, explain)))
 }
 
 async fn handle_read(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Path(file): Path<String>,
+    Query(p): Query<crate::params::Read>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, false)?;
     let store = state.store.lock().await;
@@ -570,27 +449,26 @@ async fn handle_read(
         vault_path: &state.vault_path,
         profile: state.profile.as_ref().as_ref(),
     };
-    let note =
-        context::context_read(&ctx, &file).map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    let note = context::context_read(&ctx, &p.file, p.section.as_deref()).map_err(|e| {
+        // A file or a section the vault does not hold is the caller's own text
+        // naming nothing, not a server fault — the rule `handle_search` and
+        // `handle_list` already follow (#60). The message text is the cheapest
+        // honest signal `context_read` gives a caller this far from the error's
+        // construction.
+        let message = e.to_string();
+        if message.starts_with("Section not found") || message.starts_with("File not found") {
+            ApiError::bad_request(&format!("{e:#}"))
+        } else {
+            ApiError::internal(&format!("{e:#}"))
+        }
+    })?;
     Ok(Json(serde_json::json!(note)))
-}
-
-async fn handle_read_section(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Query(params): Query<ReadSectionQuery>,
-) -> Result<impl IntoResponse, ApiError> {
-    authorize(&headers, &state, false)?;
-    let store = state.store.lock().await;
-    let result = context::read_section(&store, &state.vault_path, &params.file, &params.heading)
-        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
-    Ok(Json(serde_json::json!(result)))
 }
 
 async fn handle_list(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Query(params): Query<ListQuery>,
+    Query(params): Query<crate::params::List>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, false)?;
     let store = state.store.lock().await;
@@ -599,7 +477,6 @@ async fn handle_list(
         vault_path: &state.vault_path,
         profile: state.profile.as_ref().as_ref(),
     };
-    let limit = params.limit.unwrap_or(20);
     let all_terms = crate::tags::merge_all_alias(params.tags, params.all);
     let filter = crate::tags::TagFilter::parse(&all_terms, &params.any, &params.none)
         .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
@@ -608,7 +485,7 @@ async fn handle_list(
         params.folder.as_deref(),
         &filter,
         params.created_by.as_deref(),
-        limit,
+        params.limit,
     )
     .map_err(|e| {
         // An unknown tag is a caller's typo, not a server fault. The message
@@ -628,7 +505,7 @@ async fn handle_list(
 async fn handle_tags(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Query(params): Query<TagsQuery>,
+    Query(params): Query<crate::params::Tags>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, false)?;
     let store = state.store.lock().await;
@@ -657,7 +534,7 @@ async fn handle_vault_map(
 async fn handle_who(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Path(name): Path<String>,
+    Query(p): Query<crate::params::Who>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, false)?;
     let store = state.store.lock().await;
@@ -667,14 +544,14 @@ async fn handle_who(
         profile: state.profile.as_ref().as_ref(),
     };
     let person =
-        context::context_who(&ctx, &name).map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+        context::context_who(&ctx, &p.name).map_err(|e| ApiError::internal(&format!("{e:#}")))?;
     Ok(Json(serde_json::json!(person)))
 }
 
 async fn handle_project(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Path(name): Path<String>,
+    Query(p): Query<crate::params::Project>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, false)?;
     let store = state.store.lock().await;
@@ -683,18 +560,17 @@ async fn handle_project(
         vault_path: &state.vault_path,
         profile: state.profile.as_ref().as_ref(),
     };
-    let proj =
-        context::context_project(&ctx, &name).map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    let proj = context::context_project(&ctx, &p.name)
+        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
     Ok(Json(serde_json::json!(proj)))
 }
 
-async fn handle_context(
+async fn handle_topic(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(body): Json<ContextBody>,
+    Json(body): Json<crate::params::Topic>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, false)?;
-    let budget = body.budget.unwrap_or(32000);
     let store = state.store.lock().await;
     let mut embedder = state.embedder.lock().await;
     let ctx = ContextParams {
@@ -702,7 +578,7 @@ async fn handle_context(
         vault_path: &state.vault_path,
         profile: state.profile.as_ref().as_ref(),
     };
-    let bundle = context::context_topic_with_search(&ctx, &body.topic, budget, &mut *embedder)
+    let bundle = context::context_topic_with_search(&ctx, &body.query, body.budget, &mut *embedder)
         .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
     Ok(Json(serde_json::json!(bundle)))
 }
@@ -723,6 +599,24 @@ async fn handle_health(
     Ok(Json(serde_json::json!(report)))
 }
 
+/// What the index holds. It reads and writes nothing, so it takes the read
+/// permission, and it answers the fields the CLI's `status --json` prints —
+/// one composer for the three surfaces (#62).
+async fn handle_status(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    authorize(&headers, &state, false)?;
+    let data_dir =
+        crate::config::Config::data_dir().map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    // The store is this server's own, so the reads see one snapshot and no
+    // second connection runs the schema batch against the writer.
+    let store = state.store.lock().await;
+    let report = search::status_json(&store, &data_dir)
+        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    Ok(Json(report))
+}
+
 // ---------------------------------------------------------------------------
 // Write helpers
 // ---------------------------------------------------------------------------
@@ -736,58 +630,6 @@ async fn record_write(recent_writes: &RecentWrites, path: &std::path::Path) {
     }
 }
 
-/// Convert typed operation inputs into `Vec<FrontmatterOp>`.
-fn parse_frontmatter_ops(
-    operations: &[FrontmatterOpInput],
-) -> Result<Vec<FrontmatterOp>, ApiError> {
-    let mut ops = Vec::with_capacity(operations.len());
-    for input in operations {
-        let op = match input.op {
-            FrontmatterOpKind::Set => {
-                let key = input.key.as_deref().ok_or_else(|| {
-                    ApiError::bad_request("\"set\" operation requires a \"key\" field")
-                })?;
-                let value = input.value.as_deref().ok_or_else(|| {
-                    ApiError::bad_request("\"set\" operation requires a \"value\" field")
-                })?;
-                FrontmatterOp::Set(key.to_string(), value.to_string())
-            }
-            FrontmatterOpKind::Remove => {
-                let key = input.key.as_deref().ok_or_else(|| {
-                    ApiError::bad_request("\"remove\" operation requires a \"key\" field")
-                })?;
-                FrontmatterOp::Remove(key.to_string())
-            }
-            FrontmatterOpKind::AddTag => {
-                let value = input.value.as_deref().ok_or_else(|| {
-                    ApiError::bad_request("\"add_tag\" operation requires a \"value\" field")
-                })?;
-                FrontmatterOp::AddTag(value.to_string())
-            }
-            FrontmatterOpKind::RemoveTag => {
-                let value = input.value.as_deref().ok_or_else(|| {
-                    ApiError::bad_request("\"remove_tag\" operation requires a \"value\" field")
-                })?;
-                FrontmatterOp::RemoveTag(value.to_string())
-            }
-            FrontmatterOpKind::AddAlias => {
-                let value = input.value.as_deref().ok_or_else(|| {
-                    ApiError::bad_request("\"add_alias\" operation requires a \"value\" field")
-                })?;
-                FrontmatterOp::AddAlias(value.to_string())
-            }
-            FrontmatterOpKind::RemoveAlias => {
-                let value = input.value.as_deref().ok_or_else(|| {
-                    ApiError::bad_request("\"remove_alias\" operation requires a \"value\" field")
-                })?;
-                FrontmatterOp::RemoveAlias(value.to_string())
-            }
-        };
-        ops.push(op);
-    }
-    Ok(ops)
-}
-
 // ---------------------------------------------------------------------------
 // Write endpoint handlers
 // ---------------------------------------------------------------------------
@@ -795,7 +637,7 @@ fn parse_frontmatter_ops(
 async fn handle_create(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(body): Json<CreateBody>,
+    Json(body): Json<crate::params::Create>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
     if state.read_only {
@@ -803,10 +645,15 @@ async fn handle_create(
             "Write operations disabled in read-only mode",
         ));
     }
+    // No stdin exists on this surface, so an omitted content is an error
+    // here instead of the CLI's fallback read.
+    let content = body
+        .content
+        .ok_or_else(|| ApiError::bad_request("content is required"))?;
     let store = state.store.lock().await;
     let mut embedder = state.embedder.lock().await;
     let input = CreateNoteInput {
-        content: body.content,
+        content,
         filename: body.filename,
         type_hint: body.type_hint,
         tags: body.tags,
@@ -829,10 +676,13 @@ async fn handle_create(
     Ok(Json(serde_json::json!(result)))
 }
 
-async fn handle_append(
+/// One capability for every change to an existing note (#62). The whole
+/// edit list is read before anything is written, so a request that names an
+/// impossible target answers 400 and writes nothing.
+async fn handle_update(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(body): Json<AppendBody>,
+    Json(body): Json<crate::params::Update>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
     if state.read_only {
@@ -840,103 +690,42 @@ async fn handle_append(
             "Write operations disabled in read-only mode",
         ));
     }
+    let edits = body
+        .to_writer_edits()
+        .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
     let store = state.store.lock().await;
-    let mut embedder = state.embedder.lock().await;
-    let input = AppendInput {
+    let input = UpdateInput {
         file: body.file,
-        content: body.content,
-        modified_by: "http-api".into(),
+        edits,
     };
-    let result = writer::append_to_note(
-        input,
+    let result = writer::update_note(&store, &state.vault_path, &input)
+        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    // `update_note` stores the new content hash and writes no chunks, so
+    // nothing else will re-derive them: not `diff_vault`, which sees a hash
+    // that already matches disk, and not the watcher, which the `record_write`
+    // below tells to skip this file. Re-index here or the note stays
+    // searchable only as the text it held before the edit (#62).
+    let mut embedder = state.embedder.lock().await;
+    // A failure here happens after the write, so a bare 500 would read as
+    // "nothing happened" — say what did. Returning early also skips
+    // `record_write` below, so the watcher's event on this file is not
+    // suppressed and it re-indexes it on its own; that recovery is
+    // deliberate, not accidental.
+    crate::indexer::reindex_written_file(
+        &result.path,
         &store,
         &mut *embedder,
+        &state.vault_path,
         state.embed,
         state.chunk_opts,
-        &state.vault_path,
     )
+    .with_context(|| {
+        format!(
+            "the file was written; its index rows were not updated for {}",
+            result.path
+        )
+    })
     .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
-    let full_path = state.vault_path.join(&result.path);
-    record_write(&state.recent_writes, &full_path).await;
-    Ok(Json(serde_json::json!(result)))
-}
-
-async fn handle_edit(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Json(body): Json<EditBody>,
-) -> Result<impl IntoResponse, ApiError> {
-    authorize(&headers, &state, true)?;
-    if state.read_only {
-        return Err(ApiError::forbidden(
-            "Write operations disabled in read-only mode",
-        ));
-    }
-    let store = state.store.lock().await;
-    let mode = match body.mode.as_deref().unwrap_or("append") {
-        "replace" => EditMode::Replace,
-        "prepend" => EditMode::Prepend,
-        _ => EditMode::Append,
-    };
-    let input = EditInput {
-        file: body.file,
-        heading: body.heading,
-        content: body.content,
-        mode,
-        modified_by: "http-api".into(),
-    };
-    let result = writer::edit_note(&store, &state.vault_path, &input, None)
-        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
-    let full_path = state.vault_path.join(&result.path);
-    record_write(&state.recent_writes, &full_path).await;
-    Ok(Json(serde_json::json!(result)))
-}
-
-async fn handle_rewrite(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Json(body): Json<RewriteBody>,
-) -> Result<impl IntoResponse, ApiError> {
-    authorize(&headers, &state, true)?;
-    if state.read_only {
-        return Err(ApiError::forbidden(
-            "Write operations disabled in read-only mode",
-        ));
-    }
-    let store = state.store.lock().await;
-    let input = RewriteInput {
-        file: body.file,
-        content: body.content,
-        preserve_frontmatter: body.preserve_frontmatter.unwrap_or(true),
-        modified_by: "http-api".into(),
-    };
-    let result = writer::rewrite_note(&store, &state.vault_path, &input)
-        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
-    let full_path = state.vault_path.join(&result.path);
-    record_write(&state.recent_writes, &full_path).await;
-    Ok(Json(serde_json::json!(result)))
-}
-
-async fn handle_edit_frontmatter(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Json(body): Json<EditFrontmatterBody>,
-) -> Result<impl IntoResponse, ApiError> {
-    authorize(&headers, &state, true)?;
-    if state.read_only {
-        return Err(ApiError::forbidden(
-            "Write operations disabled in read-only mode",
-        ));
-    }
-    let ops = parse_frontmatter_ops(&body.operations)?;
-    let store = state.store.lock().await;
-    let input = EditFrontmatterInput {
-        file: body.file,
-        operations: ops,
-        modified_by: "http-api".into(),
-    };
-    let result = writer::edit_frontmatter(&store, &state.vault_path, &input)
-        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
     let full_path = state.vault_path.join(&result.path);
     record_write(&state.recent_writes, &full_path).await;
     Ok(Json(serde_json::json!(result)))
@@ -945,7 +734,7 @@ async fn handle_edit_frontmatter(
 async fn handle_move(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(body): Json<MoveBody>,
+    Json(body): Json<crate::params::Move>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
     if state.read_only {
@@ -961,10 +750,13 @@ async fn handle_move(
     Ok(Json(serde_json::json!(result)))
 }
 
+/// Archive a note, or restore one previously archived with `undo: true`.
+/// Archiving and restoring are one operation and its reverse, so they are
+/// one capability with a flag rather than two routes (#62).
 async fn handle_archive(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(body): Json<ArchiveBody>,
+    Json(body): Json<crate::params::Archive>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
     if state.read_only {
@@ -973,65 +765,26 @@ async fn handle_archive(
         ));
     }
     let store = state.store.lock().await;
-    let result = writer::archive_note(
-        &body.file,
-        &store,
-        &state.vault_path,
-        state.profile.as_ref().as_ref(),
-    )
-    .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
-    let full_path = state.vault_path.join(&result.path);
-    record_write(&state.recent_writes, &full_path).await;
-    Ok(Json(serde_json::json!(result)))
-}
-
-async fn handle_unarchive(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Json(body): Json<UnarchiveBody>,
-) -> Result<impl IntoResponse, ApiError> {
-    authorize(&headers, &state, true)?;
-    if state.read_only {
-        return Err(ApiError::forbidden(
-            "Write operations disabled in read-only mode",
-        ));
-    }
-    let store = state.store.lock().await;
-    let mut embedder = state.embedder.lock().await;
-    let result = writer::unarchive_note(
-        &body.file,
-        &store,
-        &mut *embedder,
-        state.embed,
-        state.chunk_opts,
-        &state.vault_path,
-    )
-    .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
-    let full_path = state.vault_path.join(&result.path);
-    record_write(&state.recent_writes, &full_path).await;
-    Ok(Json(serde_json::json!(result)))
-}
-
-async fn handle_update_metadata(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Json(body): Json<UpdateMetadataBody>,
-) -> Result<impl IntoResponse, ApiError> {
-    authorize(&headers, &state, true)?;
-    if state.read_only {
-        return Err(ApiError::forbidden(
-            "Write operations disabled in read-only mode",
-        ));
-    }
-    let store = state.store.lock().await;
-    let input = UpdateMetadataInput {
-        file: body.file,
-        tags: body.tags,
-        aliases: body.aliases,
-        modified_by: "http-api".into(),
+    let result = if body.undo {
+        let mut embedder = state.embedder.lock().await;
+        writer::unarchive_note(
+            &body.file,
+            &store,
+            &mut *embedder,
+            state.embed,
+            state.chunk_opts,
+            &state.vault_path,
+        )
+        .map_err(|e| ApiError::internal(&format!("{e:#}")))?
+    } else {
+        writer::archive_note(
+            &body.file,
+            &store,
+            &state.vault_path,
+            state.profile.as_ref().as_ref(),
+        )
+        .map_err(|e| ApiError::internal(&format!("{e:#}")))?
     };
-    let result = writer::update_metadata(input, &store, &state.vault_path)
-        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
     let full_path = state.vault_path.join(&result.path);
     record_write(&state.recent_writes, &full_path).await;
     Ok(Json(serde_json::json!(result)))
@@ -1041,67 +794,59 @@ async fn handle_update_metadata(
 // Migration endpoint handlers
 // ---------------------------------------------------------------------------
 
-async fn handle_migrate_preview(
+async fn handle_migrate(
     State(state): State<ApiState>,
     headers: HeaderMap,
+    Json(body): Json<crate::params::Migrate>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
-    if state.read_only {
-        return Err(ApiError::forbidden(
-            "Write operations disabled in read-only mode",
-        ));
-    }
     let store = state.store.lock().await;
-    let profile_ref = state.profile.as_ref().as_ref();
-    let preview = crate::migrate::generate_preview(&store, &state.vault_path, profile_ref)
-        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
-    Ok(Json(serde_json::to_value(&preview).unwrap()))
-}
-
-#[derive(Deserialize)]
-struct MigrateApplyBody {
-    preview: serde_json::Value,
-}
-
-async fn handle_migrate_apply(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Json(body): Json<MigrateApplyBody>,
-) -> Result<impl IntoResponse, ApiError> {
-    authorize(&headers, &state, true)?;
-    if state.read_only {
-        return Err(ApiError::forbidden(
-            "Write operations disabled in read-only mode",
-        ));
+    // The CLI already took a mode. MCP and HTTP split it into three names,
+    // which is the same capability spelled three ways (#62). The mode is read
+    // before the read-only guard, so that one word means the same thing on
+    // both servers: `preview` writes nothing and runs, and a word that names
+    // no operation is answered as such rather than as a refused write.
+    match body.mode.as_str() {
+        "preview" => {
+            let profile_ref = state.profile.as_ref().as_ref();
+            let preview = crate::migrate::generate_preview(&store, &state.vault_path, profile_ref)
+                .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+            Ok(Json(serde_json::to_value(&preview).unwrap()))
+        }
+        "apply" => {
+            if state.read_only {
+                return Err(ApiError::forbidden(
+                    "Write operations disabled in read-only mode",
+                ));
+            }
+            let preview = crate::migrate::resolve_preview(body.preview)
+                .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
+            let result = crate::migrate::apply_preview(&preview, &store, &state.vault_path)
+                .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+            Ok(Json(serde_json::to_value(&result).unwrap()))
+        }
+        "undo" => {
+            if state.read_only {
+                return Err(ApiError::forbidden(
+                    "Write operations disabled in read-only mode",
+                ));
+            }
+            let result = crate::migrate::undo_last(&store, &state.vault_path)
+                .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+            Ok(Json(serde_json::to_value(&result).unwrap()))
+        }
+        // The mode is the caller's own text, so a word that names no
+        // operation is a bad request and not an internal fault.
+        other => Err(ApiError::bad_request(&format!(
+            "Unknown mode: {other}. Use 'preview', 'apply' or 'undo'."
+        ))),
     }
-    let store = state.store.lock().await;
-    let preview: crate::migrate::MigrationPreview = serde_json::from_value(body.preview)
-        .map_err(|e| ApiError::bad_request(&format!("Invalid preview: {e}")))?;
-    let result = crate::migrate::apply_preview(&preview, &store, &state.vault_path)
-        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
-    Ok(Json(serde_json::to_value(&result).unwrap()))
-}
-
-async fn handle_migrate_undo(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-) -> Result<impl IntoResponse, ApiError> {
-    authorize(&headers, &state, true)?;
-    if state.read_only {
-        return Err(ApiError::forbidden(
-            "Write operations disabled in read-only mode",
-        ));
-    }
-    let store = state.store.lock().await;
-    let result = crate::migrate::undo_last(&store, &state.vault_path)
-        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
-    Ok(Json(serde_json::to_value(&result).unwrap()))
 }
 
 async fn handle_delete(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(body): Json<DeleteBody>,
+    Json(body): Json<crate::params::Delete>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
     if state.read_only {
@@ -1110,10 +855,7 @@ async fn handle_delete(
         ));
     }
     let store = state.store.lock().await;
-    let mode = match body.mode.as_deref().unwrap_or("soft") {
-        "hard" => DeleteMode::Hard,
-        _ => DeleteMode::Soft,
-    };
+    let mode = DeleteMode::from(body.mode);
     let archive_folder = state
         .profile
         .as_ref()
@@ -1124,55 +866,83 @@ async fn handle_delete(
         .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
     Ok(Json(serde_json::json!({
         "deleted": body.file,
-        "mode": body.mode.as_deref().unwrap_or("soft"),
+        "mode": body.mode,
+    })))
+}
+
+/// Index the server's vault.
+///
+/// An agent that writes a batch of notes needs a way to rebuild the whole
+/// index, and a multi-minute call is acceptable for that (#62). It writes the
+/// index, so it takes the write permission; the vault it walks is the one the
+/// server was started on, and no caller-supplied path reaches it.
+async fn handle_index(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(body): Json<crate::params::Index>,
+) -> Result<impl IntoResponse, ApiError> {
+    authorize(&headers, &state, true)?;
+    // A read-only server refuses it like any other write, the way MCP's
+    // `index` does: `rebuild: true` discards the index before it builds one
+    // again, so this destroys derived state and stalls every other call while
+    // it runs (#62).
+    if state.read_only {
+        return Err(ApiError::forbidden(
+            "Write operations disabled in read-only mode",
+        ));
+    }
+    let store = state.store.lock().await;
+    let mut embedder = state.embedder.lock().await;
+    let mut config = crate::config::Config::load().unwrap_or_default();
+    // The chunker settings come from the session, for the reason
+    // `handle_reindex_file` gives: one store holds one chunking.
+    config.set_chunk_options(state.chunk_opts);
+    if body.no_gitignore {
+        config.respect_gitignore = false;
+    }
+    let result = crate::indexer::run_index_shared(
+        &state.vault_path,
+        &config,
+        &store,
+        &mut *embedder,
+        body.rebuild,
+        state.profile.as_ref().as_ref(),
+    )
+    .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    Ok(Json(serde_json::json!({
+        "new_files": result.new_files,
+        "updated_files": result.updated_files,
+        "deleted_files": result.deleted_files,
+        "total_chunks": result.total_chunks,
+        "duration_secs": result.duration.as_secs_f64(),
     })))
 }
 
 async fn handle_reindex_file(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(body): Json<ReindexFileBody>,
+    Json(body): Json<crate::params::ReindexFile>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
     let store = state.store.lock().await;
     let mut embedder = state.embedder.lock().await;
-    let full_path = state.vault_path.join(&body.file);
 
-    let content = std::fs::read_to_string(&full_path)
-        .map_err(|e| ApiError::internal(&format!("Cannot read file {}: {e}", body.file)))?;
-
-    let content_hash = {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(content.as_bytes());
-        format!("{:x}", hasher.finalize())
-    };
-
-    let mut config = crate::config::Config::load().unwrap_or_default();
-    // The chunker settings come from the session, not from this load: a load
-    // that fails falls back to the defaults, and one file re-chunked at
-    // settings the rest of the store was not built at is a set of rows nothing
-    // downstream can tell apart. Carrying the captured value is what
-    // `ChunkOptions` exists to give.
-    config.set_chunk_options(state.chunk_opts);
-
-    let result = crate::indexer::index_file(
+    // One helper packages the six steps this used to spell out, so the three
+    // callers cannot drift apart (#62). A file the server cannot read is the
+    // caller's own text naming nothing, which is the 400 the neighbouring
+    // handlers answer for that class (#60).
+    let result = crate::indexer::reindex_written_file(
         &body.file,
-        &content,
-        &content_hash,
         &store,
         &mut *embedder,
         &state.vault_path,
-        &config,
+        state.embed,
+        state.chunk_opts,
     )
-    .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
-
-    // Outgoing only — see issue #27.
-    store
-        .delete_outgoing_edges_for_file(result.file_id)
-        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
-    crate::indexer::build_edges_for_file(&store, result.file_id, &content)
-        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    .map_err(|e| match e.downcast_ref::<std::io::Error>() {
+        Some(_) => ApiError::bad_request(&format!("Cannot read file {}: {e:#}", body.file)),
+        None => ApiError::internal(&format!("{e:#}")),
+    })?;
 
     Ok(Json(serde_json::json!({
         "file": body.file,
@@ -1182,34 +952,64 @@ async fn handle_reindex_file(
 }
 
 // ---------------------------------------------------------------------------
-// Identity / setup endpoint handlers
+// Identity / init endpoint handlers
 // ---------------------------------------------------------------------------
 
+/// The identity block, optionally re-extracted first.
+///
+/// `refresh` is a parameter of the capability on every surface (#62). It
+/// re-reads the L1 facts from the store the server already holds, so an agent
+/// whose session started before the last write can ask for current ones
+/// without a full re-index.
 async fn handle_identity(
     State(state): State<ApiState>,
     headers: HeaderMap,
+    Query(p): Query<crate::params::Identity>,
 ) -> Result<impl IntoResponse, ApiError> {
-    authorize(&headers, &state, false)?;
+    // Re-extraction clears the `identity_facts` rows and derives them again,
+    // so it takes the write permission and a read-only server refuses it; the
+    // block itself is a read either way.
+    authorize(&headers, &state, p.refresh)?;
+    if p.refresh && state.read_only {
+        return Err(ApiError::forbidden(
+            "Write operations disabled in read-only mode",
+        ));
+    }
     let store = state.store.lock().await;
+    if p.refresh {
+        let profile = state.profile.as_ref().as_ref().ok_or_else(|| {
+            ApiError::bad_request("No vault profile found. Run `engraph init` first.")
+        })?;
+        crate::identity::extract_l1_facts(&store, profile)
+            .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    }
     let config = crate::config::Config::load().unwrap_or_default();
     let block = crate::identity::format_identity_block(&config, &store)
         .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
     Ok(Json(serde_json::json!({ "identity": block })))
 }
 
-async fn handle_setup(
+async fn handle_init(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(body): Json<SetupBody>,
+    Json(body): Json<crate::params::Init>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
-    match body.mode.as_str() {
-        "detect" => {
+    match body.mode.as_deref() {
+        Some("detect") => {
             let result = crate::onboarding::run_detect_json(&state.vault_path)
                 .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
             Ok(Json(result))
         }
-        "apply" => {
+        Some("apply") => {
+            // `apply` indexes the vault, which is the work `index` is guarded
+            // against on a read-only server. The mode is read first, so
+            // `detect` — which writes nothing — still runs (#62).
+            if state.read_only {
+                return Err(ApiError::forbidden(
+                    "Write operations disabled in read-only mode",
+                ));
+            }
             let mut config = crate::config::Config::load().unwrap_or_default();
             let data_dir = crate::config::Config::data_dir()
                 .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
@@ -1225,9 +1025,15 @@ async fn handle_setup(
                     .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
             Ok(Json(result))
         }
-        other => Err(ApiError::bad_request(&format!(
+        Some(other) => Err(ApiError::bad_request(&format!(
             "Unknown mode: {other}. Use 'detect' or 'apply'."
         ))),
+        // A server has no interactive flow, so `init` there needs a mode.
+        // The CLI's no-mode form is its own prompt sequence and reaches no
+        // surface but the CLI (#62).
+        None => Err(ApiError::bad_request(
+            "init needs mode=detect or mode=apply",
+        )),
     }
 }
 
@@ -1289,6 +1095,10 @@ mod tests {
     }
 
     fn test_api_state() -> ApiState {
+        test_api_state_at(PathBuf::from("/tmp/test-vault"))
+    }
+
+    fn test_api_state_at(vault_path: PathBuf) -> ApiState {
         let store = Store::open_memory().expect("in-memory store");
         let config = test_http_config();
         let rate_limiter = Arc::new(RateLimiter::new(config.rate_limit));
@@ -1297,7 +1107,7 @@ mod tests {
             embedder: Arc::new(Mutex::new(
                 Box::new(DummyEmbedder) as Box<dyn EmbedModel + Send>
             )),
-            vault_path: Arc::new(PathBuf::from("/tmp/test-vault")),
+            vault_path: Arc::new(vault_path),
             profile: Arc::new(None),
             reranker: None,
             http_config: Arc::new(config),
@@ -1307,6 +1117,7 @@ mod tests {
             read_only: false,
             max_chunks_per_file: crate::config::default_max_chunks_per_file(),
             group_by: crate::config::GroupBy::default(),
+            top_n: crate::config::Config::default().top_n,
             rerank: crate::config::RerankConfig::default(),
             ranking: crate::config::RankingConfig::default(),
             lane_weights: crate::config::LaneWeights::default(),
@@ -1445,6 +1256,45 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// `status` reads and writes nothing, so a read key reaches it and no key
+    /// does not (#62).
+    #[tokio::test]
+    async fn status_takes_the_read_permission() {
+        let state = test_api_state();
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// `index` writes the index, so a read key is refused before the walk
+    /// starts (#62).
+    #[tokio::test]
+    async fn index_takes_the_write_permission() {
+        let state = test_api_state();
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/index")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer eg_readkey")
+                    .body(Body::from(r#"{}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
@@ -1719,11 +1569,11 @@ mod tests {
             .oneshot(
                 axum::http::Request::builder()
                     .method("POST")
-                    .uri("/api/edit")
+                    .uri("/api/update")
                     .header("content-type", "application/json")
                     .header("authorization", "Bearer eg_writekey")
                     .body(Body::from(
-                        r#"{"file":"nonexistent","heading":"Test","content":"new"}"#,
+                        r#"{"file":"nonexistent","edits":[{"section":"Test","mode":"append","content":"new"}]}"#,
                     ))
                     .unwrap(),
             )
@@ -1836,5 +1686,531 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // -----------------------------------------------------------------------
+    // Mode routing (#62)
+    // -----------------------------------------------------------------------
+
+    /// POST `body` to `path` as a writer, and return the status and the body.
+    async fn post_json(state: ApiState, path: &str, body: &str) -> (StatusCode, serde_json::Value) {
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer eg_writekey")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn each_migrate_mode_reaches_the_operation_it_names() {
+        // One name takes three modes (#62), so the one thing worth proving is
+        // that each mode string still arrives at the operation it names.
+        // Each answer below can come from one of the three and no other.
+
+        // `preview` classifies: an empty index proposes no move, and the
+        // response is a preview and not a result.
+        let (status, body) =
+            post_json(test_api_state(), "/api/migrate", r#"{"mode":"preview"}"#).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.get("files").is_some(), "not a preview: {body}");
+        assert_eq!(body["files"].as_array().unwrap().len(), 0);
+
+        // `apply` executes the preview it is given: this one moves nothing,
+        // and it answers with that preview's own id.
+        let (status, body) = post_json(
+            test_api_state(),
+            "/api/migrate",
+            r#"{"mode":"apply","preview":{"migration_id":"m-14","files":[],"uncertain":[],"skipped":0}}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["migration_id"], "m-14");
+        assert_eq!(body["moved"], 0);
+
+        // `undo` reads the migration log, which this store has no row in.
+        let (status, body) =
+            post_json(test_api_state(), "/api/migrate", r#"{"mode":"undo"}"#).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("No migration to undo"),
+            "not the undo path: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_refuses_the_migrate_modes_that_write_and_no_others() {
+        // One name now carries all three modes, so the guard belongs to the
+        // modes that write and not to the route. `preview` writes nothing, so
+        // it runs here as it does on MCP, and an unknown mode is still
+        // answered as an unknown mode (#62).
+        let mut state = test_api_state();
+        state.read_only = true;
+        let (status, _) = post_json(state, "/api/migrate", r#"{"mode":"preview"}"#).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let mut state = test_api_state();
+        state.read_only = true;
+        let (status, _) = post_json(
+            state,
+            "/api/migrate",
+            r#"{"mode":"apply","preview":{"migration_id":"m","files":[],"uncertain":[],"skipped":0}}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let mut state = test_api_state();
+        state.read_only = true;
+        let (status, _) = post_json(state, "/api/migrate", r#"{"mode":"undo"}"#).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let mut state = test_api_state();
+        state.read_only = true;
+        let (status, body) = post_json(state, "/api/migrate", r#"{"mode":"sideways"}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body["error"],
+            "Unknown mode: sideways. Use 'preview', 'apply' or 'undo'."
+        );
+    }
+
+    #[tokio::test]
+    async fn a_migrate_mode_naming_nothing_is_a_bad_request() {
+        // The mode is the caller's own text, so a word that names no
+        // operation is a 400 and not a 500 (#62).
+        let (status, body) =
+            post_json(test_api_state(), "/api/migrate", r#"{"mode":"sideways"}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body["error"],
+            "Unknown mode: sideways. Use 'preview', 'apply' or 'undo'."
+        );
+    }
+
+    #[tokio::test]
+    async fn init_detect_reaches_detection_and_writes_nothing() {
+        // `detect` is the half of `init` a server can run without touching
+        // the vault (#62): it reports what it found and leaves no file.
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(vault.path().join("note.md"), "# Note\n").unwrap();
+        let (status, body) = post_json(
+            test_api_state_at(vault.path().to_path_buf()),
+            "/api/init",
+            r#"{"mode":"detect"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.get("structure").is_some(), "not a detection: {body}");
+        let left: Vec<_> = std::fs::read_dir(vault.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left.len(), 1, "detect wrote something: {left:?}");
+    }
+
+    #[tokio::test]
+    async fn init_without_a_mode_is_a_bad_request() {
+        // A server has no interactive flow, so the CLI's no-mode form has no
+        // meaning here (#62).
+        let (status, body) = post_json(test_api_state(), "/api/init", r#"{}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "init needs mode=detect or mode=apply");
+    }
+
+    #[tokio::test]
+    async fn an_init_mode_naming_nothing_is_a_bad_request() {
+        let (status, body) =
+            post_json(test_api_state(), "/api/init", r#"{"mode":"sideways"}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body["error"],
+            "Unknown mode: sideways. Use 'detect' or 'apply'."
+        );
+    }
+
+    /// One result with every field filled. The envelope is what the test
+    /// asserts on, so the values themselves carry no meaning (#62).
+    fn sample_result() -> search::InternalSearchResult {
+        search::InternalSearchResult {
+            file_path: "Notes/Warding.md".to_string(),
+            file_id: 7,
+            chunk_seq: 2,
+            score: 0.5,
+            confidence: 0.75,
+            heading: Some("Level 4 Silence".to_string()),
+            snippet: "a snippet".to_string(),
+            docid: Some("a1b2c3".to_string()),
+        }
+    }
+
+    #[test]
+    fn a_search_response_carries_its_results_and_its_message() {
+        let empty = search_response(&[], None);
+        assert_eq!(empty["results"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            empty["message"].as_str().unwrap(),
+            crate::ranking::NO_RELEVANT_CONTENT
+        );
+        assert!(empty.get("explain").is_none());
+
+        let one = search_response(std::slice::from_ref(&sample_result()), None);
+        assert_eq!(one["results"].as_array().unwrap().len(), 1);
+        assert!(one["message"].is_null());
+
+        let explained = search_response(&[], Some("--- Query run ---\n".to_string()));
+        assert_eq!(
+            explained["explain"].as_str().unwrap(),
+            "--- Query run ---\n"
+        );
+    }
+
+    /// A vault of two notes, indexed in memory. The mock's vectors are hashes,
+    /// so the keyword lane carries the meaning here — which is all a
+    /// granularity assertion needs.
+    fn indexed_state() -> (tempfile::TempDir, ApiState) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("rules")).unwrap();
+        std::fs::write(
+            root.join("rules/abjuration-spells.md"),
+            "# Abjuration\n\n\
+             ## Level 3 Counterspell\n\nA warding effect that stops a spell mid-cast. \
+             It interrupts the casting itself and does nothing to a spell already in effect.\n\n\
+             ## Level 5 Dispel Magic\n\nA warding effect that ends an ongoing spell. \
+             It reaches an effect already in place and cannot interrupt one \
+             that is still being cast, which is the whole of the difference.\n\n\
+             ## Level 9 Dimensional Anchor\n\nA warding effect that pins a creature. \
+             It closes every route out of the space the creature \
+             currently stands in, and it does not care how that route was opened.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("rules/evocation-spells.md"),
+            "# Evocation\n\n## Level 1 Firebolt\n\nA bolt of flame.\n",
+        )
+        .unwrap();
+
+        let store = Store::open_memory().unwrap();
+        let mut embedder = crate::llm::MockLlm::new(256);
+        crate::indexer::run_index_shared(
+            root,
+            &crate::config::Config::default(),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let mut state = test_api_state_at(root.to_path_buf());
+        state.store = Arc::new(Mutex::new(store));
+        state.embedder = Arc::new(Mutex::new(Box::new(embedder) as Box<dyn EmbedModel + Send>));
+        (tmp, state)
+    }
+
+    /// How many sections of the one file that holds three matching ones came
+    /// back.
+    fn sections_of_the_abjuration_note(body: &serde_json::Value) -> usize {
+        body["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["file_path"] == "rules/abjuration-spells.md")
+            .count()
+    }
+
+    #[tokio::test]
+    async fn a_search_takes_its_granularity_from_the_call() {
+        // `group_by` is per call, with the process setting as the default
+        // (#62). The server here is started on `file`, so a call that names
+        // `chunk` proves the override rather than the default.
+        let (_tmp, mut state) = indexed_state();
+        state.group_by = crate::config::GroupBy::File;
+
+        let (status, body) =
+            post_json(state.clone(), "/api/search", r#"{"query":"warding"}"#).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(sections_of_the_abjuration_note(&body), 1, "got {body}");
+
+        let (status, body) = post_json(
+            state,
+            "/api/search",
+            r#"{"query":"warding","group_by":"chunk"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(sections_of_the_abjuration_note(&body) > 1, "got {body}");
+    }
+
+    #[tokio::test]
+    async fn the_per_lane_detail_answers_the_call_that_asked_for_it() {
+        // `explain` is per call on all three surfaces (#62). A caller that did
+        // not ask reads no explain field at all, so the detail costs the
+        // callers who did not want it nothing.
+        let (_tmp, state) = indexed_state();
+        let (status, body) =
+            post_json(state.clone(), "/api/search", r#"{"query":"warding"}"#).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.get("explain").is_none());
+
+        let (status, body) = post_json(
+            state,
+            "/api/search",
+            r#"{"query":"warding","explain":true}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body["explain"]
+                .as_str()
+                .unwrap()
+                .contains("--- Query run ---")
+        );
+    }
+
+    /// A section the note does not hold is the caller's own text naming
+    /// nothing, so it is a 400 and not the 500 every error on this route used
+    /// to answer. It is the first error an agent using the newly documented
+    /// `section` parameter meets (#60, #62).
+    #[tokio::test]
+    async fn a_read_of_a_section_the_note_does_not_hold_is_a_bad_request() {
+        let (_tmp, state) = indexed_state();
+
+        let response = get(
+            state.clone(),
+            "/api/read?file=rules/abjuration-spells.md&section=Level%203%20Counterspell",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = get(
+            state.clone(),
+            "/api/read?file=rules/abjuration-spells.md&section=Nowhere",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // A file the vault does not hold is the same class of mistake.
+        let response = get(state, "/api/read?file=nowhere.md").await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// `archive` and `archive {undo: true}` are one operation and its reverse
+    /// (#62). The handler's own branch chooses `archive_note` against
+    /// `unarchive_note`, and nothing else covers it — an inverted branch would
+    /// move the file the opposite way with the whole suite green.
+    #[tokio::test]
+    async fn the_undo_flag_chooses_the_operation_it_names() {
+        let (_tmp, state) = indexed_state();
+        let vault = state.vault_path.as_ref().clone();
+        let live = vault.join("rules/evocation-spells.md");
+        let archived = vault.join("04-Archive/rules/evocation-spells.md");
+        assert!(live.exists());
+
+        let (status, _) = post_json(
+            state.clone(),
+            "/api/archive",
+            r#"{"file":"rules/evocation-spells.md"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!live.exists(), "undo: false must archive");
+        assert!(archived.exists(), "undo: false must archive");
+
+        let (status, _) = post_json(
+            state,
+            "/api/archive",
+            r#"{"file":"04-Archive/rules/evocation-spells.md","undo":true}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(live.exists(), "undo: true must restore");
+        assert!(!archived.exists(), "undo: true must restore");
+    }
+
+    /// A read-only server refuses `index` the way MCP's `index` refuses it:
+    /// `rebuild: true` discards derived state and stalls every other call
+    /// while it runs (#62).
+    #[tokio::test]
+    async fn a_read_only_server_refuses_index() {
+        let mut state = test_api_state();
+        state.read_only = true;
+        let (status, _) = post_json(state, "/api/index", r#"{}"#).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    /// `init {mode: apply}` indexes the vault, which is the work `index` is
+    /// guarded against. `detect` writes nothing and still runs (#62).
+    #[tokio::test]
+    async fn a_read_only_server_refuses_init_apply_and_runs_init_detect() {
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(vault.path().join("note.md"), "# Note\n").unwrap();
+
+        let mut state = test_api_state_at(vault.path().to_path_buf());
+        state.read_only = true;
+        let (status, _) = post_json(state, "/api/init", r#"{"mode":"apply"}"#).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let mut state = test_api_state_at(vault.path().to_path_buf());
+        state.read_only = true;
+        let (status, _) = post_json(state, "/api/init", r#"{"mode":"detect"}"#).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// A server's `apply` acts on the plan its caller sends and no other. The
+    /// copy `engraph migrate --mode preview` saves belongs to the CLI's own
+    /// two-step flow, and an `apply` that fell back to it would move files
+    /// against a plan this caller never saw (#62).
+    #[tokio::test]
+    async fn a_migrate_apply_with_no_preview_is_a_bad_request() {
+        let (status, body) =
+            post_json(test_api_state(), "/api/migrate", r#"{"mode":"apply"}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body["error"].as_str().unwrap().contains("needs a preview"),
+            "got {body}"
+        );
+    }
+
+    /// `identity` takes `refresh` on every surface (#62). Before this the
+    /// route had no extractor at all, so the flag the CLI honoured had no
+    /// spelling here. `extract_l1_facts` clears tier 1 before it derives it
+    /// again, so a stale fact seeded first is what proves the call was made.
+    #[tokio::test]
+    async fn identity_refresh_re_extracts_the_l1_facts() {
+        let (_tmp, mut state) = indexed_state();
+        let root = state.vault_path.as_ref().clone();
+        state.profile = Arc::new(Some(crate::profile::VaultProfile {
+            vault_path: root,
+            vault_type: crate::profile::VaultType::Obsidian,
+            structure: crate::profile::StructureDetection {
+                method: crate::profile::StructureMethod::Para,
+                folders: crate::profile::FolderMap::default(),
+            },
+            stats: crate::profile::VaultStats::default(),
+        }));
+
+        let stale = |state: &ApiState| {
+            let store = state.store.try_lock().expect("uncontended");
+            store
+                .get_identity_facts(1)
+                .unwrap()
+                .into_iter()
+                .any(|f| f.key == "stale")
+        };
+        {
+            let store = state.store.try_lock().expect("uncontended");
+            store
+                .upsert_identity_fact(1, "stale", "from an older session", None)
+                .unwrap();
+        }
+        assert!(stale(&state));
+
+        // A read key reaches the block itself and no re-extraction happens.
+        let response = get(state.clone(), "/api/identity").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(stale(&state), "a call that did not ask re-extracts nothing");
+
+        // Re-extraction writes rows, so a read key is refused.
+        let response = get(state.clone(), "/api/identity?refresh=true").await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(stale(&state));
+
+        let response = build_router(state.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/identity?refresh=true")
+                    .header("authorization", "Bearer eg_writekey")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!stale(&state), "refresh=true must re-derive tier 1");
+    }
+
+    /// Five notes that all answer one query. Five is more than the `top_n` the
+    /// R21 test configures, so a truncation reads as a truncation and not as a
+    /// corpus that had no more to give (#62). Each body is well over
+    /// `chunk_min_chars`, so each note is one chunk of its own.
+    fn state_over_five_answering_notes() -> (tempfile::TempDir, ApiState) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        for (i, subject) in ["counterspell", "dispel", "anchor", "ward", "seal"]
+            .iter()
+            .enumerate()
+        {
+            std::fs::write(
+                root.join(format!("{i}-{subject}.md")),
+                format!(
+                    "# The {subject} rule\n\nA warding effect. Every warding effect in this \
+                     ruleset states what it stops, when it may be cast, and what it leaves \
+                     alone, and the {subject} rule is one of them among several others.\n"
+                ),
+            )
+            .unwrap();
+        }
+
+        let store = Store::open_memory().unwrap();
+        let mut embedder = crate::llm::MockLlm::new(256);
+        crate::indexer::run_index_shared(
+            root,
+            &crate::config::Config::default(),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let mut state = test_api_state_at(root.to_path_buf());
+        state.store = Arc::new(Mutex::new(store));
+        state.embedder = Arc::new(Mutex::new(Box::new(embedder) as Box<dyn EmbedModel + Send>));
+        (tmp, state)
+    }
+
+    /// R21 (#62): the number of results a call that names no `top_n` gets is
+    /// the configured one, and not a literal this server holds. A state built
+    /// at three answers three, and the same state answers more when the call
+    /// asks for more — which is what separates the configured default from a
+    /// corpus that ran out.
+    #[tokio::test]
+    async fn a_search_that_names_no_top_n_gets_the_configured_number() {
+        let (_tmp, mut state) = state_over_five_answering_notes();
+        state.top_n = 3;
+
+        let (status, body) =
+            post_json(state.clone(), "/api/search", r#"{"query":"warding"}"#).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["results"].as_array().unwrap().len(),
+            3,
+            "the configured top_n is 3, got {body}"
+        );
+
+        let (status, body) =
+            post_json(state, "/api/search", r#"{"query":"warding","top_n":5}"#).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body["results"].as_array().unwrap().len() > 3,
+            "the corpus holds more than three answers, got {body}"
+        );
     }
 }

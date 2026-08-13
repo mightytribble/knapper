@@ -3,14 +3,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, ServerCapabilities, ServerInfo};
-use rmcp::schemars;
-use rmcp::schemars::JsonSchema;
 use rmcp::{ErrorData as McpError, ServiceExt, tool, tool_handler, tool_router};
-use serde::Deserialize;
 use tokio::sync::Mutex;
 
 use crate::config::Config;
@@ -19,241 +16,6 @@ use crate::llm::{EmbedModel, RerankModel};
 use crate::profile::VaultProfile;
 use crate::search;
 use crate::store::Store;
-use crate::writer::FrontmatterOp;
-
-// ---------------------------------------------------------------------------
-// Parameter structs
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct SearchParams {
-    /// The search query.
-    pub query: String,
-    /// Number of results (default 10).
-    pub top_n: Option<usize>,
-    /// Filter to notes with all listed tags. Alias of `all`.
-    pub tags: Option<Vec<String>>,
-    /// Notes carrying every term. A term is a tag path; a trailing `/` or
-    /// `/*` matches the tag and its descendants. An unknown term is an error
-    /// naming the nearest tag the vault holds.
-    pub all: Option<Vec<String>>,
-    /// Notes carrying at least one of these terms. An unknown term is an
-    /// error naming the nearest tag the vault holds.
-    pub any: Option<Vec<String>>,
-    /// Notes carrying none of these terms. An unknown term here is ignored.
-    pub none: Option<Vec<String>>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct ReadParams {
-    /// File path, basename, or #docid.
-    pub file: String,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct ListParams {
-    /// Filter to folder path prefix.
-    pub folder: Option<String>,
-    /// Filter to notes with all listed tags. Alias of `all`.
-    pub tags: Option<Vec<String>>,
-    /// Notes carrying every term. A term is a tag path; a trailing `/` or
-    /// `/*` matches the tag and its descendants. An unknown term is an error
-    /// naming the nearest tag the vault holds.
-    pub all: Option<Vec<String>>,
-    /// Notes carrying at least one of these terms. An unknown term is an
-    /// error naming the nearest tag the vault holds.
-    pub any: Option<Vec<String>>,
-    /// Notes carrying none of these terms. An unknown term here is ignored.
-    pub none: Option<Vec<String>>,
-    /// Filter to notes created by a specific agent.
-    pub created_by: Option<String>,
-    /// Maximum results (default 20). Raising it adds results below the same
-    /// ranking; it does not change what the top of the ranking holds.
-    pub limit: Option<usize>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct TagsParams {
-    /// Limit to one tag and its descendants, as `type/` or `type/*`. Omit
-    /// for the whole vocabulary.
-    pub under: Option<String>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct WhoParams {
-    /// Person name (matches filename in People folder).
-    pub name: String,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct ProjectParams {
-    /// Project name (matches filename).
-    pub name: String,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct ContextToolParams {
-    /// Search query for the topic.
-    pub topic: String,
-    /// Character budget (default 32000).
-    pub budget: Option<usize>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct CreateParams {
-    /// Note content (markdown body).
-    pub content: String,
-    /// Optional filename (without .md). Auto-generated if omitted.
-    pub filename: Option<String>,
-    /// Type hint for placement: "person", "daily", "meeting", "decision".
-    pub type_hint: Option<String>,
-    /// Proposed tags (auto-resolved against registry).
-    pub tags: Option<Vec<String>>,
-    /// Explicit folder path (skips placement engine).
-    pub folder: Option<String>,
-    /// Set to false to skip automatic wikilink resolution. Defaults to true.
-    pub auto_link: Option<bool>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct AppendParams {
-    /// Target note: file path, basename, or #docid.
-    pub file: String,
-    /// Content to append to the note.
-    pub content: String,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct UpdateMetadataParams {
-    /// Target note: file path, basename, or #docid.
-    pub file: String,
-    /// New tags (replaces existing).
-    pub tags: Option<Vec<String>>,
-    /// New aliases.
-    pub aliases: Option<Vec<String>>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct MoveNoteParams {
-    /// Target note: file path, basename, or #docid.
-    pub file: String,
-    /// New folder path (relative to vault root).
-    pub new_folder: String,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct ArchiveParams {
-    /// Target note: file path, basename, or #docid.
-    pub file: String,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct UnarchiveParams {
-    /// Archived note path (e.g., "04-Archive/01-Projects/note.md").
-    pub file: String,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct ReadSectionParams {
-    /// Target note: file path, basename, or #docid.
-    pub file: String,
-    /// Section heading to read (case-insensitive).
-    pub heading: String,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct HealthParams {}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct MigratePreviewParams {}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct MigrateApplyParams {
-    /// Migration preview JSON (from migrate_preview).
-    pub preview: serde_json::Value,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct MigrateUndoParams {}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct EditParams {
-    /// Target note: file path, basename, or #docid.
-    pub file: String,
-    /// Section heading to edit (case-insensitive).
-    pub heading: String,
-    /// Content to add/replace in the section.
-    pub content: String,
-    /// Edit mode: "replace", "prepend", or "append" (default: "append").
-    pub mode: Option<String>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct RewriteParams {
-    /// Target note: file path, basename, or #docid.
-    pub file: String,
-    /// New body content (replaces everything below frontmatter).
-    pub content: String,
-    /// Whether to preserve existing frontmatter (default: true).
-    pub preserve_frontmatter: Option<bool>,
-}
-
-/// Operation kind for frontmatter edits.
-#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum FrontmatterOpKind {
-    Set,
-    Remove,
-    AddTag,
-    RemoveTag,
-    AddAlias,
-    RemoveAlias,
-}
-
-/// A single frontmatter operation.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct FrontmatterOpInput {
-    /// Operation type.
-    pub op: FrontmatterOpKind,
-    /// Property key (required for "set" and "remove").
-    pub key: Option<String>,
-    /// Value (required for "set", "add_tag", "remove_tag", "add_alias", "remove_alias").
-    pub value: Option<String>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct EditFrontmatterParams {
-    /// Target note: file path, basename, or #docid.
-    pub file: String,
-    /// Operations to apply. Array of objects like {"op": "add_tag", "value": "rust"} or {"op": "set", "key": "status", "value": "done"} or {"op": "remove", "key": "status"} or {"op": "remove_tag", "value": "old"}.
-    pub operations: Vec<FrontmatterOpInput>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct DeleteParams {
-    /// Target note: file path, basename, or #docid.
-    pub file: String,
-    /// Delete mode: "soft" (archive, default) or "hard" (permanent).
-    pub mode: Option<String>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct ReindexFileParams {
-    /// File path relative to vault root (e.g. "07-Daily/2026-04-10.md").
-    pub file: String,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct SetupParams {
-    /// Mode: "detect" to inspect vault, "apply" to configure identity and index.
-    pub mode: String,
-    /// User name (required for apply mode).
-    pub name: Option<String>,
-    /// User role (required for apply mode).
-    pub role: Option<String>,
-    /// Vault purpose (optional for apply mode).
-    pub purpose: Option<String>,
-}
 
 // ---------------------------------------------------------------------------
 // Server
@@ -281,6 +43,10 @@ pub struct EngraphServer {
     /// same result shape the CLI does.
     max_chunks_per_file: usize,
     group_by: crate::config::GroupBy,
+    /// How many results a call that names no `top_n` gets. It comes from
+    /// `config.toml`, the way the CLI's does: a default that differs per
+    /// surface is the last place one query answers two ways (#62).
+    top_n: usize,
     /// Rerank-lane settings from `config.toml`.
     rerank: crate::config::RerankConfig,
     /// Ranking-stage settings from `config.toml`.
@@ -336,104 +102,21 @@ async fn record_write(recent_writes: &RecentWrites, path: &Path) {
     }
 }
 
-/// Convert typed operation inputs into `Vec<FrontmatterOp>`.
-fn parse_frontmatter_ops(
-    operations: &[FrontmatterOpInput],
-) -> Result<Vec<FrontmatterOp>, McpError> {
-    let mut ops = Vec::with_capacity(operations.len());
-    for input in operations {
-        let op = match input.op {
-            FrontmatterOpKind::Set => {
-                let key = input.key.as_deref().ok_or_else(|| {
-                    McpError::new(
-                        rmcp::model::ErrorCode::INVALID_PARAMS,
-                        "\"set\" operation requires a \"key\" field",
-                        None::<serde_json::Value>,
-                    )
-                })?;
-                let value = input.value.as_deref().ok_or_else(|| {
-                    McpError::new(
-                        rmcp::model::ErrorCode::INVALID_PARAMS,
-                        "\"set\" operation requires a \"value\" field",
-                        None::<serde_json::Value>,
-                    )
-                })?;
-                FrontmatterOp::Set(key.to_string(), value.to_string())
-            }
-            FrontmatterOpKind::Remove => {
-                let key = input.key.as_deref().ok_or_else(|| {
-                    McpError::new(
-                        rmcp::model::ErrorCode::INVALID_PARAMS,
-                        "\"remove\" operation requires a \"key\" field",
-                        None::<serde_json::Value>,
-                    )
-                })?;
-                FrontmatterOp::Remove(key.to_string())
-            }
-            FrontmatterOpKind::AddTag => {
-                let value = input.value.as_deref().ok_or_else(|| {
-                    McpError::new(
-                        rmcp::model::ErrorCode::INVALID_PARAMS,
-                        "\"add_tag\" operation requires a \"value\" field",
-                        None::<serde_json::Value>,
-                    )
-                })?;
-                FrontmatterOp::AddTag(value.to_string())
-            }
-            FrontmatterOpKind::RemoveTag => {
-                let value = input.value.as_deref().ok_or_else(|| {
-                    McpError::new(
-                        rmcp::model::ErrorCode::INVALID_PARAMS,
-                        "\"remove_tag\" operation requires a \"value\" field",
-                        None::<serde_json::Value>,
-                    )
-                })?;
-                FrontmatterOp::RemoveTag(value.to_string())
-            }
-            FrontmatterOpKind::AddAlias => {
-                let value = input.value.as_deref().ok_or_else(|| {
-                    McpError::new(
-                        rmcp::model::ErrorCode::INVALID_PARAMS,
-                        "\"add_alias\" operation requires a \"value\" field",
-                        None::<serde_json::Value>,
-                    )
-                })?;
-                FrontmatterOp::AddAlias(value.to_string())
-            }
-            FrontmatterOpKind::RemoveAlias => {
-                let value = input.value.as_deref().ok_or_else(|| {
-                    McpError::new(
-                        rmcp::model::ErrorCode::INVALID_PARAMS,
-                        "\"remove_alias\" operation requires a \"value\" field",
-                        None::<serde_json::Value>,
-                    )
-                })?;
-                FrontmatterOp::RemoveAlias(value.to_string())
-            }
-        };
-        ops.push(op);
-    }
-    Ok(ops)
-}
-
-#[tool_router]
+#[tool_router(vis = "pub(crate)")]
 impl EngraphServer {
     #[tool(
         name = "search",
         description = "Semantic + keyword hybrid search across the vault. Returns ranked results with file paths, scores, headings, and snippets."
     )]
-    async fn search(&self, params: Parameters<SearchParams>) -> Result<CallToolResult, McpError> {
-        let top_n = params.0.top_n.unwrap_or(10);
-        let all_terms = crate::tags::merge_all_alias(
-            params.0.tags.unwrap_or_default(),
-            params.0.all.unwrap_or_default(),
-        );
-        let scope = crate::tags::TagFilter::parse(
-            &all_terms,
-            &params.0.any.unwrap_or_default(),
-            &params.0.none.unwrap_or_default(),
-        )
-        .map_err(|e| mcp_err(&e))?;
+    async fn search(
+        &self,
+        params: Parameters<crate::params::Search>,
+    ) -> Result<CallToolResult, McpError> {
+        // Per call, with the configured default behind it (#62).
+        let top_n = params.0.top_n.unwrap_or(self.top_n);
+        let all_terms = crate::tags::merge_all_alias(params.0.tags, params.0.all);
+        let scope = crate::tags::TagFilter::parse(&all_terms, &params.0.any, &params.0.none)
+            .map_err(|e| mcp_err(&e))?;
         let store = self.store.lock().await;
         let mut embedder = self.embedder.lock().await;
 
@@ -451,7 +134,11 @@ impl EngraphServer {
             rerank_candidates: 30,
             rerank: self.rerank,
             max_chunks_per_file: self.max_chunks_per_file,
-            group_by: self.group_by,
+            // Per call, with the process setting as the default: one query
+            // answers the same way whoever asks it, and the granularity is
+            // part of the question rather than of how the server was started
+            // (#62).
+            group_by: params.0.group_by.unwrap_or(self.group_by),
             ranking: self.ranking,
             lane_weights: self.lane_weights,
             fts: self.fts,
@@ -468,28 +155,40 @@ impl EngraphServer {
         // replace the JSON, because text in place of the array would break a
         // client that parses it. MCP holds both without a change to the schema,
         // and #35 owns the schema.
+        let mut result = to_json_result(&output.results)?;
         if output.results.is_empty() {
-            let mut result = to_json_result(&output.results)?;
             result
                 .content
                 .push(Content::text(crate::ranking::NO_RELEVANT_CONTENT));
-            return Ok(result);
         }
-        to_json_result(&output.results)
+        // The per-lane detail is a second content block, the way the CLI
+        // prints it after the results and the HTTP envelope carries it in
+        // `explain`. It is absent unless the caller asked, because an agent
+        // that did not ask must not have to read past it (#62).
+        if params.0.explain {
+            result
+                .content
+                .push(Content::text(search::explain_report(&output, top_n)));
+        }
+        Ok(result)
     }
 
     #[tool(
         name = "read",
         description = "Read a note's full content with metadata, tags, and graph edges. Accepts file path, basename, or #docid."
     )]
-    async fn read(&self, params: Parameters<ReadParams>) -> Result<CallToolResult, McpError> {
+    async fn read(
+        &self,
+        params: Parameters<crate::params::Read>,
+    ) -> Result<CallToolResult, McpError> {
         let store = self.store.lock().await;
         let ctx = ContextParams {
             store: &store,
             vault_path: &self.vault_path,
             profile: self.profile.as_ref().as_ref(),
         };
-        let note = context::context_read(&ctx, &params.0.file).map_err(|e| mcp_err(&e))?;
+        let note = context::context_read(&ctx, &params.0.file, params.0.section.as_deref())
+            .map_err(|e| mcp_err(&e))?;
         to_json_result(&note)
     }
 
@@ -497,30 +196,25 @@ impl EngraphServer {
         name = "list",
         description = "List notes filtered by folder prefix and tag operators (all/any/none). A term is a tag path; a trailing `/` matches the tag and its descendants. Returns paths, docids, tags, and edge counts."
     )]
-    async fn list(&self, params: Parameters<ListParams>) -> Result<CallToolResult, McpError> {
+    async fn list(
+        &self,
+        params: Parameters<crate::params::List>,
+    ) -> Result<CallToolResult, McpError> {
         let store = self.store.lock().await;
         let ctx = ContextParams {
             store: &store,
             vault_path: &self.vault_path,
             profile: self.profile.as_ref().as_ref(),
         };
-        let all_terms = crate::tags::merge_all_alias(
-            params.0.tags.unwrap_or_default(),
-            params.0.all.unwrap_or_default(),
-        );
-        let tags = crate::tags::TagFilter::parse(
-            &all_terms,
-            &params.0.any.unwrap_or_default(),
-            &params.0.none.unwrap_or_default(),
-        )
-        .map_err(|e| mcp_err(&e))?;
-        let limit = params.0.limit.unwrap_or(20);
+        let all_terms = crate::tags::merge_all_alias(params.0.tags, params.0.all);
+        let tags = crate::tags::TagFilter::parse(&all_terms, &params.0.any, &params.0.none)
+            .map_err(|e| mcp_err(&e))?;
         let items = context::context_list(
             &ctx,
             params.0.folder.as_deref(),
             &tags,
             params.0.created_by.as_deref(),
-            limit,
+            params.0.limit,
         )
         .map_err(|e| mcp_err(&e))?;
         to_json_result(&items)
@@ -530,7 +224,10 @@ impl EngraphServer {
         name = "tags",
         description = "The vault's tag vocabulary: every tag, or the subtree under one term, each with the notes carrying it. Call before filtering with list."
     )]
-    async fn tags(&self, params: Parameters<TagsParams>) -> Result<CallToolResult, McpError> {
+    async fn tags(
+        &self,
+        params: Parameters<crate::params::Tags>,
+    ) -> Result<CallToolResult, McpError> {
         let store = self.store.lock().await;
         let prefix = params.0.under.as_deref().and_then(crate::tags::parse_term);
         let rows = store.tags_under(prefix.as_ref()).map_err(|e| mcp_err(&e))?;
@@ -556,7 +253,10 @@ impl EngraphServer {
         name = "who",
         description = "Person context bundle: their note, mentions across the vault, and graph connections."
     )]
-    async fn who(&self, params: Parameters<WhoParams>) -> Result<CallToolResult, McpError> {
+    async fn who(
+        &self,
+        params: Parameters<crate::params::Who>,
+    ) -> Result<CallToolResult, McpError> {
         let store = self.store.lock().await;
         let ctx = ContextParams {
             store: &store,
@@ -571,7 +271,10 @@ impl EngraphServer {
         name = "project",
         description = "Project context bundle: project note, child notes, active tasks, team members, and recent daily mentions."
     )]
-    async fn project(&self, params: Parameters<ProjectParams>) -> Result<CallToolResult, McpError> {
+    async fn project(
+        &self,
+        params: Parameters<crate::params::Project>,
+    ) -> Result<CallToolResult, McpError> {
         let store = self.store.lock().await;
         let ctx = ContextParams {
             store: &store,
@@ -583,14 +286,13 @@ impl EngraphServer {
     }
 
     #[tool(
-        name = "context",
+        name = "topic",
         description = "Rich topic context with search-driven section selection and character budget trimming. Returns the most relevant note sections for a topic."
     )]
-    async fn context(
+    async fn topic(
         &self,
-        params: Parameters<ContextToolParams>,
+        params: Parameters<crate::params::Topic>,
     ) -> Result<CallToolResult, McpError> {
-        let budget = params.0.budget.unwrap_or(32000);
         let store = self.store.lock().await;
         let mut embedder = self.embedder.lock().await;
         let ctx = ContextParams {
@@ -598,9 +300,13 @@ impl EngraphServer {
             vault_path: &self.vault_path,
             profile: self.profile.as_ref().as_ref(),
         };
-        let bundle =
-            context::context_topic_with_search(&ctx, &params.0.topic, budget, &mut *embedder)
-                .map_err(|e| mcp_err(&e))?;
+        let bundle = context::context_topic_with_search(
+            &ctx,
+            &params.0.query,
+            params.0.budget,
+            &mut *embedder,
+        )
+        .map_err(|e| mcp_err(&e))?;
         to_json_result(&bundle)
     }
 
@@ -608,17 +314,29 @@ impl EngraphServer {
         name = "create",
         description = "Create a new note with automatic tag resolution, link discovery, and folder placement. Returns the created file's path, docid, and what was auto-resolved."
     )]
-    async fn create(&self, params: Parameters<CreateParams>) -> Result<CallToolResult, McpError> {
+    async fn create(
+        &self,
+        params: Parameters<crate::params::Create>,
+    ) -> Result<CallToolResult, McpError> {
         if self.read_only {
             return Err(read_only_err());
         }
+        // No stdin exists on this surface, so an omitted content is an
+        // error here instead of the CLI's fallback read.
+        let content = params.0.content.ok_or_else(|| {
+            McpError::new(
+                rmcp::model::ErrorCode::INVALID_PARAMS,
+                "content is required",
+                None::<serde_json::Value>,
+            )
+        })?;
         let store = self.store.lock().await;
         let mut embedder = self.embedder.lock().await;
         let input = crate::writer::CreateNoteInput {
-            content: params.0.content,
+            content,
             filename: params.0.filename,
             type_hint: params.0.type_hint,
-            tags: params.0.tags.unwrap_or_default(),
+            tags: params.0.tags,
             folder: params.0.folder,
             created_by: "claude-code".into(),
             auto_link: params.0.auto_link,
@@ -637,62 +355,81 @@ impl EngraphServer {
     }
 
     #[tool(
-        name = "append",
-        description = "Append content to an existing note. Safe: only adds content, never overwrites. Detects conflicts via mtime checking."
+        name = "update",
+        description = "Change an existing note. Takes a list of edits and applies them in order, in one write: one conflict check, one file write. \
+             Each edit names its target. `section` is one heading. `property` is one frontmatter key. An edit that names neither targets the note's body, and an edit that names both is an error. \
+             `mode` is `replace`, `append`, `prepend` or `remove`. `remove` is for a property alone. \
+             `content` is a string, or a list of strings to set a list-valued property such as tags or aliases. A body edit and a section edit take a string. \
+             A body edit always keeps the note's frontmatter: content that starts with its own `---` block gives the note two of them. Change the frontmatter with `property` edits in the same list. \
+             Three things differ from the calls this replaces. A note changed outside engraph and not yet re-indexed fails with an mtime conflict. \
+             Replacing a note's frontmatter wholesale has no spelling here — `rewrite`'s `preserve_frontmatter: false` is gone, not renamed, and write the new frontmatter with `property` edits instead. \
+             A whole-note tag or alias replacement no longer stamps a `modified_by` property on the note."
     )]
-    async fn append(&self, params: Parameters<AppendParams>) -> Result<CallToolResult, McpError> {
-        if self.read_only {
-            return Err(read_only_err());
-        }
-        let store = self.store.lock().await;
-        let mut embedder = self.embedder.lock().await;
-        let input = crate::writer::AppendInput {
-            file: params.0.file,
-            content: params.0.content,
-            modified_by: "claude-code".into(),
-        };
-        let result = crate::writer::append_to_note(
-            input,
-            &store,
-            &mut *embedder,
-            self.embed,
-            self.chunk_opts,
-            &self.vault_path,
-        )
-        .map_err(|e| mcp_err(&e))?;
-        to_json_result(&result)
-    }
-
-    #[tool(
-        name = "update_metadata",
-        description = "Update a note's tags or aliases. Uses mtime conflict detection."
-    )]
-    async fn update_metadata(
+    async fn update(
         &self,
-        params: Parameters<UpdateMetadataParams>,
+        params: Parameters<crate::params::Update>,
     ) -> Result<CallToolResult, McpError> {
         if self.read_only {
             return Err(read_only_err());
         }
+        // The whole list is read before anything is written, so a request
+        // that names an impossible target is a parameter error and not a
+        // half-applied write (#62).
+        let edits = params.0.to_writer_edits().map_err(|e| {
+            McpError::new(
+                rmcp::model::ErrorCode::INVALID_PARAMS,
+                format!("{e:#}"),
+                None::<serde_json::Value>,
+            )
+        })?;
         let store = self.store.lock().await;
-        let input = crate::writer::UpdateMetadataInput {
+        let input = crate::writer::UpdateInput {
             file: params.0.file,
-            tags: params.0.tags,
-            aliases: params.0.aliases,
-            modified_by: "claude-code".into(),
+            edits,
         };
-        let result = crate::writer::update_metadata(input, &store, &self.vault_path)
+        let result = crate::writer::update_note(&store, &self.vault_path, &input)
             .map_err(|e| mcp_err(&e))?;
+        // `update_note` stores the new content hash and writes no chunks, so
+        // nothing else will re-derive them: not `diff_vault`, which sees a
+        // hash that already matches disk, and not the watcher, which the
+        // `record_write` below tells to skip this file. Re-index here or the
+        // note stays searchable only as the text it held before the edit (#62).
+        let mut embedder = self.embedder.lock().await;
+        // A failure here happens after the write, so a bare INTERNAL_ERROR
+        // would read as "nothing happened" — say what did. Returning early
+        // also skips `record_write` below, so the watcher's event on this
+        // file is not suppressed and it re-indexes it on its own; that
+        // recovery is deliberate, not accidental.
+        crate::indexer::reindex_written_file(
+            &result.path,
+            &store,
+            &mut *embedder,
+            &self.vault_path,
+            self.embed,
+            self.chunk_opts,
+        )
+        .with_context(|| {
+            format!(
+                "the file was written; its index rows were not updated for {}",
+                result.path
+            )
+        })
+        .map_err(|e| mcp_err(&e))?;
+        // Record write so the watcher skips re-indexing
+        let full_path = self.vault_path.join(&result.path);
+        record_write(&self.recent_writes, &full_path).await;
         to_json_result(&result)
     }
 
+    // `move` is a Rust keyword, so the tool's name is declared and the
+    // function keeps the longer one (#62).
     #[tool(
-        name = "move_note",
+        name = "move",
         description = "Move a note to a different folder. Updates the index path."
     )]
     async fn move_note(
         &self,
-        params: Parameters<MoveNoteParams>,
+        params: Parameters<crate::params::Move>,
     ) -> Result<CallToolResult, McpError> {
         if self.read_only {
             return Err(read_only_err());
@@ -710,60 +447,38 @@ impl EngraphServer {
 
     #[tool(
         name = "archive",
-        description = "Archive a note: moves it to the archive folder, removes from search index. The note is preserved on disk but invisible to search/context. Use unarchive to restore."
+        description = "Archive a note: moves it to the archive folder, removes from search index. The note is preserved on disk but invisible to search/context. `undo: true` reverses this: restores the note to its original location and re-indexes it."
     )]
-    async fn archive(&self, params: Parameters<ArchiveParams>) -> Result<CallToolResult, McpError> {
-        if self.read_only {
-            return Err(read_only_err());
-        }
-        let store = self.store.lock().await;
-        let result = crate::writer::archive_note(
-            &params.0.file,
-            &store,
-            &self.vault_path,
-            self.profile.as_ref().as_ref(),
-        )
-        .map_err(|e| mcp_err(&e))?;
-        to_json_result(&result)
-    }
-
-    #[tool(
-        name = "unarchive",
-        description = "Restore an archived note to its original location and re-index it for search."
-    )]
-    async fn unarchive(
+    async fn archive(
         &self,
-        params: Parameters<UnarchiveParams>,
+        params: Parameters<crate::params::Archive>,
     ) -> Result<CallToolResult, McpError> {
         if self.read_only {
             return Err(read_only_err());
         }
         let store = self.store.lock().await;
-        let mut embedder = self.embedder.lock().await;
-        let result = crate::writer::unarchive_note(
-            &params.0.file,
-            &store,
-            &mut *embedder,
-            self.embed,
-            self.chunk_opts,
-            &self.vault_path,
-        )
-        .map_err(|e| mcp_err(&e))?;
-        to_json_result(&result)
-    }
-
-    #[tool(
-        name = "read_section",
-        description = "Read a specific heading section from a note. Returns content from that heading to the next same-level heading."
-    )]
-    async fn read_section(
-        &self,
-        params: Parameters<ReadSectionParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let store = self.store.lock().await;
-        let result =
-            context::read_section(&store, &self.vault_path, &params.0.file, &params.0.heading)
-                .map_err(|e| mcp_err(&e))?;
+        // Archiving and restoring are one operation and its reverse, so they
+        // are one capability with a flag rather than two names (#62).
+        let result = if params.0.undo {
+            let mut embedder = self.embedder.lock().await;
+            crate::writer::unarchive_note(
+                &params.0.file,
+                &store,
+                &mut *embedder,
+                self.embed,
+                self.chunk_opts,
+                &self.vault_path,
+            )
+            .map_err(|e| mcp_err(&e))?
+        } else {
+            crate::writer::archive_note(
+                &params.0.file,
+                &store,
+                &self.vault_path,
+                self.profile.as_ref().as_ref(),
+            )
+            .map_err(|e| mcp_err(&e))?
+        };
         to_json_result(&result)
     }
 
@@ -771,7 +486,10 @@ impl EngraphServer {
         name = "health",
         description = "Vault health report: orphans, broken links, stale notes, tag hygiene, index freshness."
     )]
-    async fn health(&self, _params: Parameters<HealthParams>) -> Result<CallToolResult, McpError> {
+    async fn health(
+        &self,
+        _params: Parameters<crate::params::Health>,
+    ) -> Result<CallToolResult, McpError> {
         let store = self.store.lock().await;
         let profile_ref = self.profile.as_ref().as_ref();
         let config = crate::health::HealthConfig {
@@ -784,145 +502,76 @@ impl EngraphServer {
     }
 
     #[tool(
-        name = "edit",
-        description = "Edit a specific section of a note. Supports replace, prepend, or append modes. Targets sections by heading name."
+        name = "migrate",
+        description = "Restructure the vault into PARA. Mode 'preview' classifies every note into Projects/Areas/Resources/Archive and returns the proposed moves with confidence scores; 'apply' performs the moves of a preview; 'undo' reverses the last migration."
     )]
-    async fn edit(&self, params: Parameters<EditParams>) -> Result<CallToolResult, McpError> {
-        if self.read_only {
-            return Err(read_only_err());
-        }
-        let store = self.store.lock().await;
-        let mode = match params.0.mode.as_deref().unwrap_or("append") {
-            "replace" => crate::writer::EditMode::Replace,
-            "prepend" => crate::writer::EditMode::Prepend,
-            _ => crate::writer::EditMode::Append,
-        };
-        let input = crate::writer::EditInput {
-            file: params.0.file,
-            heading: params.0.heading,
-            content: params.0.content,
-            mode,
-            modified_by: "claude-code".into(),
-        };
-        let result = crate::writer::edit_note(&store, &self.vault_path, &input, None)
-            .map_err(|e| mcp_err(&e))?;
-        // Record write so the watcher skips re-indexing
-        let full_path = self.vault_path.join(&result.path);
-        record_write(&self.recent_writes, &full_path).await;
-        to_json_result(&result)
-    }
-
-    #[tool(
-        name = "rewrite",
-        description = "Replace the entire body of a note. Optionally preserves existing frontmatter. Use for major content overhauls."
-    )]
-    async fn rewrite(&self, params: Parameters<RewriteParams>) -> Result<CallToolResult, McpError> {
-        if self.read_only {
-            return Err(read_only_err());
-        }
-        let store = self.store.lock().await;
-        let input = crate::writer::RewriteInput {
-            file: params.0.file,
-            content: params.0.content,
-            preserve_frontmatter: params.0.preserve_frontmatter.unwrap_or(true),
-            modified_by: "claude-code".into(),
-        };
-        let result = crate::writer::rewrite_note(&store, &self.vault_path, &input)
-            .map_err(|e| mcp_err(&e))?;
-        let full_path = self.vault_path.join(&result.path);
-        record_write(&self.recent_writes, &full_path).await;
-        to_json_result(&result)
-    }
-
-    #[tool(
-        name = "edit_frontmatter",
-        description = "Edit frontmatter fields with granular operations: set/remove properties, add/remove tags, add/remove aliases."
-    )]
-    async fn edit_frontmatter(
+    async fn migrate(
         &self,
-        params: Parameters<EditFrontmatterParams>,
+        params: Parameters<crate::params::Migrate>,
     ) -> Result<CallToolResult, McpError> {
-        if self.read_only {
-            return Err(read_only_err());
+        // The CLI already took a mode. MCP and HTTP split it into three
+        // names, which is the same capability spelled three ways (#62).
+        match params.0.mode.as_str() {
+            "preview" => {
+                let store = self.store.lock().await;
+                let profile_ref = self.profile.as_ref().as_ref();
+                let preview =
+                    crate::migrate::generate_preview(&store, &self.vault_path, profile_ref)
+                        .map_err(|e| mcp_err(&e))?;
+                to_json_result(&preview)
+            }
+            "apply" => {
+                if self.read_only {
+                    return Err(read_only_err());
+                }
+                let store = self.store.lock().await;
+                // The preview is required here: this server's own `preview`
+                // mode returned the plan to the caller, so a caller holds it
+                // and sends it back. A dropped key must not silently apply an
+                // unrelated plan (#62).
+                let preview = crate::migrate::resolve_preview(params.0.preview).map_err(|e| {
+                    McpError::new(
+                        rmcp::model::ErrorCode::INVALID_PARAMS,
+                        format!("{e:#}"),
+                        None::<serde_json::Value>,
+                    )
+                })?;
+                let result = crate::migrate::apply_preview(&preview, &store, &self.vault_path)
+                    .map_err(|e| mcp_err(&e))?;
+                to_json_result(&result)
+            }
+            "undo" => {
+                if self.read_only {
+                    return Err(read_only_err());
+                }
+                let store = self.store.lock().await;
+                let result =
+                    crate::migrate::undo_last(&store, &self.vault_path).map_err(|e| mcp_err(&e))?;
+                to_json_result(&result)
+            }
+            // The mode is the caller's own text, so a word that names no
+            // operation is an invalid parameter and not an internal fault.
+            other => Err(McpError::new(
+                rmcp::model::ErrorCode::INVALID_PARAMS,
+                format!("Unknown mode: {other}. Use 'preview', 'apply' or 'undo'."),
+                None::<serde_json::Value>,
+            )),
         }
-        let ops = parse_frontmatter_ops(&params.0.operations)?;
-        let store = self.store.lock().await;
-        let input = crate::writer::EditFrontmatterInput {
-            file: params.0.file,
-            operations: ops,
-            modified_by: "claude-code".into(),
-        };
-        let result = crate::writer::edit_frontmatter(&store, &self.vault_path, &input)
-            .map_err(|e| mcp_err(&e))?;
-        let full_path = self.vault_path.join(&result.path);
-        record_write(&self.recent_writes, &full_path).await;
-        to_json_result(&result)
-    }
-
-    #[tool(
-        name = "migrate_preview",
-        description = "Generate PARA migration preview. Classifies all notes into Projects/Areas/Resources/Archive and returns proposed moves with confidence scores."
-    )]
-    async fn migrate_preview(
-        &self,
-        _params: Parameters<MigratePreviewParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let store = self.store.lock().await;
-        let profile_ref = self.profile.as_ref().as_ref();
-        let preview = crate::migrate::generate_preview(&store, &self.vault_path, profile_ref)
-            .map_err(|e| mcp_err(&e))?;
-        to_json_result(&preview)
-    }
-
-    #[tool(
-        name = "migrate_apply",
-        description = "Apply a PARA migration preview. Moves files to their classified PARA locations. Reversible via migrate_undo."
-    )]
-    async fn migrate_apply(
-        &self,
-        params: Parameters<MigrateApplyParams>,
-    ) -> Result<CallToolResult, McpError> {
-        if self.read_only {
-            return Err(read_only_err());
-        }
-        let store = self.store.lock().await;
-        let preview: crate::migrate::MigrationPreview = serde_json::from_value(params.0.preview)
-            .map_err(|e| mcp_err(&anyhow::anyhow!("Invalid preview JSON: {e}")))?;
-        let result = crate::migrate::apply_preview(&preview, &store, &self.vault_path)
-            .map_err(|e| mcp_err(&e))?;
-        to_json_result(&result)
-    }
-
-    #[tool(
-        name = "migrate_undo",
-        description = "Undo the most recent PARA migration, restoring all moved files to their original locations."
-    )]
-    async fn migrate_undo(
-        &self,
-        _params: Parameters<MigrateUndoParams>,
-    ) -> Result<CallToolResult, McpError> {
-        if self.read_only {
-            return Err(read_only_err());
-        }
-        let store = self.store.lock().await;
-        let result =
-            crate::migrate::undo_last(&store, &self.vault_path).map_err(|e| mcp_err(&e))?;
-        to_json_result(&result)
     }
 
     #[tool(
         name = "delete",
         description = "Delete a note. Soft mode (default) moves it to the archive folder. Hard mode permanently removes it from disk and index."
     )]
-    async fn delete(&self, params: Parameters<DeleteParams>) -> Result<CallToolResult, McpError> {
+    async fn delete(
+        &self,
+        params: Parameters<crate::params::Delete>,
+    ) -> Result<CallToolResult, McpError> {
         if self.read_only {
             return Err(read_only_err());
         }
         let store = self.store.lock().await;
-        let mode = match params.0.mode.as_deref().unwrap_or("soft") {
-            "hard" => crate::writer::DeleteMode::Hard,
-            _ => crate::writer::DeleteMode::Soft,
-        };
+        let mode = crate::writer::DeleteMode::from(params.0.mode);
         let archive_folder = self
             .profile
             .as_ref()
@@ -939,7 +588,7 @@ impl EngraphServer {
         .map_err(|e| mcp_err(&e))?;
         let result = serde_json::json!({
             "deleted": params.0.file,
-            "mode": params.0.mode.as_deref().unwrap_or("soft"),
+            "mode": params.0.mode,
         });
         to_json_result(&result)
     }
@@ -950,56 +599,32 @@ impl EngraphServer {
     )]
     async fn reindex_file(
         &self,
-        params: Parameters<ReindexFileParams>,
+        params: Parameters<crate::params::ReindexFile>,
     ) -> Result<CallToolResult, McpError> {
         let store = self.store.lock().await;
         let mut embedder = self.embedder.lock().await;
         let rel_path = params.0.file;
-        let full_path = self.vault_path.join(&rel_path);
 
-        // Read file content from disk
-        let content = std::fs::read_to_string(&full_path).map_err(|e| {
-            McpError::new(
-                rmcp::model::ErrorCode::INVALID_PARAMS,
-                format!("Cannot read file {rel_path}: {e}"),
-                None::<serde_json::Value>,
-            )
-        })?;
-
-        let content_hash = {
-            use sha2::{Digest, Sha256};
-            let mut hasher = Sha256::new();
-            hasher.update(content.as_bytes());
-            format!("{:x}", hasher.finalize())
-        };
-
-        let mut config = crate::config::Config::load().unwrap_or_default();
-        // The chunker settings come from the session, not from this load: a
-        // load that fails falls back to the defaults, and one file re-chunked
-        // at settings the rest of the store was not built at is a set of rows
-        // nothing downstream can tell apart. Carrying the captured value is
-        // what `ChunkOptions` exists to give.
-        config.set_chunk_options(self.chunk_opts);
-
-        // Re-index the file (handles cleanup of old entries automatically)
-        let result = crate::indexer::index_file(
+        // One helper packages the six steps this used to spell out, so the
+        // three callers cannot drift apart (#62). A file the server cannot
+        // read is the caller's own text naming nothing, which is this
+        // surface's INVALID_PARAMS and the HTTP route's 400.
+        let result = crate::indexer::reindex_written_file(
             &rel_path,
-            &content,
-            &content_hash,
             &store,
             &mut *embedder,
             &self.vault_path,
-            &config,
+            self.embed,
+            self.chunk_opts,
         )
-        .map_err(|e| mcp_err(&e))?;
-
-        // Rebuild edges for the re-indexed file
-        // Outgoing only — see issue #27.
-        store
-            .delete_outgoing_edges_for_file(result.file_id)
-            .map_err(|e| mcp_err(&e))?;
-        crate::indexer::build_edges_for_file(&store, result.file_id, &content)
-            .map_err(|e| mcp_err(&e))?;
+        .map_err(|e| match e.downcast_ref::<std::io::Error>() {
+            Some(_) => McpError::new(
+                rmcp::model::ErrorCode::INVALID_PARAMS,
+                format!("Cannot read file {rel_path}: {e:#}"),
+                None::<serde_json::Value>,
+            ),
+            None => mcp_err(&e),
+        })?;
 
         let output = serde_json::json!({
             "file": rel_path,
@@ -1010,11 +635,95 @@ impl EngraphServer {
     }
 
     #[tool(
-        name = "identity",
-        description = "Returns compact user identity and current context. Call at session start for instant context. L0 = static identity (~50 tokens), L1 = dynamic state (~120 tokens)."
+        name = "index",
+        description = "Index the server's vault: walk it, diff it against the store, and re-embed what changed. `rebuild: true` discards the index and builds it again. Use after a batch of writes made outside engraph; a single file is cheaper through reindex_file. \
+             The call runs to completion once it starts. It holds the store and the embedder while it runs, so every other tool waits on it, and a graceful shutdown will not interrupt it. On a large vault a rebuild takes minutes."
     )]
-    async fn identity(&self) -> Result<CallToolResult, McpError> {
+    async fn index(
+        &self,
+        params: Parameters<crate::params::Index>,
+    ) -> Result<CallToolResult, McpError> {
+        // An agent that writes a batch of notes needs a way to rebuild the whole
+        // index, and a multi-minute call is acceptable for that (#62).
+        //
+        // A read-only server refuses it like any other write: `rebuild: true`
+        // discards the index before it builds one again, so this destroys
+        // derived state and stalls every other tool while it runs.
+        if self.read_only {
+            return Err(read_only_err());
+        }
         let store = self.store.lock().await;
+        let mut embedder = self.embedder.lock().await;
+        let mut config = crate::config::Config::load().unwrap_or_default();
+        // The chunker settings come from the session, for the reason
+        // `reindex_file` gives: one store holds one chunking.
+        config.set_chunk_options(self.chunk_opts);
+        if params.0.no_gitignore {
+            config.respect_gitignore = false;
+        }
+        // A server is bound to the vault it was started on, so there is no
+        // path parameter here — that argument is the CLI's alone (#62).
+        let result = crate::indexer::run_index_shared(
+            &self.vault_path,
+            &config,
+            &store,
+            &mut *embedder,
+            params.0.rebuild,
+            self.profile.as_ref().as_ref(),
+        )
+        .map_err(|e| mcp_err(&e))?;
+        to_json_result(&serde_json::json!({
+            "new_files": result.new_files,
+            "updated_files": result.updated_files,
+            "deleted_files": result.deleted_files,
+            "total_chunks": result.total_chunks,
+            "duration_secs": result.duration.as_secs_f64(),
+        }))
+    }
+
+    #[tool(
+        name = "status",
+        description = "What the index holds: vault path, file and chunk counts, edge and connectivity counts, date coverage, index size, and whether intelligence is enabled."
+    )]
+    async fn status(
+        &self,
+        _params: Parameters<crate::params::Status>,
+    ) -> Result<CallToolResult, McpError> {
+        let data_dir = crate::config::Config::data_dir().map_err(|e| mcp_err(&e))?;
+        // The same fields the CLI's `status --json` prints: one composer, so
+        // the three surfaces cannot report different ones (#62). The store is
+        // this server's own, so the reads see one snapshot and no second
+        // connection runs the schema batch against the writer.
+        let store = self.store.lock().await;
+        let report = search::status_json(&store, &data_dir).map_err(|e| mcp_err(&e))?;
+        to_json_result(&report)
+    }
+
+    #[tool(
+        name = "identity",
+        description = "Returns compact user identity and current context. Call at session start for instant context. L0 = static identity (~50 tokens), L1 = dynamic state (~120 tokens). `refresh: true` re-extracts the L1 facts from the index first, without a full re-index."
+    )]
+    async fn identity(
+        &self,
+        params: Parameters<crate::params::Identity>,
+    ) -> Result<CallToolResult, McpError> {
+        let store = self.store.lock().await;
+        // `refresh` is a parameter of the capability on every surface (#62).
+        // It clears the `identity_facts` rows and derives them again, which is
+        // a write of derived state, so a read-only server refuses it.
+        if params.0.refresh {
+            if self.read_only {
+                return Err(read_only_err());
+            }
+            let profile = self.profile.as_ref().as_ref().ok_or_else(|| {
+                McpError::new(
+                    rmcp::model::ErrorCode::INVALID_REQUEST,
+                    "No vault profile found. Run `engraph init` first.",
+                    None::<serde_json::Value>,
+                )
+            })?;
+            crate::identity::extract_l1_facts(&store, profile).map_err(|e| mcp_err(&e))?;
+        }
         let config = crate::config::Config::load().unwrap_or_default();
         let block =
             crate::identity::format_identity_block(&config, &store).map_err(|e| mcp_err(&e))?;
@@ -1022,17 +731,27 @@ impl EngraphServer {
     }
 
     #[tool(
-        name = "setup",
+        name = "init",
         description = "Run first-time setup or update identity. Use 'detect' mode to inspect the vault without changes, 'apply' mode to configure identity and index. Returns JSON."
     )]
-    async fn setup(&self, params: Parameters<SetupParams>) -> Result<CallToolResult, McpError> {
-        match params.0.mode.as_str() {
-            "detect" => {
+    async fn init(
+        &self,
+        params: Parameters<crate::params::Init>,
+    ) -> Result<CallToolResult, McpError> {
+        match params.0.mode.as_deref() {
+            Some("detect") => {
                 let result = crate::onboarding::run_detect_json(&self.vault_path)
                     .map_err(|e| mcp_err(&e))?;
                 to_json_result(&result)
             }
-            "apply" => {
+            Some("apply") => {
+                // `apply` indexes the vault, which is the work `index` is
+                // guarded against on a read-only server. The mode is read
+                // first, so `detect` — which writes nothing — still runs
+                // (#62).
+                if self.read_only {
+                    return Err(read_only_err());
+                }
                 let mut config = crate::config::Config::load().unwrap_or_default();
                 let data_dir = crate::config::Config::data_dir().map_err(|e| mcp_err(&e))?;
                 let flags = crate::onboarding::ApplyFlags {
@@ -1051,9 +770,17 @@ impl EngraphServer {
                 .map_err(|e| mcp_err(&e))?;
                 to_json_result(&result)
             }
-            other => Err(McpError::new(
+            Some(other) => Err(McpError::new(
                 rmcp::model::ErrorCode::INVALID_PARAMS,
                 format!("Unknown mode: {other}. Use 'detect' or 'apply'."),
+                None::<serde_json::Value>,
+            )),
+            // A server has no interactive flow, so `init` there needs a
+            // mode. The CLI's no-mode form is its own prompt sequence and
+            // reaches no surface but the CLI (#62).
+            None => Err(McpError::new(
+                rmcp::model::ErrorCode::INVALID_PARAMS,
+                "init needs mode=detect or mode=apply",
                 None::<serde_json::Value>,
             )),
         }
@@ -1065,13 +792,13 @@ impl rmcp::handler::server::ServerHandler for EngraphServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "engraph: vault intelligence for Obsidian. \
-                 Read: vault_map to orient, tags for the tag vocabulary, search to find, read/read_section for content, who/project for context bundles, health for vault diagnostics. \
-                 Write: create for new notes, append to add content, edit to modify a section, rewrite to replace body, \
-                 edit_frontmatter for tags/properties, update_metadata for bulk tag/alias replacement. \
-                 Lifecycle: move_note to relocate, archive to soft-delete, unarchive to restore, delete for permanent removal. \
-                 Index: reindex_file to refresh a single file's index after external edits. \
-                 Identity: identity for user context at session start, setup to run first-time onboarding (detect/apply). \
-                 Migration: migrate_preview to classify notes into PARA folders, migrate_apply to execute the migration, migrate_undo to revert.",
+                 Read: vault_map to orient, tags for the tag vocabulary, search to find, read for content (a section parameter narrows it), list to filter notes by folder and tags, who/project for context bundles, topic for a budgeted bundle of the sections about one subject. \
+                 Write: create for new notes, update for every change to an existing one — a list of edits over the body, a section or a frontmatter property, applied in one write. \
+                 Lifecycle: move to relocate, archive to soft-delete (`undo: true` to restore), delete for permanent removal. \
+                 Index: reindex_file to refresh a single file after external edits, index to walk the whole vault (`rebuild: true` builds it again from nothing). \
+                 Diagnostics: status for what the index holds, health for orphans, broken links, stale notes and tag hygiene. \
+                 Identity: identity for user context at session start, init to run first-time onboarding (`mode: detect` or `mode: apply`). \
+                 Migration: migrate with `mode: preview` to classify notes into PARA folders, `mode: apply` to execute the migration, `mode: undo` to revert.",
         )
     }
 }
@@ -1197,6 +924,7 @@ pub async fn run_serve(
     // Capture retrieval settings before the watcher takes ownership of `config`.
     let max_chunks_per_file = config.max_chunks_per_file;
     let group_by = config.group_by;
+    let top_n = config.top_n;
     let rerank = config.rerank;
     let ranking = config.ranking;
     let lane_weights = config.lane_weights;
@@ -1229,6 +957,7 @@ pub async fn run_serve(
         read_only,
         max_chunks_per_file,
         group_by,
+        top_n,
         rerank,
         ranking,
         lane_weights,
@@ -1256,6 +985,7 @@ pub async fn run_serve(
             read_only,
             max_chunks_per_file,
             group_by,
+            top_n,
             rerank,
             ranking,
             lane_weights,
@@ -1307,18 +1037,21 @@ pub async fn run_serve(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use rmcp::schemars;
 
-    /// Regression test for <https://github.com/devwhodevs/engraph/issues/32>.
+    /// Regression test for <https://github.com/devwhodevs/engraph/issues/32>,
+    /// carried onto `update`'s edit list (#62). `edits` is the one array of
+    /// objects an MCP tool takes, so it is the one place the schema can
+    /// publish an `items` that OpenAI refuses.
     #[test]
-    fn edit_frontmatter_operations_schema_has_object_items() {
-        let schema = schemars::schema_for!(EditFrontmatterParams);
+    fn update_edits_schema_has_object_items() {
+        let schema = schemars::schema_for!(crate::params::Update);
         let json = serde_json::to_value(&schema).unwrap();
 
-        let items = &json["properties"]["operations"]["items"];
+        let items = &json["properties"]["edits"]["items"];
         assert!(
             items.is_object(),
-            "operations.items must be an object schema, got: {items}"
+            "edits.items must be an object schema, got: {items}"
         );
 
         // schemars may inline properties or use a $ref to $defs; both are
@@ -1327,36 +1060,427 @@ mod tests {
         let has_ref = items.get("$ref").is_some();
         assert!(
             has_properties || has_ref,
-            "operations.items must define properties or $ref, got: {items}"
+            "edits.items must define properties or $ref, got: {items}"
         );
     }
 
+    /// `migrate` is one tool for three operations (#62), so the mode is the
+    /// one parameter a caller must always send, and the preview it may hold
+    /// from a `preview` call stays reachable.
     #[test]
-    fn frontmatter_op_input_deserializes_all_variants() {
-        let cases = [
-            (r#"{"op":"set","key":"status","value":"done"}"#, "set"),
-            (r#"{"op":"remove","key":"status"}"#, "remove"),
-            (r#"{"op":"add_tag","value":"rust"}"#, "add_tag"),
-            (r#"{"op":"remove_tag","value":"old"}"#, "remove_tag"),
-            (r#"{"op":"add_alias","value":"eng"}"#, "add_alias"),
-            (r#"{"op":"remove_alias","value":"eng"}"#, "remove_alias"),
-        ];
-        for (json, label) in cases {
-            let input: FrontmatterOpInput = serde_json::from_str(json)
-                .unwrap_or_else(|e| panic!("failed to deserialize {label}: {e}"));
-            // Verify the parsed input converts to a valid FrontmatterOp.
-            let ops = parse_frontmatter_ops(&[input]);
-            assert!(ops.is_ok(), "{label} should produce a valid op: {:?}", ops);
+    fn the_migrate_schema_requires_a_mode_and_still_accepts_a_preview() {
+        let schema = schemars::schema_for!(crate::params::Migrate);
+        let json = serde_json::to_value(&schema).unwrap();
+
+        let required: Vec<&str> = json["required"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        assert_eq!(required, vec!["mode"], "got {json}");
+        assert!(
+            json["properties"].get("preview").is_some(),
+            "the preview an apply acts on is not in the schema: {json}"
+        );
+    }
+
+    /// A server over a vault of two notes, indexed in memory. The mock's
+    /// vectors are hashes, so the keyword lane carries the meaning here —
+    /// which is all a granularity assertion needs.
+    fn indexed_server(
+        group_by: crate::config::GroupBy,
+    ) -> (tempfile::TempDir, super::EngraphServer) {
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("rules")).unwrap();
+        std::fs::write(
+            root.join("rules/abjuration-spells.md"),
+            "# Abjuration\n\n\
+             ## Level 3 Counterspell\n\nA warding effect that stops a spell mid-cast. \
+             It interrupts the casting itself and does nothing to a spell already in effect.\n\n\
+             ## Level 5 Dispel Magic\n\nA warding effect that ends an ongoing spell. \
+             It reaches an effect already in place and cannot interrupt one \
+             that is still being cast, which is the whole of the difference.\n\n\
+             ## Level 9 Dimensional Anchor\n\nA warding effect that pins a creature. \
+             It closes every route out of the space the creature \
+             currently stands in, and it does not care how that route was opened.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("rules/evocation-spells.md"),
+            "# Evocation\n\n## Level 1 Firebolt\n\nA bolt of flame.\n",
+        )
+        .unwrap();
+
+        let store = crate::store::Store::open_memory().unwrap();
+        let mut embedder = crate::llm::MockLlm::new(256);
+        crate::indexer::run_index_shared(
+            root,
+            &crate::config::Config::default(),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let server = super::EngraphServer {
+            store: Arc::new(Mutex::new(store)),
+            embedder: Arc::new(Mutex::new(
+                Box::new(embedder) as Box<dyn crate::llm::EmbedModel + Send>
+            )),
+            vault_path: Arc::new(root.to_path_buf()),
+            profile: Arc::new(None),
+            tool_router: super::EngraphServer::tool_router(),
+            reranker: None,
+            recent_writes: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            read_only: false,
+            max_chunks_per_file: crate::config::default_max_chunks_per_file(),
+            group_by,
+            top_n: crate::config::Config::default().top_n,
+            rerank: crate::config::RerankConfig::default(),
+            ranking: crate::config::RankingConfig::default(),
+            lane_weights: crate::config::LaneWeights::default(),
+            fts: crate::config::FtsConfig::default(),
+            embed: crate::prefix::EmbedComposition::default(),
+            chunk_opts: crate::chunker::ChunkOptions {
+                min_chars: 0,
+                promote_bold: false,
+            },
+        };
+        (tmp, server)
+    }
+
+    /// A PARA profile over `root`, for the calls that need one.
+    fn test_profile(root: &std::path::Path) -> crate::profile::VaultProfile {
+        crate::profile::VaultProfile {
+            vault_path: root.to_path_buf(),
+            vault_type: crate::profile::VaultType::Obsidian,
+            structure: crate::profile::StructureDetection {
+                method: crate::profile::StructureMethod::Para,
+                folders: crate::profile::FolderMap::default(),
+            },
+            stats: crate::profile::VaultStats::default(),
         }
     }
 
-    #[test]
-    fn frontmatter_op_input_rejects_unknown_variant() {
-        let json = r#"{"op":"unknown_op","value":"x"}"#;
-        let result: Result<FrontmatterOpInput, _> = serde_json::from_str(json);
+    /// `archive` and `archive {undo: true}` are one operation and its reverse
+    /// (#62). The handler's own branch chooses `archive_note` against
+    /// `unarchive_note`, and nothing else covers it — an inverted branch would
+    /// move the file the opposite way with the whole suite green.
+    #[tokio::test]
+    async fn the_undo_flag_chooses_the_operation_it_names() {
+        let (_tmp, server) = indexed_server(crate::config::GroupBy::Chunk);
+        let vault = server.vault_path.as_ref().clone();
+        let live = vault.join("rules/evocation-spells.md");
+        let archived = vault.join("04-Archive/rules/evocation-spells.md");
+        assert!(live.exists());
+
+        server
+            .archive(super::Parameters(crate::params::Archive {
+                file: "rules/evocation-spells.md".into(),
+                undo: false,
+            }))
+            .await
+            .unwrap();
+        assert!(!live.exists(), "undo: false must archive");
+        assert!(archived.exists(), "undo: false must archive");
+
+        server
+            .archive(super::Parameters(crate::params::Archive {
+                file: "04-Archive/rules/evocation-spells.md".into(),
+                undo: true,
+            }))
+            .await
+            .unwrap();
+        assert!(live.exists(), "undo: true must restore");
+        assert!(!archived.exists(), "undo: true must restore");
+    }
+
+    /// `identity` takes `refresh` on every surface (#62). Before this the
+    /// tool declared no parameters at all, so the flag the CLI honoured had no
+    /// spelling here. `extract_l1_facts` clears tier 1 before it derives it
+    /// again, so a stale fact seeded first is what proves the call was made.
+    #[tokio::test]
+    async fn identity_refresh_re_extracts_the_l1_facts() {
+        let (_tmp, mut server) = indexed_server(crate::config::GroupBy::Chunk);
+        let root = server.vault_path.as_ref().clone();
+        server.profile = std::sync::Arc::new(Some(test_profile(&root)));
+
+        let stale = || {
+            let store = server.store.try_lock().expect("uncontended");
+            store
+                .get_identity_facts(1)
+                .unwrap()
+                .into_iter()
+                .any(|f| f.key == "stale")
+        };
+        {
+            let store = server.store.try_lock().expect("uncontended");
+            store
+                .upsert_identity_fact(1, "stale", "from an older session", None)
+                .unwrap();
+        }
+        assert!(stale());
+
+        // No refresh: the facts are answered as they stand.
+        server
+            .identity(super::Parameters(crate::params::Identity {
+                refresh: false,
+            }))
+            .await
+            .unwrap();
+        assert!(stale(), "a call that did not ask must re-extract nothing");
+
+        server
+            .identity(super::Parameters(crate::params::Identity { refresh: true }))
+            .await
+            .unwrap();
+        assert!(!stale(), "refresh: true must re-derive tier 1");
+    }
+
+    /// A read-only server refuses every call that writes derived state, and
+    /// `identity {refresh: true}` is one: it clears the `identity_facts` rows
+    /// (#62).
+    #[tokio::test]
+    async fn a_read_only_server_refuses_an_identity_refresh_and_answers_a_plain_one() {
+        let (_tmp, mut server) = indexed_server(crate::config::GroupBy::Chunk);
+        let root = server.vault_path.as_ref().clone();
+        server.profile = std::sync::Arc::new(Some(test_profile(&root)));
+        server.read_only = true;
+
         assert!(
-            result.is_err(),
-            "unknown op variant should fail deserialization"
+            server
+                .identity(super::Parameters(crate::params::Identity { refresh: true }))
+                .await
+                .is_err()
+        );
+        assert!(
+            server
+                .identity(super::Parameters(crate::params::Identity {
+                    refresh: false,
+                }))
+                .await
+                .is_ok()
+        );
+    }
+
+    /// `init {mode: apply}` indexes the vault, which is the work `index` is
+    /// guarded against. `detect` writes nothing and still runs (#62).
+    #[tokio::test]
+    async fn a_read_only_server_refuses_init_apply_and_runs_init_detect() {
+        let (_tmp, mut server) = indexed_server(crate::config::GroupBy::Chunk);
+        server.read_only = true;
+
+        let init = |mode: &str| crate::params::Init {
+            mode: Some(mode.to_string()),
+            name: None,
+            role: None,
+            purpose: None,
+        };
+        assert!(server.init(super::Parameters(init("apply"))).await.is_err());
+        assert!(server.init(super::Parameters(init("detect"))).await.is_ok());
+    }
+
+    /// A server's `apply` acts on the plan its caller sends and no other. The
+    /// copy `engraph migrate --mode preview` saves belongs to the CLI's own
+    /// two-step flow, and an `apply` that fell back to it would move files
+    /// against a plan this caller never saw (#62).
+    #[tokio::test]
+    async fn a_migrate_apply_with_no_preview_is_a_parameter_error() {
+        let (_tmp, server) = indexed_server(crate::config::GroupBy::Chunk);
+        let err = server
+            .migrate(super::Parameters(crate::params::Migrate {
+                mode: "apply".into(),
+                preview: None,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(err.message.contains("apply needs a preview"), "got {err:?}");
+    }
+
+    /// A search asking for one query, with everything but the two per-call
+    /// settings left at its default.
+    fn search_params(
+        group_by: Option<crate::config::GroupBy>,
+        explain: bool,
+    ) -> crate::params::Search {
+        crate::params::Search {
+            query: "warding".to_string(),
+            top_n: None,
+            explain,
+            group_by,
+            tags: vec![],
+            all: vec![],
+            any: vec![],
+            none: vec![],
+        }
+    }
+
+    /// The first content block, read as the JSON array of results.
+    fn results(result: &rmcp::model::CallToolResult) -> serde_json::Value {
+        let text = result.content[0].as_text().unwrap().text.clone();
+        serde_json::from_str(&text).unwrap()
+    }
+
+    /// How many sections of the one file that holds three matching ones came
+    /// back.
+    fn sections_of_the_abjuration_note(results: &serde_json::Value) -> usize {
+        results
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["file_path"] == "rules/abjuration-spells.md")
+            .count()
+    }
+
+    #[tokio::test]
+    async fn a_search_takes_its_granularity_from_the_call() {
+        // `group_by` is per call, with the process setting as the default
+        // (#62). The server here is started on `file`, so a call that names
+        // `chunk` proves the override rather than the default.
+        let (_tmp, server) = indexed_server(crate::config::GroupBy::File);
+
+        let by_default = server
+            .search(super::Parameters(search_params(None, false)))
+            .await
+            .unwrap();
+        let rows = results(&by_default);
+        assert_eq!(sections_of_the_abjuration_note(&rows), 1, "got {rows}");
+
+        let by_call = server
+            .search(super::Parameters(search_params(
+                Some(crate::config::GroupBy::Chunk),
+                false,
+            )))
+            .await
+            .unwrap();
+        let rows = results(&by_call);
+        assert!(sections_of_the_abjuration_note(&rows) > 1, "got {rows}");
+    }
+
+    #[tokio::test]
+    async fn the_per_lane_detail_is_the_content_block_the_call_asked_for() {
+        // MCP carries the detail the way it carries the answer-floor message:
+        // a second content block, which leaves the JSON a client parses
+        // untouched. A caller that did not ask gets one block only (#62).
+        let (_tmp, server) = indexed_server(crate::config::GroupBy::Chunk);
+
+        let plain = server
+            .search(super::Parameters(search_params(None, false)))
+            .await
+            .unwrap();
+        assert_eq!(plain.content.len(), 1);
+
+        let explained = server
+            .search(super::Parameters(search_params(None, true)))
+            .await
+            .unwrap();
+        assert_eq!(explained.content.len(), 2);
+        assert!(
+            explained.content[1]
+                .as_text()
+                .unwrap()
+                .text
+                .contains("--- Query run ---")
+        );
+    }
+
+    /// A server over five notes that all answer one query, started at the
+    /// `top_n` given. Five is more than the `top_n` the R21 test configures,
+    /// so a truncation reads as a truncation and not as a corpus that had no
+    /// more to give (#62). Each body is well over `chunk_min_chars`, so each
+    /// note is one chunk of its own.
+    fn server_over_five_answering_notes(top_n: usize) -> (tempfile::TempDir, super::EngraphServer) {
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        for (i, subject) in ["counterspell", "dispel", "anchor", "ward", "seal"]
+            .iter()
+            .enumerate()
+        {
+            std::fs::write(
+                root.join(format!("{i}-{subject}.md")),
+                format!(
+                    "# The {subject} rule\n\nA warding effect. Every warding effect in this \
+                     ruleset states what it stops, when it may be cast, and what it leaves \
+                     alone, and the {subject} rule is one of them among several others.\n"
+                ),
+            )
+            .unwrap();
+        }
+
+        let store = crate::store::Store::open_memory().unwrap();
+        let mut embedder = crate::llm::MockLlm::new(256);
+        crate::indexer::run_index_shared(
+            root,
+            &crate::config::Config::default(),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let server = super::EngraphServer {
+            store: Arc::new(Mutex::new(store)),
+            embedder: Arc::new(Mutex::new(
+                Box::new(embedder) as Box<dyn crate::llm::EmbedModel + Send>
+            )),
+            vault_path: Arc::new(root.to_path_buf()),
+            profile: Arc::new(None),
+            tool_router: super::EngraphServer::tool_router(),
+            reranker: None,
+            recent_writes: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            read_only: false,
+            max_chunks_per_file: crate::config::default_max_chunks_per_file(),
+            group_by: crate::config::GroupBy::Chunk,
+            top_n,
+            rerank: crate::config::RerankConfig::default(),
+            ranking: crate::config::RankingConfig::default(),
+            lane_weights: crate::config::LaneWeights::default(),
+            fts: crate::config::FtsConfig::default(),
+            embed: crate::prefix::EmbedComposition::default(),
+            chunk_opts: crate::chunker::ChunkOptions {
+                min_chars: 0,
+                promote_bold: false,
+            },
+        };
+        (tmp, server)
+    }
+
+    /// R21 (#62): the number of results a call that names no `top_n` gets is
+    /// the configured one, and not a literal this server holds. A server
+    /// started at three answers three, and the same server answers more when
+    /// the call asks for more — which is what separates the configured default
+    /// from a corpus that ran out.
+    #[tokio::test]
+    async fn a_search_that_names_no_top_n_gets_the_configured_number() {
+        let (_tmp, server) = server_over_five_answering_notes(3);
+
+        let by_default = server
+            .search(super::Parameters(search_params(None, false)))
+            .await
+            .unwrap();
+        let rows = results(&by_default);
+        assert_eq!(
+            rows.as_array().unwrap().len(),
+            3,
+            "the configured top_n is 3, got {rows}"
+        );
+
+        let mut asked = search_params(None, false);
+        asked.top_n = Some(5);
+        let by_call = server.search(super::Parameters(asked)).await.unwrap();
+        let rows = results(&by_call);
+        assert!(
+            rows.as_array().unwrap().len() > 3,
+            "the corpus holds more than three answers, got {rows}"
         );
     }
 }

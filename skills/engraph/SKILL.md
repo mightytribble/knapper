@@ -36,7 +36,7 @@ engraph search "architecture decisions" -n 5 --json
 
 | Flag              | Description                                    |
 | ----------------- | ---------------------------------------------- |
-| `-n, --top-n <N>` | Number of results (default: from config or 10) |
+| `-n, --top-n <N>` | Number of results (default: `top_n` in `config.toml`) |
 | `--explain`       | Show per-lane RRF score breakdown              |
 | `--json`          | Machine-readable JSON output                   |
 
@@ -49,26 +49,38 @@ engraph search "architecture decisions" -n 5 --json
 ## Graph Inspection
 
 ```bash
-engraph graph show "path/to/note.md"    # Connections for a document
-engraph graph show "#docid"             # By document ID
-engraph graph stats                     # Nodes, edges, density
+engraph read "path/to/note.md"          # Content, metadata, incoming and outgoing links
+engraph read "#docid"                   # By document ID
+engraph status                          # Files, chunks, edges, wikilinks, mentions
 ```
 
 ## Context Queries
 
 ```bash
-engraph context topic "authentication" --budget 8000
-engraph context who "Person Name"
-engraph context project "Project Name"
-engraph context vault-map                 # Collection structure overview
-engraph context read "path/to/note.md"    # Full content + metadata
-engraph context list --tags architecture  # Filter by tags, folder, created_by, etc.
-engraph context tags --under type/        # The tag vocabulary, whole or under one term
+engraph topic "authentication" --budget 8000
+engraph who "Person Name"
+engraph project "Project Name"
+engraph vault-map                 # Collection structure overview
+engraph read "path/to/note.md"    # Full content + metadata
+engraph read "path/to/note.md" --section "Action Items"   # One section
+engraph list --tags architecture  # Filter by tags, folder, created_by, etc.
+engraph tags --under type/        # The tag vocabulary, whole or under one term
 ```
 
-> One capability, three surfaces: `context tags` is the MCP `tags` tool and `GET /api/tags`; `context list` is the MCP `list` tool and `GET /api/list`. The tag operators are `--all`/`--any`/`--none` on the CLI, spelled `all`/`any`/`none` on both other surfaces, with `tags` an alias of `all`.
+## Writing
 
-> Health diagnostics (orphans, broken links, stale notes, tag hygiene) are exposed through the MCP `health` tool and the HTTP `GET /api/health` endpoint — see `references/http-rest-api.md`.
+```bash
+engraph create --content "# Meeting Notes" --tags meeting
+engraph update "Meeting Notes" --section "Action Items" --mode append --content="- [ ] Follow up"
+engraph update "Meeting Notes" --property tags --mode append --content "actionable"
+engraph move "Meeting Notes" --new-folder 02-Areas
+engraph archive "Old Draft"          # --undo restores it
+engraph delete "Old Draft" --mode soft
+```
+
+> One capability, one name, three surfaces: `engraph tags` is the MCP `tags` tool and `GET /api/tags`; `engraph list` is the MCP `list` tool and `GET /api/list`. A CLI command's name becomes the MCP tool by writing `-` as `_`, and the HTTP route by putting it under `/api/`. The tag operators are `--all`/`--any`/`--none` on the CLI, spelled `all`/`any`/`none` on both other surfaces, with `tags` an alias of `all`.
+
+> Health diagnostics (orphans, broken links, stale notes, tag hygiene) are `engraph health`, the MCP `health` tool and the HTTP `GET /api/health` endpoint — see `references/http-rest-api.md`.
 
 ## Setup
 

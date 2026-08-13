@@ -1,414 +1,16 @@
+use engraph::cli::{Cli, Command, ModelsAction};
 use engraph::config;
 use engraph::indexer;
+use engraph::profile::VaultProfile;
 use engraph::search;
 use engraph::store;
 
-use anyhow::Result;
-use clap::{Parser, Subcommand};
+use anyhow::{Context, Result};
+use clap::Parser;
 use std::io::{self, BufRead, Read as _, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use config::Config;
-
-#[derive(Parser, Debug)]
-#[command(
-    name = "engraph",
-    version,
-    about = "Local semantic search for Obsidian vaults"
-)]
-struct Cli {
-    /// Output results as JSON.
-    #[arg(long, global = true)]
-    json: bool,
-
-    /// Enable verbose logging.
-    #[arg(long, global = true)]
-    verbose: bool,
-
-    #[command(subcommand)]
-    command: Command,
-}
-
-#[derive(Subcommand, Debug)]
-enum Command {
-    /// Index a vault directory for semantic search.
-    Index {
-        /// Path to the vault (overrides config).
-        path: Option<PathBuf>,
-
-        /// Rebuild the index from scratch.
-        #[arg(long)]
-        rebuild: bool,
-
-        /// Index files that `.gitignore` / `.ignore` would normally exclude.
-        #[arg(long)]
-        no_gitignore: bool,
-    },
-
-    /// Search the indexed vault.
-    Search {
-        /// The search query.
-        query: String,
-
-        /// Number of results to return.
-        #[arg(short = 'n', long)]
-        top_n: Option<usize>,
-
-        /// Show per-lane RRF score breakdown for each result.
-        #[arg(long, conflicts_with = "json")]
-        explain: bool,
-
-        /// Return one result per matching section, or one per document.
-        #[arg(long, value_enum)]
-        group_by: Option<engraph::config::GroupBy>,
-
-        /// Filter to notes with all listed tags (comma-separated). A trailing
-        /// `/` or `/*` matches the tag and its descendants.
-        #[arg(long, value_delimiter = ',')]
-        tags: Vec<String>,
-        /// Filter to notes carrying every term (comma-separated). A trailing
-        /// `/` or `/*` matches the tag and its descendants.
-        #[arg(long, value_delimiter = ',')]
-        all: Vec<String>,
-        /// Filter to notes carrying at least one term (comma-separated). An
-        /// unknown term is an error naming the nearest tag the vault holds.
-        #[arg(long, value_delimiter = ',')]
-        any: Vec<String>,
-        /// Filter out notes carrying any of these terms (comma-separated).
-        /// An unknown term here is ignored.
-        #[arg(long, value_delimiter = ',')]
-        none: Vec<String>,
-    },
-
-    /// Show index status and statistics.
-    Status,
-
-    /// Clear cached data.
-    Clear {
-        /// Remove everything including the database and embeddings.
-        #[arg(long)]
-        all: bool,
-    },
-
-    /// Initialize vault profile, identity, and search index.
-    Init {
-        /// Path to vault directory.
-        path: Option<PathBuf>,
-        /// Only run identity setup (skip indexing).
-        #[arg(long)]
-        identity: bool,
-        /// Only re-index (skip identity prompts).
-        #[arg(long)]
-        reindex: bool,
-        /// Detect vault without writing anything (agent mode).
-        #[arg(long)]
-        detect: bool,
-        /// Output as JSON (agent mode).
-        #[arg(long)]
-        json: bool,
-        /// Suppress interactive prompts.
-        #[arg(long)]
-        quiet: bool,
-        /// User name (non-interactive mode).
-        #[arg(long)]
-        name: Option<String>,
-        /// User role (non-interactive mode).
-        #[arg(long)]
-        role: Option<String>,
-        /// Vault purpose (non-interactive mode).
-        #[arg(long)]
-        purpose: Option<String>,
-    },
-
-    /// Print identity block (L0 + L1 context for AI agents).
-    Identity {
-        /// Output as JSON.
-        #[arg(long)]
-        json: bool,
-        /// Force L1 re-extraction without full reindex.
-        #[arg(long)]
-        refresh: bool,
-    },
-
-    /// Configure engraph settings.
-    Configure {
-        /// Enable intelligence features.
-        #[arg(long, conflicts_with = "disable_intelligence")]
-        enable_intelligence: bool,
-
-        /// Disable intelligence features.
-        #[arg(long, conflicts_with = "enable_intelligence")]
-        disable_intelligence: bool,
-
-        /// Override a model: --model embed|rerank <uri>
-        #[arg(long, num_args = 2, value_names = &["TYPE", "URI"])]
-        model: Option<Vec<String>>,
-
-        /// Enable Obsidian CLI integration.
-        #[arg(long, conflicts_with = "disable_obsidian_cli")]
-        enable_obsidian_cli: bool,
-
-        /// Disable Obsidian CLI integration.
-        #[arg(long, conflicts_with = "enable_obsidian_cli")]
-        disable_obsidian_cli: bool,
-
-        /// Register with an AI agent: "claude-code", "cursor", or "windsurf".
-        #[arg(long)]
-        register: Option<String>,
-
-        /// Generate and add a new API key.
-        #[arg(long)]
-        add_api_key: bool,
-
-        /// Name for the new API key (requires --add-api-key).
-        #[arg(long, requires = "add_api_key")]
-        key_name: Option<String>,
-
-        /// Permissions for the new key: "read" or "write" (requires --add-api-key).
-        #[arg(long, requires = "add_api_key")]
-        key_permissions: Option<String>,
-
-        /// List all API keys.
-        #[arg(long)]
-        list_api_keys: bool,
-
-        /// Revoke an API key by name.
-        #[arg(long)]
-        revoke_api_key: Option<String>,
-
-        /// Interactive setup for ChatGPT Actions integration.
-        #[arg(long)]
-        setup_chatgpt: bool,
-    },
-
-    /// Manage embedding models.
-    Models {
-        #[command(subcommand)]
-        action: ModelsAction,
-    },
-
-    /// Start MCP stdio server for AI agent access.
-    Serve {
-        /// Enable HTTP REST API alongside MCP.
-        #[arg(long)]
-        http: bool,
-        /// HTTP port (default: from config or 3000).
-        #[arg(long)]
-        port: Option<u16>,
-        /// HTTP host to bind to (default: 127.0.0.1).
-        #[arg(long)]
-        host: Option<String>,
-        /// Disable API key authentication (local development only, 127.0.0.1 only).
-        #[arg(long)]
-        no_auth: bool,
-        /// Read-only mode: only expose search and read MCP tools, disable all write operations.
-        #[arg(long)]
-        read_only: bool,
-    },
-
-    /// Inspect vault graph connections.
-    Graph {
-        #[command(subcommand)]
-        action: GraphAction,
-    },
-
-    /// Query vault context.
-    Context {
-        #[command(subcommand)]
-        action: ContextAction,
-    },
-
-    /// Write a note to the vault.
-    Write {
-        #[command(subcommand)]
-        action: WriteAction,
-    },
-
-    /// Migrate vault structure.
-    Migrate {
-        #[command(subcommand)]
-        action: MigrateAction,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum GraphAction {
-    /// Show connections for a note.
-    Show {
-        /// File path or #docid.
-        file: String,
-    },
-    /// Show vault graph statistics.
-    Stats,
-}
-
-#[derive(Subcommand, Debug)]
-enum ContextAction {
-    /// Read a note's full content with metadata.
-    Read {
-        /// File path, basename, or #docid.
-        file: String,
-    },
-    /// List notes by metadata filters.
-    List {
-        /// Filter to folder path prefix.
-        #[arg(long)]
-        folder: Option<String>,
-        /// Filter to notes with all listed tags (comma-separated). A trailing
-        /// `/` or `/*` matches the tag and its descendants.
-        #[arg(long, value_delimiter = ',')]
-        tags: Vec<String>,
-        /// Filter to notes carrying every term (comma-separated). A trailing
-        /// `/` or `/*` matches the tag and its descendants.
-        #[arg(long, value_delimiter = ',')]
-        all: Vec<String>,
-        /// Filter to notes carrying at least one term (comma-separated). An
-        /// unknown term is an error naming the nearest tag the vault holds.
-        #[arg(long, value_delimiter = ',')]
-        any: Vec<String>,
-        /// Filter out notes carrying any of these terms (comma-separated).
-        /// An unknown term here is ignored.
-        #[arg(long, value_delimiter = ',')]
-        none: Vec<String>,
-        /// Filter to notes created by a specific agent.
-        #[arg(long)]
-        created_by: Option<String>,
-        /// Maximum results.
-        #[arg(long, default_value = "20")]
-        limit: usize,
-    },
-    /// List the vault's tag vocabulary.
-    Tags {
-        /// Limit to one tag and its descendants, as `type/` or `type/*`.
-        #[arg(long)]
-        under: Option<String>,
-    },
-    /// Vault structure overview.
-    VaultMap,
-    /// Person context bundle.
-    Who {
-        /// Person name (matches filename in People folder).
-        name: String,
-    },
-    /// Project context bundle.
-    Project {
-        /// Project name (matches filename).
-        name: String,
-    },
-    /// Rich topic context with budget.
-    Topic {
-        /// Search query for the topic.
-        query: String,
-        /// Character budget (default 32000, ~8000 tokens).
-        #[arg(long, default_value = "32000")]
-        budget: usize,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum WriteAction {
-    /// Create a new note.
-    Create {
-        /// Note content (reads from stdin if omitted).
-        #[arg(long)]
-        content: Option<String>,
-        /// Filename (without .md).
-        #[arg(long)]
-        filename: Option<String>,
-        /// Type hint for placement.
-        #[arg(long)]
-        type_hint: Option<String>,
-        /// Tags (comma-separated).
-        #[arg(long, value_delimiter = ',')]
-        tags: Vec<String>,
-        /// Explicit folder (skips placement).
-        #[arg(long)]
-        folder: Option<String>,
-    },
-    /// Append content to an existing note.
-    Append {
-        /// Target note (path, basename, or #docid).
-        file: String,
-        /// Content to append (reads from stdin if omitted).
-        #[arg(long)]
-        content: Option<String>,
-    },
-    /// Archive a note (soft delete — moves to archive, removes from index).
-    Archive {
-        /// Target note (path, basename, or #docid).
-        file: String,
-    },
-    /// Restore an archived note to its original location.
-    Unarchive {
-        /// Archived note path (e.g., "04-Archive/01-Projects/note.md").
-        file: String,
-    },
-    /// Edit a specific section of a note.
-    Edit {
-        /// Target note (path, basename, or #docid).
-        #[arg(long)]
-        file: String,
-        /// Section heading to edit (case-insensitive).
-        #[arg(long)]
-        heading: String,
-        /// Content to add/replace in the section.
-        #[arg(long)]
-        content: String,
-        /// Edit mode: "replace", "prepend", or "append" (default: "append").
-        #[arg(long, default_value = "append")]
-        mode: String,
-    },
-    /// Rewrite a note's body content (preserves frontmatter by default).
-    Rewrite {
-        /// Target note (path, basename, or #docid).
-        #[arg(long)]
-        file: String,
-        /// New body content.
-        #[arg(long)]
-        content: String,
-        /// Preserve existing frontmatter (default: true).
-        #[arg(long, default_value_t = true)]
-        preserve_frontmatter: bool,
-    },
-    /// Edit a note's frontmatter properties.
-    EditFrontmatter {
-        /// Target note (path, basename, or #docid).
-        #[arg(long)]
-        file: String,
-        /// Operations as JSON string: [{"op":"add_tag","value":"rust"},{"op":"set","key":"status","value":"done"}]
-        #[arg(long)]
-        operations: String,
-    },
-    /// Delete a note.
-    Delete {
-        /// Target note (path, basename, or #docid).
-        file: String,
-        /// Delete mode: "soft" (archive, default) or "hard" (permanent).
-        #[arg(long, default_value = "soft")]
-        mode: String,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum ModelsAction {
-    /// List available models.
-    List,
-    /// Show info about a model.
-    Info { name: String },
-}
-
-#[derive(Subcommand, Debug)]
-enum MigrateAction {
-    /// Classify notes and generate PARA migration preview.
-    Para {
-        /// Apply a previously generated preview.
-        #[arg(long)]
-        apply: bool,
-        /// Undo the last migration.
-        #[arg(long, conflicts_with = "apply")]
-        undo: bool,
-    },
-}
 
 /// Prompt user to enable intelligence, download models if yes.
 fn prompt_intelligence(data_dir: &std::path::Path) -> Result<bool> {
@@ -462,6 +64,63 @@ fn remove_dir_if_exists(path: &std::path::Path) -> Result<bool> {
     }
 }
 
+/// The store, the vault it indexed and that vault's profile.
+///
+/// Every capability that reads or writes the vault opens these three the same
+/// way. The two command groups used to open them once for a whole group; the
+/// commands are flat now, so one function is what keeps the twelve arms below
+/// from each spelling it out (#62).
+fn open_vault(data_dir: &Path) -> Result<(store::Store, PathBuf, Option<VaultProfile>)> {
+    if !index_exists(data_dir) {
+        eprintln!("No index found. Run 'engraph index <path>' first.");
+        std::process::exit(1);
+    }
+    let store = store::Store::open(&data_dir.join("engraph.db"))?;
+    let vault_path = store.get_meta("vault_path")?.ok_or_else(|| {
+        anyhow::anyhow!("No vault path in index. Run 'engraph index <path>' first.")
+    })?;
+    let profile = config::Config::load_vault_profile().ok().flatten();
+    Ok((store, PathBuf::from(&vault_path), profile))
+}
+
+/// The embedding model, checked against the store it is about to write into.
+///
+/// A command that indexes what it wrote has to produce rows the rest of the
+/// index agrees with: the same vector width (issue #12), and the same code
+/// that built the index (issue #31). Mixing two chunkings in one store is
+/// worse than either of them.
+fn open_indexing_embedder(
+    cfg: &Config,
+    data_dir: &Path,
+    store: &store::Store,
+) -> Result<engraph::llm::LlamaEmbed> {
+    let models_dir = data_dir.join("models");
+    let embedder = engraph::llm::LlamaEmbed::new(&models_dir, cfg)?;
+    store.verify_embedding_dim(engraph::llm::EmbedModel::dim(&embedder))?;
+    engraph::fingerprint::verify(
+        store,
+        &engraph::fingerprint::Fingerprints::compute(
+            cfg,
+            &engraph::llm::EmbedModel::fingerprint(&embedder),
+            None,
+        ),
+    )?;
+    Ok(embedder)
+}
+
+/// The content a write takes, read from stdin when the argument is omitted.
+/// The CLI is the one surface that has a stdin, so this fallback is its own.
+fn content_or_stdin(content: Option<String>) -> Result<String> {
+    match content {
+        Some(c) => Ok(c),
+        None => {
+            let mut buf = String::new();
+            io::stdin().lock().read_to_string(&mut buf)?;
+            Ok(buf)
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -485,11 +144,8 @@ async fn main() -> Result<()> {
     let data_dir = Config::data_dir()?;
 
     match cli.command {
-        Command::Index {
-            path,
-            rebuild,
-            no_gitignore,
-        } => {
+        Command::Index { args, path } => {
+            let (rebuild, no_gitignore) = (args.rebuild, args.no_gitignore);
             // Merge CLI vault path over config.
             cfg.merge_vault_path(path);
             if no_gitignore {
@@ -553,20 +209,11 @@ async fn main() -> Result<()> {
             );
         }
 
-        Command::Search {
-            query,
-            top_n,
-            explain,
-            group_by,
-            tags,
-            all,
-            any,
-            none,
-        } => {
-            cfg.merge_top_n(top_n);
-            let group_by = group_by.unwrap_or(cfg.group_by);
-            let all_terms = engraph::tags::merge_all_alias(tags, all);
-            let scope = engraph::tags::TagFilter::parse(&all_terms, &any, &none)?;
+        Command::Search(args) => {
+            cfg.merge_top_n(args.top_n);
+            let group_by = args.group_by.unwrap_or(cfg.group_by);
+            let all_terms = engraph::tags::merge_all_alias(args.tags, args.all);
+            let scope = engraph::tags::TagFilter::parse(&all_terms, &args.any, &args.none)?;
 
             if !index_exists(&data_dir) {
                 eprintln!("No index found. Run 'engraph index <path>' first.");
@@ -574,17 +221,296 @@ async fn main() -> Result<()> {
             }
 
             search::run_search(
-                &query, cfg.top_n, cli.json, explain, group_by, &scope, &data_dir, &cfg,
+                &args.query,
+                cfg.top_n,
+                cli.json,
+                args.explain,
+                group_by,
+                &scope,
+                &data_dir,
+                &cfg,
             )?;
         }
 
-        Command::Status => {
+        Command::Status(_) => {
             if !index_exists(&data_dir) {
                 eprintln!("No index found. Run 'engraph index <path>' first.");
                 std::process::exit(1);
             }
 
             search::run_status(cli.json, &data_dir)?;
+        }
+
+        Command::Read(args) => {
+            let (store, vault_path, profile) = open_vault(&data_dir)?;
+            let params = engraph::context::ContextParams {
+                store: &store,
+                vault_path: &vault_path,
+                profile: profile.as_ref(),
+            };
+            let note =
+                engraph::context::context_read(&params, &args.file, args.section.as_deref())?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&note)?);
+            } else {
+                println!(
+                    "{} {}",
+                    note.path,
+                    note.docid
+                        .as_deref()
+                        .map(|d| format!("(#{})", d))
+                        .unwrap_or_default()
+                );
+                println!("Tags: {}", note.tags.join(", "));
+                println!("Outgoing links: {}", note.outgoing_links.len());
+                println!("Incoming links: {}", note.incoming_links.len());
+                println!("Bytes: {}\n", note.byte_count);
+                println!("{}", note.body);
+            }
+        }
+
+        Command::List(args) => {
+            let (store, vault_path, profile) = open_vault(&data_dir)?;
+            let params = engraph::context::ContextParams {
+                store: &store,
+                vault_path: &vault_path,
+                profile: profile.as_ref(),
+            };
+            let all_terms = engraph::tags::merge_all_alias(args.tags, args.all);
+            let filter = engraph::tags::TagFilter::parse(&all_terms, &args.any, &args.none)?;
+            let items = engraph::context::context_list(
+                &params,
+                args.folder.as_deref(),
+                &filter,
+                args.created_by.as_deref(),
+                args.limit,
+            )?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&items)?);
+            } else {
+                for item in &items {
+                    let did = item
+                        .docid
+                        .as_deref()
+                        .map(|d| format!(" #{d}"))
+                        .unwrap_or_default();
+                    let tags_str = if item.tags.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" [{}]", item.tags.join(", "))
+                    };
+                    println!(
+                        "{}{}{} ({} edges)",
+                        item.path, did, tags_str, item.edge_count
+                    );
+                }
+                println!("\n{} notes", items.len());
+            }
+        }
+
+        Command::Tags(args) => {
+            let (store, _vault_path, _profile) = open_vault(&data_dir)?;
+            let prefix = args.under.as_deref().and_then(engraph::tags::parse_term);
+            let rows = store.tags_under(prefix.as_ref())?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+            } else {
+                for row in &rows {
+                    println!("{} ({})", row.display, row.note_count);
+                }
+            }
+        }
+
+        Command::VaultMap(_) => {
+            let (store, vault_path, profile) = open_vault(&data_dir)?;
+            let params = engraph::context::ContextParams {
+                store: &store,
+                vault_path: &vault_path,
+                profile: profile.as_ref(),
+            };
+            let map = engraph::context::vault_map(&params)?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&map)?);
+            } else {
+                println!("Vault: {}", map.vault_path);
+                println!("Type: {}, Structure: {}", map.vault_type, map.structure);
+                println!(
+                    "Files: {}, Chunks: {}, Edges: {}\n",
+                    map.total_files, map.total_chunks, map.total_edges
+                );
+                println!("Folders:");
+                for f in &map.folders {
+                    println!("  {}: {} notes", f.path, f.note_count);
+                }
+                println!("\nTop tags:");
+                for (tag, count) in &map.top_tags {
+                    println!("  {}: {}", tag, count);
+                }
+                println!("\nRecent files:");
+                for path in &map.recent_files {
+                    println!("  {}", path);
+                }
+            }
+        }
+
+        Command::Who(args) => {
+            let (store, vault_path, profile) = open_vault(&data_dir)?;
+            let params = engraph::context::ContextParams {
+                store: &store,
+                vault_path: &vault_path,
+                profile: profile.as_ref(),
+            };
+            let person = engraph::context::context_who(&params, &args.name)?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&person)?);
+            } else {
+                println!("# {}\n", person.name);
+                if let Some(note) = &person.note {
+                    println!(
+                        "Note: {} {}",
+                        note.path,
+                        note.docid
+                            .as_deref()
+                            .map(|d| format!("(#{})", d))
+                            .unwrap_or_default()
+                    );
+                    println!("Tags: {}\n", note.tags.join(", "));
+                    println!("{}\n", note.body);
+                } else {
+                    println!("(No person note found)\n");
+                }
+                if !person.mentioned_in.is_empty() {
+                    println!("Mentioned in ({} notes):", person.mentioned_in.len());
+                    for m in &person.mentioned_in {
+                        println!("  {} — {}", m.path, m.snippet);
+                    }
+                    println!();
+                }
+                if !person.linked_from.is_empty() {
+                    println!("Linked from ({}):", person.linked_from.len());
+                    for p in &person.linked_from {
+                        println!("  {}", p);
+                    }
+                    println!();
+                }
+                println!("Total: {} chars", person.total_chars);
+            }
+        }
+
+        Command::Project(args) => {
+            let (store, vault_path, profile) = open_vault(&data_dir)?;
+            let params = engraph::context::ContextParams {
+                store: &store,
+                vault_path: &vault_path,
+                profile: profile.as_ref(),
+            };
+            let proj = engraph::context::context_project(&params, &args.name)?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&proj)?);
+            } else {
+                println!("# {}\n", proj.name);
+                if let Some(note) = &proj.note {
+                    println!("Note: {}\n", note.path);
+                    println!("{}\n", note.body);
+                }
+                if !proj.active_tasks.is_empty() {
+                    println!("Active tasks ({}):", proj.active_tasks.len());
+                    for t in &proj.active_tasks {
+                        println!("  - [ ] {} ({})", t.text, t.source_file);
+                    }
+                    println!();
+                }
+                if !proj.child_notes.is_empty() {
+                    println!("Child notes ({}):", proj.child_notes.len());
+                    for c in &proj.child_notes {
+                        println!("  {}", c.path);
+                    }
+                    println!();
+                }
+                if !proj.team.is_empty() {
+                    println!("Team:");
+                    for p in &proj.team {
+                        println!("  {}", p);
+                    }
+                    println!();
+                }
+                if !proj.recent_mentions.is_empty() {
+                    println!("Recent daily mentions:");
+                    for m in &proj.recent_mentions {
+                        println!("  {} — {}", m.path, m.snippet);
+                    }
+                    println!();
+                }
+            }
+        }
+
+        Command::Topic(args) => {
+            let (store, vault_path, profile) = open_vault(&data_dir)?;
+            let params = engraph::context::ContextParams {
+                store: &store,
+                vault_path: &vault_path,
+                profile: profile.as_ref(),
+            };
+            let models_dir = data_dir.join("models");
+            let mut embedder = engraph::llm::LlamaEmbed::new(&models_dir, &cfg)?;
+
+            let bundle = engraph::context::context_topic_with_search(
+                &params,
+                &args.query,
+                args.budget,
+                &mut embedder,
+            )?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&bundle)?);
+            } else {
+                println!("# Context: {}\n", bundle.topic);
+                println!(
+                    "Budget: {} / {} chars{}\n",
+                    bundle.total_chars,
+                    bundle.budget_chars,
+                    if bundle.truncated { " (truncated)" } else { "" }
+                );
+                for s in &bundle.sections {
+                    let did = s
+                        .docid
+                        .as_deref()
+                        .map(|d| format!(" #{d}"))
+                        .unwrap_or_default();
+                    println!("## {} — {}{}", s.label, s.path, did);
+                    println!("[{}]\n", s.relevance);
+                    println!("{}\n", s.content);
+                }
+            }
+        }
+
+        Command::Health(_) => {
+            let (store, _vault_path, profile) = open_vault(&data_dir)?;
+            let health_config = engraph::health::HealthConfig {
+                daily_folder: profile
+                    .as_ref()
+                    .and_then(|p| p.structure.folders.daily.clone()),
+                inbox_folder: profile
+                    .as_ref()
+                    .and_then(|p| p.structure.folders.inbox.clone()),
+            };
+            let report = engraph::health::generate_health_report(&store, &health_config)?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("Files:        {}", report.total_files);
+                println!("Orphans:      {}", report.orphans.len());
+                println!("Broken links: {}", report.broken_links.len());
+                println!("Stale notes:  {}", report.stale_notes.len());
+                println!("Inbox:        {} pending", report.inbox_pending.len());
+                println!("Tag issues:   {}", report.tag_issues.len());
+                println!("Index age:    {}s", report.index_age_seconds);
+                for link in &report.broken_links {
+                    println!("  broken: {} -> {}", link.source, link.target);
+                }
+                for issue in &report.tag_issues {
+                    println!("  tag: {} — {}", issue.file, issue.issue);
+                }
+            }
         }
 
         Command::Clear { all } => {
@@ -607,16 +533,41 @@ async fn main() -> Result<()> {
         }
 
         Command::Init {
+            args,
             path,
             identity,
             reindex,
             detect,
             json,
             quiet,
-            name,
-            role,
-            purpose,
         } => {
+            let engraph::params::Init {
+                mode,
+                name,
+                role,
+                purpose,
+            } = args;
+            // `--mode` is the name the servers call these two paths by;
+            // `--detect` and `--json` are the CLI's older spelling of the
+            // same two, and both reach the same code (#62).
+            let (detect, json) = match mode.as_deref() {
+                Some("detect") => (true, json),
+                Some("apply") => {
+                    // `--detect` is the older spelling of the other mode, so
+                    // the two together name two modes. Which one the caller
+                    // meant is not for this arm to guess.
+                    if detect {
+                        eprintln!("--mode apply and --detect name different modes. Use one.");
+                        std::process::exit(1);
+                    }
+                    (detect, true)
+                }
+                Some(other) => {
+                    eprintln!("Unknown mode: {other}. Use 'detect' or 'apply'.");
+                    std::process::exit(1);
+                }
+                None => (detect, json),
+            };
             cfg.merge_vault_path(path);
             let vault_path = match &cfg.vault_path {
                 Some(p) => p.clone(),
@@ -655,13 +606,14 @@ async fn main() -> Result<()> {
             engraph::onboarding::run_interactive(&vault_path, &mut cfg, &data_dir, flags)?;
         }
 
-        Command::Identity { json, refresh } => {
+        Command::Identity(args) => {
+            let json = cli.json;
             let db_path = data_dir.join("engraph.db");
             if !db_path.exists() {
                 anyhow::bail!("No index found. Run `engraph init` first.");
             }
             let store = engraph::store::Store::open(&db_path)?;
-            if refresh {
+            if args.refresh {
                 let profile = engraph::config::Config::load_vault_profile()?;
                 match profile {
                     Some(ref p) => {
@@ -909,349 +861,6 @@ async fn main() -> Result<()> {
             );
         }
 
-        Command::Graph { action } => {
-            if !index_exists(&data_dir) {
-                eprintln!("No index found. Run 'engraph index <path>' first.");
-                std::process::exit(1);
-            }
-            let db_path = data_dir.join("engraph.db");
-            let store = store::Store::open(&db_path)?;
-
-            match action {
-                GraphAction::Show { file } => {
-                    // Resolve: docid first, then exact path, then basename
-                    let record = if file.starts_with('#') && file.len() == 7 {
-                        store.get_file_by_docid(&file[1..])?
-                    } else if let Some(f) = store.get_file(&file)? {
-                        Some(f)
-                    } else {
-                        store.find_file_by_basename(&file)?
-                    };
-
-                    let record = match record {
-                        Some(r) => r,
-                        None => {
-                            eprintln!("File not found: {file}");
-                            std::process::exit(1);
-                        }
-                    };
-
-                    let docid_str = record
-                        .docid
-                        .as_deref()
-                        .map(|d| format!(" (#{d})"))
-                        .unwrap_or_default();
-                    println!("{}{}\n", record.path, docid_str);
-
-                    let outgoing_wl = store.get_outgoing(record.id, Some("wikilink"))?;
-                    println!("Outgoing wikilinks ({}):", outgoing_wl.len());
-                    for (fid, _) in &outgoing_wl {
-                        if let Some(f) = store.get_file_by_id(*fid)? {
-                            let did = f
-                                .docid
-                                .as_deref()
-                                .map(|d| format!(" (#{d})"))
-                                .unwrap_or_default();
-                            println!("  → {}{}", f.path, did);
-                        }
-                    }
-
-                    println!();
-                    let incoming_wl = store.get_incoming(record.id, Some("wikilink"))?;
-                    println!("Incoming wikilinks ({}):", incoming_wl.len());
-                    for (fid, _) in &incoming_wl {
-                        if let Some(f) = store.get_file_by_id(*fid)? {
-                            let did = f
-                                .docid
-                                .as_deref()
-                                .map(|d| format!(" (#{d})"))
-                                .unwrap_or_default();
-                            println!("  ← {}{}", f.path, did);
-                        }
-                    }
-
-                    println!();
-                    let mentions_out = store.get_outgoing(record.id, Some("mention"))?;
-                    let mentions_in = store.get_incoming(record.id, Some("mention"))?;
-                    println!("Mentions out ({}):", mentions_out.len());
-                    for (fid, _) in &mentions_out {
-                        if let Some(f) = store.get_file_by_id(*fid)? {
-                            let did = f
-                                .docid
-                                .as_deref()
-                                .map(|d| format!(" (#{d})"))
-                                .unwrap_or_default();
-                            println!("  → {}{}", f.path, did);
-                        }
-                    }
-                    if !mentions_in.is_empty() {
-                        println!("Mentioned by ({}):", mentions_in.len());
-                        for (fid, _) in &mentions_in {
-                            if let Some(f) = store.get_file_by_id(*fid)? {
-                                let did = f
-                                    .docid
-                                    .as_deref()
-                                    .map(|d| format!(" (#{d})"))
-                                    .unwrap_or_default();
-                                println!("  ← {}{}", f.path, did);
-                            }
-                        }
-                    }
-                }
-
-                GraphAction::Stats => {
-                    let stats = store.get_edge_stats()?;
-                    println!("Vault Graph:");
-                    println!(
-                        "  Wikilink edges: {} ({} bidirectional pairs)",
-                        stats.wikilink_count,
-                        stats.wikilink_count / 2
-                    );
-                    println!("  Mention edges:  {}", stats.mention_count);
-                    println!("  Total edges:    {}", stats.total_edges);
-                    let total_files = stats.connected_file_count + stats.isolated_file_count;
-                    let pct = if total_files > 0 {
-                        stats.connected_file_count as f64 / total_files as f64 * 100.0
-                    } else {
-                        0.0
-                    };
-                    println!(
-                        "  Connected files: {} / {} ({:.1}%)",
-                        stats.connected_file_count, total_files, pct
-                    );
-                    println!("  Isolated files:  {}", stats.isolated_file_count);
-                }
-            }
-        }
-
-        Command::Context { action } => {
-            if !index_exists(&data_dir) {
-                eprintln!("No index found. Run 'engraph index <path>' first.");
-                std::process::exit(1);
-            }
-            let db_path = data_dir.join("engraph.db");
-            let store = store::Store::open(&db_path)?;
-            let vault_path_str = store.get_meta("vault_path")?.ok_or_else(|| {
-                anyhow::anyhow!("No vault path in index. Run 'engraph index <path>' first.")
-            })?;
-            let vault_path = PathBuf::from(&vault_path_str);
-            let profile = config::Config::load_vault_profile().ok().flatten();
-
-            let params = engraph::context::ContextParams {
-                store: &store,
-                vault_path: &vault_path,
-                profile: profile.as_ref(),
-            };
-
-            match action {
-                ContextAction::Read { file } => {
-                    let note = engraph::context::context_read(&params, &file)?;
-                    if cli.json {
-                        println!("{}", serde_json::to_string_pretty(&note)?);
-                    } else {
-                        println!(
-                            "{} {}",
-                            note.path,
-                            note.docid
-                                .as_deref()
-                                .map(|d| format!("(#{})", d))
-                                .unwrap_or_default()
-                        );
-                        println!("Tags: {}", note.tags.join(", "));
-                        println!("Outgoing links: {}", note.outgoing_links.len());
-                        println!("Incoming links: {}", note.incoming_links.len());
-                        println!("Bytes: {}\n", note.byte_count);
-                        println!("{}", note.body);
-                    }
-                }
-                ContextAction::List {
-                    folder,
-                    tags,
-                    all,
-                    any,
-                    none,
-                    created_by,
-                    limit,
-                } => {
-                    let all_terms = engraph::tags::merge_all_alias(tags, all);
-                    let filter = engraph::tags::TagFilter::parse(&all_terms, &any, &none)?;
-                    let items = engraph::context::context_list(
-                        &params,
-                        folder.as_deref(),
-                        &filter,
-                        created_by.as_deref(),
-                        limit,
-                    )?;
-                    if cli.json {
-                        println!("{}", serde_json::to_string_pretty(&items)?);
-                    } else {
-                        for item in &items {
-                            let did = item
-                                .docid
-                                .as_deref()
-                                .map(|d| format!(" #{d}"))
-                                .unwrap_or_default();
-                            let tags_str = if item.tags.is_empty() {
-                                String::new()
-                            } else {
-                                format!(" [{}]", item.tags.join(", "))
-                            };
-                            println!(
-                                "{}{}{} ({} edges)",
-                                item.path, did, tags_str, item.edge_count
-                            );
-                        }
-                        println!("\n{} notes", items.len());
-                    }
-                }
-                ContextAction::Tags { under } => {
-                    let prefix = under.as_deref().and_then(engraph::tags::parse_term);
-                    let rows = store.tags_under(prefix.as_ref())?;
-                    if cli.json {
-                        println!("{}", serde_json::to_string_pretty(&rows)?);
-                    } else {
-                        for row in &rows {
-                            println!("{} ({})", row.display, row.note_count);
-                        }
-                    }
-                }
-                ContextAction::VaultMap => {
-                    let map = engraph::context::vault_map(&params)?;
-                    if cli.json {
-                        println!("{}", serde_json::to_string_pretty(&map)?);
-                    } else {
-                        println!("Vault: {}", map.vault_path);
-                        println!("Type: {}, Structure: {}", map.vault_type, map.structure);
-                        println!(
-                            "Files: {}, Chunks: {}, Edges: {}\n",
-                            map.total_files, map.total_chunks, map.total_edges
-                        );
-                        println!("Folders:");
-                        for f in &map.folders {
-                            println!("  {}: {} notes", f.path, f.note_count);
-                        }
-                        println!("\nTop tags:");
-                        for (tag, count) in &map.top_tags {
-                            println!("  {}: {}", tag, count);
-                        }
-                        println!("\nRecent files:");
-                        for path in &map.recent_files {
-                            println!("  {}", path);
-                        }
-                    }
-                }
-                ContextAction::Who { name } => {
-                    let person = engraph::context::context_who(&params, &name)?;
-                    if cli.json {
-                        println!("{}", serde_json::to_string_pretty(&person)?);
-                    } else {
-                        println!("# {}\n", person.name);
-                        if let Some(note) = &person.note {
-                            println!(
-                                "Note: {} {}",
-                                note.path,
-                                note.docid
-                                    .as_deref()
-                                    .map(|d| format!("(#{})", d))
-                                    .unwrap_or_default()
-                            );
-                            println!("Tags: {}\n", note.tags.join(", "));
-                            println!("{}\n", note.body);
-                        } else {
-                            println!("(No person note found)\n");
-                        }
-                        if !person.mentioned_in.is_empty() {
-                            println!("Mentioned in ({} notes):", person.mentioned_in.len());
-                            for m in &person.mentioned_in {
-                                println!("  {} — {}", m.path, m.snippet);
-                            }
-                            println!();
-                        }
-                        if !person.linked_from.is_empty() {
-                            println!("Linked from ({}):", person.linked_from.len());
-                            for p in &person.linked_from {
-                                println!("  {}", p);
-                            }
-                            println!();
-                        }
-                        println!("Total: {} chars", person.total_chars);
-                    }
-                }
-                ContextAction::Project { name } => {
-                    let proj = engraph::context::context_project(&params, &name)?;
-                    if cli.json {
-                        println!("{}", serde_json::to_string_pretty(&proj)?);
-                    } else {
-                        println!("# {}\n", proj.name);
-                        if let Some(note) = &proj.note {
-                            println!("Note: {}\n", note.path);
-                            println!("{}\n", note.body);
-                        }
-                        if !proj.active_tasks.is_empty() {
-                            println!("Active tasks ({}):", proj.active_tasks.len());
-                            for t in &proj.active_tasks {
-                                println!("  - [ ] {} ({})", t.text, t.source_file);
-                            }
-                            println!();
-                        }
-                        if !proj.child_notes.is_empty() {
-                            println!("Child notes ({}):", proj.child_notes.len());
-                            for c in &proj.child_notes {
-                                println!("  {}", c.path);
-                            }
-                            println!();
-                        }
-                        if !proj.team.is_empty() {
-                            println!("Team:");
-                            for p in &proj.team {
-                                println!("  {}", p);
-                            }
-                            println!();
-                        }
-                        if !proj.recent_mentions.is_empty() {
-                            println!("Recent daily mentions:");
-                            for m in &proj.recent_mentions {
-                                println!("  {} — {}", m.path, m.snippet);
-                            }
-                            println!();
-                        }
-                    }
-                }
-                ContextAction::Topic { query, budget } => {
-                    let models_dir = data_dir.join("models");
-                    let mut embedder = engraph::llm::LlamaEmbed::new(&models_dir, &cfg)?;
-
-                    let bundle = engraph::context::context_topic_with_search(
-                        &params,
-                        &query,
-                        budget,
-                        &mut embedder,
-                    )?;
-                    if cli.json {
-                        println!("{}", serde_json::to_string_pretty(&bundle)?);
-                    } else {
-                        println!("# Context: {}\n", bundle.topic);
-                        println!(
-                            "Budget: {} / {} chars{}\n",
-                            bundle.total_chars,
-                            bundle.budget_chars,
-                            if bundle.truncated { " (truncated)" } else { "" }
-                        );
-                        for s in &bundle.sections {
-                            let did = s
-                                .docid
-                                .as_deref()
-                                .map(|d| format!(" #{d}"))
-                                .unwrap_or_default();
-                            println!("## {} — {}{}", s.label, s.path, did);
-                            println!("[{}]\n", s.relevance);
-                            println!("{}\n", s.content);
-                        }
-                    }
-                }
-            }
-        }
-
         Command::Serve {
             http,
             port,
@@ -1276,301 +885,202 @@ async fn main() -> Result<()> {
             engraph::serve::run_serve(&data_dir, http_opts, read_only).await?;
         }
 
-        Command::Write { action } => {
-            if !index_exists(&data_dir) {
-                eprintln!("No index found. Run 'engraph index <path>' first.");
-                std::process::exit(1);
-            }
-            let db_path = data_dir.join("engraph.db");
-            let store = store::Store::open(&db_path)?;
-            let vault_path_str = store
-                .get_meta("vault_path")?
-                .ok_or_else(|| anyhow::anyhow!("No vault path in index."))?;
-            let vault_path = PathBuf::from(&vault_path_str);
-            let models_dir = data_dir.join("models");
-            let mut embedder = engraph::llm::LlamaEmbed::new(&models_dir, &cfg)?;
-            store.verify_embedding_dim(engraph::llm::EmbedModel::dim(&embedder))?;
-            // A write indexes the note it just wrote. Doing that against an
-            // index built by different code mixes two chunkings in one store,
-            // which is worse than either of them (issue #31).
-            engraph::fingerprint::verify(
+        Command::Create(args) => {
+            let (store, vault_path, profile) = open_vault(&data_dir)?;
+            let mut embedder = open_indexing_embedder(&cfg, &data_dir, &store)?;
+            // The CLI is the one surface with a stdin, so an omitted content
+            // is read from it here and is an error on the other two.
+            let content = content_or_stdin(args.content)?;
+            let input = engraph::writer::CreateNoteInput {
+                content,
+                filename: args.filename,
+                type_hint: args.type_hint,
+                tags: args.tags,
+                folder: args.folder,
+                created_by: "cli".into(),
+                auto_link: args.auto_link,
+            };
+            let result = engraph::writer::create_note(
+                input,
                 &store,
-                &engraph::fingerprint::Fingerprints::compute(
-                    &cfg,
-                    &engraph::llm::EmbedModel::fingerprint(&embedder),
-                    None,
-                ),
+                &mut embedder,
+                engraph::prefix::EmbedComposition::from_config(&cfg),
+                cfg.chunk_options(),
+                &vault_path,
+                profile.as_ref(),
             )?;
-            let profile = config::Config::load_vault_profile().ok().flatten();
-
-            match action {
-                WriteAction::Create {
-                    content,
-                    filename,
-                    type_hint,
-                    tags,
-                    folder,
-                } => {
-                    let content = match content {
-                        Some(c) => c,
-                        None => {
-                            let mut buf = String::new();
-                            io::stdin().lock().read_to_string(&mut buf)?;
-                            buf
-                        }
-                    };
-                    let input = engraph::writer::CreateNoteInput {
-                        content,
-                        filename,
-                        type_hint,
-                        tags,
-                        folder,
-                        created_by: "cli".into(),
-                        auto_link: None,
-                    };
-                    let result = engraph::writer::create_note(
-                        input,
-                        &store,
-                        &mut embedder,
-                        engraph::prefix::EmbedComposition::from_config(&cfg),
-                        cfg.chunk_options(),
-                        &vault_path,
-                        profile.as_ref(),
-                    )?;
-                    if cli.json {
-                        println!("{}", serde_json::to_string_pretty(&result)?);
-                    } else {
-                        println!(
-                            "Created: {} (#{}) [{}]",
-                            result.path, result.docid, result.strategy
-                        );
-                        if !result.links_added.is_empty() {
-                            println!("Links: {}", result.links_added.join(", "));
-                        }
-                        if !result.links_suggested.is_empty() {
-                            println!("Suggested: {}", result.links_suggested.join(", "));
-                        }
-                    }
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!(
+                    "Created: {} (#{}) [{}]",
+                    result.path, result.docid, result.strategy
+                );
+                if !result.links_added.is_empty() {
+                    println!("Links: {}", result.links_added.join(", "));
                 }
-                WriteAction::Append { file, content } => {
-                    let content = match content {
-                        Some(c) => c,
-                        None => {
-                            let mut buf = String::new();
-                            io::stdin().lock().read_to_string(&mut buf)?;
-                            buf
-                        }
-                    };
-                    let input = engraph::writer::AppendInput {
-                        file,
-                        content,
-                        modified_by: "cli".into(),
-                    };
-                    let result = engraph::writer::append_to_note(
-                        input,
-                        &store,
-                        &mut embedder,
-                        engraph::prefix::EmbedComposition::from_config(&cfg),
-                        cfg.chunk_options(),
-                        &vault_path,
-                    )?;
-                    if cli.json {
-                        println!("{}", serde_json::to_string_pretty(&result)?);
-                    } else {
-                        println!("Appended to: {} (#{})", result.path, result.docid);
-                    }
-                }
-                WriteAction::Archive { file } => {
-                    let result = engraph::writer::archive_note(
-                        &file,
-                        &store,
-                        &vault_path,
-                        profile.as_ref(),
-                    )?;
-                    if cli.json {
-                        println!("{}", serde_json::to_string_pretty(&result)?);
-                    } else {
-                        println!("Archived: {} → {}", file, result.path);
-                    }
-                }
-                WriteAction::Unarchive { file } => {
-                    let result = engraph::writer::unarchive_note(
-                        &file,
-                        &store,
-                        &mut embedder,
-                        engraph::prefix::EmbedComposition::from_config(&cfg),
-                        cfg.chunk_options(),
-                        &vault_path,
-                    )?;
-                    if cli.json {
-                        println!("{}", serde_json::to_string_pretty(&result)?);
-                    } else {
-                        println!("Restored: {} → {}", file, result.path);
-                    }
-                }
-                WriteAction::Edit {
-                    file,
-                    heading,
-                    content,
-                    mode,
-                } => {
-                    let edit_mode = match mode.as_str() {
-                        "replace" => engraph::writer::EditMode::Replace,
-                        "prepend" => engraph::writer::EditMode::Prepend,
-                        _ => engraph::writer::EditMode::Append,
-                    };
-                    let input = engraph::writer::EditInput {
-                        file,
-                        heading,
-                        content,
-                        mode: edit_mode,
-                        modified_by: "cli".into(),
-                    };
-                    let result = engraph::writer::edit_note(&store, &vault_path, &input, None)?;
-                    if cli.json {
-                        println!("{}", serde_json::to_string_pretty(&result)?);
-                    } else {
-                        println!(
-                            "Edited: {} section \"{}\" ({})",
-                            result.path, result.heading, result.mode
-                        );
-                    }
-                }
-                WriteAction::Rewrite {
-                    file,
-                    content,
-                    preserve_frontmatter,
-                } => {
-                    let input = engraph::writer::RewriteInput {
-                        file,
-                        content,
-                        preserve_frontmatter,
-                        modified_by: "cli".into(),
-                    };
-                    let result = engraph::writer::rewrite_note(&store, &vault_path, &input)?;
-                    if cli.json {
-                        println!("{}", serde_json::to_string_pretty(&result)?);
-                    } else {
-                        println!(
-                            "Rewrote: {} (frontmatter {})",
-                            result.path,
-                            if preserve_frontmatter {
-                                "preserved"
-                            } else {
-                                "replaced"
-                            }
-                        );
-                    }
-                }
-                WriteAction::EditFrontmatter { file, operations } => {
-                    let raw_ops: Vec<serde_json::Value> = serde_json::from_str(&operations)
-                        .map_err(|e| anyhow::anyhow!("invalid JSON operations: {}", e))?;
-                    let mut ops = Vec::new();
-                    for raw in &raw_ops {
-                        let op = raw.get("op").and_then(|v| v.as_str()).unwrap_or("");
-                        match op {
-                            "set" => {
-                                let key = raw
-                                    .get("key")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                let value = raw
-                                    .get("value")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                ops.push(engraph::writer::FrontmatterOp::Set(key, value));
-                            }
-                            "remove" => {
-                                let key = raw
-                                    .get("key")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                ops.push(engraph::writer::FrontmatterOp::Remove(key));
-                            }
-                            "add_tag" => {
-                                let value = raw
-                                    .get("value")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                ops.push(engraph::writer::FrontmatterOp::AddTag(value));
-                            }
-                            "remove_tag" => {
-                                let value = raw
-                                    .get("value")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                ops.push(engraph::writer::FrontmatterOp::RemoveTag(value));
-                            }
-                            "add_alias" => {
-                                let value = raw
-                                    .get("value")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                ops.push(engraph::writer::FrontmatterOp::AddAlias(value));
-                            }
-                            "remove_alias" => {
-                                let value = raw
-                                    .get("value")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                ops.push(engraph::writer::FrontmatterOp::RemoveAlias(value));
-                            }
-                            _ => {
-                                return Err(anyhow::anyhow!("unknown frontmatter op: {:?}", op));
-                            }
-                        }
-                    }
-                    let input = engraph::writer::EditFrontmatterInput {
-                        file,
-                        operations: ops,
-                        modified_by: "cli".into(),
-                    };
-                    let result = engraph::writer::edit_frontmatter(&store, &vault_path, &input)?;
-                    if cli.json {
-                        println!("{}", serde_json::to_string_pretty(&result)?);
-                    } else {
-                        println!("Frontmatter updated: {}", result.path);
-                    }
-                }
-                WriteAction::Delete { file, mode } => {
-                    let delete_mode = match mode.as_str() {
-                        "hard" => engraph::writer::DeleteMode::Hard,
-                        _ => engraph::writer::DeleteMode::Soft,
-                    };
-                    let archive_folder = profile
-                        .as_ref()
-                        .and_then(|p| p.structure.folders.archive.as_deref())
-                        .unwrap_or("04-Archive");
-                    engraph::writer::delete_note(
-                        &store,
-                        &vault_path,
-                        &file,
-                        delete_mode,
-                        archive_folder,
-                    )?;
-                    if cli.json {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&serde_json::json!({
-                                "deleted": file,
-                                "mode": mode
-                            }))?
-                        );
-                    } else {
-                        println!("Deleted: {} ({})", file, mode);
-                    }
+                if !result.links_suggested.is_empty() {
+                    println!("Suggested: {}", result.links_suggested.join(", "));
                 }
             }
         }
 
-        Command::Migrate { action } => {
+        Command::Update {
+            file,
+            section,
+            property,
+            mode,
+            content,
+            edits,
+        } => {
+            let (store, vault_path, _profile) = open_vault(&data_dir)?;
+            // The model loads before the write, not after it: a store this
+            // build must not index into is a refusal, and a refusal has to
+            // come while the file is still untouched (issues #12 and #31).
+            let mut embedder = open_indexing_embedder(&cfg, &data_dir, &store)?;
+            // The whole list is read before anything is written, so a request
+            // that names an impossible target writes nothing (#62).
+            let request = engraph::params::Update::from_cli(
+                file,
+                section,
+                property,
+                mode,
+                content,
+                edits,
+                || content_or_stdin(None),
+            )?;
+            let edits = request.to_writer_edits()?;
+            let input = engraph::writer::UpdateInput {
+                file: request.file,
+                edits,
+            };
+            let result = engraph::writer::update_note(&store, &vault_path, &input)?;
+            // `update_note` stores the new content hash and writes no chunks,
+            // so nothing else will re-derive them: `diff_vault` sees a hash
+            // that already matches disk. Re-index here or the note stays
+            // searchable only as the text it held before the edit (#62). Both
+            // servers do the same after their own `update`.
+            //
+            // A failure here happens after the write, so the message says what
+            // did happen rather than reading as "nothing did".
+            engraph::indexer::reindex_written_file(
+                &result.path,
+                &store,
+                &mut embedder,
+                &vault_path,
+                engraph::prefix::EmbedComposition::from_config(&cfg),
+                cfg.chunk_options(),
+            )
+            .with_context(|| {
+                format!(
+                    "the file was written; its index rows were not updated for {}",
+                    result.path
+                )
+            })?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!("Updated: {}", result.path);
+            }
+        }
+
+        Command::Move(args) => {
+            let (store, vault_path, _profile) = open_vault(&data_dir)?;
+            // A move changes a path and no content, so it re-indexes nothing
+            // and needs no model.
+            let result =
+                engraph::writer::move_note(&args.file, &args.new_folder, &store, &vault_path)?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!("Moved: {} → {}", args.file, result.path);
+            }
+        }
+
+        Command::Archive(args) => {
+            let (store, vault_path, profile) = open_vault(&data_dir)?;
+            // Archiving and restoring are one operation and its reverse, so
+            // they are one capability with a flag rather than two names (#62).
+            // Only the restore indexes anything, so only it loads a model.
+            let result = if args.undo {
+                let mut embedder = open_indexing_embedder(&cfg, &data_dir, &store)?;
+                engraph::writer::unarchive_note(
+                    &args.file,
+                    &store,
+                    &mut embedder,
+                    engraph::prefix::EmbedComposition::from_config(&cfg),
+                    cfg.chunk_options(),
+                    &vault_path,
+                )?
+            } else {
+                engraph::writer::archive_note(&args.file, &store, &vault_path, profile.as_ref())?
+            };
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else if args.undo {
+                println!("Restored: {} → {}", args.file, result.path);
+            } else {
+                println!("Archived: {} → {}", args.file, result.path);
+            }
+        }
+
+        Command::Delete(args) => {
+            let (store, vault_path, profile) = open_vault(&data_dir)?;
+            let delete_mode = engraph::writer::DeleteMode::from(args.mode);
+            let archive_folder = profile
+                .as_ref()
+                .and_then(|p| p.structure.folders.archive.as_deref())
+                .unwrap_or("04-Archive");
+            engraph::writer::delete_note(
+                &store,
+                &vault_path,
+                &args.file,
+                delete_mode,
+                archive_folder,
+            )?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "deleted": args.file,
+                        "mode": args.mode
+                    }))?
+                );
+            } else {
+                println!("Deleted: {} ({})", args.file, args.mode);
+            }
+        }
+
+        Command::ReindexFile(args) => {
+            let (store, vault_path, _profile) = open_vault(&data_dir)?;
+            let mut embedder = open_indexing_embedder(&cfg, &data_dir, &store)?;
+            let result = engraph::indexer::reindex_written_file(
+                &args.file,
+                &store,
+                &mut embedder,
+                &vault_path,
+                engraph::prefix::EmbedComposition::from_config(&cfg),
+                cfg.chunk_options(),
+            )?;
+            let output = serde_json::json!({
+                "file": args.file,
+                "chunks": result.total_chunks,
+                "docid": result.docid,
+            });
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&output)?);
+            } else {
+                println!(
+                    "Re-indexed: {} ({} chunks, #{})",
+                    args.file, result.total_chunks, result.docid
+                );
+            }
+        }
+
+        Command::Migrate(args) => {
+            // `preview` has no command-line spelling, so the CLI's `apply`
+            // reads the plan its own `preview` saved (#62).
+            let mode = args.mode;
             let data_dir = Config::data_dir()?;
             if !index_exists(&data_dir) {
                 eprintln!("No index found. Run 'engraph index <path>' first.");
@@ -1584,55 +1094,56 @@ async fn main() -> Result<()> {
             let vault_path = PathBuf::from(&vault_path_str);
             let profile = Config::load_vault_profile().ok().flatten();
 
-            match action {
-                MigrateAction::Para { apply, undo } => {
-                    if undo {
-                        let result = engraph::migrate::undo_last(&store, &vault_path)?;
-                        println!(
-                            "Migration {} undone: {} files restored",
-                            result.migration_id, result.restored
-                        );
-                        if !result.errors.is_empty() {
-                            eprintln!("Errors:");
-                            for e in &result.errors {
-                                eprintln!("  {}", e);
-                            }
+            // PARA is the only strategy, so the mode names the operation and
+            // nothing spells PARA any more (#62).
+            match mode.as_str() {
+                "preview" => {
+                    println!("Scanning vault for PARA classification...");
+                    let preview =
+                        engraph::migrate::generate_preview(&store, &vault_path, profile.as_ref())?;
+                    engraph::migrate::save_preview(&preview, &data_dir)?;
+                    println!();
+                    println!("Preview generated:");
+                    println!("  Files to move: {}", preview.files.len());
+                    println!("  Uncertain:     {}", preview.uncertain.len());
+                    println!("  Skipped:       {}", preview.skipped);
+                    println!();
+                    println!("Preview saved to:");
+                    println!("  {}", data_dir.join("migration-preview.md").display());
+                    println!("  {}", data_dir.join("migration-preview.json").display());
+                    println!();
+                    println!("Review the preview, then run: engraph migrate --mode apply");
+                }
+                "apply" => {
+                    let preview = engraph::migrate::load_preview(&data_dir)?;
+                    let result = engraph::migrate::apply_preview(&preview, &store, &vault_path)?;
+                    println!(
+                        "Migration {} applied: {} files moved",
+                        result.migration_id, result.moved
+                    );
+                    if !result.errors.is_empty() {
+                        eprintln!("Errors:");
+                        for e in &result.errors {
+                            eprintln!("  {}", e);
                         }
-                    } else if apply {
-                        let preview = engraph::migrate::load_preview(&data_dir)?;
-                        let result =
-                            engraph::migrate::apply_preview(&preview, &store, &vault_path)?;
-                        println!(
-                            "Migration {} applied: {} files moved",
-                            result.migration_id, result.moved
-                        );
-                        if !result.errors.is_empty() {
-                            eprintln!("Errors:");
-                            for e in &result.errors {
-                                eprintln!("  {}", e);
-                            }
-                        }
-                    } else {
-                        // Generate preview
-                        println!("Scanning vault for PARA classification...");
-                        let preview = engraph::migrate::generate_preview(
-                            &store,
-                            &vault_path,
-                            profile.as_ref(),
-                        )?;
-                        engraph::migrate::save_preview(&preview, &data_dir)?;
-                        println!();
-                        println!("Preview generated:");
-                        println!("  Files to move: {}", preview.files.len());
-                        println!("  Uncertain:     {}", preview.uncertain.len());
-                        println!("  Skipped:       {}", preview.skipped);
-                        println!();
-                        println!("Preview saved to:");
-                        println!("  {}", data_dir.join("migration-preview.md").display());
-                        println!("  {}", data_dir.join("migration-preview.json").display());
-                        println!();
-                        println!("Review the preview, then run: engraph migrate para --apply");
                     }
+                }
+                "undo" => {
+                    let result = engraph::migrate::undo_last(&store, &vault_path)?;
+                    println!(
+                        "Migration {} undone: {} files restored",
+                        result.migration_id, result.restored
+                    );
+                    if !result.errors.is_empty() {
+                        eprintln!("Errors:");
+                        for e in &result.errors {
+                            eprintln!("  {}", e);
+                        }
+                    }
+                }
+                other => {
+                    eprintln!("Unknown mode: {other}. Use 'preview', 'apply' or 'undo'.");
+                    std::process::exit(1);
                 }
             }
         }

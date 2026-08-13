@@ -418,6 +418,63 @@ pub fn build_people_edges(
     Ok(())
 }
 
+/// Re-derive one file's index rows from what a write left on disk: chunks,
+/// vectors, keyword rows, tag rows and outgoing edges.
+///
+/// A write path has to call this itself. `writer::update_note` stores the new
+/// content hash, so `diff_vault` will not list the file as changed at the next
+/// index, and a server that records the write makes the watcher skip its one
+/// event. Without this call the note's rows keep the text it held before the
+/// edit, and nothing later re-derives them (#62).
+///
+/// The chunker settings and the embedding composition both come from the
+/// caller's session, not from the config this loads: a load that fails falls
+/// back to the defaults, and one file re-chunked — or re-embedded — at settings
+/// the rest of the store was not built at is a set of rows nothing downstream
+/// can tell apart. `EmbedComposition` carries `[embedding_prefix]`,
+/// `[embedding_prompt] document_title` and `breadcrumb_root` together for that
+/// reason: a caller that threads one and forgets the others writes vectors into
+/// a space the store does not share, which is what `prefix::EmbedComposition`
+/// exists to prevent. It takes both beside each other, the way `create_note`
+/// and `unarchive_note` do.
+pub fn reindex_written_file(
+    rel_path: &str,
+    store: &Store,
+    embedder: &mut impl EmbedModel,
+    vault_path: &Path,
+    embed: crate::prefix::EmbedComposition,
+    chunk_opts: crate::chunker::ChunkOptions,
+) -> Result<IndexFileResult> {
+    let full_path = vault_path.join(rel_path);
+    let content = std::fs::read_to_string(&full_path)
+        .with_context(|| format!("reading written file for re-index: {rel_path}"))?;
+    let content_hash = {
+        let mut hasher = Sha256::new();
+        hasher.update(content.as_bytes());
+        format!("{:x}", hasher.finalize())
+    };
+
+    let mut config = Config::load().unwrap_or_default();
+    config.set_chunk_options(chunk_opts);
+    config.set_embed_composition(embed);
+
+    let result = index_file(
+        rel_path,
+        &content,
+        &content_hash,
+        store,
+        embedder,
+        vault_path,
+        &config,
+    )?;
+
+    // Outgoing only — see issue #27.
+    store.delete_outgoing_edges_for_file(result.file_id)?;
+    build_edges_for_file(store, result.file_id, &content)?;
+
+    Ok(result)
+}
+
 /// Process a single file: chunk, embed, and store in a single transaction.
 ///
 /// This is the self-contained per-file indexing unit. If the file already exists
@@ -1041,6 +1098,67 @@ mod tests {
         assert!(
             err.to_string().contains("invalid exclude pattern"),
             "unexpected error: {err}"
+        );
+    }
+
+    /// `writer::update_note` writes the file and the new content hash and no
+    /// chunks at all, so the store keeps the pre-edit text unless the write
+    /// path re-indexes. The hash it stored is the same SHA-256 `diff_vault`
+    /// computes, so a later index finds nothing to do — this is the call that
+    /// stops a note from staying searchable as text it no longer holds (#62).
+    #[test]
+    fn re_indexing_a_written_file_replaces_the_chunk_text() {
+        use crate::llm::MockLlm;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write_file(root, "note.md", "---\ntags:\n  - a\n---\n\nthe old line\n");
+
+        let store = Store::open_memory().unwrap();
+        let mut embedder = MockLlm::new(256);
+        let config = Config::default();
+        run_index_shared(root, &config, &store, &mut embedder, false, None).unwrap();
+
+        let input = crate::writer::UpdateInput {
+            file: "note.md".into(),
+            edits: vec![crate::writer::NoteEdit {
+                target: crate::writer::EditTarget::Body,
+                mode: crate::writer::EditMode::Append,
+                content: Some(crate::writer::EditContent::Text("the new line".into())),
+            }],
+        };
+        crate::writer::update_note(&store, root, &input).unwrap();
+
+        // The written hash already matches disk, which is what makes the
+        // staleness permanent without the re-index below.
+        let record = store.get_file("note.md").unwrap().unwrap();
+        assert_eq!(
+            record.content_hash,
+            compute_file_hash(&root.join("note.md")).unwrap(),
+            "update_note stores the hash of what it wrote"
+        );
+
+        reindex_written_file(
+            "note.md",
+            &store,
+            &mut embedder,
+            root,
+            crate::prefix::EmbedComposition::from_config(&config),
+            config.chunk_options(),
+        )
+        .unwrap();
+
+        let file_id = store.get_file("note.md").unwrap().unwrap().id;
+        let text: String = store
+            .get_chunks_by_file(file_id)
+            .unwrap()
+            .iter()
+            .map(|c| c.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("the new line"),
+            "the store must hold the appended text, got: {text:?}"
         );
     }
 

@@ -35,7 +35,7 @@ Type "# Get rich context for an AI agent"
 Enter
 Sleep 500ms
 
-Type "engraph context who 'Steve Barbera'"
+Type "engraph who 'Steve Barbera'"
 Enter
 Sleep 3s
 

@@ -7,37 +7,31 @@ pub fn build_openapi_spec(server_url: &str) -> serde_json::Value {
     // Read endpoints
     paths.insert("/api/health-check".into(), build_health_check());
     paths.insert("/api/search".into(), build_search());
-    paths.insert("/api/read/{file}".into(), build_read());
-    paths.insert("/api/read-section".into(), build_read_section());
+    paths.insert("/api/read".into(), build_read());
     paths.insert("/api/list".into(), build_list());
     paths.insert("/api/tags".into(), build_tags());
     paths.insert("/api/vault-map".into(), build_vault_map());
-    paths.insert("/api/who/{name}".into(), build_who());
-    paths.insert("/api/project/{name}".into(), build_project());
-    paths.insert("/api/context".into(), build_context());
+    paths.insert("/api/who".into(), build_who());
+    paths.insert("/api/project".into(), build_project());
+    paths.insert("/api/topic".into(), build_topic());
     paths.insert("/api/health".into(), build_health());
+    paths.insert("/api/status".into(), build_status());
 
     // Write endpoints
     paths.insert("/api/create".into(), build_create());
-    paths.insert("/api/append".into(), build_append());
-    paths.insert("/api/edit".into(), build_edit());
-    paths.insert("/api/rewrite".into(), build_rewrite());
-    paths.insert("/api/edit-frontmatter".into(), build_edit_frontmatter());
+    paths.insert("/api/update".into(), build_update());
     paths.insert("/api/move".into(), build_move());
     paths.insert("/api/archive".into(), build_archive());
-    paths.insert("/api/unarchive".into(), build_unarchive());
-    paths.insert("/api/update-metadata".into(), build_update_metadata());
     paths.insert("/api/delete".into(), build_delete());
+    paths.insert("/api/index".into(), build_index());
     paths.insert("/api/reindex-file".into(), build_reindex_file());
 
     // Identity endpoints
     paths.insert("/api/identity".into(), build_identity_endpoint());
-    paths.insert("/api/setup".into(), build_setup_endpoint());
+    paths.insert("/api/init".into(), build_init_endpoint());
 
     // Migration endpoints
-    paths.insert("/api/migrate/preview".into(), build_migrate_preview());
-    paths.insert("/api/migrate/apply".into(), build_migrate_apply());
-    paths.insert("/api/migrate/undo".into(), build_migrate_undo());
+    paths.insert("/api/migrate".into(), build_migrate());
 
     serde_json::json!({
         "openapi": "3.1.0",
@@ -86,7 +80,9 @@ fn build_search() -> serde_json::Value {
                     "required": ["query"],
                     "properties": {
                         "query": { "type": "string", "description": "Search query text" },
-                        "top_n": { "type": "integer", "description": "Number of results (default 10)" },
+                        "top_n": { "type": "integer", "description": "Number of results. Defaults to the configured top_n, the same number on every surface" },
+                        "explain": { "type": "boolean", "description": "Return the per-lane score breakdown in the response's explain field" },
+                        "group_by": { "type": "string", "enum": ["chunk", "file"], "description": "One result per matching section, or one per document. Defaults to the server's setting" },
                         "tags": { "type": "array", "items": { "type": "string" }, "description": "Tag terms; a trailing / matches the tag and its descendants. Alias of all" },
                         "all": { "type": "array", "items": { "type": "string" }, "description": "Tag terms a note carries every one of" },
                         "any": { "type": "array", "items": { "type": "string" }, "description": "Tag terms a note carries at least one of" },
@@ -94,7 +90,7 @@ fn build_search() -> serde_json::Value {
                     }
                 }}}
             },
-            "responses": { "200": { "description": "Search results with scores and snippets" } }
+            "responses": { "200": { "description": "An envelope: results, an array of {file_path, file_id, chunk_seq, score, confidence, heading, snippet, docid}; message, which holds the answer-floor text when the array is empty and is null otherwise; and explain, the per-lane breakdown, present when the request asked for it" } }
         }
     })
 }
@@ -104,26 +100,19 @@ fn build_read() -> serde_json::Value {
         "get": {
             "operationId": "readNote",
             "summary": "Read a note's full content with metadata and graph connections.",
-            "parameters": [{
-                "name": "file", "in": "path", "required": true,
-                "description": "File path, basename, or #docid",
-                "schema": { "type": "string" }
-            }],
-            "responses": { "200": { "description": "Note content with metadata" } }
-        }
-    })
-}
-
-fn build_read_section() -> serde_json::Value {
-    serde_json::json!({
-        "get": {
-            "operationId": "readSection",
-            "summary": "Read a specific section of a note by heading name.",
             "parameters": [
-                { "name": "file", "in": "query", "required": true, "description": "File path, basename, or #docid", "schema": { "type": "string" } },
-                { "name": "heading", "in": "query", "required": true, "description": "Section heading (case-insensitive)", "schema": { "type": "string" } }
+                {
+                    "name": "file", "in": "query", "required": true,
+                    "description": "File path, basename, or #docid",
+                    "schema": { "type": "string" }
+                },
+                {
+                    "name": "section", "in": "query", "required": false,
+                    "description": "Read one section by its heading. Omit for the whole note. The heading is an ATX # heading and the match folds case, so 'spells' finds '## Spells'. A section read narrows content and byte_count to that section; the note's tags and links are reported either way.",
+                    "schema": { "type": "string" }
+                }
             ],
-            "responses": { "200": { "description": "Section content" } }
+            "responses": { "200": { "description": "Note content with metadata; outgoing_links, incoming_links, mentions_people and mentioned_by are arrays of {path, docid}" } }
         }
     })
 }
@@ -176,7 +165,7 @@ fn build_who() -> serde_json::Value {
             "operationId": "getWho",
             "summary": "Get a person context bundle with note, related notes, and interaction history.",
             "parameters": [{
-                "name": "name", "in": "path", "required": true,
+                "name": "name", "in": "query", "required": true,
                 "description": "Person name (matches filename in People folder)",
                 "schema": { "type": "string" }
             }],
@@ -191,7 +180,7 @@ fn build_project() -> serde_json::Value {
             "operationId": "getProject",
             "summary": "Get a project context bundle with project note, related files, and graph connections.",
             "parameters": [{
-                "name": "name", "in": "path", "required": true,
+                "name": "name", "in": "query", "required": true,
                 "description": "Project name (matches filename)",
                 "schema": { "type": "string" }
             }],
@@ -200,18 +189,18 @@ fn build_project() -> serde_json::Value {
     })
 }
 
-fn build_context() -> serde_json::Value {
+fn build_topic() -> serde_json::Value {
     serde_json::json!({
         "post": {
-            "operationId": "getContext",
+            "operationId": "getTopic",
             "summary": "Get rich topic context with semantic search, graph expansion, and budget-aware trimming.",
             "requestBody": {
                 "required": true,
                 "content": { "application/json": { "schema": {
                     "type": "object",
-                    "required": ["topic"],
+                    "required": ["query"],
                     "properties": {
-                        "topic": { "type": "string", "description": "Topic or question" },
+                        "query": { "type": "string", "description": "Topic or question" },
                         "budget": { "type": "integer", "description": "Character budget (default 32000)" }
                     }
                 }}}
@@ -256,97 +245,45 @@ fn build_create() -> serde_json::Value {
     })
 }
 
-fn build_append() -> serde_json::Value {
+fn build_update() -> serde_json::Value {
     serde_json::json!({
         "post": {
-            "operationId": "appendToNote",
-            "summary": "Append content to the end of an existing note.",
+            "operationId": "updateNote",
+            "summary": "Change an existing note. Applies a list of edits in order, in one write.",
+            "description": "Each edit names its target: `section` for one heading, `property` for one frontmatter key, and neither for the note's body. An edit naming both is an error. `content` is a string, or a list of strings for a list-valued property such as tags or aliases; a body edit and a section edit take a string. A body edit always keeps the note's frontmatter, so change the frontmatter with `property` edits in the same list. Three things differ from the append/edit/rewrite/edit-frontmatter/update-metadata calls this replaces. A note changed outside engraph and not yet re-indexed fails with an mtime conflict. Replacing a note's frontmatter wholesale has no spelling here: rewrite's `preserve_frontmatter: false` is gone rather than renamed, and the new frontmatter is written with `property` edits instead. A whole-note tag or alias replacement no longer stamps a `modified_by` property on the note.",
             "requestBody": {
                 "required": true,
                 "content": { "application/json": { "schema": {
                     "type": "object",
-                    "required": ["file", "content"],
+                    "required": ["file", "edits"],
+                    "additionalProperties": false,
                     "properties": {
                         "file": { "type": "string", "description": "Target note (path, basename, or #docid)" },
-                        "content": { "type": "string", "description": "Content to append" }
-                    }
-                }}}
-            },
-            "responses": { "200": { "description": "Updated note path and metadata" } }
-        }
-    })
-}
-
-fn build_edit() -> serde_json::Value {
-    serde_json::json!({
-        "post": {
-            "operationId": "editNote",
-            "summary": "Edit a specific section of a note by heading. Supports replace, prepend, append modes.",
-            "requestBody": {
-                "required": true,
-                "content": { "application/json": { "schema": {
-                    "type": "object",
-                    "required": ["file", "heading", "content"],
-                    "properties": {
-                        "file": { "type": "string", "description": "Target note (path, basename, or #docid)" },
-                        "heading": { "type": "string", "description": "Section heading (case-insensitive)" },
-                        "content": { "type": "string", "description": "Content to add or replace" },
-                        "mode": { "type": "string", "description": "'replace', 'prepend', or 'append' (default)" }
-                    }
-                }}}
-            },
-            "responses": { "200": { "description": "Updated note path and metadata" } }
-        }
-    })
-}
-
-fn build_rewrite() -> serde_json::Value {
-    serde_json::json!({
-        "post": {
-            "operationId": "rewriteNote",
-            "summary": "Rewrite a note's body content. Preserves frontmatter by default.",
-            "requestBody": {
-                "required": true,
-                "content": { "application/json": { "schema": {
-                    "type": "object",
-                    "required": ["file", "content"],
-                    "properties": {
-                        "file": { "type": "string", "description": "Target note (path, basename, or #docid)" },
-                        "content": { "type": "string", "description": "New body content" },
-                        "preserve_frontmatter": { "type": "boolean", "description": "Preserve frontmatter (default true)" }
-                    }
-                }}}
-            },
-            "responses": { "200": { "description": "Updated note path and metadata" } }
-        }
-    })
-}
-
-fn build_edit_frontmatter() -> serde_json::Value {
-    serde_json::json!({
-        "post": {
-            "operationId": "editFrontmatter",
-            "summary": "Edit a note's frontmatter with structured operations (set, remove, add_tag, etc.).",
-            "requestBody": {
-                "required": true,
-                "content": { "application/json": { "schema": {
-                    "type": "object",
-                    "required": ["file", "operations"],
-                    "properties": {
-                        "file": { "type": "string", "description": "Target note (path, basename, or #docid)" },
-                        "operations": {
+                        "edits": {
                             "type": "array",
-                            "description": "Frontmatter operations",
-                            "items": { "type": "object", "properties": {
-                                "op": { "type": "string", "description": "set/remove/add_tag/remove_tag/add_alias/remove_alias" },
-                                "key": { "type": "string", "description": "Property key (for set/remove)" },
-                                "value": { "type": "string", "description": "Value" }
-                            }}
+                            "description": "Edits to apply, in order, in one write",
+                            "items": {
+                                "type": "object",
+                                "required": ["mode"],
+                                "additionalProperties": false,
+                                "properties": {
+                                    "section": { "type": "string", "description": "Heading of the section to edit. Omit this and property to edit the body" },
+                                    "property": { "type": "string", "description": "Frontmatter property to edit. Naming a section as well is an error" },
+                                    "mode": { "type": "string", "enum": ["replace", "prepend", "append", "remove"], "description": "What the edit does. remove is for a property alone" },
+                                    "content": {
+                                        "description": "A string, or a list of strings to set a list-valued property",
+                                        "oneOf": [
+                                            { "type": "string" },
+                                            { "type": "array", "items": { "type": "string" } }
+                                        ]
+                                    }
+                                }
+                            }
                         }
                     }
                 }}}
             },
-            "responses": { "200": { "description": "Updated note path and metadata" } }
+            "responses": { "200": { "description": "Updated note path" } }
         }
     })
 }
@@ -376,60 +313,19 @@ fn build_archive() -> serde_json::Value {
     serde_json::json!({
         "post": {
             "operationId": "archiveNote",
-            "summary": "Archive a note (soft delete). Moves to archive folder and removes from index.",
+            "summary": "Archive a note (soft delete), or restore one previously archived with `undo: true`. Archiving moves the note to the archive folder and removes it from the index; `undo` reverses that and re-indexes it.",
             "requestBody": {
                 "required": true,
                 "content": { "application/json": { "schema": {
                     "type": "object",
                     "required": ["file"],
                     "properties": {
-                        "file": { "type": "string", "description": "Target note (path, basename, or #docid)" }
+                        "file": { "type": "string", "description": "Target note (path, basename, or #docid); an archived note's path when undoing" },
+                        "undo": { "type": "boolean", "description": "Restore the note instead of archiving it (default false)" }
                     }
                 }}}
             },
-            "responses": { "200": { "description": "Archived note path" } }
-        }
-    })
-}
-
-fn build_unarchive() -> serde_json::Value {
-    serde_json::json!({
-        "post": {
-            "operationId": "unarchiveNote",
-            "summary": "Restore an archived note to its original location and re-index it.",
-            "requestBody": {
-                "required": true,
-                "content": { "application/json": { "schema": {
-                    "type": "object",
-                    "required": ["file"],
-                    "properties": {
-                        "file": { "type": "string", "description": "Archived note path" }
-                    }
-                }}}
-            },
-            "responses": { "200": { "description": "Restored note path" } }
-        }
-    })
-}
-
-fn build_update_metadata() -> serde_json::Value {
-    serde_json::json!({
-        "post": {
-            "operationId": "updateMetadata",
-            "summary": "Update a note's tags and aliases in bulk.",
-            "requestBody": {
-                "required": true,
-                "content": { "application/json": { "schema": {
-                    "type": "object",
-                    "required": ["file"],
-                    "properties": {
-                        "file": { "type": "string", "description": "Target note (path, basename, or #docid)" },
-                        "tags": { "type": "array", "items": { "type": "string" }, "description": "New tags (replaces existing)" },
-                        "aliases": { "type": "array", "items": { "type": "string" }, "description": "New aliases (replaces existing)" }
-                    }
-                }}}
-            },
-            "responses": { "200": { "description": "Updated note metadata" } }
+            "responses": { "200": { "description": "Archived (or restored) note path" } }
         }
     })
 }
@@ -446,11 +342,42 @@ fn build_delete() -> serde_json::Value {
                     "required": ["file"],
                     "properties": {
                         "file": { "type": "string", "description": "Target note (path, basename, or #docid)" },
-                        "mode": { "type": "string", "description": "'soft' (default) or 'hard'" }
+                        "mode": { "type": "string", "enum": ["soft", "hard"], "description": "'soft' (default) archives the note; 'hard' removes it permanently. A word outside the two is refused." }
                     }
                 }}}
             },
             "responses": { "200": { "description": "Deletion confirmation" } }
+        }
+    })
+}
+
+fn build_index() -> serde_json::Value {
+    serde_json::json!({
+        "post": {
+            "operationId": "indexVault",
+            "summary": "Index the server's vault: walk it, diff it against the store, and re-embed what changed.",
+            "description": "The vault is the one the server was started on; no path is taken here. Send {} to index with no options. A single file is cheaper through /api/reindex-file. The call runs to completion once it starts: it holds the store and the embedder while it runs, so every other request waits on it, and a graceful shutdown will not interrupt it. On a large vault a rebuild takes minutes. A read-only server refuses it.",
+            "requestBody": {
+                "required": true,
+                "content": { "application/json": { "schema": {
+                    "type": "object",
+                    "properties": {
+                        "rebuild": { "type": "boolean", "description": "Discard the index and build it again from nothing" },
+                        "no_gitignore": { "type": "boolean", "description": "Index files that .gitignore or .ignore would exclude" }
+                    }
+                }}}
+            },
+            "responses": { "200": { "description": "Counts of new, updated and deleted files, total chunks and the elapsed seconds" } }
+        }
+    })
+}
+
+fn build_status() -> serde_json::Value {
+    serde_json::json!({
+        "get": {
+            "operationId": "getStatus",
+            "summary": "What the index holds: file and chunk counts, edge and connectivity counts, date coverage, index size, and whether intelligence is enabled.",
+            "responses": { "200": { "description": "Index status fields" } }
         }
     })
 }
@@ -480,15 +407,22 @@ fn build_identity_endpoint() -> serde_json::Value {
         "get": {
             "operationId": "getIdentity",
             "summary": "Returns compact user identity (L0) and current context (L1).",
+            "parameters": [
+                {
+                    "name": "refresh", "in": "query", "required": false,
+                    "description": "Re-extract the L1 facts from the index before answering, without a full re-index. It rewrites the identity_facts rows, so it takes a write key and a read-only server refuses it.",
+                    "schema": { "type": "boolean" }
+                }
+            ],
             "responses": { "200": { "description": "Identity block as JSON with 'identity' key" } }
         }
     })
 }
 
-fn build_setup_endpoint() -> serde_json::Value {
+fn build_init_endpoint() -> serde_json::Value {
     serde_json::json!({
         "post": {
-            "operationId": "setup",
+            "operationId": "init",
             "summary": "Run first-time setup or update identity. Use 'detect' to inspect, 'apply' to configure.",
             "requestBody": {
                 "required": true,
@@ -496,7 +430,7 @@ fn build_setup_endpoint() -> serde_json::Value {
                     "type": "object",
                     "required": ["mode"],
                     "properties": {
-                        "mode": { "type": "string", "description": "'detect' or 'apply'" },
+                        "mode": { "type": "string", "enum": ["detect", "apply"], "description": "'detect' inspects the vault and writes nothing; 'apply' configures identity and indexes. A read-only server refuses 'apply', because it reaches the same indexing work /api/index is guarded against." },
                         "name": { "type": "string", "description": "User name (apply mode)" },
                         "role": { "type": "string", "description": "User role (apply mode)" },
                         "purpose": { "type": "string", "description": "Vault purpose (apply mode)" }
@@ -508,48 +442,23 @@ fn build_setup_endpoint() -> serde_json::Value {
     })
 }
 
-fn build_migrate_preview() -> serde_json::Value {
+fn build_migrate() -> serde_json::Value {
     serde_json::json!({
         "post": {
-            "operationId": "migratePreview",
-            "summary": "Generate a PARA migration preview. Classifies notes and suggests folder moves.",
-            "requestBody": {
-                "content": { "application/json": { "schema": { "type": "object", "properties": {} } } }
-            },
-            "responses": { "200": { "description": "Migration preview with proposed moves" } }
-        }
-    })
-}
-
-fn build_migrate_apply() -> serde_json::Value {
-    serde_json::json!({
-        "post": {
-            "operationId": "migrateApply",
-            "summary": "Apply a previously generated migration preview. Moves notes to suggested PARA folders.",
+            "operationId": "migrate",
+            "summary": "Restructure the vault into PARA. 'preview' classifies notes and suggests folder moves, 'apply' performs them, 'undo' restores the last migration.",
             "requestBody": {
                 "required": true,
                 "content": { "application/json": { "schema": {
                     "type": "object",
-                    "required": ["preview"],
+                    "required": ["mode"],
                     "properties": {
-                        "preview": { "type": "object", "description": "Migration preview from migratePreview" }
+                        "mode": { "type": "string", "description": "'preview', 'apply' or 'undo'" },
+                        "preview": { "type": "object", "description": "The preview to apply. Required for 'apply' mode: send back the plan that 'preview' returned. There is no fallback to a plan saved on the server's disk, because a dropped key would then apply a plan this caller never saw." }
                     }
                 }}}
             },
-            "responses": { "200": { "description": "Migration result with moved files count" } }
-        }
-    })
-}
-
-fn build_migrate_undo() -> serde_json::Value {
-    serde_json::json!({
-        "post": {
-            "operationId": "migrateUndo",
-            "summary": "Undo the last applied migration, restoring notes to original locations.",
-            "requestBody": {
-                "content": { "application/json": { "schema": { "type": "object", "properties": {} } } }
-            },
-            "responses": { "200": { "description": "Undo result with restored files count" } }
+            "responses": { "200": { "description": "Migration preview, migration result or undo result, per mode" } }
         }
     })
 }
@@ -586,7 +495,20 @@ mod tests {
     fn test_openapi_spec_structure() {
         let spec = build_openapi_spec("http://localhost:3000");
         assert_eq!(spec["openapi"], "3.1.0");
-        assert!(spec["paths"].as_object().unwrap().len() >= 20);
+        // How many paths there are is the router's business, and
+        // `the_spec_describes_every_route_the_router_serves` reads it from
+        // there. A count here is a second declaration that falls out of step
+        // every time one name absorbs another (#62). Assert the shape
+        // instead: every path item declares a method.
+        let paths = spec["paths"].as_object().unwrap();
+        assert!(!paths.is_empty());
+        for (path, item) in paths {
+            let methods = item.as_object().unwrap();
+            assert!(
+                methods.contains_key("get") || methods.contains_key("post"),
+                "{path} declares no method"
+            );
+        }
         assert_eq!(spec["servers"][0]["url"], "http://localhost:3000");
     }
 
@@ -638,50 +560,78 @@ mod tests {
         assert_eq!(named, vec!["under"]);
     }
 
+    /// `read` absorbed `graph show`'s docid fact (#62). Every endpoint here
+    /// is description-only, with no per-field schema to keep it honest, so
+    /// the shape change has to be said in the one line that exists.
+    #[test]
+    fn test_read_documents_the_link_shape() {
+        let spec = build_openapi_spec("http://localhost:3000");
+        let description = spec["paths"]["/api/read"]["get"]["responses"]["200"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(
+            description.contains("docid"),
+            "the response description doesn't say what a link looks like: {description}"
+        );
+    }
+
+    /// The set the spec publishes is the set named here — equal, not merely
+    /// contained. A containment check in one direction lets an `operationId`
+    /// be lost with the suite still green, and `reindexFile` and `getIdentity`
+    /// were both absent from the list (#62).
     #[test]
     fn test_openapi_has_all_operation_ids() {
+        use std::collections::BTreeSet;
+
         let spec = build_openapi_spec("http://localhost:3000");
         let paths = spec["paths"].as_object().unwrap();
-        let mut op_ids: Vec<String> = Vec::new();
-        for (_path, methods) in paths {
-            for (_method, details) in methods.as_object().unwrap() {
-                if let Some(id) = details.get("operationId").and_then(|v| v.as_str()) {
-                    op_ids.push(id.to_string());
-                }
+        let mut op_ids: BTreeSet<String> = BTreeSet::new();
+        for (path, methods) in paths {
+            for (method, details) in methods.as_object().unwrap() {
+                let id = details
+                    .get("operationId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_else(|| panic!("{method} {path} has no operationId"));
+                assert!(
+                    op_ids.insert(id.to_string()),
+                    "{method} {path} repeats operationId {id}"
+                );
             }
         }
-        let expected = vec![
+        let expected: BTreeSet<String> = [
             "healthCheck",
             "searchVault",
             "readNote",
-            "readSection",
             "listNotes",
             "listTags",
             "getVaultMap",
             "getWho",
             "getProject",
-            "getContext",
+            "getTopic",
             "getHealth",
+            "getStatus",
             "createNote",
-            "appendToNote",
-            "editNote",
-            "rewriteNote",
-            "editFrontmatter",
+            "updateNote",
             "moveNote",
             "archiveNote",
-            "unarchiveNote",
-            "updateMetadata",
             "deleteNote",
-            "migratePreview",
-            "migrateApply",
-            "migrateUndo",
-        ];
-        for id in &expected {
-            assert!(
-                op_ids.contains(&id.to_string()),
-                "Missing operationId: {id}"
-            );
-        }
+            "indexVault",
+            "reindexFile",
+            "getIdentity",
+            "init",
+            "migrate",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        assert_eq!(
+            op_ids,
+            expected,
+            "\nonly in the spec: {:?}\nonly in the list: {:?}",
+            op_ids.difference(&expected).collect::<Vec<_>>(),
+            expected.difference(&op_ids).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -698,5 +648,21 @@ mod tests {
         let manifest = build_plugin_manifest(&config, "https://example.com");
         assert_eq!(manifest["name_for_human"], "my-vault");
         assert_eq!(manifest["contact_email"], "test@example.com");
+    }
+
+    #[test]
+    fn the_spec_describes_every_route_the_router_serves() {
+        let spec = build_openapi_spec("http://localhost:7777");
+        let described: std::collections::BTreeSet<String> =
+            spec["paths"].as_object().unwrap().keys().cloned().collect();
+
+        // The router writes a wildcard as `{*file}`; OpenAPI writes `{file}`.
+        let served: std::collections::BTreeSet<String> = crate::http::routes()
+            .into_iter()
+            .map(|(p, _)| p.replace("{*", "{"))
+            .filter(|p| p.starts_with("/api/"))
+            .collect();
+
+        assert_eq!(served, described, "the spec and the router disagree");
     }
 }

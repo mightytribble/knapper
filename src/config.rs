@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -129,7 +130,18 @@ pub struct ApiKeyConfig {
 }
 
 /// Granularity of search results.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, clap::ValueEnum)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    Serialize,
+    Deserialize,
+    clap::ValueEnum,
+    schemars::JsonSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum GroupBy {
     /// One result per matching section — a document may appear more than once,
@@ -669,7 +681,7 @@ pub struct Config {
     pub group_by: GroupBy,
     /// What document identity is prepended to a chunk's text before embedding.
     /// Affects the vector only — storage, snippets and FTS see the raw chunk.
-    /// Changing this needs `engraph index --reindex`; the incremental path
+    /// Changing this needs `engraph index --rebuild`; the incremental path
     /// compares content hashes and will not notice.
     #[serde(default)]
     pub embedding_prefix: PrefixConfig,
@@ -831,6 +843,21 @@ impl Config {
     pub fn set_chunk_options(&mut self, opts: crate::chunker::ChunkOptions) {
         self.chunk_min_chars = opts.min_chars;
         self.promote_bold_headings = opts.promote_bold;
+    }
+
+    /// Put the embedding composition of `cfg` back on this config.
+    ///
+    /// The inverse of [`crate::prefix::EmbedComposition::from_config`], and it
+    /// sits beside [`Config::set_chunk_options`] for the same reason: a
+    /// long-running session captures the composition once at startup, and a
+    /// path that hands a whole `Config` to the indexer uses this to carry the
+    /// session's settings rather than a fresh load's. The three keys travel as
+    /// one value, so no path can take one and forget another and write vectors
+    /// into a space the store does not share (issues #2, #36, #46).
+    pub fn set_embed_composition(&mut self, cfg: crate::prefix::EmbedComposition) {
+        self.embedding_prefix = cfg.prefix;
+        self.embedding_prompt.document_title = cfg.title;
+        self.breadcrumb_root = cfg.root;
     }
 
     /// Merge CLI-provided top_n over the loaded config.

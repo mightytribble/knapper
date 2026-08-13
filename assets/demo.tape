@@ -49,7 +49,7 @@ Sleep 1.5s
 Ctrl+U
 Sleep 200ms
 
-Type "engraph context who 'Sarah Chen'"
+Type "engraph who 'Sarah Chen'"
 Enter
 Sleep 4s
 

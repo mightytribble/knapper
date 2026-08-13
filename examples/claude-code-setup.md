@@ -28,25 +28,36 @@ Add to `~/.claude/settings.json`:
 
 ### 3. Start using
 
-Claude Code now has access to 14 vault tools:
+Claude Code now has access to 20 vault tools. Each one is named after the CLI
+command it answers, with `-` written as `_`.
 
 **Read tools:**
 - `search` — hybrid search across the vault
-- `read` — read a full note with metadata
+- `read` — read a full note with metadata, or one section of it (`section`)
 - `list` — filtered note listing (by folder, tag terms, creator)
 - `tags` — the vault's tag vocabulary, whole or under one term
 - `vault_map` — vault structure overview
 - `who` — person context bundle (note + mentions + connections)
 - `project` — project context bundle
-- `context` — rich topic context with token budget
+- `topic` — rich topic context with a character budget
 
 **Write tools:**
 - `create` — create a note with smart filing
-- `append` — append content to an existing note
-- `update_metadata` — update tags and aliases
-- `move_note` — move a note to a different folder
-- `archive` — soft-delete to archive folder
-- `unarchive` — restore from archive
+- `update` — a list of edits to one note in one write: the body, a section
+  (`section`) or a frontmatter property (`property`), each with a `mode` of
+  `replace`, `prepend`, `append` or `remove`
+- `move` — move a note to a different folder
+- `archive` — soft-delete to the archive folder, or restore with `undo`
+- `delete` — delete a note (`mode`: soft or hard)
+
+**Index and diagnostic tools:**
+- `index` — index the configured vault
+- `reindex_file` — re-index one file after an edit made outside engraph
+- `status` — index status and statistics
+- `health` — vault health diagnostics
+- `identity` — user identity (L0) and current context (L1)
+- `init` — first-time onboarding (`mode`: detect or apply)
+- `migrate` — PARA migration (`mode`: preview, apply or undo)
 
 ## Example interactions
 
@@ -65,7 +76,7 @@ The MCP server includes a file watcher. When you edit notes in Obsidian, engraph
 
 ## Tips
 
-- Use `context("topic", budget=8000)` for token-budgeted context bundles — great for feeding context into prompts
+- Use `topic` with a `budget` (for example 8000) for budgeted context bundles — great for feeding context into prompts
 - `vault_map` helps Claude understand your vault structure before searching
 - `who("Person Name")` is powerful for understanding someone's involvement across projects
 - The `--explain` flag on CLI search shows per-lane score breakdown — useful for debugging search quality

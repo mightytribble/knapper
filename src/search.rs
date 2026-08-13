@@ -9,7 +9,7 @@ use crate::fusion::{self, FusedResult, RankedResult};
 use crate::graph;
 use crate::llm::{self, EmbedModel, RerankModel};
 use crate::ranking;
-use crate::store::{Store, StoreStats};
+use crate::store::{EdgeStats, Store, StoreStats};
 
 /// A single search result with metadata.
 pub struct SearchResult {
@@ -35,6 +35,22 @@ pub struct InternalSearchResult {
     pub heading: Option<String>,
     pub snippet: String,
     pub docid: Option<String>,
+}
+
+impl SearchResult {
+    /// The pipeline's row as the CLI formats it. What a result item holds on
+    /// each surface is issue #35's question, not this one's (#62).
+    pub fn from_internal(r: &InternalSearchResult) -> Self {
+        SearchResult {
+            score: r.score as f32,
+            confidence: r.confidence,
+            file_path: r.file_path.clone(),
+            chunk_seq: r.chunk_seq,
+            heading: r.heading.clone(),
+            snippet: r.snippet.clone(),
+            docid: r.docid.clone(),
+        }
+    }
 }
 
 /// Output from `search_internal`: structured results plus raw fused data for --explain.
@@ -1219,15 +1235,7 @@ pub fn run_search(
     let results: Vec<SearchResult> = output
         .results
         .iter()
-        .map(|r| SearchResult {
-            score: r.score as f32,
-            confidence: r.confidence,
-            file_path: r.file_path.clone(),
-            chunk_seq: r.chunk_seq,
-            heading: r.heading.clone(),
-            snippet: r.snippet.clone(),
-            docid: r.docid.clone(),
-        })
+        .map(SearchResult::from_internal)
         .collect();
 
     let mut out = format_results(&results, json);
@@ -1241,49 +1249,109 @@ pub fn run_search(
     }
 
     if explain && !json {
-        let mut explain_out = String::new();
-        explain_out.push_str(&format_retrieval(&output.retrieval, &output.fts_columns));
-        explain_out.push_str("--- Explain ---\n");
-        for f in output.fused.iter().take(top_n) {
-            explain_out.push_str(&format!("{}\n", f.file_path));
-            explain_out.push_str(&fusion::format_explain(f));
-        }
-        out.push_str(&explain_out);
+        out.push_str(&explain_report(&output, top_n));
     }
 
     print!("{out}");
     Ok(())
 }
 
-/// Run the status command and print index information.
-pub fn run_status(json: bool, data_dir: &Path) -> Result<()> {
-    let db_path = data_dir.join("engraph.db");
-    let store = Store::open(&db_path).context("opening store")?;
+/// The `--explain` record: the retrieval step, then the fusion step per result.
+///
+/// It reads the retrieval trace and the fused lanes, which no caller of the
+/// pipeline holds by any other route, so the one composition serves all three
+/// surfaces: the CLI prints it, MCP sends it as a second content block and the
+/// HTTP envelope carries it in `explain` (#62). It is built only when the
+/// caller asks for it, because an agent that did not ask must not read past it.
+pub fn explain_report(output: &SearchOutput, top_n: usize) -> String {
+    let mut out = format_retrieval(&output.retrieval, &output.fts_columns);
+    out.push_str("--- Explain ---\n");
+    for f in output.fused.iter().take(top_n) {
+        out.push_str(&format!("{}\n", f.file_path));
+        out.push_str(&fusion::format_explain(f));
+    }
+    out
+}
+
+/// What `status` reports, read from the store and from the config.
+///
+/// The CLI prints it and the two servers answer it as JSON, so all three read
+/// one gatherer and one field list (#62).
+struct StatusInputs {
+    stats: StoreStats,
+    edges: EdgeStats,
+    index_size: u64,
+    model_name: &'static str,
+    intelligence: &'static str,
+    date_count: usize,
+}
+
+/// The status fields, read from a store the caller supplies.
+///
+/// The three reads are separate statements, so a writer that commits between
+/// them would give an answer mixing two snapshots. A server passes the store
+/// it already holds the lock on, which is what stops that (#62).
+fn collect_status(store: &Store, data_dir: &Path) -> Result<StatusInputs> {
     let stats = store.stats()?;
+    let edges = store.get_edge_stats()?;
     let date_count = store.count_files_with_dates().unwrap_or(0);
 
     // Compute index size on disk (sqlite db file).
-    let index_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
-
-    let model_name = "all-MiniLM-L6-v2";
+    let index_size = std::fs::metadata(data_dir.join("engraph.db"))
+        .map(|m| m.len())
+        .unwrap_or(0);
 
     let config = crate::config::Config::load().unwrap_or_default();
-    let intelligence = if config.intelligence_enabled() {
-        "enabled"
-    } else {
-        "disabled"
-    };
-
-    let output = format_status(
-        &stats,
+    Ok(StatusInputs {
+        stats,
+        edges,
         index_size,
-        model_name,
-        intelligence,
+        model_name: "all-MiniLM-L6-v2",
+        intelligence: if config.intelligence_enabled() {
+            "enabled"
+        } else {
+            "disabled"
+        },
         date_count,
+    })
+}
+
+/// Run the status command and print index information. The CLI holds no
+/// store, so this opens one.
+pub fn run_status(json: bool, data_dir: &Path) -> Result<()> {
+    let store = Store::open(&data_dir.join("engraph.db")).context("opening store")?;
+    let s = collect_status(&store, data_dir)?;
+    let output = format_status(
+        &s.stats,
+        &s.edges,
+        s.index_size,
+        s.model_name,
+        s.intelligence,
+        s.date_count,
         json,
     );
     print!("{output}");
     Ok(())
+}
+
+/// What `status` reports, as the object the JSON channel names.
+///
+/// `run_status` prints; this is what the two servers answer with, and they
+/// pass the store they already hold rather than opening a second connection:
+/// `Store::open` runs the schema batch and the migrations again, which would
+/// wait out the busy timeout against the server's own writer and then fail
+/// the call. Both routes compose the fields through `status_object`, so the
+/// three surfaces report the same ones and cannot drift apart (#62).
+pub fn status_json(store: &Store, data_dir: &Path) -> Result<serde_json::Value> {
+    let s = collect_status(store, data_dir)?;
+    Ok(status_object(
+        &s.stats,
+        &s.edges,
+        s.index_size,
+        s.model_name,
+        s.intelligence,
+        s.date_count,
+    ))
 }
 
 /// Format search results for display (pure function, no I/O).
@@ -1350,9 +1418,51 @@ pub fn format_results(results: &[SearchResult], json: bool) -> String {
     }
 }
 
+/// The fields `status` reports, composed once (pure function, no I/O).
+///
+/// The CLI's `--json`, the MCP tool and the HTTP route all answer this
+/// object, so a field added here reaches the three surfaces together (#62).
+pub fn status_object(
+    stats: &StoreStats,
+    edges: &EdgeStats,
+    index_size: u64,
+    model_name: &str,
+    intelligence: &str,
+    date_count: usize,
+) -> serde_json::Value {
+    let vault = stats.vault_path.as_deref().unwrap_or("<not set>");
+    let last_indexed = stats.last_indexed_at.as_deref().unwrap_or("never");
+
+    // `edges` is the one source for every edge number. `files` above already
+    // says how many files the index holds, so a second `total_files` derived
+    // from the connectivity split would be the same number twice (#62).
+    json!({
+        "vault": vault,
+        "files": stats.file_count,
+        "chunks": stats.chunk_count,
+        "tombstones": stats.tombstone_count,
+        "last_indexed": last_indexed,
+        "index_size": index_size,
+        "model": model_name,
+        "intelligence": intelligence,
+        "files_with_dates": date_count,
+        "edges": edges.total_edges,
+        "wikilink_edges": edges.wikilink_count,
+        "mention_edges": edges.mention_count,
+        "wikilink_pairs": edges.wikilink_count / 2,
+        "connected_files": edges.connected_file_count,
+        "isolated_files": edges.isolated_file_count,
+    })
+}
+
 /// Format status information for display (pure function, no I/O).
+///
+/// `edges` folds in `graph stats` (#62): `status` is what answers "what is in
+/// the index", so the connectivity counts belong beside the file and chunk
+/// counts rather than behind a second command.
 pub fn format_status(
     stats: &StoreStats,
+    edges: &EdgeStats,
     index_size: u64,
     model_name: &str,
     intelligence: &str,
@@ -1361,42 +1471,48 @@ pub fn format_status(
 ) -> String {
     let vault = stats.vault_path.as_deref().unwrap_or("<not set>");
     let last_indexed = stats.last_indexed_at.as_deref().unwrap_or("never");
+    let wikilink_pairs = edges.wikilink_count / 2;
+    let total_files = edges.connected_file_count + edges.isolated_file_count;
+    let connected_pct = if total_files > 0 {
+        edges.connected_file_count as f64 / total_files as f64 * 100.0
+    } else {
+        0.0
+    };
 
     if json {
-        let mut obj = json!({
-            "vault": vault,
-            "files": stats.file_count,
-            "chunks": stats.chunk_count,
-            "tombstones": stats.tombstone_count,
-            "last_indexed": last_indexed,
-            "index_size": index_size,
-            "model": model_name,
-            "intelligence": intelligence,
-            "files_with_dates": date_count,
-        });
-        if let (Some(edges), Some(wl), Some(mn)) =
-            (stats.edge_count, stats.wikilink_count, stats.mention_count)
-        {
-            obj["edges"] = json!(edges);
-            obj["wikilink_edges"] = json!(wl);
-            obj["mention_edges"] = json!(mn);
-        }
+        let obj = status_object(
+            stats,
+            edges,
+            index_size,
+            model_name,
+            intelligence,
+            date_count,
+        );
         format!("{}\n", serde_json::to_string_pretty(&obj).unwrap())
     } else {
+        // The `Edges:` header and the four lines under it come from one
+        // `EdgeStats`, so the header is always printed and the indented lines
+        // always have one to sit under (#62).
         let mut out = format!(
             "Vault:      {}\n\
              Files:      {}\n\
-             Chunks:     {}\n",
-            vault, stats.file_count, stats.chunk_count,
+             Chunks:     {}\n\
+             Edges:      {}\n",
+            vault, stats.file_count, stats.chunk_count, edges.total_edges,
         );
-        if let (Some(edges), Some(wl), Some(mn)) =
-            (stats.edge_count, stats.wikilink_count, stats.mention_count)
-        {
-            out.push_str(&format!(
-                "Edges:      {} ({} wikilinks, {} mentions)\n",
-                edges, wl, mn
-            ));
-        }
+        out.push_str(&format!(
+            "  Wikilink edges:  {} ({} bidirectional pairs)\n",
+            edges.wikilink_count, wikilink_pairs
+        ));
+        out.push_str(&format!("  Mention edges:   {}\n", edges.mention_count));
+        out.push_str(&format!(
+            "  Connected files: {} / {} ({:.1}%)\n",
+            edges.connected_file_count, total_files, connected_pct
+        ));
+        out.push_str(&format!(
+            "  Isolated files:  {}\n",
+            edges.isolated_file_count
+        ));
         out.push_str(&format!(
             "Dates:      {}/{} files\n\
              Tombstones: {} (pending cleanup)\n\
@@ -1527,6 +1643,16 @@ mod tests {
         assert_eq!(json_output, "[]\n", "the array channel keeps its shape");
     }
 
+    fn sample_edge_stats() -> EdgeStats {
+        EdgeStats {
+            total_edges: 10,
+            wikilink_count: 6,
+            mention_count: 4,
+            connected_file_count: 8,
+            isolated_file_count: 2,
+        }
+    }
+
     #[test]
     fn test_format_status_human() {
         let stats = StoreStats {
@@ -1535,11 +1661,16 @@ mod tests {
             tombstone_count: 3,
             last_indexed_at: Some("2026-03-19 14:30:00".to_string()),
             vault_path: Some("/path/to/vault".to_string()),
-            edge_count: None,
-            wikilink_count: None,
-            mention_count: None,
         };
-        let output = format_status(&stats, 2_516_582, "all-MiniLM-L6-v2", "disabled", 30, false);
+        let output = format_status(
+            &stats,
+            &sample_edge_stats(),
+            2_516_582,
+            "all-MiniLM-L6-v2",
+            "disabled",
+            30,
+            false,
+        );
 
         assert!(output.contains("/path/to/vault"), "missing vault path");
         assert!(output.contains("42"), "missing file count");
@@ -1552,6 +1683,37 @@ mod tests {
         assert!(output.contains("disabled"), "missing intelligence");
     }
 
+    /// `status` absorbs `graph stats` (#62): the connectivity counts that
+    /// used to need a second command are printed here.
+    #[test]
+    fn status_reports_the_edge_counts_graph_stats_used_to_own() {
+        let stats = StoreStats {
+            file_count: 10,
+            chunk_count: 20,
+            tombstone_count: 0,
+            last_indexed_at: Some("2026-03-19 14:30:00".to_string()),
+            vault_path: Some("/path/to/vault".to_string()),
+        };
+        let output = format_status(
+            &stats,
+            &sample_edge_stats(),
+            2_516_582,
+            "all-MiniLM-L6-v2",
+            "disabled",
+            10,
+            false,
+        );
+
+        assert!(
+            output.contains("Wikilink edges:"),
+            "graph stats's wikilink line is missing: {output}"
+        );
+        assert!(output.contains("6 (3 bidirectional pairs)"));
+        assert!(output.contains("Mention edges:   4"));
+        assert!(output.contains("Connected files: 8 / 10 (80.0%)"));
+        assert!(output.contains("Isolated files:  2"));
+    }
+
     #[test]
     fn test_format_status_json() {
         let stats = StoreStats {
@@ -1560,11 +1722,16 @@ mod tests {
             tombstone_count: 3,
             last_indexed_at: Some("2026-03-19 14:30:00".to_string()),
             vault_path: Some("/path/to/vault".to_string()),
-            edge_count: None,
-            wikilink_count: None,
-            mention_count: None,
         };
-        let output = format_status(&stats, 2_516_582, "all-MiniLM-L6-v2", "enabled", 30, true);
+        let output = format_status(
+            &stats,
+            &sample_edge_stats(),
+            2_516_582,
+            "all-MiniLM-L6-v2",
+            "enabled",
+            30,
+            true,
+        );
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
 
         assert_eq!(parsed["vault"], "/path/to/vault");
@@ -1576,6 +1743,18 @@ mod tests {
         assert_eq!(parsed["model"], "all-MiniLM-L6-v2");
         assert_eq!(parsed["intelligence"], "enabled");
         assert_eq!(parsed["files_with_dates"], 30);
+        // The printed and JSON views report the same numbers.
+        assert_eq!(parsed["wikilink_pairs"], 3);
+        assert_eq!(parsed["connected_files"], 8);
+        assert_eq!(parsed["isolated_files"], 2);
+        // `files` is the file count; a second `total_files` derived from the
+        // connectivity split said the same thing twice (#62).
+        assert!(parsed.get("total_files").is_none(), "got {parsed}");
+        // The edge numbers have one source now, and the JSON always carries
+        // them.
+        assert_eq!(parsed["edges"], 10);
+        assert_eq!(parsed["wikilink_edges"], 6);
+        assert_eq!(parsed["mention_edges"], 4);
     }
 
     #[test]

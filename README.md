@@ -21,9 +21,9 @@ engraph turns your markdown vault into a searchable knowledge graph that any AI 
 Plain vector search treats your notes as isolated documents. But knowledge isn't flat — your notes link to each other, share tags, reference the same people and projects. engraph understands these connections.
 
 - **5-lane hybrid search** — semantic embeddings + BM25 full-text + graph expansion + cross-encoder reranking + temporal scoring, fused via [Reciprocal Rank Fusion](https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf). Lane weights are configurable. Time-aware queries like "what happened last week" or "March 2026 notes" activate the temporal lane automatically.
-- **MCP server for AI agents** — `engraph serve` exposes 26 tools (search, read, the tag vocabulary, section-level editing, frontmatter mutations, vault health, context bundles, note creation, PARA migration, identity) that Claude, Cursor, or any MCP client can call directly.
-- **HTTP REST API** — `engraph serve --http` adds an axum-based HTTP server alongside MCP with 27 REST endpoints, API key authentication, rate limiting, and CORS. Web-based agents and scripts can query your vault with simple `curl` calls.
-- **Section-level editing** — AI agents can read, replace, prepend, or append to specific sections by heading. Full note rewriting with frontmatter preservation. Granular frontmatter mutations (set/remove fields, add/remove tags and aliases).
+- **MCP server for AI agents** — `engraph serve` exposes 20 tools (search, read, list, tags, vault_map, who, project, topic, create, update, delete, move, archive, index, reindex_file, status, health, identity, init, migrate) that Claude, Cursor, or any MCP client can call directly.
+- **HTTP REST API** — `engraph serve --http` adds an axum-based HTTP server alongside MCP with 21 REST endpoints, API key authentication, rate limiting, and CORS. Web-based agents and scripts can query your vault with simple `curl` calls.
+- **Section-level editing** — AI agents can read, replace, prepend, or append to a section by heading, to the note's body, or to a frontmatter property — every change is one `update` call carrying a list of edits.
 - **Vault health diagnostics** — detect orphan notes, broken wikilinks, stale content, and tag hygiene issues. Available as MCP tool and CLI command.
 - **Obsidian CLI integration** — auto-detects running Obsidian and delegates compatible operations. Circuit breaker (Closed/Degraded/Open) ensures graceful fallback.
 - **Real-time sync** — file watcher keeps the index fresh as you edit in Obsidian. No manual re-indexing needed.
@@ -61,7 +61,7 @@ Your vault (markdown files)
 │  Search: 3-lane retrieval → Reranker        │
 │          → Two-pass RRF fusion              │
 │                                             │
-│  26 MCP tools + 27 REST endpoints           │
+│  20 MCP tools + 21 REST endpoints           │
 └─────────────────────────────────────────────┘
         │
         ▼
@@ -205,7 +205,7 @@ The reranker scored each result for relevance as the 4th RRF lane.
 **Rich context for AI agents:**
 
 ```bash
-engraph context topic "authentication" --budget 8000
+engraph topic "authentication" --budget 8000
 ```
 
 Returns a token-budgeted context bundle: relevant notes, connected people, related projects — ready to paste into a prompt or serve via MCP.
@@ -213,7 +213,7 @@ Returns a token-budgeted context bundle: relevant notes, connected people, relat
 **Person context:**
 
 ```bash
-engraph context who "Sarah Chen"
+engraph who "Sarah Chen"
 ```
 
 Returns Sarah's note, all mentions across the vault, connected notes via wikilinks, and recent activity.
@@ -221,7 +221,7 @@ Returns Sarah's note, all mentions across the vault, connected notes via wikilin
 **Vault structure overview:**
 
 ```bash
-engraph context vault-map
+engraph vault-map
 ```
 
 Returns folder counts, top tags, recent files — gives an AI agent orientation before it starts searching.
@@ -229,7 +229,7 @@ Returns folder counts, top tags, recent files — gives an AI agent orientation 
 **Create a note via the write pipeline:**
 
 ```bash
-engraph write create --content "# Meeting Notes\n\nDiscussed auth timeline with Sarah." --tags meeting,auth
+engraph create --content "# Meeting Notes\n\nDiscussed auth timeline with Sarah." --tags meeting,auth
 ```
 
 engraph resolves tags against the registry (fuzzy matching), discovers potential wikilinks (`[[Sarah Chen]]`), suggests the best folder based on semantic similarity to existing notes, and writes atomically.
@@ -237,15 +237,15 @@ engraph resolves tags against the registry (fuzzy matching), discovers potential
 **Edit a specific section:**
 
 ```bash
-engraph write edit --file "Meeting Notes" --heading "Action Items" --mode append --content "- [ ] Follow up with Sarah"
+engraph update "Meeting Notes" --section "Action Items" --mode append --content="- [ ] Follow up with Sarah"
 ```
 
-Targets the "Action Items" section by heading, appends content without touching the rest of the note.
+Targets the "Action Items" section by heading, appends content without touching the rest of the note. Write `--content=` with an equals sign when the value starts with a `-`: the shell passes the text through untouched, and clap reads a leading `-` as a flag.
 
 **Rewrite a note (preserves frontmatter):**
 
 ```bash
-engraph write rewrite --file "Meeting Notes" --content "# Meeting Notes\n\nRevised content here."
+engraph update "Meeting Notes" --mode replace --content "# Meeting Notes\n\nRevised content here."
 ```
 
 Replaces the entire body while keeping existing frontmatter (tags, dates, metadata) intact.
@@ -253,22 +253,22 @@ Replaces the entire body while keeping existing frontmatter (tags, dates, metada
 **Edit frontmatter:**
 
 ```bash
-engraph write edit-frontmatter --file "Meeting Notes" --op add_tag --value "actionable"
+engraph update "Meeting Notes" --property tags --mode append --content "actionable"
 ```
 
-Granular frontmatter mutations: `set`, `remove`, `add_tag`, `remove_tag`, `add_alias`, `remove_alias`.
+A property takes `--mode replace`, `append` or `remove`; a body or a section takes `replace`, `prepend` or `append`. Repeat `--content` to write a list-valued property such as tags or aliases.
 
 **Delete a note:**
 
 ```bash
-engraph write delete --file "Old Draft" --mode soft   # moves to archive
-engraph write delete --file "Old Draft" --mode hard   # permanent removal
+engraph delete "Old Draft" --mode soft   # moves to archive
+engraph delete "Old Draft" --mode hard   # permanent removal
 ```
 
 **Check vault health:**
 
 ```bash
-engraph context health
+engraph health
 ```
 
 Returns orphan notes (no links in or out), broken wikilinks, stale notes, and tag hygiene issues.
@@ -277,37 +277,33 @@ Returns orphan notes (no links in or out), broken wikilinks, stale notes, and ta
 
 `engraph serve --http` adds a full REST API alongside the MCP server, exposing the same capabilities over HTTP for web agents, scripts, and integrations.
 
-**27 endpoints:**
+**21 endpoints:**
+
+Every capability is one route, and the route is the CLI command's name under `/api/`. `docs/surfaces.md` is the generated table of all three surfaces.
 
 | Method | Endpoint | Permission | Description |
 |--------|----------|------------|-------------|
 | GET | `/api/health-check` | read | Server health check |
 | POST | `/api/search` | read | Hybrid search (semantic + FTS5 + graph + reranker + temporal), scoped by tag terms (`tags`/`all`, `any`, `none`) |
-| GET | `/api/read/{file}` | read | Read full note content + metadata |
-| GET | `/api/read-section` | read | Read a specific section by heading |
+| GET | `/api/read` | read | Read a note (`file`), or one of its sections (`section`) |
 | GET | `/api/list` | read | List notes by folder and tag terms (`tags`/`all`, `any`, `none`), creator, limit |
 | GET | `/api/tags` | read | The tag vocabulary, whole or under one term (`under`) |
 | GET | `/api/vault-map` | read | Vault structure overview (folders, tags, recent files) |
-| GET | `/api/who/{name}` | read | Person context bundle |
-| GET | `/api/project/{name}` | read | Project context bundle |
-| POST | `/api/context` | read | Rich topic context with token budget |
+| GET | `/api/who` | read | Person context bundle (`name`) |
+| GET | `/api/project` | read | Project context bundle (`name`) |
+| POST | `/api/topic` | read | Rich topic context with a character budget |
+| GET | `/api/status` | read | Index status and statistics |
 | GET | `/api/health` | read | Vault health diagnostics |
 | POST | `/api/create` | write | Create a new note |
-| POST | `/api/append` | write | Append content to existing note |
-| POST | `/api/edit` | write | Section-level editing (replace/prepend/append) |
-| POST | `/api/rewrite` | write | Full note rewrite (preserves frontmatter) |
-| POST | `/api/edit-frontmatter` | write | Granular frontmatter mutations |
+| POST | `/api/update` | write | Apply a list of edits to one note in one write |
 | POST | `/api/move` | write | Move note to different folder |
-| POST | `/api/archive` | write | Soft-delete (archive) a note |
-| POST | `/api/unarchive` | write | Restore archived note |
-| POST | `/api/update-metadata` | write | Update note metadata |
+| POST | `/api/archive` | write | Archive a note, or restore one with `undo` |
 | POST | `/api/delete` | write | Delete note (soft or hard) |
-| GET | `/api/identity` | read | User identity (L0) and current context (L1) |
-| POST | `/api/setup` | write | First-time onboarding setup (detect/apply modes) |
+| POST | `/api/index` | write | Index the configured vault |
 | POST | `/api/reindex-file` | write | Re-index a single file after external edits |
-| POST | `/api/migrate/preview` | write | Preview PARA migration (classify + suggest moves) |
-| POST | `/api/migrate/apply` | write | Apply PARA migration (move files) |
-| POST | `/api/migrate/undo` | write | Undo last PARA migration |
+| GET | `/api/identity` | read | User identity (L0) and current context (L1). `?refresh=true` re-extracts the L1 facts and takes a write key |
+| POST | `/api/init` | write | First-time onboarding setup (`mode`: detect or apply) |
+| POST | `/api/migrate` | write | PARA migration (`mode`: preview, apply or undo). `apply` requires the `preview` that `preview` returned |
 
 **Authentication:**
 
@@ -334,8 +330,10 @@ curl -X POST http://localhost:3000/api/search \
   -H "Content-Type: application/json" \
   -d '{"query": "authentication architecture", "top_n": 5, "tags": ["project/auth"], "all": ["type/decision"], "any": ["status/reviewed", "status/draft"], "none": ["status/archived"]}'
 
-# Read a note
-curl http://localhost:3000/api/read/01-Projects/API-Design.md \
+# Read a note, or one of its sections
+curl "http://localhost:3000/api/read?file=01-Projects/API-Design.md" \
+  -H "Authorization: Bearer eg_..."
+curl "http://localhost:3000/api/read?file=01-Projects/API-Design.md&section=Endpoints" \
   -H "Authorization: Bearer eg_..."
 
 # Create a note
@@ -363,23 +361,23 @@ permission = "write"
 
 ## PARA Migration
 
-`engraph migrate para` restructures your vault into the [PARA method](https://fortelabs.com/blog/para/) (Projects, Areas, Resources, Archive) using heuristic classification. The workflow is non-destructive: preview first, review the plan, then apply.
+`engraph migrate` restructures your vault into the [PARA method](https://fortelabs.com/blog/para/) (Projects, Areas, Resources, Archive) using heuristic classification. The workflow is non-destructive: preview first, review the plan, then apply.
 
 **Workflow:**
 
 ```bash
 # 1. Preview — classify notes and generate a migration plan
-engraph migrate para --preview
+engraph migrate --mode preview
 # Outputs: markdown summary + JSON plan saved to ~/.engraph/
 
 # 2. Review the plan (edit if needed)
 cat ~/.engraph/migration_preview.md
 
 # 3. Apply — move files according to the plan
-engraph migrate para --apply
+engraph migrate --mode apply
 
 # 4. Undo — reverse the last migration if something looks wrong
-engraph migrate para --undo
+engraph migrate --mode undo
 ```
 
 **Classification signals:**
@@ -393,9 +391,9 @@ engraph migrate para --undo
 
 Notes that don't match any signal with sufficient confidence stay in place. Daily notes (`YYYY-MM-DD.md`) and templates are always skipped.
 
-**MCP tools:** `migrate_preview`, `migrate_apply`, `migrate_undo` — available in `engraph serve` for AI-assisted migration.
+**MCP tool:** `migrate`, with the same `mode` — available in `engraph serve` for AI-assisted migration.
 
-**HTTP endpoints:** `POST /api/migrate/preview`, `/api/migrate/apply`, `/api/migrate/undo` — available via `engraph serve --http`.
+**HTTP endpoint:** `POST /api/migrate`, with the same `mode` — available via `engraph serve --http`. On both servers `mode: apply` takes the `preview` that `mode: preview` returned; only the CLI reads the copy saved on disk.
 
 ## ChatGPT Actions
 
@@ -489,7 +487,7 @@ You are a knowledge assistant connected to the user's Obsidian vault via engraph
 
 WORKFLOW:
 1. Use searchVault to find relevant notes before answering questions
-2. Use readNote for full content, readSection for specific headings
+2. Use readNote for full content, and its section parameter for one heading
 3. Use getWho for people context, getProject for project context
 4. Use getVaultMap to orient yourself in the vault structure
 5. Only create or edit notes when explicitly asked
@@ -544,7 +542,7 @@ STYLE:
 | Search method | 5-lane RRF (semantic + BM25 + graph + reranker + temporal) | Vector similarity only | Keyword only |
 | Query understanding | Cross-encoder reads each candidate jointly with the query | None | None |
 | Understands note links | Yes (wikilink graph traversal) | No | Limited (backlinks panel) |
-| AI agent access | MCP server (26 tools) + HTTP REST API (27 endpoints) | Custom API needed | No |
+| AI agent access | MCP server (20 tools) + HTTP REST API (21 endpoints) | Custom API needed | No |
 | Write capability | Create/edit/rewrite/delete with smart filing | No | Manual |
 | Vault health | Orphans, broken links, stale notes, tag hygiene | No | Limited |
 | Real-time sync | File watcher, 2s debounce | Manual re-index | N/A |
@@ -560,12 +558,12 @@ engraph is not a replacement for Obsidian — it's the intelligence layer that s
 - Confidence % display: search results show normalized 0-100% confidence instead of raw RRF scores
 - llama.cpp inference via Rust bindings (GGUF models, Metal GPU on macOS, CUDA on Linux)
 - Intelligence opt-in: the cross-encoder lane is off unless enabled
-- MCP server with 26 tools (9 read, 11 write, 2 diagnostic, 3 migrate, 1 setup) via stdio
-- HTTP REST API with 27 endpoints, API key auth (`eg_` prefix), rate limiting, CORS — enabled via `engraph serve --http`
+- MCP server with 20 tools (8 read, 5 write, 5 index and diagnostic, 1 setup, 1 migrate) via stdio
+- HTTP REST API with 21 endpoints, API key auth (`eg_` prefix), rate limiting, CORS — enabled via `engraph serve --http`
 - User identity with L0/L1 tiered context for AI agent session starts
 - Section-level reading and editing: target specific headings with replace/prepend/append modes
 - Full note rewriting with automatic frontmatter preservation
-- Granular frontmatter mutations: set/remove fields, add/remove tags and aliases
+- Frontmatter property edits: replace, append to or remove a property, scalar or list-valued
 - Soft delete (archive) and hard delete (permanent) with audit logging
 - Vault health diagnostics: orphan notes, broken wikilinks, stale content, tag hygiene
 - Obsidian CLI integration with circuit breaker (Closed/Degraded/Open) for resilient delegation
@@ -578,7 +576,7 @@ engraph is not a replacement for Obsidian — it's the intelligence layer that s
 - Content-based folder role detection (people, daily, archive) by content patterns
 - PARA migration: AI-assisted vault restructuring into Projects/Areas/Resources/Archive with preview, apply, and undo workflow
 - Configurable model overrides for multilingual support
-- 426 unit tests, CI on macOS + Ubuntu
+- 846 unit tests, CI on macOS + Ubuntu
 
 ## Roadmap
 
@@ -626,7 +624,7 @@ intelligence = true
 
 # Prepend document identity to each chunk before embedding. Off by default —
 # it helped conceptual queries and hurt exact-name lookup on the test vault.
-# Needs `engraph index --reindex` to take effect either way.
+# Needs `engraph index --rebuild` to take effect either way.
 [embedding_prefix]
 enabled = false
 # path = true      # "Archdragon — lore/bestiary/archdragon.md"
@@ -662,7 +660,7 @@ All data stored in `~/.engraph/` — single SQLite database (~10MB typical), GGU
 ## Development
 
 ```bash
-cargo test --lib          # 426 unit tests, no network (requires CMake for llama.cpp)
+cargo test --lib          # 846 unit tests, no network (requires CMake for llama.cpp)
 cargo clippy -- -D warnings
 cargo fmt --check
 
@@ -674,7 +672,7 @@ cargo test --test integration -- --ignored
 
 Contributions welcome. Please open an issue first to discuss what you'd like to change.
 
-The codebase is 26 Rust modules behind a lib crate. `CLAUDE.md` in the repo root has detailed architecture documentation for AI-assisted development.
+The codebase is 35 Rust modules behind a lib crate. `CLAUDE.md` in the repo root has detailed architecture documentation for AI-assisted development.
 
 ## License
 

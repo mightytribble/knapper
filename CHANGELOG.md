@@ -1,5 +1,46 @@
 # Changelog
 
+## Unreleased — One name per capability ([#62](https://github.com/devwhodevs/engraph/issues/62))
+
+Every capability now has one name and one parameter set on the CLI, the MCP server and the HTTP API. The name is one word in `kebab-case`, and each surface spells it its own way: the CLI command as written, the MCP tool with `-` as `_`, and the HTTP route under `/api/` and the name. One transform gets from any spelling to any other.
+
+**The renames land with no aliases and with no deprecation window.** Nothing outside this repository named an MCP tool or a CLI command, so no old name is kept working. Everything under "Removed" below is a hard break: an agent or a script that calls an old name gets an error, not a warning. This section is the whole list.
+
+### Removed
+
+- **CLI command groups.** `engraph context <leaf>` and `engraph write <leaf>` are gone; every leaf is a top-level command. `context read` → `read`, `context list` → `list`, `context tags` → `tags`, `context vault-map` → `vault-map`, `context who` → `who`, `context project` → `project`, `context topic` → `topic`, `write create` → `create`, `write archive` → `archive`, `write delete` → `delete`.
+- **`engraph graph`**, both leaves. `graph show` ran the same four queries `read` runs, so `read` answers it and now carries a docid beside each link. `graph stats` is folded into `status`.
+- **`engraph migrate para`.** PARA is the only strategy, so the leaf is gone: `engraph migrate --mode preview|apply|undo`.
+- **12 MCP tools** (26 → 20, with six added below): `read_section` is a `section` parameter of `read`; `append`, `edit`, `rewrite`, `edit_frontmatter` and `update_metadata` are one `update` tool; `unarchive` is `archive {undo: true}`; `setup` is `init {mode}`; `migrate_preview`, `migrate_apply` and `migrate_undo` are `migrate {mode}`; `context` is renamed `topic`. `move_note` is renamed `move`.
+- **12 HTTP routes** (29 → 23, 27 under `/api` → 21, with five added below): `POST /api/read-section`, `/api/append`, `/api/edit`, `/api/rewrite`, `/api/edit-frontmatter`, `/api/update-metadata`, `/api/unarchive`, `/api/setup`, `/api/context`, and `POST /api/migrate/preview`, `/apply` and `/undo`.
+- **Path parameters.** `GET /api/read/{*file}`, `/api/who/{name}` and `/api/project/{name}` are `?file=`, `?name=` and `?name=` query parameters, because the shared parameter struct carries its arguments the way it names them.
+- **`rewrite`'s `preserve_frontmatter: false`** has no spelling in `update`. A body edit always keeps the note's frontmatter; change the frontmatter with `property` edits in the same list.
+- **`update_metadata`'s `modified_by` stamp.** A whole-note tag or alias replacement no longer writes a `modified_by` property into the note.
+- **`total_files`** from the `status` JSON. `files` already reports it.
+- **The disk fallback for `migrate` `mode: apply`** on the two servers. `apply` now requires the `preview` the caller's own `mode: preview` returned; it no longer falls back to `~/.engraph/migration-preview.json`. The CLI's two-step flow, which saves and reads that file itself, is unchanged.
+
+### Added
+
+- **`update`**, one capability for every change to an existing note. It takes a list of edits and applies them in order in one write: one mtime conflict check, one file write, one re-index. Each edit names a `section`, a `property`, or neither (the note's body), and carries a `mode` of `replace`, `prepend`, `append` or `remove`. `content` is a string, or a list of strings for a list-valued property. The grammar reaches something no call it replaced could: two sections and a tag change in one atomic write.
+- **`read --section`** narrows the content to one ATX heading's body and adds `heading`, `line_start` and `line_end`. The heading match folds case, and `byte_count` measures the section. The note's tags and links are reported either way, because a section's are its file's.
+- **The gaps fill.** Six MCP tools are new — `index`, `status`, `topic`, `update`, `init` and `migrate` — and five HTTP routes — `POST /api/index`, `/api/update`, `/api/migrate`, `/api/topic` and `GET /api/status`. On the CLI, `health`, `reindex-file`, `move`, `update`, `status` and `index` each reach a surface that did not have them.
+- **`explain` and `group_by` are per call on every surface**, so one query answers the same way whoever asks it.
+- **`GET /api/identity?refresh=` and MCP `identity {refresh}`** re-extract the L1 facts, which was a CLI-only flag. It rewrites the `identity_facts` rows, so it takes the write permission and a read-only server refuses it.
+- **`docs/surfaces.md`**, generated from `src/surface.rs` and checked by a test, listing what every capability is called on each surface.
+- **Parity tests.** Five tests compare the capability table with what `Cli::command()`, `EngraphServer::tool_router()` and `http::routes()` register, including each tool's schema against its clap arguments. A capability added to one surface and forgotten on another fails the build.
+
+### Changed
+
+- **`search`'s default `top_n` is the configured one** on both servers. It was a hardcoded 10; it is now `top_n` from `config.toml`, whose default is **5** — the same number the CLI has always used. A caller that relied on ten results per query must now ask for `top_n: 10`.
+- **`search` over HTTP returns an envelope**, `{"results": [...], "message": ...}`, replacing the bare array. `explain` joins it when the call asked for it. HTTP was the one surface with nowhere to put the answer-floor signal.
+- **`update`'s `--mode` defaults to `replace`.** The calls it absorbed were stricter — `write rewrite --content` and `write edit --content` were required, and `write edit`'s mode defaulted to `append`. `engraph update <file>` with no `--content` and no `--edits` still reads stdin, and an empty read is now refused for a body or section `replace` rather than blanking the note. `--content ""` is the deliberate spelling for that.
+- **A body edit adds no blank line of its own.** `split_frontmatter` rejoins the body carrying the break after the closing `---`, and the reassembly supplies its own, so successive appends and successive property edits used to push the body one line down per call. Both reassembly paths now normalise it.
+- **`update` checks the mtime.** A note changed outside engraph and not yet re-indexed fails with an mtime conflict, which `edit`, `rewrite` and `edit_frontmatter` did not do.
+- **`delete`'s `mode` is an enum** on all three surfaces. It read `"hard" => hard, _ => soft`, so `mode: "hardd"` archived the note silently; an unknown word is now refused where the request is read.
+- **A read-only server refuses `index` and `init {mode: apply}`** on both servers, as it already refused the write calls.
+- **MCP tools: 26 → 20. HTTP routes: 29 → 23** (27 under `/api` → 21, beside the `/api/health-check` liveness probe and the two discovery routes). **CLI top-level commands: 13 → 24** — twenty capabilities plus `configure`, `models`, `clear` and `serve`, which configure the process and not the vault.
+- **Test count: 785 → 851.**
+
 ## v1.6.1 — Patch Release (2026-04-21)
 
 ### Fixed
