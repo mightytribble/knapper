@@ -201,7 +201,11 @@ fn build_topic() -> serde_json::Value {
                     "required": ["query"],
                     "properties": {
                         "query": { "type": "string", "description": "Topic or question" },
-                        "budget": { "type": "integer", "description": "Character budget (default 32000)" }
+                        "budget": { "type": "integer", "description": "Character budget (default 32000)" },
+                        "tags": { "type": "array", "items": { "type": "string" }, "description": "Tag terms; a trailing / matches the tag and its descendants. Alias of all" },
+                        "all": { "type": "array", "items": { "type": "string" }, "description": "Gather context from notes carrying every one of these terms" },
+                        "any": { "type": "array", "items": { "type": "string" }, "description": "Gather context from notes carrying at least one of these terms" },
+                        "none": { "type": "array", "items": { "type": "string" }, "description": "Leave out notes carrying any of these terms" }
                     }
                 }}}
             },
