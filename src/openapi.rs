@@ -699,4 +699,20 @@ mod tests {
         assert_eq!(manifest["name_for_human"], "my-vault");
         assert_eq!(manifest["contact_email"], "test@example.com");
     }
+
+    #[test]
+    fn the_spec_describes_every_route_the_router_serves() {
+        let spec = build_openapi_spec("http://localhost:7777");
+        let described: std::collections::BTreeSet<String> =
+            spec["paths"].as_object().unwrap().keys().cloned().collect();
+
+        // The router writes a wildcard as `{*file}`; OpenAPI writes `{file}`.
+        let served: std::collections::BTreeSet<String> = crate::http::routes()
+            .into_iter()
+            .map(|(p, _)| p.replace("{*", "{"))
+            .filter(|p| p.starts_with("/api/"))
+            .collect();
+
+        assert_eq!(served, described, "the spec and the router disagree");
+    }
 }
