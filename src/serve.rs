@@ -129,7 +129,11 @@ impl EngraphServer {
             rerank_candidates: 30,
             rerank: self.rerank,
             max_chunks_per_file: self.max_chunks_per_file,
-            group_by: self.group_by,
+            // Per call, with the process setting as the default: one query
+            // answers the same way whoever asks it, and the granularity is
+            // part of the question rather than of how the server was started
+            // (#62).
+            group_by: params.0.group_by.unwrap_or(self.group_by),
             ranking: self.ranking,
             lane_weights: self.lane_weights,
             fts: self.fts,
@@ -146,14 +150,22 @@ impl EngraphServer {
         // replace the JSON, because text in place of the array would break a
         // client that parses it. MCP holds both without a change to the schema,
         // and #35 owns the schema.
+        let mut result = to_json_result(&output.results)?;
         if output.results.is_empty() {
-            let mut result = to_json_result(&output.results)?;
             result
                 .content
                 .push(Content::text(crate::ranking::NO_RELEVANT_CONTENT));
-            return Ok(result);
         }
-        to_json_result(&output.results)
+        // The per-lane detail is a second content block, the way the CLI
+        // prints it after the results and the HTTP envelope carries it in
+        // `explain`. It is absent unless the caller asked, because an agent
+        // that did not ask must not have to read past it (#62).
+        if params.0.explain {
+            result
+                .content
+                .push(Content::text(search::explain_report(&output, top_n)));
+        }
+        Ok(result)
     }
 
     #[tool(

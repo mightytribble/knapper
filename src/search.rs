@@ -12,6 +12,10 @@ use crate::ranking;
 use crate::store::{EdgeStats, Store, StoreStats};
 
 /// A single search result with metadata.
+///
+/// It serialises, because the HTTP envelope carries these items (#62). What a
+/// result item holds is issue #35's question, not this one's.
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct SearchResult {
     pub score: f32,
     pub confidence: f64,
@@ -35,6 +39,22 @@ pub struct InternalSearchResult {
     pub heading: Option<String>,
     pub snippet: String,
     pub docid: Option<String>,
+}
+
+impl SearchResult {
+    /// The pipeline's row as a caller sees it. The three surfaces answer one
+    /// query with one item list, so the conversion has one home (#62).
+    pub fn from_internal(r: &InternalSearchResult) -> Self {
+        SearchResult {
+            score: r.score as f32,
+            confidence: r.confidence,
+            file_path: r.file_path.clone(),
+            chunk_seq: r.chunk_seq,
+            heading: r.heading.clone(),
+            snippet: r.snippet.clone(),
+            docid: r.docid.clone(),
+        }
+    }
 }
 
 /// Output from `search_internal`: structured results plus raw fused data for --explain.
@@ -1219,15 +1239,7 @@ pub fn run_search(
     let results: Vec<SearchResult> = output
         .results
         .iter()
-        .map(|r| SearchResult {
-            score: r.score as f32,
-            confidence: r.confidence,
-            file_path: r.file_path.clone(),
-            chunk_seq: r.chunk_seq,
-            heading: r.heading.clone(),
-            snippet: r.snippet.clone(),
-            docid: r.docid.clone(),
-        })
+        .map(SearchResult::from_internal)
         .collect();
 
     let mut out = format_results(&results, json);
@@ -1241,18 +1253,28 @@ pub fn run_search(
     }
 
     if explain && !json {
-        let mut explain_out = String::new();
-        explain_out.push_str(&format_retrieval(&output.retrieval, &output.fts_columns));
-        explain_out.push_str("--- Explain ---\n");
-        for f in output.fused.iter().take(top_n) {
-            explain_out.push_str(&format!("{}\n", f.file_path));
-            explain_out.push_str(&fusion::format_explain(f));
-        }
-        out.push_str(&explain_out);
+        out.push_str(&explain_report(&output, top_n));
     }
 
     print!("{out}");
     Ok(())
+}
+
+/// The `--explain` record: the retrieval step, then the fusion step per result.
+///
+/// It reads the retrieval trace and the fused lanes, which no caller of the
+/// pipeline holds by any other route, so the one composition serves all three
+/// surfaces: the CLI prints it, MCP sends it as a second content block and the
+/// HTTP envelope carries it in `explain` (#62). It is built only when the
+/// caller asks for it, because an agent that did not ask must not read past it.
+pub fn explain_report(output: &SearchOutput, top_n: usize) -> String {
+    let mut out = format_retrieval(&output.retrieval, &output.fts_columns);
+    out.push_str("--- Explain ---\n");
+    for f in output.fused.iter().take(top_n) {
+        out.push_str(&format!("{}\n", f.file_path));
+        out.push_str(&fusion::format_explain(f));
+    }
+    out
 }
 
 /// What `status` reports, read from the store and from the config.

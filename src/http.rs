@@ -355,6 +355,20 @@ async fn handle_plugin_manifest(State(state): State<ApiState>) -> impl IntoRespo
 // Read endpoint handlers
 // ---------------------------------------------------------------------------
 
+/// A search response is an envelope, because HTTP is the one surface with
+/// nowhere else to put the answer-floor signal — the CLI prints it and MCP
+/// sends a second content block (#34, #62). #35 owns what a result item
+/// holds; this owns the envelope around it.
+fn search_response(results: &[search::SearchResult]) -> serde_json::Value {
+    serde_json::json!({
+        "results": results,
+        "message": match results.is_empty() {
+            true => Some(crate::ranking::NO_RELEVANT_CONTENT),
+            false => None,
+        },
+    })
+}
+
 async fn handle_search(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -381,7 +395,10 @@ async fn handle_search(
         rerank_candidates: 30,
         rerank: state.rerank,
         max_chunks_per_file: state.max_chunks_per_file,
-        group_by: state.group_by,
+        // Per call, with the process setting as the default: one query answers
+        // the same way whoever asks it, and the granularity is part of the
+        // question rather than of how the server was started (#62).
+        group_by: body.group_by.unwrap_or(state.group_by),
         ranking: state.ranking,
         lane_weights: state.lane_weights,
         fts: state.fts,
@@ -399,7 +416,19 @@ async fn handle_search(
                 ApiError::internal(&format!("{e:#}"))
             }
         })?;
-    Ok(Json(serde_json::json!(output.results)))
+    let results: Vec<search::SearchResult> = output
+        .results
+        .iter()
+        .map(search::SearchResult::from_internal)
+        .collect();
+    let mut response = search_response(&results);
+    // The per-lane detail rides in the envelope, next to the results it
+    // explains. It is absent unless the caller asked, because an agent that
+    // did not ask must not have to read past it (#62).
+    if body.explain {
+        response["explain"] = serde_json::json!(search::explain_report(&output, top_n));
+    }
+    Ok(Json(response))
 }
 
 async fn handle_read(
@@ -1780,6 +1809,59 @@ mod tests {
         assert_eq!(
             body["error"],
             "Unknown mode: sideways. Use 'detect' or 'apply'."
+        );
+    }
+
+    /// One result with every field filled. The envelope is what the test
+    /// asserts on, so the values themselves carry no meaning (#62).
+    fn sample_result() -> search::SearchResult {
+        search::SearchResult {
+            score: 0.5,
+            confidence: 0.75,
+            file_path: "Notes/Warding.md".to_string(),
+            chunk_seq: 2,
+            heading: Some("Level 4 Silence".to_string()),
+            snippet: "a snippet".to_string(),
+            docid: Some("a1b2c3".to_string()),
+        }
+    }
+
+    #[test]
+    fn a_search_response_carries_its_results_and_its_message() {
+        let empty = search_response(&[]);
+        assert_eq!(empty["results"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            empty["message"].as_str().unwrap(),
+            crate::ranking::NO_RELEVANT_CONTENT
+        );
+
+        let one = search_response(std::slice::from_ref(&sample_result()));
+        assert_eq!(one["results"].as_array().unwrap().len(), 1);
+        assert!(one["message"].is_null());
+    }
+
+    #[tokio::test]
+    async fn the_per_lane_detail_answers_the_call_that_asked_for_it() {
+        // `explain` is per call on all three surfaces (#62). A caller that did
+        // not ask reads no explain field at all, so the detail costs the
+        // callers who did not want it nothing.
+        let (status, body) =
+            post_json(test_api_state(), "/api/search", r#"{"query":"warding"}"#).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["explain"].is_null());
+
+        let (status, body) = post_json(
+            test_api_state(),
+            "/api/search",
+            r#"{"query":"warding","explain":true}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body["explain"]
+                .as_str()
+                .unwrap()
+                .contains("--- Query run ---")
         );
     }
 }
