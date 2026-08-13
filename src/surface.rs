@@ -35,6 +35,12 @@ pub struct Capability {
     /// Arguments this capability takes on the CLI alone, each with its
     /// reason. The parameter parity test reads them as allowed absences.
     pub cli_only_args: &'static [(&'static str, &'static str)],
+    /// Arguments this capability takes on the servers alone, each with its
+    /// reason. The asymmetry runs both ways — `migrate` takes a `preview` that
+    /// a command line has no spelling for — so the parity test needs a word
+    /// for it, or the only way to make it pass is to stop reading a whole
+    /// direction (#62).
+    pub server_only_args: &'static [(&'static str, &'static str)],
 }
 
 impl Capability {
@@ -77,6 +83,7 @@ pub const CAPABILITIES: &[Capability] = &[
         mcp: Presence::On,
         http: Http::Post,
         cli_only_args: &[],
+        server_only_args: &[],
     },
     Capability {
         name: "read",
@@ -84,6 +91,7 @@ pub const CAPABILITIES: &[Capability] = &[
         mcp: Presence::On,
         http: Http::Get,
         cli_only_args: &[],
+        server_only_args: &[],
     },
     Capability {
         name: "list",
@@ -91,6 +99,7 @@ pub const CAPABILITIES: &[Capability] = &[
         mcp: Presence::On,
         http: Http::Get,
         cli_only_args: &[],
+        server_only_args: &[],
     },
     Capability {
         name: "tags",
@@ -98,6 +107,7 @@ pub const CAPABILITIES: &[Capability] = &[
         mcp: Presence::On,
         http: Http::Get,
         cli_only_args: &[],
+        server_only_args: &[],
     },
     Capability {
         name: "vault-map",
@@ -105,6 +115,7 @@ pub const CAPABILITIES: &[Capability] = &[
         mcp: Presence::On,
         http: Http::Get,
         cli_only_args: &[],
+        server_only_args: &[],
     },
     Capability {
         name: "who",
@@ -112,6 +123,7 @@ pub const CAPABILITIES: &[Capability] = &[
         mcp: Presence::On,
         http: Http::Get,
         cli_only_args: &[],
+        server_only_args: &[],
     },
     Capability {
         name: "project",
@@ -119,6 +131,7 @@ pub const CAPABILITIES: &[Capability] = &[
         mcp: Presence::On,
         http: Http::Get,
         cli_only_args: &[],
+        server_only_args: &[],
     },
     Capability {
         name: "topic",
@@ -126,6 +139,7 @@ pub const CAPABILITIES: &[Capability] = &[
         mcp: Presence::On,
         http: Http::Post,
         cli_only_args: &[],
+        server_only_args: &[],
     },
     // ── Writing ──
     Capability {
@@ -134,6 +148,7 @@ pub const CAPABILITIES: &[Capability] = &[
         mcp: Presence::On,
         http: Http::Post,
         cli_only_args: &[],
+        server_only_args: &[],
     },
     Capability {
         name: "update",
@@ -141,6 +156,7 @@ pub const CAPABILITIES: &[Capability] = &[
         mcp: Presence::On,
         http: Http::Post,
         cli_only_args: &[],
+        server_only_args: &[],
     },
     Capability {
         name: "delete",
@@ -148,6 +164,7 @@ pub const CAPABILITIES: &[Capability] = &[
         mcp: Presence::On,
         http: Http::Post,
         cli_only_args: &[],
+        server_only_args: &[],
     },
     Capability {
         name: "move",
@@ -155,6 +172,7 @@ pub const CAPABILITIES: &[Capability] = &[
         mcp: Presence::On,
         http: Http::Post,
         cli_only_args: &[],
+        server_only_args: &[],
     },
     Capability {
         name: "archive",
@@ -162,6 +180,7 @@ pub const CAPABILITIES: &[Capability] = &[
         mcp: Presence::On,
         http: Http::Post,
         cli_only_args: &[],
+        server_only_args: &[],
     },
     // ── Indexing and diagnostics ──
     Capability {
@@ -170,6 +189,7 @@ pub const CAPABILITIES: &[Capability] = &[
         mcp: Presence::On,
         http: Http::Post,
         cli_only_args: &[("path", "a running server is bound to its configured vault")],
+        server_only_args: &[],
     },
     Capability {
         name: "reindex-file",
@@ -177,6 +197,7 @@ pub const CAPABILITIES: &[Capability] = &[
         mcp: Presence::On,
         http: Http::Post,
         cli_only_args: &[],
+        server_only_args: &[],
     },
     Capability {
         name: "status",
@@ -184,6 +205,7 @@ pub const CAPABILITIES: &[Capability] = &[
         mcp: Presence::On,
         http: Http::Get,
         cli_only_args: &[],
+        server_only_args: &[],
     },
     Capability {
         name: "health",
@@ -191,6 +213,7 @@ pub const CAPABILITIES: &[Capability] = &[
         mcp: Presence::On,
         http: Http::Get,
         cli_only_args: &[],
+        server_only_args: &[],
     },
     Capability {
         name: "identity",
@@ -198,6 +221,7 @@ pub const CAPABILITIES: &[Capability] = &[
         mcp: Presence::On,
         http: Http::Get,
         cli_only_args: &[],
+        server_only_args: &[],
     },
     Capability {
         name: "init",
@@ -218,6 +242,7 @@ pub const CAPABILITIES: &[Capability] = &[
             ),
             ("quiet", "suppresses prompts the other surfaces never show"),
         ],
+        server_only_args: &[],
     },
     Capability {
         name: "migrate",
@@ -225,6 +250,10 @@ pub const CAPABILITIES: &[Capability] = &[
         mcp: Presence::On,
         http: Http::Post,
         cli_only_args: &[],
+        server_only_args: &[(
+            "preview",
+            "the plan `mode=preview` returned; the CLI saves its own copy to disk instead",
+        )],
     },
 ];
 
@@ -394,6 +423,151 @@ mod tests {
             actual.difference(&want).collect::<Vec<_>>(),
             want.difference(&actual).collect::<Vec<_>>()
         );
+    }
+
+    /// The parameter names a capability's MCP tool publishes, and the ones its
+    /// clap command takes, are one set (#62).
+    ///
+    /// This is the guard the whole sweep exists to keep. `params.rs` derives
+    /// `clap::Args`, `Deserialize` and `JsonSchema` from one declaration, so a
+    /// capability that reads its struct holds by construction — but nothing
+    /// stopped a capability from declaring its arguments twice, and `update`
+    /// already has to. The test reads both registries and compares them, so a
+    /// second declaration that drifts fails the build rather than reaching a
+    /// caller.
+    ///
+    /// Three classes of clap argument are not parameters of the capability and
+    /// are subtracted: the `--help` clap adds itself, the global flags that
+    /// configure the process rather than the call, and each capability's own
+    /// `cli_only_args`, which name an argument the other surfaces cannot have
+    /// and say why.
+    #[test]
+    fn every_tool_takes_the_parameters_its_command_takes() {
+        let cmd = crate::cli::Cli::command();
+        let mut checked = 0;
+
+        for tool in crate::serve::EngraphServer::tool_router().list_all() {
+            let name = tool.name.to_string();
+            let capability = CAPABILITIES
+                .iter()
+                .find(|c| c.mcp_name() == name)
+                .unwrap_or_else(|| panic!("the tool {name} names no capability"));
+
+            // A capability that declares its arguments apart from the shared
+            // struct opts out here with a reason, which the test above checks.
+            if PARAMS_NOT_SHARED.iter().any(|(n, _)| *n == capability.name) {
+                continue;
+            }
+
+            let server_only: BTreeSet<String> = capability
+                .server_only_args
+                .iter()
+                .map(|(a, _)| (*a).to_string())
+                .collect();
+
+            let schema: BTreeSet<String> = tool
+                .input_schema
+                .get("properties")
+                .and_then(|p| p.as_object())
+                .map(|o| o.keys().cloned().collect::<BTreeSet<String>>())
+                .unwrap_or_default()
+                .difference(&server_only)
+                .cloned()
+                .collect();
+
+            let subcommand = cmd
+                .get_subcommands()
+                .find(|s| s.get_name() == capability.name)
+                .unwrap_or_else(|| panic!("{} is not a CLI command", capability.name));
+
+            let exempt: BTreeSet<String> = capability
+                .cli_only_args
+                .iter()
+                .map(|(a, _)| (*a).to_string())
+                .collect();
+
+            let clap: BTreeSet<String> = subcommand
+                .get_arguments()
+                // `help` is clap's own, and a global flag configures the
+                // process and not the call — the design names `--json` and
+                // `--verbose` as CLI-only for that reason.
+                .filter(|a| a.get_id() != "help" && !a.is_global_set())
+                .map(|a| a.get_id().to_string())
+                .filter(|id| !exempt.contains(id))
+                .collect();
+
+            assert_eq!(
+                clap,
+                schema,
+                "\n{}: only on the CLI: {:?}\n{}: only in the tool schema: {:?}",
+                capability.name,
+                clap.difference(&schema).collect::<Vec<_>>(),
+                capability.name,
+                schema.difference(&clap).collect::<Vec<_>>()
+            );
+            checked += 1;
+        }
+
+        assert_eq!(
+            checked,
+            CAPABILITIES.len() - PARAMS_NOT_SHARED.len(),
+            "the test skipped a capability it should have compared"
+        );
+    }
+
+    /// Every exemption names a real argument of the surface it exempts, and
+    /// gives a reason. A stale entry would silently widen the parity test
+    /// above into an exemption for nothing (#62).
+    #[test]
+    fn every_exempt_argument_exists_and_says_why() {
+        let cmd = crate::cli::Cli::command();
+        let tools = crate::serve::EngraphServer::tool_router().list_all();
+
+        for capability in CAPABILITIES {
+            let subcommand = cmd
+                .get_subcommands()
+                .find(|s| s.get_name() == capability.name)
+                .unwrap_or_else(|| panic!("{} is not a CLI command", capability.name));
+            let clap_args: BTreeSet<String> = subcommand
+                .get_arguments()
+                .map(|a| a.get_id().to_string())
+                .collect();
+            for (arg, reason) in capability.cli_only_args {
+                assert!(
+                    clap_args.contains(*arg),
+                    "{}: cli_only_args names {arg}, which the command does not take",
+                    capability.name
+                );
+                assert!(
+                    !reason.is_empty(),
+                    "{}: {arg} is exempt with no reason",
+                    capability.name
+                );
+            }
+
+            let tool = tools
+                .iter()
+                .find(|t| t.name == capability.mcp_name())
+                .unwrap_or_else(|| panic!("{} is not an MCP tool", capability.name));
+            let schema: BTreeSet<String> = tool
+                .input_schema
+                .get("properties")
+                .and_then(|p| p.as_object())
+                .map(|o| o.keys().cloned().collect())
+                .unwrap_or_default();
+            for (arg, reason) in capability.server_only_args {
+                assert!(
+                    schema.contains(*arg),
+                    "{}: server_only_args names {arg}, which the tool schema does not publish",
+                    capability.name
+                );
+                assert!(
+                    !reason.is_empty(),
+                    "{}: {arg} is exempt with no reason",
+                    capability.name
+                );
+            }
+        }
     }
 
     #[test]

@@ -1432,9 +1432,11 @@ pub fn status_object(
 ) -> serde_json::Value {
     let vault = stats.vault_path.as_deref().unwrap_or("<not set>");
     let last_indexed = stats.last_indexed_at.as_deref().unwrap_or("never");
-    let total_files = edges.connected_file_count + edges.isolated_file_count;
 
-    let mut obj = json!({
+    // `edges` is the one source for every edge number. `files` above already
+    // says how many files the index holds, so a second `total_files` derived
+    // from the connectivity split would be the same number twice (#62).
+    json!({
         "vault": vault,
         "files": stats.file_count,
         "chunks": stats.chunk_count,
@@ -1444,19 +1446,13 @@ pub fn status_object(
         "model": model_name,
         "intelligence": intelligence,
         "files_with_dates": date_count,
-    });
-    if let (Some(edge_count), Some(wl), Some(mn)) =
-        (stats.edge_count, stats.wikilink_count, stats.mention_count)
-    {
-        obj["edges"] = json!(edge_count);
-        obj["wikilink_edges"] = json!(wl);
-        obj["mention_edges"] = json!(mn);
-    }
-    obj["wikilink_pairs"] = json!(edges.wikilink_count / 2);
-    obj["connected_files"] = json!(edges.connected_file_count);
-    obj["total_files"] = json!(total_files);
-    obj["isolated_files"] = json!(edges.isolated_file_count);
-    obj
+        "edges": edges.total_edges,
+        "wikilink_edges": edges.wikilink_count,
+        "mention_edges": edges.mention_count,
+        "wikilink_pairs": edges.wikilink_count / 2,
+        "connected_files": edges.connected_file_count,
+        "isolated_files": edges.isolated_file_count,
+    })
 }
 
 /// Format status information for display (pure function, no I/O).
@@ -1494,20 +1490,16 @@ pub fn format_status(
         );
         format!("{}\n", serde_json::to_string_pretty(&obj).unwrap())
     } else {
+        // The `Edges:` header and the four lines under it come from one
+        // `EdgeStats`, so the header is always printed and the indented lines
+        // always have one to sit under (#62).
         let mut out = format!(
             "Vault:      {}\n\
              Files:      {}\n\
-             Chunks:     {}\n",
-            vault, stats.file_count, stats.chunk_count,
+             Chunks:     {}\n\
+             Edges:      {}\n",
+            vault, stats.file_count, stats.chunk_count, edges.total_edges,
         );
-        if let (Some(edge_count), Some(wl), Some(mn)) =
-            (stats.edge_count, stats.wikilink_count, stats.mention_count)
-        {
-            out.push_str(&format!(
-                "Edges:      {} ({} wikilinks, {} mentions)\n",
-                edge_count, wl, mn
-            ));
-        }
         out.push_str(&format!(
             "  Wikilink edges:  {} ({} bidirectional pairs)\n",
             edges.wikilink_count, wikilink_pairs
@@ -1669,9 +1661,6 @@ mod tests {
             tombstone_count: 3,
             last_indexed_at: Some("2026-03-19 14:30:00".to_string()),
             vault_path: Some("/path/to/vault".to_string()),
-            edge_count: None,
-            wikilink_count: None,
-            mention_count: None,
         };
         let output = format_status(
             &stats,
@@ -1704,9 +1693,6 @@ mod tests {
             tombstone_count: 0,
             last_indexed_at: Some("2026-03-19 14:30:00".to_string()),
             vault_path: Some("/path/to/vault".to_string()),
-            edge_count: Some(10),
-            wikilink_count: Some(6),
-            mention_count: Some(4),
         };
         let output = format_status(
             &stats,
@@ -1736,9 +1722,6 @@ mod tests {
             tombstone_count: 3,
             last_indexed_at: Some("2026-03-19 14:30:00".to_string()),
             vault_path: Some("/path/to/vault".to_string()),
-            edge_count: None,
-            wikilink_count: None,
-            mention_count: None,
         };
         let output = format_status(
             &stats,
@@ -1763,8 +1746,15 @@ mod tests {
         // The printed and JSON views report the same numbers.
         assert_eq!(parsed["wikilink_pairs"], 3);
         assert_eq!(parsed["connected_files"], 8);
-        assert_eq!(parsed["total_files"], 10);
         assert_eq!(parsed["isolated_files"], 2);
+        // `files` is the file count; a second `total_files` derived from the
+        // connectivity split said the same thing twice (#62).
+        assert!(parsed.get("total_files").is_none(), "got {parsed}");
+        // The edge numbers have one source now, and the JSON always carries
+        // them.
+        assert_eq!(parsed["edges"], 10);
+        assert_eq!(parsed["wikilink_edges"], 6);
+        assert_eq!(parsed["mention_edges"], 4);
     }
 
     #[test]
