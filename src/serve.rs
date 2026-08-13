@@ -386,7 +386,6 @@ impl EngraphServer {
         let input = crate::writer::UpdateInput {
             file: params.0.file,
             edits,
-            modified_by: "claude-code".into(),
         };
         let result = crate::writer::update_note(&store, &self.vault_path, &input)
             .map_err(|e| mcp_err(&e))?;
@@ -406,6 +405,7 @@ impl EngraphServer {
             &store,
             &mut *embedder,
             &self.vault_path,
+            self.embed,
             self.chunk_opts,
         )
         .with_context(|| {
@@ -525,9 +525,17 @@ impl EngraphServer {
                     return Err(read_only_err());
                 }
                 let store = self.store.lock().await;
-                let data_dir = crate::config::Config::data_dir().map_err(|e| mcp_err(&e))?;
-                let preview = crate::migrate::resolve_preview(params.0.preview, &data_dir)
-                    .map_err(|e| mcp_err(&e))?;
+                // The preview is required here: this server's own `preview`
+                // mode returned the plan to the caller, so a caller holds it
+                // and sends it back. A dropped key must not silently apply an
+                // unrelated plan (#62).
+                let preview = crate::migrate::resolve_preview(params.0.preview).map_err(|e| {
+                    McpError::new(
+                        rmcp::model::ErrorCode::INVALID_PARAMS,
+                        format!("{e:#}"),
+                        None::<serde_json::Value>,
+                    )
+                })?;
                 let result = crate::migrate::apply_preview(&preview, &store, &self.vault_path)
                     .map_err(|e| mcp_err(&e))?;
                 to_json_result(&result)
@@ -563,10 +571,7 @@ impl EngraphServer {
             return Err(read_only_err());
         }
         let store = self.store.lock().await;
-        let mode = match params.0.mode.as_str() {
-            "hard" => crate::writer::DeleteMode::Hard,
-            _ => crate::writer::DeleteMode::Soft,
-        };
+        let mode = crate::writer::DeleteMode::from(params.0.mode);
         let archive_folder = self
             .profile
             .as_ref()
@@ -599,51 +604,27 @@ impl EngraphServer {
         let store = self.store.lock().await;
         let mut embedder = self.embedder.lock().await;
         let rel_path = params.0.file;
-        let full_path = self.vault_path.join(&rel_path);
 
-        // Read file content from disk
-        let content = std::fs::read_to_string(&full_path).map_err(|e| {
-            McpError::new(
-                rmcp::model::ErrorCode::INVALID_PARAMS,
-                format!("Cannot read file {rel_path}: {e}"),
-                None::<serde_json::Value>,
-            )
-        })?;
-
-        let content_hash = {
-            use sha2::{Digest, Sha256};
-            let mut hasher = Sha256::new();
-            hasher.update(content.as_bytes());
-            format!("{:x}", hasher.finalize())
-        };
-
-        let mut config = crate::config::Config::load().unwrap_or_default();
-        // The chunker settings come from the session, not from this load: a
-        // load that fails falls back to the defaults, and one file re-chunked
-        // at settings the rest of the store was not built at is a set of rows
-        // nothing downstream can tell apart. Carrying the captured value is
-        // what `ChunkOptions` exists to give.
-        config.set_chunk_options(self.chunk_opts);
-
-        // Re-index the file (handles cleanup of old entries automatically)
-        let result = crate::indexer::index_file(
+        // One helper packages the six steps this used to spell out, so the
+        // three callers cannot drift apart (#62). A file the server cannot
+        // read is the caller's own text naming nothing, which is this
+        // surface's INVALID_PARAMS and the HTTP route's 400.
+        let result = crate::indexer::reindex_written_file(
             &rel_path,
-            &content,
-            &content_hash,
             &store,
             &mut *embedder,
             &self.vault_path,
-            &config,
+            self.embed,
+            self.chunk_opts,
         )
-        .map_err(|e| mcp_err(&e))?;
-
-        // Rebuild edges for the re-indexed file
-        // Outgoing only — see issue #27.
-        store
-            .delete_outgoing_edges_for_file(result.file_id)
-            .map_err(|e| mcp_err(&e))?;
-        crate::indexer::build_edges_for_file(&store, result.file_id, &content)
-            .map_err(|e| mcp_err(&e))?;
+        .map_err(|e| match e.downcast_ref::<std::io::Error>() {
+            Some(_) => McpError::new(
+                rmcp::model::ErrorCode::INVALID_PARAMS,
+                format!("Cannot read file {rel_path}: {e:#}"),
+                None::<serde_json::Value>,
+            ),
+            None => mcp_err(&e),
+        })?;
 
         let output = serde_json::json!({
             "file": rel_path,
@@ -655,7 +636,8 @@ impl EngraphServer {
 
     #[tool(
         name = "index",
-        description = "Index the server's vault: walk it, diff it against the store, and re-embed what changed. `rebuild: true` discards the index and builds it again. Use after a batch of writes made outside engraph; a single file is cheaper through reindex_file."
+        description = "Index the server's vault: walk it, diff it against the store, and re-embed what changed. `rebuild: true` discards the index and builds it again. Use after a batch of writes made outside engraph; a single file is cheaper through reindex_file. \
+             The call runs to completion once it starts. It holds the store and the embedder while it runs, so every other tool waits on it, and a graceful shutdown will not interrupt it. On a large vault a rebuild takes minutes."
     )]
     async fn index(
         &self,
@@ -719,10 +701,29 @@ impl EngraphServer {
 
     #[tool(
         name = "identity",
-        description = "Returns compact user identity and current context. Call at session start for instant context. L0 = static identity (~50 tokens), L1 = dynamic state (~120 tokens)."
+        description = "Returns compact user identity and current context. Call at session start for instant context. L0 = static identity (~50 tokens), L1 = dynamic state (~120 tokens). `refresh: true` re-extracts the L1 facts from the index first, without a full re-index."
     )]
-    async fn identity(&self) -> Result<CallToolResult, McpError> {
+    async fn identity(
+        &self,
+        params: Parameters<crate::params::Identity>,
+    ) -> Result<CallToolResult, McpError> {
         let store = self.store.lock().await;
+        // `refresh` is a parameter of the capability on every surface (#62).
+        // It clears the `identity_facts` rows and derives them again, which is
+        // a write of derived state, so a read-only server refuses it.
+        if params.0.refresh {
+            if self.read_only {
+                return Err(read_only_err());
+            }
+            let profile = self.profile.as_ref().as_ref().ok_or_else(|| {
+                McpError::new(
+                    rmcp::model::ErrorCode::INVALID_REQUEST,
+                    "No vault profile found. Run `engraph init` first.",
+                    None::<serde_json::Value>,
+                )
+            })?;
+            crate::identity::extract_l1_facts(&store, profile).map_err(|e| mcp_err(&e))?;
+        }
         let config = crate::config::Config::load().unwrap_or_default();
         let block =
             crate::identity::format_identity_block(&config, &store).map_err(|e| mcp_err(&e))?;
@@ -744,6 +745,13 @@ impl EngraphServer {
                 to_json_result(&result)
             }
             Some("apply") => {
+                // `apply` indexes the vault, which is the work `index` is
+                // guarded against on a read-only server. The mode is read
+                // first, so `detect` — which writes nothing — still runs
+                // (#62).
+                if self.read_only {
+                    return Err(read_only_err());
+                }
                 let mut config = crate::config::Config::load().unwrap_or_default();
                 let data_dir = crate::config::Config::data_dir().map_err(|e| mcp_err(&e))?;
                 let flags = crate::onboarding::ApplyFlags {
@@ -1143,6 +1151,155 @@ mod tests {
             },
         };
         (tmp, server)
+    }
+
+    /// A PARA profile over `root`, for the calls that need one.
+    fn test_profile(root: &std::path::Path) -> crate::profile::VaultProfile {
+        crate::profile::VaultProfile {
+            vault_path: root.to_path_buf(),
+            vault_type: crate::profile::VaultType::Obsidian,
+            structure: crate::profile::StructureDetection {
+                method: crate::profile::StructureMethod::Para,
+                folders: crate::profile::FolderMap::default(),
+            },
+            stats: crate::profile::VaultStats::default(),
+        }
+    }
+
+    /// `archive` and `archive {undo: true}` are one operation and its reverse
+    /// (#62). The handler's own branch chooses `archive_note` against
+    /// `unarchive_note`, and nothing else covers it — an inverted branch would
+    /// move the file the opposite way with the whole suite green.
+    #[tokio::test]
+    async fn the_undo_flag_chooses_the_operation_it_names() {
+        let (_tmp, server) = indexed_server(crate::config::GroupBy::Chunk);
+        let vault = server.vault_path.as_ref().clone();
+        let live = vault.join("rules/evocation-spells.md");
+        let archived = vault.join("04-Archive/rules/evocation-spells.md");
+        assert!(live.exists());
+
+        server
+            .archive(super::Parameters(crate::params::Archive {
+                file: "rules/evocation-spells.md".into(),
+                undo: false,
+            }))
+            .await
+            .unwrap();
+        assert!(!live.exists(), "undo: false must archive");
+        assert!(archived.exists(), "undo: false must archive");
+
+        server
+            .archive(super::Parameters(crate::params::Archive {
+                file: "04-Archive/rules/evocation-spells.md".into(),
+                undo: true,
+            }))
+            .await
+            .unwrap();
+        assert!(live.exists(), "undo: true must restore");
+        assert!(!archived.exists(), "undo: true must restore");
+    }
+
+    /// `identity` takes `refresh` on every surface (#62). Before this the
+    /// tool declared no parameters at all, so the flag the CLI honoured had no
+    /// spelling here. `extract_l1_facts` clears tier 1 before it derives it
+    /// again, so a stale fact seeded first is what proves the call was made.
+    #[tokio::test]
+    async fn identity_refresh_re_extracts_the_l1_facts() {
+        let (_tmp, mut server) = indexed_server(crate::config::GroupBy::Chunk);
+        let root = server.vault_path.as_ref().clone();
+        server.profile = std::sync::Arc::new(Some(test_profile(&root)));
+
+        let stale = || {
+            let store = server.store.try_lock().expect("uncontended");
+            store
+                .get_identity_facts(1)
+                .unwrap()
+                .into_iter()
+                .any(|f| f.key == "stale")
+        };
+        {
+            let store = server.store.try_lock().expect("uncontended");
+            store
+                .upsert_identity_fact(1, "stale", "from an older session", None)
+                .unwrap();
+        }
+        assert!(stale());
+
+        // No refresh: the facts are answered as they stand.
+        server
+            .identity(super::Parameters(crate::params::Identity {
+                refresh: false,
+            }))
+            .await
+            .unwrap();
+        assert!(stale(), "a call that did not ask must re-extract nothing");
+
+        server
+            .identity(super::Parameters(crate::params::Identity { refresh: true }))
+            .await
+            .unwrap();
+        assert!(!stale(), "refresh: true must re-derive tier 1");
+    }
+
+    /// A read-only server refuses every call that writes derived state, and
+    /// `identity {refresh: true}` is one: it clears the `identity_facts` rows
+    /// (#62).
+    #[tokio::test]
+    async fn a_read_only_server_refuses_an_identity_refresh_and_answers_a_plain_one() {
+        let (_tmp, mut server) = indexed_server(crate::config::GroupBy::Chunk);
+        let root = server.vault_path.as_ref().clone();
+        server.profile = std::sync::Arc::new(Some(test_profile(&root)));
+        server.read_only = true;
+
+        assert!(
+            server
+                .identity(super::Parameters(crate::params::Identity { refresh: true }))
+                .await
+                .is_err()
+        );
+        assert!(
+            server
+                .identity(super::Parameters(crate::params::Identity {
+                    refresh: false,
+                }))
+                .await
+                .is_ok()
+        );
+    }
+
+    /// `init {mode: apply}` indexes the vault, which is the work `index` is
+    /// guarded against. `detect` writes nothing and still runs (#62).
+    #[tokio::test]
+    async fn a_read_only_server_refuses_init_apply_and_runs_init_detect() {
+        let (_tmp, mut server) = indexed_server(crate::config::GroupBy::Chunk);
+        server.read_only = true;
+
+        let init = |mode: &str| crate::params::Init {
+            mode: Some(mode.to_string()),
+            name: None,
+            role: None,
+            purpose: None,
+        };
+        assert!(server.init(super::Parameters(init("apply"))).await.is_err());
+        assert!(server.init(super::Parameters(init("detect"))).await.is_ok());
+    }
+
+    /// A server's `apply` acts on the plan its caller sends and no other. The
+    /// copy `engraph migrate --mode preview` saves belongs to the CLI's own
+    /// two-step flow, and an `apply` that fell back to it would move files
+    /// against a plan this caller never saw (#62).
+    #[tokio::test]
+    async fn a_migrate_apply_with_no_preview_is_a_parameter_error() {
+        let (_tmp, server) = indexed_server(crate::config::GroupBy::Chunk);
+        let err = server
+            .migrate(super::Parameters(crate::params::Migrate {
+                mode: "apply".into(),
+                preview: None,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(err.message.contains("apply needs a preview"), "got {err:?}");
     }
 
     /// A search asking for one query, with everything but the two per-call

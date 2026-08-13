@@ -108,7 +108,7 @@ fn build_read() -> serde_json::Value {
                 },
                 {
                     "name": "section", "in": "query", "required": false,
-                    "description": "Read one section by its heading. Omit for the whole note.",
+                    "description": "Read one section by its heading. Omit for the whole note. The heading is an ATX # heading and the match folds case, so 'spells' finds '## Spells'. A section read narrows content and byte_count to that section; the note's tags and links are reported either way.",
                     "schema": { "type": "string" }
                 }
             ],
@@ -342,7 +342,7 @@ fn build_delete() -> serde_json::Value {
                     "required": ["file"],
                     "properties": {
                         "file": { "type": "string", "description": "Target note (path, basename, or #docid)" },
-                        "mode": { "type": "string", "description": "'soft' (default) or 'hard'" }
+                        "mode": { "type": "string", "enum": ["soft", "hard"], "description": "'soft' (default) archives the note; 'hard' removes it permanently. A word outside the two is refused." }
                     }
                 }}}
             },
@@ -356,7 +356,7 @@ fn build_index() -> serde_json::Value {
         "post": {
             "operationId": "indexVault",
             "summary": "Index the server's vault: walk it, diff it against the store, and re-embed what changed.",
-            "description": "The vault is the one the server was started on; no path is taken here. Send {} to index with no options. A single file is cheaper through /api/reindex-file.",
+            "description": "The vault is the one the server was started on; no path is taken here. Send {} to index with no options. A single file is cheaper through /api/reindex-file. The call runs to completion once it starts: it holds the store and the embedder while it runs, so every other request waits on it, and a graceful shutdown will not interrupt it. On a large vault a rebuild takes minutes. A read-only server refuses it.",
             "requestBody": {
                 "required": true,
                 "content": { "application/json": { "schema": {
@@ -407,6 +407,13 @@ fn build_identity_endpoint() -> serde_json::Value {
         "get": {
             "operationId": "getIdentity",
             "summary": "Returns compact user identity (L0) and current context (L1).",
+            "parameters": [
+                {
+                    "name": "refresh", "in": "query", "required": false,
+                    "description": "Re-extract the L1 facts from the index before answering, without a full re-index. It rewrites the identity_facts rows, so it takes a write key and a read-only server refuses it.",
+                    "schema": { "type": "boolean" }
+                }
+            ],
             "responses": { "200": { "description": "Identity block as JSON with 'identity' key" } }
         }
     })
@@ -423,7 +430,7 @@ fn build_init_endpoint() -> serde_json::Value {
                     "type": "object",
                     "required": ["mode"],
                     "properties": {
-                        "mode": { "type": "string", "description": "'detect' or 'apply'" },
+                        "mode": { "type": "string", "enum": ["detect", "apply"], "description": "'detect' inspects the vault and writes nothing; 'apply' configures identity and indexes. A read-only server refuses 'apply', because it reaches the same indexing work /api/index is guarded against." },
                         "name": { "type": "string", "description": "User name (apply mode)" },
                         "role": { "type": "string", "description": "User role (apply mode)" },
                         "purpose": { "type": "string", "description": "Vault purpose (apply mode)" }
@@ -447,7 +454,7 @@ fn build_migrate() -> serde_json::Value {
                     "required": ["mode"],
                     "properties": {
                         "mode": { "type": "string", "description": "'preview', 'apply' or 'undo'" },
-                        "preview": { "type": "object", "description": "The preview to apply (apply mode). Omit it to apply the last saved preview." }
+                        "preview": { "type": "object", "description": "The preview to apply. Required for 'apply' mode: send back the plan that 'preview' returned. There is no fallback to a plan saved on the server's disk, because a dropped key would then apply a plan this caller never saw." }
                     }
                 }}}
             },
@@ -568,19 +575,30 @@ mod tests {
         );
     }
 
+    /// The set the spec publishes is the set named here — equal, not merely
+    /// contained. A containment check in one direction lets an `operationId`
+    /// be lost with the suite still green, and `reindexFile` and `getIdentity`
+    /// were both absent from the list (#62).
     #[test]
     fn test_openapi_has_all_operation_ids() {
+        use std::collections::BTreeSet;
+
         let spec = build_openapi_spec("http://localhost:3000");
         let paths = spec["paths"].as_object().unwrap();
-        let mut op_ids: Vec<String> = Vec::new();
-        for (_path, methods) in paths {
-            for (_method, details) in methods.as_object().unwrap() {
-                if let Some(id) = details.get("operationId").and_then(|v| v.as_str()) {
-                    op_ids.push(id.to_string());
-                }
+        let mut op_ids: BTreeSet<String> = BTreeSet::new();
+        for (path, methods) in paths {
+            for (method, details) in methods.as_object().unwrap() {
+                let id = details
+                    .get("operationId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_else(|| panic!("{method} {path} has no operationId"));
+                assert!(
+                    op_ids.insert(id.to_string()),
+                    "{method} {path} repeats operationId {id}"
+                );
             }
         }
-        let expected = vec![
+        let expected: BTreeSet<String> = [
             "healthCheck",
             "searchVault",
             "readNote",
@@ -598,15 +616,22 @@ mod tests {
             "archiveNote",
             "deleteNote",
             "indexVault",
+            "reindexFile",
+            "getIdentity",
             "init",
             "migrate",
-        ];
-        for id in &expected {
-            assert!(
-                op_ids.contains(&id.to_string()),
-                "Missing operationId: {id}"
-            );
-        }
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        assert_eq!(
+            op_ids,
+            expected,
+            "\nonly in the spec: {:?}\nonly in the list: {:?}",
+            op_ids.difference(&expected).collect::<Vec<_>>(),
+            expected.difference(&op_ids).collect::<Vec<_>>()
+        );
     }
 
     #[test]

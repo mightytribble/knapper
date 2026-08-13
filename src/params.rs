@@ -36,7 +36,7 @@ pub struct Search {
     /// Return one result per matching section, or one per document.
     #[arg(long, value_enum)]
     pub group_by: Option<crate::config::GroupBy>,
-    /// Filter to notes with all listed tags. An alias of `all`.
+    /// An alias of `all`.
     #[arg(long, value_delimiter = ',')]
     #[serde(default, deserialize_with = "deserialize_tag_list")]
     pub tags: Vec<String>,
@@ -63,6 +63,11 @@ pub struct Read {
     /// File path, basename, or #docid.
     pub file: String,
     /// Read one section by its heading. Omit for the whole note.
+    ///
+    /// The heading is an ATX `#` heading and the match folds case, so
+    /// `spells` finds `## Spells`. A section read narrows `content` and
+    /// `byte_count` to that section; the note's tags and links are reported
+    /// either way, because a section's are its file's (#62).
     #[arg(long)]
     pub section: Option<String>,
 }
@@ -404,6 +409,109 @@ impl Update {
             }],
         }
     }
+
+    /// The request an `engraph update` names, whichever of its two forms the
+    /// caller used.
+    ///
+    /// `--edits` is the whole grammar; the flags beside it are the one-edit
+    /// form of the same thing, so both build one `Update` and
+    /// `to_writer_edits` stays the one converter (#62).
+    ///
+    /// An edit that needs content and was given none reads stdin through
+    /// `read_stdin`, which is how `write append` took a body before `update`
+    /// absorbed it. `--edits` carries its own content and a property `remove`
+    /// needs none, so neither of those reads it. The read is a closure, and
+    /// not the read itself, so the decision is testable without a process
+    /// standard input (#62).
+    ///
+    /// An empty read is refused for a body or a section `replace`. `--mode`
+    /// defaults to `replace`, and the calls this absorbed were stricter — a
+    /// required `--content` on `write rewrite` and `write edit`, and an
+    /// `append` default on the latter — so a piped command that produces
+    /// nothing would otherwise blank the note it names. `--content ""` is the
+    /// spelling for a deliberate one.
+    pub fn from_cli(
+        file: String,
+        section: Option<String>,
+        property: Option<String>,
+        mode: EditMode,
+        content: Vec<String>,
+        edits: Option<String>,
+        read_stdin: impl FnOnce() -> anyhow::Result<String>,
+    ) -> anyhow::Result<Self> {
+        if let Some(json) = edits {
+            let edits = serde_json::from_str::<Vec<Edit>>(&json)
+                .map_err(|e| anyhow::anyhow!("--edits is not a JSON array of edits: {e}"))?;
+            return Ok(Update { file, edits });
+        }
+        let content = if content.is_empty() && !matches!(mode, EditMode::Remove) {
+            let text = read_stdin()?;
+            let targets_text = property.is_none();
+            if text.trim().is_empty() && targets_text && matches!(mode, EditMode::Replace) {
+                anyhow::bail!(
+                    "a replace of {} read no content from stdin. \
+                     Pass --content, or --content \"\" to blank it deliberately",
+                    match &section {
+                        Some(heading) => format!("section '{heading}'"),
+                        None => "the note's body".to_string(),
+                    }
+                );
+            }
+            vec![text]
+        } else {
+            content
+        };
+        Ok(Update::from_cli_edit(
+            file, section, property, mode, content,
+        ))
+    }
+}
+
+/// What `delete` does to the note it names. An enum and not a string, for the
+/// reason [`EditMode`] is one: a string read as `"hard" => Hard, _ => Soft`
+/// archives the note whenever the caller misspells `hard`, and the caller is
+/// told nothing. The four legal spellings are published to an MCP client and
+/// to the OpenAPI spec, and a fifth is refused at the boundary (#62).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, serde::Serialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum DeleteMode {
+    /// Move the note to the archive folder.
+    #[default]
+    Soft,
+    /// Remove the note from disk and from the index.
+    Hard,
+}
+
+// `clap::ValueEnum` is derived apart from the rest so that the CLI's two
+// spellings are the serde ones, lower-case, and not clap's kebab default.
+impl clap::ValueEnum for DeleteMode {
+    fn value_variants<'a>() -> &'a [Self] {
+        &[DeleteMode::Soft, DeleteMode::Hard]
+    }
+    fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
+        Some(match self {
+            DeleteMode::Soft => clap::builder::PossibleValue::new("soft"),
+            DeleteMode::Hard => clap::builder::PossibleValue::new("hard"),
+        })
+    }
+}
+
+impl std::fmt::Display for DeleteMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            DeleteMode::Soft => "soft",
+            DeleteMode::Hard => "hard",
+        })
+    }
+}
+
+impl From<DeleteMode> for crate::writer::DeleteMode {
+    fn from(mode: DeleteMode) -> Self {
+        match mode {
+            DeleteMode::Soft => crate::writer::DeleteMode::Soft,
+            DeleteMode::Hard => crate::writer::DeleteMode::Hard,
+        }
+    }
 }
 
 #[derive(Debug, Args, Deserialize, JsonSchema)]
@@ -411,37 +519,19 @@ pub struct Delete {
     /// File path, basename, or #docid.
     pub file: String,
     /// `soft` (default) archives the note; `hard` removes it permanently.
-    #[arg(long, default_value = "soft")]
-    #[serde(
-        default = "default_delete_mode",
-        deserialize_with = "deserialize_delete_mode"
-    )]
-    pub mode: String,
+    #[arg(long, value_enum, default_value = "soft")]
+    #[serde(default, deserialize_with = "deserialize_delete_mode")]
+    pub mode: DeleteMode,
 }
 
-fn default_delete_mode() -> String {
-    "soft".to_string()
-}
-
-fn deserialize_delete_mode<'de, D>(deserializer: D) -> Result<String, D::Error>
+/// The same null-must-not-fail rule the other defaulted fields take (#60):
+/// `#[serde(default)]` alone covers a missing field and not an explicit
+/// `null`.
+fn deserialize_delete_mode<'de, D>(deserializer: D) -> Result<DeleteMode, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    deserialize_string_or_default(deserializer, default_delete_mode())
-}
-
-/// A string that falls back to `default` when the field is absent, and also
-/// when a caller sends an explicit JSON `null` — the same lesson as
-/// `deserialize_number_or_default` (#60): `#[serde(default = ...)]` alone
-/// only covers the absent case.
-fn deserialize_string_or_default<'de, D>(
-    deserializer: D,
-    default: String,
-) -> Result<String, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or(default))
+    Ok(Option::<DeleteMode>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Debug, Args, Deserialize, JsonSchema)]
@@ -698,6 +788,129 @@ mod tests {
         );
         let edits = u.to_writer_edits().unwrap();
         assert!(edits[0].content.is_none());
+    }
+
+    /// The stdin read is a closure, so the decision is testable without a
+    /// process standard input (#62).
+    fn from_cli(
+        section: Option<&str>,
+        property: Option<&str>,
+        mode: EditMode,
+        content: Vec<String>,
+        edits: Option<&str>,
+        stdin: &str,
+    ) -> anyhow::Result<Update> {
+        let stdin = stdin.to_string();
+        Update::from_cli(
+            "n.md".into(),
+            section.map(String::from),
+            property.map(String::from),
+            mode,
+            content,
+            edits.map(String::from),
+            move || Ok(stdin),
+        )
+    }
+
+    /// An omitted `--content` reads stdin, which is how `write append` took a
+    /// body before `update` absorbed it (#62).
+    #[test]
+    fn an_omitted_content_reads_stdin() {
+        let u = from_cli(
+            Some("Notes"),
+            None,
+            EditMode::Append,
+            vec![],
+            None,
+            "from a pipe",
+        )
+        .unwrap();
+        let edits = u.to_writer_edits().unwrap();
+        assert!(matches!(
+            edits[0].content,
+            Some(crate::writer::EditContent::Text(ref t)) if t == "from a pipe"
+        ));
+    }
+
+    /// `--mode` defaults to `replace`, and the calls this absorbed were
+    /// stricter — `write rewrite --content` and `write edit --content` were
+    /// required, and `write edit`'s default was `append`. A piped command that
+    /// produces nothing must not blank the note (#62).
+    #[test]
+    fn an_empty_stdin_does_not_blank_a_body_or_a_section() {
+        for section in [None, Some("Notes")] {
+            let err = from_cli(section, None, EditMode::Replace, vec![], None, "")
+                .expect_err("an empty replace must be refused");
+            let message = format!("{err}");
+            assert!(message.contains("read no content from stdin"), "{message}");
+            assert!(message.contains("--content \"\""), "{message}");
+
+            // Whitespace alone is the same accident.
+            assert!(from_cli(section, None, EditMode::Replace, vec![], None, "\n\n").is_err());
+        }
+    }
+
+    /// The refusal is for a `replace` that would blank the text. An empty
+    /// append is a no-op and needs no refusal, a property edit is not the
+    /// body, and `--content ""` is the deliberate spelling (#62).
+    #[test]
+    fn the_empty_stdin_refusal_covers_a_replace_and_nothing_else() {
+        assert!(from_cli(None, None, EditMode::Append, vec![], None, "").is_ok());
+        assert!(from_cli(None, Some("status"), EditMode::Replace, vec![], None, "").is_ok());
+        assert!(
+            from_cli(
+                None,
+                None,
+                EditMode::Replace,
+                vec![String::new()],
+                None,
+                "unread"
+            )
+            .is_ok()
+        );
+    }
+
+    /// A `remove` of a property needs no content, and `--edits` carries its
+    /// own, so neither reads stdin (#62).
+    #[test]
+    fn the_forms_that_carry_their_own_content_do_not_read_stdin() {
+        let unreadable = || anyhow::bail!("stdin must not be read");
+
+        let u = Update::from_cli(
+            "n.md".into(),
+            None,
+            Some("status".into()),
+            EditMode::Remove,
+            vec![],
+            None,
+            unreadable,
+        )
+        .unwrap();
+        assert!(u.to_writer_edits().unwrap()[0].content.is_none());
+
+        let u = Update::from_cli(
+            "n.md".into(),
+            None,
+            None,
+            EditMode::Replace,
+            vec![],
+            Some(r#"[{"mode":"append","content":"x"}]"#.into()),
+            unreadable,
+        )
+        .unwrap();
+        assert_eq!(u.edits.len(), 1);
+
+        let err = Update::from_cli(
+            "n.md".into(),
+            None,
+            None,
+            EditMode::Replace,
+            vec![],
+            Some("not json".into()),
+            unreadable,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("--edits is not a JSON array of edits"));
     }
 
     #[test]

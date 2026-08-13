@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -553,32 +553,24 @@ pub fn save_preview(preview: &MigrationPreview, data_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The preview an `apply` acts on: the one the caller passed, or the one the
-/// last `preview` saved. The two surfaces differ in where the JSON waits —
-/// a server caller holds it, a CLI caller has the file — and not in what
-/// `apply` then does with it (#62).
-pub fn resolve_preview(
-    supplied: Option<serde_json::Value>,
-    data_dir: &Path,
-) -> Result<MigrationPreview> {
-    match supplied {
-        Some(value) => {
-            serde_json::from_value(value).map_err(|e| anyhow::anyhow!("Invalid preview JSON: {e}"))
-        }
-        // `apply` moves files. When no preview arrives the saved one is the
-        // caller's own last plan, but when none is saved either, the bare
-        // errno from `load_preview` names a file the caller never heard of.
-        // Say what is missing instead (#62).
-        None => {
-            let path = data_dir.join("migration-preview.json");
-            load_preview(data_dir).with_context(|| {
-                format!(
-                    "apply needs a preview: none was supplied and none is saved at {}",
-                    path.display()
-                )
-            })
-        }
-    }
+/// The preview a server's `apply` acts on: the one the caller passed, and no
+/// other.
+///
+/// `apply` moves files. A server's own `mode: preview` returns the plan to the
+/// caller, so the caller holds it and sends it back, and a dropped or
+/// misspelled key must not send `apply` to whatever plan was saved on the
+/// server's disk last — that plan can belong to another caller and to another
+/// vault state. The CLI is the surface where the saved copy is the caller's
+/// own: its `preview` writes the file and its `apply` reads it with
+/// `load_preview` (#62).
+pub fn resolve_preview(supplied: Option<serde_json::Value>) -> Result<MigrationPreview> {
+    let value = supplied.ok_or_else(|| {
+        anyhow::anyhow!(
+            "apply needs a preview: send the one that `mode: preview` returned. \
+             The saved copy on the server's disk is not read."
+        )
+    })?;
+    serde_json::from_value(value).map_err(|e| anyhow::anyhow!("Invalid preview JSON: {e}"))
 }
 
 /// Load a previously saved migration preview from disk.
@@ -950,41 +942,34 @@ mod tests {
         assert_eq!(loaded.skipped, 5);
     }
 
-    /// `apply` moves files, so the three ways a preview can reach it — sent,
-    /// saved, or absent — must each say plainly which one happened (#62).
+    /// `apply` moves files, so a server takes the plan its caller sends and
+    /// no other. The saved copy on disk belongs to the CLI's own two-step
+    /// flow, and an `apply` that fell back to it would move files against a
+    /// plan its caller never saw (#62).
     #[test]
-    fn resolve_preview_reads_the_sent_one_then_the_saved_one() {
+    fn resolve_preview_takes_the_sent_one_and_refuses_to_guess() {
         let tmp = tempfile::tempdir().unwrap();
 
-        // Sent: the caller's own JSON, and the disk is not read.
+        // Sent: the caller's own JSON.
         let sent = serde_json::json!({
             "migration_id": "sent-001",
             "files": [],
             "uncertain": [],
             "skipped": 0,
         });
-        let got = resolve_preview(Some(sent), tmp.path()).unwrap();
+        let got = resolve_preview(Some(sent)).unwrap();
         assert_eq!(got.migration_id, "sent-001");
 
         // Sent but not a preview: the caller's own text is at fault, and the
         // message says which text.
-        let err = resolve_preview(Some(serde_json::json!({"files": 3})), tmp.path()).unwrap_err();
+        let err = resolve_preview(Some(serde_json::json!({"files": 3}))).unwrap_err();
         assert!(
             format!("{err:#}").contains("Invalid preview JSON"),
             "got {err:#}"
         );
 
-        // Absent with nothing saved: an errno naming a file the caller never
-        // heard of is not an answer. Name what is missing.
-        let err = resolve_preview(None, tmp.path()).unwrap_err();
-        let text = format!("{err:#}");
-        assert!(
-            text.contains("apply needs a preview: none was supplied and none is saved at"),
-            "got {text}"
-        );
-        assert!(text.contains("migration-preview.json"), "got {text}");
-
-        // Absent with one saved: that is the plan the caller last made.
+        // Absent, with a plan saved on disk: the disk is not read at all, so
+        // the answer is the same error either way.
         let saved = MigrationPreview {
             migration_id: "saved-001".into(),
             files: vec![],
@@ -992,7 +977,15 @@ mod tests {
             skipped: 0,
         };
         save_preview(&saved, tmp.path()).unwrap();
-        let got = resolve_preview(None, tmp.path()).unwrap();
-        assert_eq!(got.migration_id, "saved-001");
+        let err = resolve_preview(None).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("apply needs a preview"), "got {text}");
+        assert!(
+            text.contains("The saved copy on the server's disk is not read."),
+            "got {text}"
+        );
+
+        // The CLI's own flow still reads it, through `load_preview`.
+        assert_eq!(load_preview(tmp.path()).unwrap().migration_id, "saved-001");
     }
 }

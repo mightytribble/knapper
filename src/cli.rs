@@ -234,7 +234,8 @@ pub enum Command {
         /// Disable API key authentication (local development only, 127.0.0.1 only).
         #[arg(long)]
         no_auth: bool,
-        /// Read-only mode: only expose search and read MCP tools, disable all write operations.
+        /// Read-only mode: every capability stays listed, and the ones that
+        /// write the vault or the index refuse the call.
         #[arg(long)]
         read_only: bool,
     },

@@ -121,38 +121,6 @@ fn content_or_stdin(content: Option<String>) -> Result<String> {
     }
 }
 
-/// The edit list an `engraph update` names, whichever of its two forms the
-/// caller used. `--edits` is the whole grammar; the flags beside it are the
-/// one-edit form of the same thing, so both build one `params::Update` and
-/// `to_writer_edits` stays the one converter (#62).
-///
-/// An edit that needs content and was given none reads it from stdin, which
-/// is how `write append` took a body before `update` absorbed it. `--edits`
-/// carries its own content, and a `remove` of a property needs none, so
-/// neither of those reads stdin.
-fn update_request(
-    file: String,
-    section: Option<String>,
-    property: Option<String>,
-    mode: engraph::params::EditMode,
-    content: Vec<String>,
-    edits: Option<String>,
-) -> Result<engraph::params::Update> {
-    if let Some(json) = edits {
-        let edits = serde_json::from_str::<Vec<engraph::params::Edit>>(&json)
-            .map_err(|e| anyhow::anyhow!("--edits is not a JSON array of edits: {e}"))?;
-        return Ok(engraph::params::Update { file, edits });
-    }
-    let content = if content.is_empty() && !matches!(mode, engraph::params::EditMode::Remove) {
-        vec![content_or_stdin(None)?]
-    } else {
-        content
-    };
-    Ok(engraph::params::Update::from_cli_edit(
-        file, section, property, mode, content,
-    ))
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -972,12 +940,19 @@ async fn main() -> Result<()> {
             let mut embedder = open_indexing_embedder(&cfg, &data_dir, &store)?;
             // The whole list is read before anything is written, so a request
             // that names an impossible target writes nothing (#62).
-            let request = update_request(file, section, property, mode, content, edits)?;
+            let request = engraph::params::Update::from_cli(
+                file,
+                section,
+                property,
+                mode,
+                content,
+                edits,
+                || content_or_stdin(None),
+            )?;
             let edits = request.to_writer_edits()?;
             let input = engraph::writer::UpdateInput {
                 file: request.file,
                 edits,
-                modified_by: "cli".into(),
             };
             let result = engraph::writer::update_note(&store, &vault_path, &input)?;
             // `update_note` stores the new content hash and writes no chunks,
@@ -993,6 +968,7 @@ async fn main() -> Result<()> {
                 &store,
                 &mut embedder,
                 &vault_path,
+                engraph::prefix::EmbedComposition::from_config(&cfg),
                 cfg.chunk_options(),
             )
             .with_context(|| {
@@ -1050,10 +1026,7 @@ async fn main() -> Result<()> {
 
         Command::Delete(args) => {
             let (store, vault_path, profile) = open_vault(&data_dir)?;
-            let delete_mode = match args.mode.as_str() {
-                "hard" => engraph::writer::DeleteMode::Hard,
-                _ => engraph::writer::DeleteMode::Soft,
-            };
+            let delete_mode = engraph::writer::DeleteMode::from(args.mode);
             let archive_folder = profile
                 .as_ref()
                 .and_then(|p| p.structure.folders.archive.as_deref())
@@ -1086,6 +1059,7 @@ async fn main() -> Result<()> {
                 &store,
                 &mut embedder,
                 &vault_path,
+                engraph::prefix::EmbedComposition::from_config(&cfg),
                 cfg.chunk_options(),
             )?;
             let output = serde_json::json!({

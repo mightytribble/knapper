@@ -449,8 +449,19 @@ async fn handle_read(
         vault_path: &state.vault_path,
         profile: state.profile.as_ref().as_ref(),
     };
-    let note = context::context_read(&ctx, &p.file, p.section.as_deref())
-        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    let note = context::context_read(&ctx, &p.file, p.section.as_deref()).map_err(|e| {
+        // A file or a section the vault does not hold is the caller's own text
+        // naming nothing, not a server fault — the rule `handle_search` and
+        // `handle_list` already follow (#60). The message text is the cheapest
+        // honest signal `context_read` gives a caller this far from the error's
+        // construction.
+        let message = e.to_string();
+        if message.starts_with("Section not found") || message.starts_with("File not found") {
+            ApiError::bad_request(&format!("{e:#}"))
+        } else {
+            ApiError::internal(&format!("{e:#}"))
+        }
+    })?;
     Ok(Json(serde_json::json!(note)))
 }
 
@@ -686,7 +697,6 @@ async fn handle_update(
     let input = UpdateInput {
         file: body.file,
         edits,
-        modified_by: "http-api".into(),
     };
     let result = writer::update_note(&store, &state.vault_path, &input)
         .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
@@ -706,6 +716,7 @@ async fn handle_update(
         &store,
         &mut *embedder,
         &state.vault_path,
+        state.embed,
         state.chunk_opts,
     )
     .with_context(|| {
@@ -808,9 +819,7 @@ async fn handle_migrate(
                     "Write operations disabled in read-only mode",
                 ));
             }
-            let data_dir = crate::config::Config::data_dir()
-                .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
-            let preview = crate::migrate::resolve_preview(body.preview, &data_dir)
+            let preview = crate::migrate::resolve_preview(body.preview)
                 .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
             let result = crate::migrate::apply_preview(&preview, &store, &state.vault_path)
                 .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
@@ -846,10 +855,7 @@ async fn handle_delete(
         ));
     }
     let store = state.store.lock().await;
-    let mode = match body.mode.as_str() {
-        "hard" => DeleteMode::Hard,
-        _ => DeleteMode::Soft,
-    };
+    let mode = DeleteMode::from(body.mode);
     let archive_folder = state
         .profile
         .as_ref()
@@ -876,6 +882,15 @@ async fn handle_index(
     Json(body): Json<crate::params::Index>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
+    // A read-only server refuses it like any other write, the way MCP's
+    // `index` does: `rebuild: true` discards the index before it builds one
+    // again, so this destroys derived state and stalls every other call while
+    // it runs (#62).
+    if state.read_only {
+        return Err(ApiError::forbidden(
+            "Write operations disabled in read-only mode",
+        ));
+    }
     let store = state.store.lock().await;
     let mut embedder = state.embedder.lock().await;
     let mut config = crate::config::Config::load().unwrap_or_default();
@@ -911,43 +926,23 @@ async fn handle_reindex_file(
     authorize(&headers, &state, true)?;
     let store = state.store.lock().await;
     let mut embedder = state.embedder.lock().await;
-    let full_path = state.vault_path.join(&body.file);
 
-    let content = std::fs::read_to_string(&full_path)
-        .map_err(|e| ApiError::internal(&format!("Cannot read file {}: {e}", body.file)))?;
-
-    let content_hash = {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(content.as_bytes());
-        format!("{:x}", hasher.finalize())
-    };
-
-    let mut config = crate::config::Config::load().unwrap_or_default();
-    // The chunker settings come from the session, not from this load: a load
-    // that fails falls back to the defaults, and one file re-chunked at
-    // settings the rest of the store was not built at is a set of rows nothing
-    // downstream can tell apart. Carrying the captured value is what
-    // `ChunkOptions` exists to give.
-    config.set_chunk_options(state.chunk_opts);
-
-    let result = crate::indexer::index_file(
+    // One helper packages the six steps this used to spell out, so the three
+    // callers cannot drift apart (#62). A file the server cannot read is the
+    // caller's own text naming nothing, which is the 400 the neighbouring
+    // handlers answer for that class (#60).
+    let result = crate::indexer::reindex_written_file(
         &body.file,
-        &content,
-        &content_hash,
         &store,
         &mut *embedder,
         &state.vault_path,
-        &config,
+        state.embed,
+        state.chunk_opts,
     )
-    .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
-
-    // Outgoing only — see issue #27.
-    store
-        .delete_outgoing_edges_for_file(result.file_id)
-        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
-    crate::indexer::build_edges_for_file(&store, result.file_id, &content)
-        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    .map_err(|e| match e.downcast_ref::<std::io::Error>() {
+        Some(_) => ApiError::bad_request(&format!("Cannot read file {}: {e:#}", body.file)),
+        None => ApiError::internal(&format!("{e:#}")),
+    })?;
 
     Ok(Json(serde_json::json!({
         "file": body.file,
@@ -960,12 +955,34 @@ async fn handle_reindex_file(
 // Identity / init endpoint handlers
 // ---------------------------------------------------------------------------
 
+/// The identity block, optionally re-extracted first.
+///
+/// `refresh` is a parameter of the capability on every surface (#62). It
+/// re-reads the L1 facts from the store the server already holds, so an agent
+/// whose session started before the last write can ask for current ones
+/// without a full re-index.
 async fn handle_identity(
     State(state): State<ApiState>,
     headers: HeaderMap,
+    Query(p): Query<crate::params::Identity>,
 ) -> Result<impl IntoResponse, ApiError> {
-    authorize(&headers, &state, false)?;
+    // Re-extraction clears the `identity_facts` rows and derives them again,
+    // so it takes the write permission and a read-only server refuses it; the
+    // block itself is a read either way.
+    authorize(&headers, &state, p.refresh)?;
+    if p.refresh && state.read_only {
+        return Err(ApiError::forbidden(
+            "Write operations disabled in read-only mode",
+        ));
+    }
     let store = state.store.lock().await;
+    if p.refresh {
+        let profile = state.profile.as_ref().as_ref().ok_or_else(|| {
+            ApiError::bad_request("No vault profile found. Run `engraph init` first.")
+        })?;
+        crate::identity::extract_l1_facts(&store, profile)
+            .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    }
     let config = crate::config::Config::load().unwrap_or_default();
     let block = crate::identity::format_identity_block(&config, &store)
         .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
@@ -985,6 +1002,14 @@ async fn handle_init(
             Ok(Json(result))
         }
         Some("apply") => {
+            // `apply` indexes the vault, which is the work `index` is guarded
+            // against on a read-only server. The mode is read first, so
+            // `detect` — which writes nothing — still runs (#62).
+            if state.read_only {
+                return Err(ApiError::forbidden(
+                    "Write operations disabled in read-only mode",
+                ));
+            }
             let mut config = crate::config::Config::load().unwrap_or_default();
             let data_dir = crate::config::Config::data_dir()
                 .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
@@ -1957,6 +1982,168 @@ mod tests {
                 .unwrap()
                 .contains("--- Query run ---")
         );
+    }
+
+    /// A section the note does not hold is the caller's own text naming
+    /// nothing, so it is a 400 and not the 500 every error on this route used
+    /// to answer. It is the first error an agent using the newly documented
+    /// `section` parameter meets (#60, #62).
+    #[tokio::test]
+    async fn a_read_of_a_section_the_note_does_not_hold_is_a_bad_request() {
+        let (_tmp, state) = indexed_state();
+
+        let response = get(
+            state.clone(),
+            "/api/read?file=rules/abjuration-spells.md&section=Level%203%20Counterspell",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = get(
+            state.clone(),
+            "/api/read?file=rules/abjuration-spells.md&section=Nowhere",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // A file the vault does not hold is the same class of mistake.
+        let response = get(state, "/api/read?file=nowhere.md").await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// `archive` and `archive {undo: true}` are one operation and its reverse
+    /// (#62). The handler's own branch chooses `archive_note` against
+    /// `unarchive_note`, and nothing else covers it — an inverted branch would
+    /// move the file the opposite way with the whole suite green.
+    #[tokio::test]
+    async fn the_undo_flag_chooses_the_operation_it_names() {
+        let (_tmp, state) = indexed_state();
+        let vault = state.vault_path.as_ref().clone();
+        let live = vault.join("rules/evocation-spells.md");
+        let archived = vault.join("04-Archive/rules/evocation-spells.md");
+        assert!(live.exists());
+
+        let (status, _) = post_json(
+            state.clone(),
+            "/api/archive",
+            r#"{"file":"rules/evocation-spells.md"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!live.exists(), "undo: false must archive");
+        assert!(archived.exists(), "undo: false must archive");
+
+        let (status, _) = post_json(
+            state,
+            "/api/archive",
+            r#"{"file":"04-Archive/rules/evocation-spells.md","undo":true}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(live.exists(), "undo: true must restore");
+        assert!(!archived.exists(), "undo: true must restore");
+    }
+
+    /// A read-only server refuses `index` the way MCP's `index` refuses it:
+    /// `rebuild: true` discards derived state and stalls every other call
+    /// while it runs (#62).
+    #[tokio::test]
+    async fn a_read_only_server_refuses_index() {
+        let mut state = test_api_state();
+        state.read_only = true;
+        let (status, _) = post_json(state, "/api/index", r#"{}"#).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    /// `init {mode: apply}` indexes the vault, which is the work `index` is
+    /// guarded against. `detect` writes nothing and still runs (#62).
+    #[tokio::test]
+    async fn a_read_only_server_refuses_init_apply_and_runs_init_detect() {
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(vault.path().join("note.md"), "# Note\n").unwrap();
+
+        let mut state = test_api_state_at(vault.path().to_path_buf());
+        state.read_only = true;
+        let (status, _) = post_json(state, "/api/init", r#"{"mode":"apply"}"#).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let mut state = test_api_state_at(vault.path().to_path_buf());
+        state.read_only = true;
+        let (status, _) = post_json(state, "/api/init", r#"{"mode":"detect"}"#).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// A server's `apply` acts on the plan its caller sends and no other. The
+    /// copy `engraph migrate --mode preview` saves belongs to the CLI's own
+    /// two-step flow, and an `apply` that fell back to it would move files
+    /// against a plan this caller never saw (#62).
+    #[tokio::test]
+    async fn a_migrate_apply_with_no_preview_is_a_bad_request() {
+        let (status, body) =
+            post_json(test_api_state(), "/api/migrate", r#"{"mode":"apply"}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body["error"].as_str().unwrap().contains("needs a preview"),
+            "got {body}"
+        );
+    }
+
+    /// `identity` takes `refresh` on every surface (#62). Before this the
+    /// route had no extractor at all, so the flag the CLI honoured had no
+    /// spelling here. `extract_l1_facts` clears tier 1 before it derives it
+    /// again, so a stale fact seeded first is what proves the call was made.
+    #[tokio::test]
+    async fn identity_refresh_re_extracts_the_l1_facts() {
+        let (_tmp, mut state) = indexed_state();
+        let root = state.vault_path.as_ref().clone();
+        state.profile = Arc::new(Some(crate::profile::VaultProfile {
+            vault_path: root,
+            vault_type: crate::profile::VaultType::Obsidian,
+            structure: crate::profile::StructureDetection {
+                method: crate::profile::StructureMethod::Para,
+                folders: crate::profile::FolderMap::default(),
+            },
+            stats: crate::profile::VaultStats::default(),
+        }));
+
+        let stale = |state: &ApiState| {
+            let store = state.store.try_lock().expect("uncontended");
+            store
+                .get_identity_facts(1)
+                .unwrap()
+                .into_iter()
+                .any(|f| f.key == "stale")
+        };
+        {
+            let store = state.store.try_lock().expect("uncontended");
+            store
+                .upsert_identity_fact(1, "stale", "from an older session", None)
+                .unwrap();
+        }
+        assert!(stale(&state));
+
+        // A read key reaches the block itself and no re-extraction happens.
+        let response = get(state.clone(), "/api/identity").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(stale(&state), "a call that did not ask re-extracts nothing");
+
+        // Re-extraction writes rows, so a read key is refused.
+        let response = get(state.clone(), "/api/identity?refresh=true").await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(stale(&state));
+
+        let response = build_router(state.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/identity?refresh=true")
+                    .header("authorization", "Bearer eg_writekey")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!stale(&state), "refresh=true must re-derive tier 1");
     }
 
     /// Five notes that all answer one query. Five is more than the `top_n` the
