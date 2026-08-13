@@ -13,8 +13,9 @@ pub fn build_openapi_spec(server_url: &str) -> serde_json::Value {
     paths.insert("/api/vault-map".into(), build_vault_map());
     paths.insert("/api/who".into(), build_who());
     paths.insert("/api/project".into(), build_project());
-    paths.insert("/api/context".into(), build_context());
+    paths.insert("/api/topic".into(), build_topic());
     paths.insert("/api/health".into(), build_health());
+    paths.insert("/api/status".into(), build_status());
 
     // Write endpoints
     paths.insert("/api/create".into(), build_create());
@@ -22,6 +23,7 @@ pub fn build_openapi_spec(server_url: &str) -> serde_json::Value {
     paths.insert("/api/move".into(), build_move());
     paths.insert("/api/archive".into(), build_archive());
     paths.insert("/api/delete".into(), build_delete());
+    paths.insert("/api/index".into(), build_index());
     paths.insert("/api/reindex-file".into(), build_reindex_file());
 
     // Identity endpoints
@@ -185,10 +187,10 @@ fn build_project() -> serde_json::Value {
     })
 }
 
-fn build_context() -> serde_json::Value {
+fn build_topic() -> serde_json::Value {
     serde_json::json!({
         "post": {
-            "operationId": "getContext",
+            "operationId": "getTopic",
             "summary": "Get rich topic context with semantic search, graph expansion, and budget-aware trimming.",
             "requestBody": {
                 "required": true,
@@ -343,6 +345,37 @@ fn build_delete() -> serde_json::Value {
                 }}}
             },
             "responses": { "200": { "description": "Deletion confirmation" } }
+        }
+    })
+}
+
+fn build_index() -> serde_json::Value {
+    serde_json::json!({
+        "post": {
+            "operationId": "indexVault",
+            "summary": "Index the server's vault: walk it, diff it against the store, and re-embed what changed.",
+            "description": "The vault is the one the server was started on; no path is taken here. A single file is cheaper through /api/reindex-file.",
+            "requestBody": {
+                "required": false,
+                "content": { "application/json": { "schema": {
+                    "type": "object",
+                    "properties": {
+                        "rebuild": { "type": "boolean", "description": "Discard the index and build it again from nothing" },
+                        "no_gitignore": { "type": "boolean", "description": "Index files that .gitignore or .ignore would exclude" }
+                    }
+                }}}
+            },
+            "responses": { "200": { "description": "Counts of new, updated and deleted files, total chunks and the elapsed seconds" } }
+        }
+    })
+}
+
+fn build_status() -> serde_json::Value {
+    serde_json::json!({
+        "get": {
+            "operationId": "getStatus",
+            "summary": "What the index holds: file and chunk counts, edge and connectivity counts, date coverage, index size, and whether intelligence is enabled.",
+            "responses": { "200": { "description": "Index status fields" } }
         }
     })
 }
@@ -554,13 +587,15 @@ mod tests {
             "getVaultMap",
             "getWho",
             "getProject",
-            "getContext",
+            "getTopic",
             "getHealth",
+            "getStatus",
             "createNote",
             "updateNote",
             "moveNote",
             "archiveNote",
             "deleteNote",
+            "indexVault",
             "init",
             "migrate",
         ];

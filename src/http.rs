@@ -285,8 +285,9 @@ pub fn routes() -> Vec<(&'static str, MethodRouter<ApiState>)> {
         ("/api/vault-map", get(handle_vault_map)),
         ("/api/who", get(handle_who)),
         ("/api/project", get(handle_project)),
-        ("/api/context", post(handle_context)),
+        ("/api/topic", post(handle_topic)),
         ("/api/health", get(handle_health)),
+        ("/api/status", get(handle_status)),
         // Write endpoints
         ("/api/create", post(handle_create)),
         ("/api/update", post(handle_update)),
@@ -294,6 +295,7 @@ pub fn routes() -> Vec<(&'static str, MethodRouter<ApiState>)> {
         ("/api/archive", post(handle_archive)),
         ("/api/delete", post(handle_delete)),
         // Index maintenance
+        ("/api/index", post(handle_index)),
         ("/api/reindex-file", post(handle_reindex_file)),
         // Identity endpoints
         ("/api/identity", get(handle_identity)),
@@ -517,7 +519,7 @@ async fn handle_project(
     Ok(Json(serde_json::json!(proj)))
 }
 
-async fn handle_context(
+async fn handle_topic(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Json(body): Json<crate::params::Topic>,
@@ -549,6 +551,21 @@ async fn handle_health(
     let report = health::generate_health_report(&store, &config)
         .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
     Ok(Json(serde_json::json!(report)))
+}
+
+/// What the index holds. It reads and writes nothing, so it takes the read
+/// permission, and it answers the fields the CLI's `status --json` prints —
+/// one composer for the three surfaces (#62).
+async fn handle_status(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    authorize(&headers, &state, false)?;
+    let data_dir =
+        crate::config::Config::data_dir().map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    let report =
+        search::status_json(&data_dir).map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    Ok(Json(report))
 }
 
 // ---------------------------------------------------------------------------
@@ -806,6 +823,45 @@ async fn handle_delete(
     Ok(Json(serde_json::json!({
         "deleted": body.file,
         "mode": body.mode,
+    })))
+}
+
+/// Index the server's vault.
+///
+/// An agent that writes a batch of notes needs a way to rebuild the whole
+/// index, and a multi-minute call is acceptable for that (#62). It writes the
+/// index, so it takes the write permission; the vault it walks is the one the
+/// server was started on, and no caller-supplied path reaches it.
+async fn handle_index(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(body): Json<crate::params::Index>,
+) -> Result<impl IntoResponse, ApiError> {
+    authorize(&headers, &state, true)?;
+    let store = state.store.lock().await;
+    let mut embedder = state.embedder.lock().await;
+    let mut config = crate::config::Config::load().unwrap_or_default();
+    // The chunker settings come from the session, for the reason
+    // `handle_reindex_file` gives: one store holds one chunking.
+    config.set_chunk_options(state.chunk_opts);
+    if body.no_gitignore {
+        config.respect_gitignore = false;
+    }
+    let result = crate::indexer::run_index_shared(
+        &state.vault_path,
+        &config,
+        &store,
+        &mut *embedder,
+        body.rebuild,
+        state.profile.as_ref().as_ref(),
+    )
+    .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    Ok(Json(serde_json::json!({
+        "new_files": result.new_files,
+        "updated_files": result.updated_files,
+        "deleted_files": result.deleted_files,
+        "total_chunks": result.total_chunks,
+        "duration_secs": result.duration.as_secs_f64(),
     })))
 }
 
@@ -1136,6 +1192,45 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// `status` reads and writes nothing, so a read key reaches it and no key
+    /// does not (#62).
+    #[tokio::test]
+    async fn status_takes_the_read_permission() {
+        let state = test_api_state();
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// `index` writes the index, so a read key is refused before the walk
+    /// starts (#62).
+    #[tokio::test]
+    async fn index_takes_the_write_permission() {
+        let state = test_api_state();
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/index")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer eg_readkey")
+                    .body(Body::from(r#"{}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

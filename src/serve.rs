@@ -7,10 +7,7 @@ use anyhow::{Context, Result};
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, ServerCapabilities, ServerInfo};
-use rmcp::schemars;
-use rmcp::schemars::JsonSchema;
 use rmcp::{ErrorData as McpError, ServiceExt, tool, tool_handler, tool_router};
-use serde::Deserialize;
 use tokio::sync::Mutex;
 
 use crate::config::Config;
@@ -19,13 +16,6 @@ use crate::llm::{EmbedModel, RerankModel};
 use crate::profile::VaultProfile;
 use crate::search;
 use crate::store::Store;
-
-// ---------------------------------------------------------------------------
-// Parameter structs
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct HealthParams {}
 
 // ---------------------------------------------------------------------------
 // Server
@@ -279,10 +269,10 @@ impl EngraphServer {
     }
 
     #[tool(
-        name = "context",
+        name = "topic",
         description = "Rich topic context with search-driven section selection and character budget trimming. Returns the most relevant note sections for a topic."
     )]
-    async fn context(
+    async fn topic(
         &self,
         params: Parameters<crate::params::Topic>,
     ) -> Result<CallToolResult, McpError> {
@@ -414,8 +404,10 @@ impl EngraphServer {
         to_json_result(&result)
     }
 
+    // `move` is a Rust keyword, so the tool's name is declared and the
+    // function keeps the longer one (#62).
     #[tool(
-        name = "move_note",
+        name = "move",
         description = "Move a note to a different folder. Updates the index path."
     )]
     async fn move_note(
@@ -477,7 +469,10 @@ impl EngraphServer {
         name = "health",
         description = "Vault health report: orphans, broken links, stale notes, tag hygiene, index freshness."
     )]
-    async fn health(&self, _params: Parameters<HealthParams>) -> Result<CallToolResult, McpError> {
+    async fn health(
+        &self,
+        _params: Parameters<crate::params::Health>,
+    ) -> Result<CallToolResult, McpError> {
         let store = self.store.lock().await;
         let profile_ref = self.profile.as_ref().as_ref();
         let config = crate::health::HealthConfig {
@@ -642,6 +637,60 @@ impl EngraphServer {
     }
 
     #[tool(
+        name = "index",
+        description = "Index the server's vault: walk it, diff it against the store, and re-embed what changed. `rebuild: true` discards the index and builds it again. Use after a batch of writes made outside engraph; a single file is cheaper through reindex_file."
+    )]
+    async fn index(
+        &self,
+        params: Parameters<crate::params::Index>,
+    ) -> Result<CallToolResult, McpError> {
+        // An agent that writes a batch of notes needs a way to rebuild the whole
+        // index, and a multi-minute call is acceptable for that (#62).
+        let store = self.store.lock().await;
+        let mut embedder = self.embedder.lock().await;
+        let mut config = crate::config::Config::load().unwrap_or_default();
+        // The chunker settings come from the session, for the reason
+        // `reindex_file` gives: one store holds one chunking.
+        config.set_chunk_options(self.chunk_opts);
+        if params.0.no_gitignore {
+            config.respect_gitignore = false;
+        }
+        // A server is bound to the vault it was started on, so there is no
+        // path parameter here — that argument is the CLI's alone (#62).
+        let result = crate::indexer::run_index_shared(
+            &self.vault_path,
+            &config,
+            &store,
+            &mut *embedder,
+            params.0.rebuild,
+            self.profile.as_ref().as_ref(),
+        )
+        .map_err(|e| mcp_err(&e))?;
+        to_json_result(&serde_json::json!({
+            "new_files": result.new_files,
+            "updated_files": result.updated_files,
+            "deleted_files": result.deleted_files,
+            "total_chunks": result.total_chunks,
+            "duration_secs": result.duration.as_secs_f64(),
+        }))
+    }
+
+    #[tool(
+        name = "status",
+        description = "What the index holds: vault path, file and chunk counts, edge and connectivity counts, date coverage, index size, and whether intelligence is enabled."
+    )]
+    async fn status(
+        &self,
+        _params: Parameters<crate::params::Status>,
+    ) -> Result<CallToolResult, McpError> {
+        let data_dir = crate::config::Config::data_dir().map_err(|e| mcp_err(&e))?;
+        // The same fields the CLI's `status --json` prints: one composer, so
+        // the three surfaces cannot report different ones (#62).
+        let report = search::status_json(&data_dir).map_err(|e| mcp_err(&e))?;
+        to_json_result(&report)
+    }
+
+    #[tool(
         name = "identity",
         description = "Returns compact user identity and current context. Call at session start for instant context. L0 = static identity (~50 tokens), L1 = dynamic state (~120 tokens)."
     )]
@@ -708,10 +757,11 @@ impl rmcp::handler::server::ServerHandler for EngraphServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "engraph: vault intelligence for Obsidian. \
-                 Read: vault_map to orient, tags for the tag vocabulary, search to find, read for content (a section parameter narrows it), who/project for context bundles, health for vault diagnostics. \
+                 Read: vault_map to orient, tags for the tag vocabulary, search to find, read for content (a section parameter narrows it), list to filter notes by folder and tags, who/project for context bundles, topic for a budgeted bundle of the sections about one subject. \
                  Write: create for new notes, update for every change to an existing one — a list of edits over the body, a section or a frontmatter property, applied in one write. \
-                 Lifecycle: move_note to relocate, archive to soft-delete (`undo: true` to restore), delete for permanent removal. \
-                 Index: reindex_file to refresh a single file's index after external edits. \
+                 Lifecycle: move to relocate, archive to soft-delete (`undo: true` to restore), delete for permanent removal. \
+                 Index: reindex_file to refresh a single file after external edits, index to walk the whole vault (`rebuild: true` builds it again from nothing). \
+                 Diagnostics: status for what the index holds, health for orphans, broken links, stale notes and tag hygiene. \
                  Identity: identity for user context at session start, init to run first-time onboarding (`mode: detect` or `mode: apply`). \
                  Migration: migrate with `mode: preview` to classify notes into PARA folders, `mode: apply` to execute the migration, `mode: undo` to revert.",
         )
@@ -949,7 +999,7 @@ pub async fn run_serve(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use rmcp::schemars;
 
     /// Regression test for <https://github.com/devwhodevs/engraph/issues/32>,
     /// carried onto `update`'s edit list (#62). `edits` is the one array of

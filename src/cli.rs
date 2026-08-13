@@ -1,6 +1,17 @@
 //! What the CLI accepts. The definitions live in the library and not in the
 //! binary so that `surface.rs`'s parity test can walk them under
 //! `cargo test --lib` (#62). The dispatch stays in `main.rs`.
+//!
+//! `Command` holds one variant per capability, at the top level. A
+//! capability's arguments come from its `crate::params` struct, so the command
+//! line, the MCP schema and the HTTP route read one declaration. A variant
+//! carries fields of its own only where the CLI has an argument the other
+//! surfaces cannot have; `surface::CAPABILITIES` names each of those with its
+//! reason.
+//!
+//! Every doc comment below is user-facing text: clap prints an item's doc
+//! comment as its help, and an enum's reaches the top-level `--help`. Notes
+//! about the code are `//` comments for that reason.
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -27,56 +38,95 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Index a vault directory for semantic search.
+    // `group(skip)` because the flattened struct already declares a group of
+    // its own name, and clap gives a variant with named fields one too.
+    #[group(skip)]
     Index {
-        /// Path to the vault (overrides config).
+        #[command(flatten)]
+        args: crate::params::Index,
+
+        /// Path to the vault (overrides config). A running server is bound to
+        /// its configured vault, so this argument is the CLI's alone.
         path: Option<PathBuf>,
-
-        /// Rebuild the index from scratch.
-        #[arg(long)]
-        rebuild: bool,
-
-        /// Index files that `.gitignore` / `.ignore` would normally exclude.
-        #[arg(long)]
-        no_gitignore: bool,
     },
 
     /// Search the indexed vault.
-    Search {
-        /// The search query.
-        query: String,
+    Search(crate::params::Search),
 
-        /// Number of results to return.
-        #[arg(short = 'n', long)]
-        top_n: Option<usize>,
+    /// Read a note's full content, or one of its sections.
+    Read(crate::params::Read),
 
-        /// Show per-lane RRF score breakdown for each result.
-        #[arg(long, conflicts_with = "json")]
-        explain: bool,
+    /// List notes by metadata filters.
+    List(crate::params::List),
 
-        /// Return one result per matching section, or one per document.
-        #[arg(long, value_enum)]
-        group_by: Option<crate::config::GroupBy>,
+    /// List the vault's tag vocabulary.
+    Tags(crate::params::Tags),
 
-        /// Filter to notes with all listed tags (comma-separated). A trailing
-        /// `/` or `/*` matches the tag and its descendants.
+    /// Vault structure overview.
+    VaultMap(crate::params::VaultMap),
+
+    /// Person context bundle.
+    Who(crate::params::Who),
+
+    /// Project context bundle.
+    Project(crate::params::Project),
+
+    /// Rich topic context with a character budget.
+    Topic(crate::params::Topic),
+
+    /// Create a new note.
+    Create(crate::params::Create),
+
+    /// Update a note's body, one of its sections, or one of its properties.
+    // The one capability that declares its arguments here and not in
+    // `crate::params`: a list of edits is not a clap-parsable type, so the
+    // flags below are the one-edit form of the same grammar and `--edits` is
+    // the whole of it (#62).
+    Update {
+        /// File path, basename, or #docid.
+        file: String,
+        /// The section to edit. Omit for the note's body.
+        #[arg(long)]
+        section: Option<String>,
+        /// The frontmatter property to edit.
+        #[arg(long)]
+        property: Option<String>,
+        /// What the edit does to what it names. `remove` is for a property
+        /// alone.
+        #[arg(long, value_enum, default_value = "replace")]
+        mode: crate::params::EditMode,
+        /// The text to write, or a comma-separated list for a list-valued
+        /// property such as tags or aliases. A comma is how the command line
+        /// spells a sequence, as it does for `--tags`; a value that has to
+        /// hold a comma is written with `--edits`.
         #[arg(long, value_delimiter = ',')]
-        tags: Vec<String>,
-        /// Filter to notes carrying every term (comma-separated). A trailing
-        /// `/` or `/*` matches the tag and its descendants.
-        #[arg(long, value_delimiter = ',')]
-        all: Vec<String>,
-        /// Filter to notes carrying at least one term (comma-separated). An
-        /// unknown term is an error naming the nearest tag the vault holds.
-        #[arg(long, value_delimiter = ',')]
-        any: Vec<String>,
-        /// Filter out notes carrying any of these terms (comma-separated).
-        /// An unknown term here is ignored.
-        #[arg(long, value_delimiter = ',')]
-        none: Vec<String>,
+        content: Vec<String>,
+        /// A JSON array of edits, applied in one write. It replaces the flags
+        /// above, which are the one-edit form of the same grammar (#62).
+        #[arg(long, conflicts_with_all = ["section", "property", "mode", "content"])]
+        edits: Option<String>,
     },
 
+    /// Delete a note.
+    Delete(crate::params::Delete),
+
+    /// Move a note to another folder.
+    // `move` is a Rust keyword, so the variant is `Move` and the command name
+    // is declared.
+    #[command(name = "move")]
+    Move(crate::params::Move),
+
+    /// Archive a note, or restore one the archive holds.
+    Archive(crate::params::Archive),
+
+    /// Re-index one file after an edit made outside engraph.
+    ReindexFile(crate::params::ReindexFile),
+
     /// Show index status and statistics.
-    Status,
+    Status(crate::params::Status),
+
+    /// Vault health report: orphans, broken links, stale notes, tag hygiene.
+    Health(crate::params::Health),
 
     /// Clear cached data.
     Clear {
@@ -86,14 +136,14 @@ pub enum Command {
     },
 
     /// Initialize vault profile, identity, and search index.
+    // `group(skip)` for the reason `index` gives: the flattened struct
+    // declares the group this variant would declare again.
+    #[group(skip)]
     Init {
+        #[command(flatten)]
+        args: crate::params::Init,
         /// Path to vault directory.
         path: Option<PathBuf>,
-        /// `detect` inspects the vault and writes nothing; `apply` configures
-        /// identity and indexes. Omit it to run the interactive flow, which
-        /// is the one thing the other surfaces cannot do (#62).
-        #[arg(long)]
-        mode: Option<String>,
         /// Only run identity setup (skip indexing).
         #[arg(long)]
         identity: bool,
@@ -109,26 +159,10 @@ pub enum Command {
         /// Suppress interactive prompts.
         #[arg(long)]
         quiet: bool,
-        /// User name (non-interactive mode).
-        #[arg(long)]
-        name: Option<String>,
-        /// User role (non-interactive mode).
-        #[arg(long)]
-        role: Option<String>,
-        /// Vault purpose (non-interactive mode).
-        #[arg(long)]
-        purpose: Option<String>,
     },
 
     /// Print identity block (L0 + L1 context for AI agents).
-    Identity {
-        /// Output as JSON.
-        #[arg(long)]
-        json: bool,
-        /// Force L1 re-extraction without full reindex.
-        #[arg(long)]
-        refresh: bool,
-    },
+    Identity(crate::params::Identity),
 
     /// Configure engraph settings.
     Configure {
@@ -206,173 +240,8 @@ pub enum Command {
         read_only: bool,
     },
 
-    /// Query vault context.
-    Context {
-        #[command(subcommand)]
-        action: ContextAction,
-    },
-
-    /// Write a note to the vault.
-    Write {
-        #[command(subcommand)]
-        action: WriteAction,
-    },
-
     /// Migrate vault structure into PARA.
-    Migrate {
-        /// `preview` classifies every note and saves the proposed moves;
-        /// `apply` performs them; `undo` reverses the last migration. PARA
-        /// is the one strategy, so it is not a leaf of its own (#62).
-        #[arg(long)]
-        mode: String,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-pub enum ContextAction {
-    /// Read a note's full content with metadata.
-    Read {
-        /// File path, basename, or #docid.
-        file: String,
-    },
-    /// List notes by metadata filters.
-    List {
-        /// Filter to folder path prefix.
-        #[arg(long)]
-        folder: Option<String>,
-        /// Filter to notes with all listed tags (comma-separated). A trailing
-        /// `/` or `/*` matches the tag and its descendants.
-        #[arg(long, value_delimiter = ',')]
-        tags: Vec<String>,
-        /// Filter to notes carrying every term (comma-separated). A trailing
-        /// `/` or `/*` matches the tag and its descendants.
-        #[arg(long, value_delimiter = ',')]
-        all: Vec<String>,
-        /// Filter to notes carrying at least one term (comma-separated). An
-        /// unknown term is an error naming the nearest tag the vault holds.
-        #[arg(long, value_delimiter = ',')]
-        any: Vec<String>,
-        /// Filter out notes carrying any of these terms (comma-separated).
-        /// An unknown term here is ignored.
-        #[arg(long, value_delimiter = ',')]
-        none: Vec<String>,
-        /// Filter to notes created by a specific agent.
-        #[arg(long)]
-        created_by: Option<String>,
-        /// Maximum results.
-        #[arg(long, default_value = "20")]
-        limit: usize,
-    },
-    /// List the vault's tag vocabulary.
-    Tags {
-        /// Limit to one tag and its descendants, as `type/` or `type/*`.
-        #[arg(long)]
-        under: Option<String>,
-    },
-    /// Vault structure overview.
-    VaultMap,
-    /// Person context bundle.
-    Who {
-        /// Person name (matches filename in People folder).
-        name: String,
-    },
-    /// Project context bundle.
-    Project {
-        /// Project name (matches filename).
-        name: String,
-    },
-    /// Rich topic context with budget.
-    Topic {
-        /// Search query for the topic.
-        query: String,
-        /// Character budget (default 32000, ~8000 tokens).
-        #[arg(long, default_value = "32000")]
-        budget: usize,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-pub enum WriteAction {
-    /// Create a new note.
-    Create {
-        /// Note content (reads from stdin if omitted).
-        #[arg(long)]
-        content: Option<String>,
-        /// Filename (without .md).
-        #[arg(long)]
-        filename: Option<String>,
-        /// Type hint for placement.
-        #[arg(long)]
-        type_hint: Option<String>,
-        /// Tags (comma-separated).
-        #[arg(long, value_delimiter = ',')]
-        tags: Vec<String>,
-        /// Explicit folder (skips placement).
-        #[arg(long)]
-        folder: Option<String>,
-    },
-    /// Append content to an existing note.
-    Append {
-        /// Target note (path, basename, or #docid).
-        file: String,
-        /// Content to append (reads from stdin if omitted).
-        #[arg(long)]
-        content: Option<String>,
-    },
-    /// Archive a note (soft delete — moves to archive, removes from index).
-    Archive {
-        /// Target note (path, basename, or #docid).
-        file: String,
-    },
-    /// Restore an archived note to its original location.
-    Unarchive {
-        /// Archived note path (e.g., "04-Archive/01-Projects/note.md").
-        file: String,
-    },
-    /// Edit a specific section of a note.
-    Edit {
-        /// Target note (path, basename, or #docid).
-        #[arg(long)]
-        file: String,
-        /// Section heading to edit (case-insensitive).
-        #[arg(long)]
-        heading: String,
-        /// Content to add/replace in the section.
-        #[arg(long)]
-        content: String,
-        /// Edit mode: "replace", "prepend", or "append" (default: "append").
-        #[arg(long, default_value = "append")]
-        mode: String,
-    },
-    /// Rewrite a note's body content (preserves frontmatter by default).
-    Rewrite {
-        /// Target note (path, basename, or #docid).
-        #[arg(long)]
-        file: String,
-        /// New body content.
-        #[arg(long)]
-        content: String,
-        /// Preserve existing frontmatter (default: true).
-        #[arg(long, default_value_t = true)]
-        preserve_frontmatter: bool,
-    },
-    /// Edit a note's frontmatter properties.
-    EditFrontmatter {
-        /// Target note (path, basename, or #docid).
-        #[arg(long)]
-        file: String,
-        /// Operations as JSON string: [{"op":"add_tag","value":"rust"},{"op":"set","key":"status","value":"done"}]
-        #[arg(long)]
-        operations: String,
-    },
-    /// Delete a note.
-    Delete {
-        /// Target note (path, basename, or #docid).
-        file: String,
-        /// Delete mode: "soft" (archive, default) or "hard" (permanent).
-        #[arg(long, default_value = "soft")]
-        mode: String,
-    },
+    Migrate(crate::params::Migrate),
 }
 
 #[derive(Subcommand, Debug)]
@@ -396,13 +265,21 @@ mod tests {
         assert!(names.contains(&"index"), "got {names:?}");
     }
 
+    /// Clap builds a subcommand only when something parses it, so a duplicate
+    /// argument or group in an arm no test parses would otherwise reach a
+    /// user first. This builds all of them and runs clap's own asserts (#62).
+    #[test]
+    fn every_command_passes_claps_own_asserts() {
+        Cli::command().debug_assert();
+    }
+
     #[test]
     fn migrate_takes_the_mode_the_servers_take() {
         // PARA is the only strategy, so `migrate` is a leaf that takes the
         // same three words every surface takes (#62).
         let cli = Cli::try_parse_from(["engraph", "migrate", "--mode", "apply"]).unwrap();
         match cli.command {
-            Command::Migrate { mode } => assert_eq!(mode, "apply"),
+            Command::Migrate(args) => assert_eq!(args.mode, "apply"),
             other => panic!("got {other:?}"),
         }
         assert!(
@@ -421,13 +298,107 @@ mod tests {
         // interactive flow when the CLI is given none (#62).
         let cli = Cli::try_parse_from(["engraph", "init", "--mode", "detect"]).unwrap();
         match cli.command {
-            Command::Init { mode, .. } => assert_eq!(mode.as_deref(), Some("detect")),
+            Command::Init { args, .. } => assert_eq!(args.mode.as_deref(), Some("detect")),
             other => panic!("got {other:?}"),
         }
         let cli = Cli::try_parse_from(["engraph", "init"]).unwrap();
         match cli.command {
-            Command::Init { mode, .. } => assert_eq!(mode, None),
+            Command::Init { args, .. } => assert_eq!(args.mode, None),
             other => panic!("got {other:?}"),
         }
+    }
+
+    /// The two command groups are gone: every capability is one word (#62).
+    #[test]
+    fn the_capabilities_are_top_level_commands() {
+        for group in [
+            ["engraph", "context", "read"],
+            ["engraph", "write", "create"],
+        ] {
+            assert!(
+                Cli::try_parse_from(group).is_err(),
+                "{group:?} still parses"
+            );
+        }
+
+        let cli = Cli::try_parse_from(["engraph", "read", "note.md", "--section", "Spells"])
+            .expect("read is a command");
+        match cli.command {
+            Command::Read(args) => {
+                assert_eq!(args.file, "note.md");
+                assert_eq!(args.section.as_deref(), Some("Spells"));
+            }
+            other => panic!("got {other:?}"),
+        }
+
+        let cli =
+            Cli::try_parse_from(["engraph", "vault-map"]).expect("vault-map is one command name");
+        assert!(matches!(cli.command, Command::VaultMap(_)), "{cli:?}");
+    }
+
+    /// `move` is a Rust keyword, so the variant carries the command name.
+    #[test]
+    fn move_is_spelled_the_way_the_table_spells_it() {
+        let cli = Cli::try_parse_from(["engraph", "move", "note.md", "--new-folder", "02-Areas"])
+            .expect("move is a command");
+        match cli.command {
+            Command::Move(args) => {
+                assert_eq!(args.file, "note.md");
+                assert_eq!(args.new_folder, "02-Areas");
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    /// The flags are the one-edit form of the edit list, and `--edits` is the
+    /// whole grammar. The two cannot be given together (#62).
+    #[test]
+    fn update_takes_one_edit_as_flags_or_a_list_as_json() {
+        let cli = Cli::try_parse_from([
+            "engraph",
+            "update",
+            "note.md",
+            "--property",
+            "tags",
+            "--content",
+            "a,b",
+        ])
+        .expect("the one-edit form parses");
+        match cli.command {
+            Command::Update {
+                file,
+                property,
+                content,
+                mode,
+                ..
+            } => {
+                assert_eq!(file, "note.md");
+                assert_eq!(property.as_deref(), Some("tags"));
+                assert_eq!(content, vec!["a".to_string(), "b".to_string()]);
+                assert!(matches!(mode, crate::params::EditMode::Replace));
+            }
+            other => panic!("got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["engraph", "update", "note.md", "--edits", "[]"])
+            .expect("the list form parses");
+        match cli.command {
+            Command::Update { edits, .. } => assert_eq!(edits.as_deref(), Some("[]")),
+            other => panic!("got {other:?}"),
+        }
+
+        assert!(
+            Cli::try_parse_from([
+                "engraph",
+                "update",
+                "note.md",
+                "--edits",
+                "[]",
+                "--content",
+                "x"
+            ])
+            .is_err(),
+            "the two forms name the same edits twice"
+        );
     }
 }

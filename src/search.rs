@@ -1255,8 +1255,20 @@ pub fn run_search(
     Ok(())
 }
 
-/// Run the status command and print index information.
-pub fn run_status(json: bool, data_dir: &Path) -> Result<()> {
+/// What `status` reports, read from the store and from the config.
+///
+/// The CLI prints it and the two servers answer it as JSON, so all three read
+/// one gatherer and one field list (#62).
+struct StatusInputs {
+    stats: StoreStats,
+    edges: EdgeStats,
+    index_size: u64,
+    model_name: &'static str,
+    intelligence: &'static str,
+    date_count: usize,
+}
+
+fn collect_status(data_dir: &Path) -> Result<StatusInputs> {
     let db_path = data_dir.join("engraph.db");
     let store = Store::open(&db_path).context("opening store")?;
     let stats = store.stats()?;
@@ -1266,26 +1278,52 @@ pub fn run_status(json: bool, data_dir: &Path) -> Result<()> {
     // Compute index size on disk (sqlite db file).
     let index_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
 
-    let model_name = "all-MiniLM-L6-v2";
-
     let config = crate::config::Config::load().unwrap_or_default();
-    let intelligence = if config.intelligence_enabled() {
-        "enabled"
-    } else {
-        "disabled"
-    };
-
-    let output = format_status(
-        &stats,
-        &edges,
+    Ok(StatusInputs {
+        stats,
+        edges,
         index_size,
-        model_name,
-        intelligence,
+        model_name: "all-MiniLM-L6-v2",
+        intelligence: if config.intelligence_enabled() {
+            "enabled"
+        } else {
+            "disabled"
+        },
         date_count,
+    })
+}
+
+/// Run the status command and print index information.
+pub fn run_status(json: bool, data_dir: &Path) -> Result<()> {
+    let s = collect_status(data_dir)?;
+    let output = format_status(
+        &s.stats,
+        &s.edges,
+        s.index_size,
+        s.model_name,
+        s.intelligence,
+        s.date_count,
         json,
     );
     print!("{output}");
     Ok(())
+}
+
+/// What `status` reports, as the object the JSON channel names.
+///
+/// `run_status` prints; this is what a server answers with. Both compose the
+/// fields through `status_object`, so the three surfaces report the same ones
+/// and cannot drift apart (#62).
+pub fn status_json(data_dir: &Path) -> Result<serde_json::Value> {
+    let s = collect_status(data_dir)?;
+    Ok(status_object(
+        &s.stats,
+        &s.edges,
+        s.index_size,
+        s.model_name,
+        s.intelligence,
+        s.date_count,
+    ))
 }
 
 /// Format search results for display (pure function, no I/O).
@@ -1352,6 +1390,47 @@ pub fn format_results(results: &[SearchResult], json: bool) -> String {
     }
 }
 
+/// The fields `status` reports, composed once (pure function, no I/O).
+///
+/// The CLI's `--json`, the MCP tool and the HTTP route all answer this
+/// object, so a field added here reaches the three surfaces together (#62).
+pub fn status_object(
+    stats: &StoreStats,
+    edges: &EdgeStats,
+    index_size: u64,
+    model_name: &str,
+    intelligence: &str,
+    date_count: usize,
+) -> serde_json::Value {
+    let vault = stats.vault_path.as_deref().unwrap_or("<not set>");
+    let last_indexed = stats.last_indexed_at.as_deref().unwrap_or("never");
+    let total_files = edges.connected_file_count + edges.isolated_file_count;
+
+    let mut obj = json!({
+        "vault": vault,
+        "files": stats.file_count,
+        "chunks": stats.chunk_count,
+        "tombstones": stats.tombstone_count,
+        "last_indexed": last_indexed,
+        "index_size": index_size,
+        "model": model_name,
+        "intelligence": intelligence,
+        "files_with_dates": date_count,
+    });
+    if let (Some(edge_count), Some(wl), Some(mn)) =
+        (stats.edge_count, stats.wikilink_count, stats.mention_count)
+    {
+        obj["edges"] = json!(edge_count);
+        obj["wikilink_edges"] = json!(wl);
+        obj["mention_edges"] = json!(mn);
+    }
+    obj["wikilink_pairs"] = json!(edges.wikilink_count / 2);
+    obj["connected_files"] = json!(edges.connected_file_count);
+    obj["total_files"] = json!(total_files);
+    obj["isolated_files"] = json!(edges.isolated_file_count);
+    obj
+}
+
 /// Format status information for display (pure function, no I/O).
 ///
 /// `edges` folds in `graph stats` (#62): `status` is what answers "what is in
@@ -1377,28 +1456,14 @@ pub fn format_status(
     };
 
     if json {
-        let mut obj = json!({
-            "vault": vault,
-            "files": stats.file_count,
-            "chunks": stats.chunk_count,
-            "tombstones": stats.tombstone_count,
-            "last_indexed": last_indexed,
-            "index_size": index_size,
-            "model": model_name,
-            "intelligence": intelligence,
-            "files_with_dates": date_count,
-        });
-        if let (Some(edge_count), Some(wl), Some(mn)) =
-            (stats.edge_count, stats.wikilink_count, stats.mention_count)
-        {
-            obj["edges"] = json!(edge_count);
-            obj["wikilink_edges"] = json!(wl);
-            obj["mention_edges"] = json!(mn);
-        }
-        obj["wikilink_pairs"] = json!(wikilink_pairs);
-        obj["connected_files"] = json!(edges.connected_file_count);
-        obj["total_files"] = json!(total_files);
-        obj["isolated_files"] = json!(edges.isolated_file_count);
+        let obj = status_object(
+            stats,
+            edges,
+            index_size,
+            model_name,
+            intelligence,
+            date_count,
+        );
         format!("{}\n", serde_json::to_string_pretty(&obj).unwrap())
     } else {
         let mut out = format!(

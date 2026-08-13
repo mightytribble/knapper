@@ -223,44 +223,17 @@ pub const CAPABILITIES: &[Capability] = &[
     },
 ];
 
-/// What the CLI has yet to bring onto the table (#62).
-pub const PENDING_CLI: &[Pending] = &[
-    Pending::NotYetAdded("health"),
-    Pending::NotYetAdded("reindex-file"),
-    Pending::NotYetAdded("move"),
-    Pending::NotYetAdded("update"),
-    Pending::NotYetAdded("read"),
-    Pending::NotYetAdded("list"),
-    Pending::NotYetAdded("tags"),
-    Pending::NotYetAdded("vault-map"),
-    Pending::NotYetAdded("who"),
-    Pending::NotYetAdded("project"),
-    Pending::NotYetAdded("topic"),
-    Pending::NotYetAdded("create"),
-    Pending::NotYetAdded("delete"),
-    Pending::NotYetAdded("archive"),
-    Pending::NotYetRemoved("context"),
-    Pending::NotYetRemoved("write"),
-];
+/// What the CLI has yet to bring onto the table (#62). Empty: every
+/// capability the table names is one top-level command.
+pub const PENDING_CLI: &[Pending] = &[];
 
-/// What the MCP server has yet to bring onto the table (#62).
-pub const PENDING_MCP: &[Pending] = &[
-    Pending::NotYetAdded("index"),
-    Pending::NotYetAdded("status"),
-    Pending::NotYetAdded("topic"),
-    Pending::NotYetAdded("move"),
-    Pending::NotYetRemoved("context"),
-    Pending::NotYetRemoved("move_note"),
-];
+/// What the MCP server has yet to bring onto the table (#62). Empty: every
+/// capability the table names is one tool.
+pub const PENDING_MCP: &[Pending] = &[];
 
-/// What the HTTP API has yet to bring onto the table (#62). Entries are
-/// route paths, because that is what the router registers.
-pub const PENDING_HTTP: &[Pending] = &[
-    Pending::NotYetAdded("/api/index"),
-    Pending::NotYetAdded("/api/status"),
-    Pending::NotYetAdded("/api/topic"),
-    Pending::NotYetRemoved("/api/context"),
-];
+/// What the HTTP API has yet to bring onto the table (#62). Empty: every
+/// capability the table names is one route.
+pub const PENDING_HTTP: &[Pending] = &[];
 
 /// Capabilities whose CLI arguments are declared apart from the shared
 /// parameter struct, and why. The parity test checks these by name,
