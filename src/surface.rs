@@ -155,7 +155,28 @@ pub const CAPABILITIES: &[Capability] = &[
         cli: Presence::On,
         mcp: Presence::On,
         http: Http::Post,
-        cli_only_args: &[],
+        // The four flags are the one-edit spelling of `edits`, which a command
+        // line cannot carry as a list. They are what `cli.rs` declares by hand,
+        // so naming them here is what lets the parity test read `update` at all
+        // (#62).
+        cli_only_args: &[
+            (
+                "section",
+                "the one edit's target section; a command line carries no `edits` list",
+            ),
+            (
+                "property",
+                "the one edit's target property; a command line carries no `edits` list",
+            ),
+            (
+                "mode",
+                "what the one edit does; a command line carries no `edits` list",
+            ),
+            (
+                "content",
+                "what the one edit writes; a command line carries no `edits` list",
+            ),
+        ],
         server_only_args: &[],
     },
     Capability {
@@ -269,11 +290,17 @@ pub const PENDING_MCP: &[Pending] = &[];
 /// capability the table names is one route.
 pub const PENDING_HTTP: &[Pending] = &[];
 
-/// Capabilities whose CLI arguments are declared apart from the shared
-/// parameter struct, and why. The parity test checks these by name,
-/// because they are the only ones where two declarations can drift.
-pub const PARAMS_NOT_SHARED: &[(&str, &str)] =
-    &[("update", "a list of edits is not a clap-parsable type")];
+/// Capabilities the parameter parity test cannot compare, and why.
+///
+/// Empty (#62). `update` is the one capability that declares its CLI
+/// arguments apart from `params::Update`, but the four extra flags are
+/// `cli_only_args` with a reason each, so both sides of `update` reduce to
+/// `file` and `edits` and the test reads it like every other capability —
+/// which is where a second declaration can drift, so it is the last one to
+/// exempt. The list stays as the declaration point for the next capability
+/// that has to opt out, and `every_capability_with_a_split_declaration_is_named`
+/// holds each entry to a real capability with a reason.
+pub const PARAMS_NOT_SHARED: &[(&str, &str)] = &[];
 
 /// Routes the transport serves for itself. They name no capability.
 pub const HTTP_TRANSPORT_ROUTES: &[(&str, &str)] = &[
@@ -430,11 +457,11 @@ mod tests {
     ///
     /// This is the guard the whole sweep exists to keep. `params.rs` derives
     /// `clap::Args`, `Deserialize` and `JsonSchema` from one declaration, so a
-    /// capability that reads its struct holds by construction — but nothing
-    /// stopped a capability from declaring its arguments twice, and `update`
-    /// already has to. The test reads both registries and compares them, so a
-    /// second declaration that drifts fails the build rather than reaching a
-    /// caller.
+    /// capability that reads its struct holds by construction. `update` is the
+    /// one that declares its arguments twice — `cli.rs` writes its flags by
+    /// hand against `params::Update` — so it is the one capability where the
+    /// two can drift, and the test reads it. Its four extra flags are
+    /// `cli_only_args`, which leaves `file` and `edits` on both sides.
     ///
     /// Three classes of clap argument are not parameters of the capability and
     /// are subtracted: the `--help` clap adds itself, the global flags that
