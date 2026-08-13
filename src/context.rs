@@ -1323,6 +1323,73 @@ mod tests {
         assert!(proj.child_notes.is_empty());
     }
 
+    /// `list_files` answers in path order, not indexed-at order (#68), and
+    /// `context_project`'s own `Some(50)` cap on that call rides along: a
+    /// project folder holding more than 50 sibling notes gets back the
+    /// first 50 of the folder in path order, not the 50 last indexed.
+    ///
+    /// The 60 siblings are indexed in reverse path order, so a reader that
+    /// took insertion order — or the pre-#68 `indexed_at DESC` — would
+    /// answer the last 50 in path order instead of the first 50, and this
+    /// test would catch it.
+    #[test]
+    fn context_project_takes_the_first_50_siblings_in_path_order() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(root.join("Projects")).unwrap();
+        // Sorts after every "n\d\d.md" sibling, so the project's own note
+        // never falls inside the folder's first 50 path-ordered rows.
+        std::fs::write(root.join("Projects/zzz-project.md"), "# Alpha Project\n").unwrap();
+
+        let store = Store::open_memory().unwrap();
+        store
+            .insert_file(
+                "Projects/zzz-project.md",
+                "hproj",
+                100,
+                "proj001",
+                None,
+                None,
+            )
+            .unwrap();
+        for i in (0..60).rev() {
+            store
+                .insert_file(
+                    &format!("Projects/n{i:02}.md"),
+                    "h",
+                    100,
+                    &format!("sib{i:03}"),
+                    None,
+                    None,
+                )
+                .unwrap();
+        }
+
+        let params = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+        let proj = context_project(&params, "Projects/zzz-project.md").unwrap();
+        assert!(proj.note.is_some());
+
+        let paths: Vec<String> = proj.child_notes.iter().map(|c| c.path.clone()).collect();
+        let expected: Vec<String> = (0..50).map(|i| format!("Projects/n{i:02}.md")).collect();
+        assert_eq!(paths.len(), 50);
+        assert_eq!(
+            paths, expected,
+            "siblings must be exactly the first 50 in path order"
+        );
+        assert_eq!(paths.first().unwrap(), "Projects/n00.md");
+        assert_eq!(paths.last().unwrap(), "Projects/n49.md");
+        assert!(
+            !paths.iter().any(|p| p == "Projects/n50.md"),
+            "the 51st sibling in path order must be cut off"
+        );
+        assert!(!paths.iter().any(|p| p == "Projects/n59.md"));
+        assert!(!paths.contains(&"Projects/zzz-project.md".to_string()));
+    }
+
     // --- context_topic tests ---
 
     #[test]
