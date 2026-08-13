@@ -230,6 +230,21 @@ engraph vault-map
 
 Returns folder counts, top tags, recent files — gives an AI agent orientation before it starts searching.
 
+**See what the vault holds:**
+
+```bash
+engraph list --scope /locations/ --detailed
+```
+```
+locations/aurelian-empire.md
+# About the Empire
+## History
+### The founding of the Empire
+## Current Events
+```
+
+One bare path per line, in path order, so a folder's notes arrive together and `wc -l` is the total. A bare `engraph list` answers every indexed note; `--scope`, `--all`, `--any` and `--none` narrow it by tag or by directory, and `--limit` keeps the first n. `--detailed` reads each listed note and prints its headings, which is how an agent finds the section to read or write before it calls `read` or `update`.
+
 **Create a note via the write pipeline:**
 
 ```bash
@@ -290,7 +305,7 @@ Every capability is one route, and the route is the CLI command's name under `/a
 | GET | `/api/health-check` | read | Server health check |
 | POST | `/api/search` | read | Hybrid search (semantic + FTS5 + graph + reranker + temporal), scoped by tag or directory terms — a leading `/` reads a term as a directory path (`scope`/`all`, `any`, `none`) |
 | GET | `/api/read` | read | Read a note (`file`), or one of its sections (`section`) |
-| GET | `/api/list` | read | List notes by folder and tag or directory terms — a leading `/` reads a term as a directory path (`scope`/`all`, `any`, `none`), creator, limit |
+| GET | `/api/list` | read | List notes by tag or directory terms — a leading `/` reads a term as a directory path (`scope`/`all`, `any`, `none`), creator, limit, and `detailed=true` for each note's heading outline |
 | GET | `/api/tags` | read | The tag vocabulary, whole or under one term (`under`) |
 | GET | `/api/vault-map` | read | Vault structure overview (folders, tags, recent files) |
 | GET | `/api/who` | read | Person context bundle (`name`) |

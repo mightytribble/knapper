@@ -34,7 +34,8 @@ command it answers, with `-` written as `_`.
 **Read tools:**
 - `search` — hybrid search across the vault
 - `read` — read a full note with metadata, or one section of it (`section`)
-- `list` — filtered note listing (by folder, tag terms, creator)
+- `list` — every note the scope admits, in path order (tag terms, directory
+  terms, creator); `detailed` adds each note's heading outline
 - `tags` — the vault's tag vocabulary, whole or under one term
 - `vault_map` — vault structure overview
 - `who` — person context bundle (their note, the notes mentioning them, their
