@@ -194,7 +194,7 @@ impl EngraphServer {
 
     #[tool(
         name = "list",
-        description = "List notes filtered by folder prefix and tag operators (all/any/none). A term is a tag path; a trailing `/` matches the tag and its descendants. Returns paths, docids, tags, and edge counts."
+        description = "List notes filtered by folder prefix and scope operators (all/any/none). A term is a tag path, or a directory path when it starts with `/`; a trailing `/` matches the tag's descendants or the directory's subtree. Returns paths, docids, tags, and edge counts."
     )]
     async fn list(
         &self,
@@ -287,7 +287,7 @@ impl EngraphServer {
 
     #[tool(
         name = "topic",
-        description = "Topic context bundle to paste into a prompt: the five notes that best match the query, each read whole, and then the notes one wikilink hop from the top three, all trimmed to a character budget. It returns whole note bodies and not sections, and it runs no cross-encoder, so `search` ranks more accurately. Tag terms (all/any/none) hold both steps to the notes they admit."
+        description = "Topic context bundle to paste into a prompt: the five notes that best match the query, each read whole, and then the notes one wikilink hop from the top three, all trimmed to a character budget. It returns whole note bodies and not sections, and it runs no cross-encoder, so `search` ranks more accurately. Scope terms (all/any/none) hold both steps to the notes they admit; a term is a tag path or, starting with `/`, a directory path from the vault root."
     )]
     async fn topic(
         &self,

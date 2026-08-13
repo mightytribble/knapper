@@ -51,11 +51,12 @@ git fetch upstream && git diff --stat upstream/main main
 | `chunk_min_chars` | a section too short to stand on its own merges into the preceding chunk rather than becoming a row. Ships at 120 — see #43 | this fork, issue #43 |
 | `structure_headings` | a bold-only line opens a section, deeper than any `#` heading and an ancestor of nothing. Ships on — see #44 | this fork, issue #44 |
 | `tags` + `file_tags` | a tag is an attribute of a note, and it joins to the note. Usage and last use are derived, so neither can drift. Upstream keys its vocabulary in `tag_registry`, a flat table with no join to `files` whose `usage_count` counts index events | this fork, issue #60 |
-| `tags::predicate` / `TagFilter` / `tags_under` | notes filter by tag term (`all`/`any`/`none`) and the vocabulary lists whole or by subtree | this fork, issue #60 |
-| one tag vocabulary on three surfaces | the filter and the vocabulary each carry one name and one parameter set across `engraph list`/`engraph tags`, MCP `list`/`tags` and `GET /api/list`/`GET /api/tags`. A term is a tag path, a trailing `/` names the subtree, `tags` is the alias of `all`, and an unmatched `all`/`any` term is an error naming the nearest tag. Only the container encoding is per-surface: a JSON body reads an array, and a query string reads one comma-separated value, because `serde_urlencoded` reads no sequence | this fork, issue #61 |
+| `tags::predicate` / `Scope` / `tags_under` | notes filter by tag term (`all`/`any`/`none`) and the vocabulary lists whole or by subtree | this fork, issue #60 |
+| one tag vocabulary on three surfaces | the filter and the vocabulary each carry one name and one parameter set across `engraph list`/`engraph tags`, MCP `list`/`tags` and `GET /api/list`/`GET /api/tags`. A term is a tag path, a trailing `/` names the subtree, `scope` is the alias of `all`, and an unmatched `all`/`any` term is an error naming the nearest tag. Only the container encoding is per-surface: a JSON body reads an array, and a query string reads one comma-separated value, because `serde_urlencoded` reads no sequence | this fork, issue #61 |
 | `Store::files_in_scope` / `rarray` scoping | a search can be scoped to the notes a tag filter admits. The scope resolves once to a set of file ids and every lane pre-filters on it: the KNN through vec0's `rowid IN`, the keyword lane through its own join, and the graph lane by dropping out-of-scope candidates before its quota truncation, so the walk still passes through untagged notes. An empty filter emits no clause and reproduces the unscoped pipeline exactly | this fork, issue #60 |
 | `src/surface.rs` | every capability has one name and one parameter set on all three surfaces, and a test fails when one does not | this fork, issue #62 |
 | the tag scope on `topic` | a context bundle is gathered from the notes a tag filter admits, by the same four operators and the same grammar `search` takes. `search_internal` carries the caller's filter and nothing else of the caller's settings, and the assembly applies it to both of its steps, so the 1-hop expansion does not carry in a note the scope excludes — #60's rule for the graph lane | this fork, issue #64 |
+| directory terms in the scope | a scope term can name a directory as well as a tag: a leading `/` marks a path from the vault root, a trailing `/` its subtree, and the two mix in the same `all`/`any`/`none` operators. A directory resolves to a range predicate on `files.path` beside the tag's junction `EXISTS`, case-sensitive, and reaches `search`, `topic` and `list`. The `tags` alias is renamed `scope` | this fork, issue #65 |
 | `.github/workflows/ci.yml` | manual dispatch only — upstream runs it on push and PR | this fork, Actions minutes |
 
 Cherry-picked rather than merged: PR #41 branched before upstream's #40 graph fix, so merging the
@@ -548,10 +549,10 @@ has never executed on this box.
 - **A term is a tag path, and a trailing `/` — or its synonym `/*` — asks for its subtree.**
   `tags::parse_term` drops one leading `#` and folds case; `tags::predicate` compiles the subtree
   form to a range over `tags.path` rather than a `LIKE` pattern, so the unique index serves it too.
-  `Store::list_files` takes a `TagFilter { all, any, none }` of terms — every `all` term, at least one
+  `Store::list_files` takes a `Scope { all, any, none }` of terms — every `all` term, at least one
   `any` term, none of the `none` terms, ANDed together and with `folder`/`created_by` — as
-  `--all/--any/--none` on the CLI, each comma-separated (`--tags` the older spelling of `--all`), as
-  `all`/`any`/`none` on MCP's `list` tool (`tags` the same alias), and as the `tags`/`all`/`any`/`none`
+  `--all/--any/--none` on the CLI, each comma-separated (`--scope` the alias of `--all`), as
+  `all`/`any`/`none` on MCP's `list` tool (`scope` the same alias), and as the `scope`/`all`/`any`/`none`
   query parameters on `/api/list`, each one comma-separated value, read through the same term grammar.
   `Store::tags_under` answers the whole vocabulary or
   one subtree, ordered by path, as `TagCount { path, display, note_count }`, the count always the
