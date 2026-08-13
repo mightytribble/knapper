@@ -714,7 +714,7 @@ async fn handle_create(
         tags: body.tags,
         folder: body.folder,
         created_by: "http-api".into(),
-        auto_link: None,
+        auto_link: body.auto_link,
     };
     let result = writer::create_note(
         input,
@@ -872,6 +872,14 @@ async fn handle_archive(
     if state.read_only {
         return Err(ApiError::forbidden(
             "Write operations disabled in read-only mode",
+        ));
+    }
+    // Task 13 (#62) replaces this guard with the undo branch; until then a
+    // schema that advertises `undo` and silently ignores it would let a
+    // caller re-archive a note it meant to restore.
+    if body.undo {
+        return Err(ApiError::bad_request(
+            "undo is not implemented yet: use unarchive",
         ));
     }
     let store = state.store.lock().await;

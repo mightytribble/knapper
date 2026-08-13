@@ -509,7 +509,7 @@ impl EngraphServer {
             tags: params.0.tags,
             folder: params.0.folder,
             created_by: "claude-code".into(),
-            auto_link: None,
+            auto_link: params.0.auto_link,
         };
         let result = crate::writer::create_note(
             input,
@@ -606,6 +606,16 @@ impl EngraphServer {
     ) -> Result<CallToolResult, McpError> {
         if self.read_only {
             return Err(read_only_err());
+        }
+        // Task 13 (#62) replaces this guard with the undo branch; until then
+        // a schema that advertises `undo` and silently ignores it would let
+        // a caller re-archive a note it meant to restore.
+        if params.0.undo {
+            return Err(McpError::new(
+                rmcp::model::ErrorCode::INVALID_PARAMS,
+                "undo is not implemented yet: use unarchive",
+                None::<serde_json::Value>,
+            ));
         }
         let store = self.store.lock().await;
         let result = crate::writer::archive_note(

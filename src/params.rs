@@ -234,13 +234,16 @@ pub struct Create {
     /// Folder to place the note in. Placement chooses one when omitted.
     #[arg(long)]
     pub folder: Option<String>,
+    /// Set to false to skip automatic wikilink resolution. Defaults to true.
+    #[arg(long)]
+    pub auto_link: Option<bool>,
 }
 
 #[derive(Debug, Args, Deserialize, JsonSchema)]
 pub struct Delete {
     /// File path, basename, or #docid.
     pub file: String,
-    /// `soft` archives the note; `hard` removes it permanently.
+    /// `soft` (default) archives the note; `hard` removes it permanently.
     #[arg(long, default_value = "soft")]
     #[serde(
         default = "default_delete_mode",
