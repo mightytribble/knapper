@@ -496,10 +496,11 @@ impl Scope {
     }
 }
 
-/// Fold the `tags` alias into `all`. `tags` is the older spelling of `--all`,
-/// on the CLI and on MCP's `list` tool.
-pub fn merge_all_alias(tags: Vec<String>, all: Vec<String>) -> Vec<String> {
-    let mut merged = tags;
+/// Fold the `scope` alias into `all`. `scope` is the friendly single-field
+/// spelling of `--all`, on the CLI and on the `list`, `search` and `topic`
+/// tools (#65).
+pub fn merge_scope_alias(scope: Vec<String>, all: Vec<String>) -> Vec<String> {
+    let mut merged = scope;
     merged.extend(all);
     merged
 }
@@ -917,12 +918,12 @@ mod tests {
     }
 
     #[test]
-    fn the_tags_alias_folds_into_all() {
+    fn the_scope_alias_folds_into_all() {
         assert_eq!(
-            merge_all_alias(vec!["a".to_string()], vec!["b".to_string()]),
+            merge_scope_alias(vec!["a".to_string()], vec!["b".to_string()]),
             vec!["a".to_string(), "b".to_string()]
         );
-        assert_eq!(merge_all_alias(vec![], vec!["b".to_string()]), vec!["b"]);
+        assert_eq!(merge_scope_alias(vec![], vec!["b".to_string()]), vec!["b"]);
     }
 
     fn setup_store() -> Store {

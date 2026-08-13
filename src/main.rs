@@ -212,7 +212,7 @@ async fn main() -> Result<()> {
         Command::Search(args) => {
             cfg.merge_top_n(args.top_n);
             let group_by = args.group_by.unwrap_or(cfg.group_by);
-            let all_terms = engraph::tags::merge_all_alias(args.tags, args.all);
+            let all_terms = engraph::tags::merge_scope_alias(args.scope, args.all);
             let scope = engraph::tags::Scope::parse(&all_terms, &args.any, &args.none)?;
 
             if !index_exists(&data_dir) {
@@ -276,7 +276,7 @@ async fn main() -> Result<()> {
                 vault_path: &vault_path,
                 profile: profile.as_ref(),
             };
-            let all_terms = engraph::tags::merge_all_alias(args.tags, args.all);
+            let all_terms = engraph::tags::merge_scope_alias(args.scope, args.all);
             let filter = engraph::tags::Scope::parse(&all_terms, &args.any, &args.none)?;
             let items = engraph::context::context_list(
                 &params,
@@ -445,7 +445,7 @@ async fn main() -> Result<()> {
         }
 
         Command::Topic(args) => {
-            let all_terms = engraph::tags::merge_all_alias(args.tags, args.all);
+            let all_terms = engraph::tags::merge_scope_alias(args.scope, args.all);
             let scope = engraph::tags::Scope::parse(&all_terms, &args.any, &args.none)?;
             let (store, vault_path, profile) = open_vault(&data_dir)?;
             let params = engraph::context::ContextParams {

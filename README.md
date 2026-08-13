@@ -288,9 +288,9 @@ Every capability is one route, and the route is the CLI command's name under `/a
 | Method | Endpoint | Permission | Description |
 |--------|----------|------------|-------------|
 | GET | `/api/health-check` | read | Server health check |
-| POST | `/api/search` | read | Hybrid search (semantic + FTS5 + graph + reranker + temporal), scoped by tag terms (`tags`/`all`, `any`, `none`) |
+| POST | `/api/search` | read | Hybrid search (semantic + FTS5 + graph + reranker + temporal), scoped by tag terms (`scope`/`all`, `any`, `none`) |
 | GET | `/api/read` | read | Read a note (`file`), or one of its sections (`section`) |
-| GET | `/api/list` | read | List notes by folder and tag terms (`tags`/`all`, `any`, `none`), creator, limit |
+| GET | `/api/list` | read | List notes by folder and tag terms (`scope`/`all`, `any`, `none`), creator, limit |
 | GET | `/api/tags` | read | The tag vocabulary, whole or under one term (`under`) |
 | GET | `/api/vault-map` | read | Vault structure overview (folders, tags, recent files) |
 | GET | `/api/who` | read | Person context bundle (`name`) |
@@ -328,11 +328,11 @@ curl -X POST http://localhost:3000/api/search \
   -H "Content-Type: application/json" \
   -d '{"query": "authentication architecture", "top_n": 5}'
 
-# Search, scoped to a tag filter (tags/all, any, none)
+# Search, scoped to a tag filter (scope/all, any, none)
 curl -X POST http://localhost:3000/api/search \
   -H "Authorization: Bearer eg_..." \
   -H "Content-Type: application/json" \
-  -d '{"query": "authentication architecture", "top_n": 5, "tags": ["project/auth"], "all": ["type/decision"], "any": ["status/reviewed", "status/draft"], "none": ["status/archived"]}'
+  -d '{"query": "authentication architecture", "top_n": 5, "scope": ["project/auth"], "all": ["type/decision"], "any": ["status/reviewed", "status/draft"], "none": ["status/archived"]}'
 
 # Read a note, or one of its sections
 curl "http://localhost:3000/api/read?file=01-Projects/API-Design.md" \

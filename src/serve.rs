@@ -114,7 +114,7 @@ impl EngraphServer {
     ) -> Result<CallToolResult, McpError> {
         // Per call, with the configured default behind it (#62).
         let top_n = params.0.top_n.unwrap_or(self.top_n);
-        let all_terms = crate::tags::merge_all_alias(params.0.tags, params.0.all);
+        let all_terms = crate::tags::merge_scope_alias(params.0.scope, params.0.all);
         let scope = crate::tags::Scope::parse(&all_terms, &params.0.any, &params.0.none)
             .map_err(|e| mcp_err(&e))?;
         let store = self.store.lock().await;
@@ -206,7 +206,7 @@ impl EngraphServer {
             vault_path: &self.vault_path,
             profile: self.profile.as_ref().as_ref(),
         };
-        let all_terms = crate::tags::merge_all_alias(params.0.tags, params.0.all);
+        let all_terms = crate::tags::merge_scope_alias(params.0.scope, params.0.all);
         let tags = crate::tags::Scope::parse(&all_terms, &params.0.any, &params.0.none)
             .map_err(|e| mcp_err(&e))?;
         let items = context::context_list(
@@ -293,7 +293,7 @@ impl EngraphServer {
         &self,
         params: Parameters<crate::params::Topic>,
     ) -> Result<CallToolResult, McpError> {
-        let all_terms = crate::tags::merge_all_alias(params.0.tags, params.0.all);
+        let all_terms = crate::tags::merge_scope_alias(params.0.scope, params.0.all);
         let scope = crate::tags::Scope::parse(&all_terms, &params.0.any, &params.0.none)
             .map_err(|e| mcp_err(&e))?;
         let store = self.store.lock().await;
@@ -1223,7 +1223,7 @@ mod tests {
         crate::params::Topic {
             query: "warding".to_string(),
             budget: 32000,
-            tags: vec![],
+            scope: vec![],
             all,
             any: vec![],
             none: vec![],
@@ -1446,7 +1446,7 @@ mod tests {
             top_n: None,
             explain,
             group_by,
-            tags: vec![],
+            scope: vec![],
             all: vec![],
             any: vec![],
             none: vec![],

@@ -39,7 +39,7 @@ pub struct Search {
     /// An alias of `all`.
     #[arg(long, value_delimiter = ',')]
     #[serde(default, deserialize_with = "deserialize_tag_list")]
-    pub tags: Vec<String>,
+    pub scope: Vec<String>,
     /// Filter to notes carrying every term. A term is a tag path; a trailing
     /// `/` or `/*` matches the tag and its descendants. An unknown term is
     /// an error naming the nearest tag the vault holds (#60).
@@ -86,7 +86,7 @@ pub struct List {
     /// An alias of `all`.
     #[arg(long, value_delimiter = ',')]
     #[serde(default, deserialize_with = "deserialize_tag_list")]
-    pub tags: Vec<String>,
+    pub scope: Vec<String>,
     /// Filter to notes carrying at least one of these terms. An unknown
     /// term is an error naming the nearest tag the vault holds (#60).
     #[arg(long, value_delimiter = ',')]
@@ -155,7 +155,7 @@ pub struct Topic {
     /// An alias of `all`.
     #[arg(long, value_delimiter = ',')]
     #[serde(default, deserialize_with = "deserialize_tag_list")]
-    pub tags: Vec<String>,
+    pub scope: Vec<String>,
     /// Gather context from notes carrying every term. A term is a tag path; a
     /// trailing `/` or `/*` matches the tag and its descendants. An unknown
     /// term is an error naming the nearest tag the vault holds (#64).

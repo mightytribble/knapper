@@ -391,7 +391,7 @@ async fn handle_search(
     authorize(&headers, &state, false)?;
     // Per call, with the configured default behind it (#62).
     let top_n = body.top_n.unwrap_or(state.top_n);
-    let all_terms = crate::tags::merge_all_alias(body.tags, body.all);
+    let all_terms = crate::tags::merge_scope_alias(body.scope, body.all);
     let scope = crate::tags::Scope::parse(&all_terms, &body.any, &body.none)
         .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
     let store = state.store.lock().await;
@@ -477,7 +477,7 @@ async fn handle_list(
         vault_path: &state.vault_path,
         profile: state.profile.as_ref().as_ref(),
     };
-    let all_terms = crate::tags::merge_all_alias(params.tags, params.all);
+    let all_terms = crate::tags::merge_scope_alias(params.scope, params.all);
     let filter = crate::tags::Scope::parse(&all_terms, &params.any, &params.none)
         .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
     let items = context::context_list(
@@ -571,7 +571,7 @@ async fn handle_topic(
     Json(body): Json<crate::params::Topic>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, false)?;
-    let all_terms = crate::tags::merge_all_alias(body.tags, body.all);
+    let all_terms = crate::tags::merge_scope_alias(body.scope, body.all);
     let scope = crate::tags::Scope::parse(&all_terms, &body.any, &body.none)
         .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
     let store = state.store.lock().await;
@@ -1386,7 +1386,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .header("authorization", "Bearer eg_readkey")
                     .body(Body::from(
-                        r#"{"query":"warding","all":null,"any":null,"none":null,"tags":null}"#,
+                        r#"{"query":"warding","all":null,"any":null,"none":null,"scope":null}"#,
                     ))
                     .unwrap(),
             )
