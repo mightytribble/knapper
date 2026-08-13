@@ -282,7 +282,7 @@ Returns orphan notes (no links in or out), broken wikilinks, stale notes, and ta
 | Method | Endpoint | Permission | Description |
 |--------|----------|------------|-------------|
 | GET | `/api/health-check` | read | Server health check |
-| POST | `/api/search` | read | Hybrid search (semantic + FTS5 + graph + reranker + temporal) |
+| POST | `/api/search` | read | Hybrid search (semantic + FTS5 + graph + reranker + temporal), scoped by tag terms (`tags`/`all`, `any`, `none`) |
 | GET | `/api/read/{file}` | read | Read full note content + metadata |
 | GET | `/api/read-section` | read | Read a specific section by heading |
 | GET | `/api/list` | read | List notes by folder and tag terms (`tags`/`all`, `any`, `none`), creator, limit |
@@ -327,6 +327,12 @@ curl -X POST http://localhost:3000/api/search \
   -H "Authorization: Bearer eg_..." \
   -H "Content-Type: application/json" \
   -d '{"query": "authentication architecture", "top_n": 5}'
+
+# Search, scoped to a tag filter (tags/all, any, none)
+curl -X POST http://localhost:3000/api/search \
+  -H "Authorization: Bearer eg_..." \
+  -H "Content-Type: application/json" \
+  -d '{"query": "authentication architecture", "top_n": 5, "tags": ["project/auth"], "all": ["type/decision"], "any": ["status/reviewed", "status/draft"], "none": ["status/archived"]}'
 
 # Read a note
 curl http://localhost:3000/api/read/01-Projects/API-Design.md \

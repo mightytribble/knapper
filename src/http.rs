@@ -254,15 +254,15 @@ struct SearchBody {
     top_n: Option<usize>,
     /// The tag scope (#60). A JSON body reads an array, unlike `/api/list`,
     /// whose query string reads one comma-separated value because
-    /// `serde_urlencoded` has no sequence support.
-    #[serde(default)]
-    tags: Vec<String>,
-    #[serde(default)]
-    all: Vec<String>,
-    #[serde(default)]
-    any: Vec<String>,
-    #[serde(default)]
-    none: Vec<String>,
+    /// `serde_urlencoded` has no sequence support. `Option` rather than a
+    /// bare `Vec` with `#[serde(default)]`, because `#[serde(default)]`
+    /// covers a missing field only — a caller that serialises an absent
+    /// optional as an explicit JSON `null` (routine in JavaScript and
+    /// Python) would fail deserialization and never reach `handle_search`.
+    tags: Option<Vec<String>>,
+    all: Option<Vec<String>>,
+    any: Option<Vec<String>>,
+    none: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -513,9 +513,14 @@ async fn handle_search(
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, false)?;
     let top_n = body.top_n.unwrap_or(10);
-    let all_terms = crate::tags::merge_all_alias(body.tags, body.all);
-    let scope = crate::tags::TagFilter::parse(&all_terms, &body.any, &body.none)
-        .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
+    let all_terms =
+        crate::tags::merge_all_alias(body.tags.unwrap_or_default(), body.all.unwrap_or_default());
+    let scope = crate::tags::TagFilter::parse(
+        &all_terms,
+        &body.any.unwrap_or_default(),
+        &body.none.unwrap_or_default(),
+    )
+    .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
     let store = state.store.lock().await;
     let mut embedder = state.embedder.lock().await;
 
@@ -1479,6 +1484,31 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn a_search_body_with_an_explicit_null_scope_field_is_not_rejected() {
+        // #60. `#[serde(default)]` on a bare `Vec<String>` covers a missing
+        // field only. A client that serialises an absent optional as JSON
+        // `null` — routine in JavaScript and Python — would fail to
+        // deserialize and never reach `handle_search`, answering 422 instead
+        // of running an unscoped search. `Option<Vec<String>>` reads `null`
+        // the same way it reads a missing field.
+        let state = test_api_state();
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/search")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer eg_readkey")
+                    .body(Body::from(r#"{"query":"warding","all":null}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

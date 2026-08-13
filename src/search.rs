@@ -2004,9 +2004,11 @@ mod tests {
     #[test]
     fn a_dated_note_outside_the_scope_is_not_a_restart_point() {
         // #60. A temporal seed asserts the note is a candidate answer, so the
-        // scope reaches it. `journal.md` is the only note in the query's date
-        // range and the only note linking to `ledger.md`, so a graph
-        // contribution for `ledger.md` is the seed's own signature.
+        // scope reaches it. `journal.md` is the only note linking to
+        // `ledger.md`, but unscoped it is already a graph seed through the
+        // content lanes too, so the scoped assertion is the one that proves
+        // the temporal path: out of scope, `journal.md` earns neither seed,
+        // and `ledger.md` loses its graph credit only because of that.
         let (_tmp, store, mut embedder) = dated_vault();
         let query = "warding 2024-03-15";
 
