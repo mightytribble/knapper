@@ -201,12 +201,6 @@ pub enum Command {
         read_only: bool,
     },
 
-    /// Inspect vault graph connections.
-    Graph {
-        #[command(subcommand)]
-        action: GraphAction,
-    },
-
     /// Query vault context.
     Context {
         #[command(subcommand)]
@@ -224,17 +218,6 @@ pub enum Command {
         #[command(subcommand)]
         action: MigrateAction,
     },
-}
-
-#[derive(Subcommand, Debug)]
-pub enum GraphAction {
-    /// Show connections for a note.
-    Show {
-        /// File path or #docid.
-        file: String,
-    },
-    /// Show vault graph statistics.
-    Stats,
 }
 
 #[derive(Subcommand, Debug)]

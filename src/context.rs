@@ -22,12 +22,21 @@ pub struct NoteContent {
     pub tags: Vec<String>,
     pub frontmatter: String,
     pub body: String,
-    pub outgoing_links: Vec<String>,
-    pub incoming_links: Vec<String>,
-    pub mentions_people: Vec<String>,
-    pub mentioned_by: Vec<String>,
+    pub outgoing_links: Vec<LinkRef>,
+    pub incoming_links: Vec<LinkRef>,
+    pub mentions_people: Vec<LinkRef>,
+    pub mentioned_by: Vec<LinkRef>,
     pub byte_count: usize,
     pub section: Option<SectionSpan>,
+}
+
+/// A link's other end. The docid is here because `graph show` printed it
+/// beside every path and `read` did not, and `read` is now the one answer
+/// to "what does this note connect to" (#62).
+#[derive(Debug, Serialize, PartialEq)]
+pub struct LinkRef {
+    pub path: String,
+    pub docid: Option<String>,
 }
 
 /// Where a section sits in its file. `read` reports it when a section was
@@ -247,29 +256,45 @@ pub fn context_read(
         }
     };
 
-    let outgoing_links: Vec<String> = params
+    let outgoing_links: Vec<LinkRef> = params
         .store
         .get_outgoing(record.id, Some("wikilink"))?
         .iter()
-        .filter_map(|(fid, _)| params.store.get_file_path_by_id(*fid).ok().flatten())
+        .filter_map(|(fid, _)| params.store.get_file_by_id(*fid).ok().flatten())
+        .map(|f| LinkRef {
+            path: f.path,
+            docid: f.docid,
+        })
         .collect();
-    let incoming_links: Vec<String> = params
+    let incoming_links: Vec<LinkRef> = params
         .store
         .get_incoming(record.id, Some("wikilink"))?
         .iter()
-        .filter_map(|(fid, _)| params.store.get_file_path_by_id(*fid).ok().flatten())
+        .filter_map(|(fid, _)| params.store.get_file_by_id(*fid).ok().flatten())
+        .map(|f| LinkRef {
+            path: f.path,
+            docid: f.docid,
+        })
         .collect();
-    let mentions_people: Vec<String> = params
+    let mentions_people: Vec<LinkRef> = params
         .store
         .get_outgoing(record.id, Some("mention"))?
         .iter()
-        .filter_map(|(fid, _)| params.store.get_file_path_by_id(*fid).ok().flatten())
+        .filter_map(|(fid, _)| params.store.get_file_by_id(*fid).ok().flatten())
+        .map(|f| LinkRef {
+            path: f.path,
+            docid: f.docid,
+        })
         .collect();
-    let mentioned_by: Vec<String> = params
+    let mentioned_by: Vec<LinkRef> = params
         .store
         .get_incoming(record.id, Some("mention"))?
         .iter()
-        .filter_map(|(fid, _)| params.store.get_file_path_by_id(*fid).ok().flatten())
+        .filter_map(|(fid, _)| params.store.get_file_by_id(*fid).ok().flatten())
+        .map(|f| LinkRef {
+            path: f.path,
+            docid: f.docid,
+        })
         .collect();
 
     let byte_count = content.len();
@@ -1192,14 +1217,19 @@ mod tests {
         assert!(snap <= 6);
     }
 
-    /// A vault of one person note, with a `Role` and an `Interactions`
-    /// section, and an outgoing wikilink to `colleague.md` — Task 9 reuses
-    /// this fixture and needs that link on `person.md`.
-    fn section_fixture() -> (Store, std::path::PathBuf) {
+    /// A vault of one person note, with a `person` tag, a `Role` and an
+    /// `Interactions` section, and an outgoing wikilink to `colleague.md` —
+    /// Task 9 reuses this fixture and needs that link on `person.md`.
+    ///
+    /// The frontmatter block is real (not empty) so a span measured against
+    /// the frontmatter-stripped body, rather than the whole file
+    /// `find_section` reads, would be caught by a test pinning the exact
+    /// line numbers.
+    fn section_fixture() -> (Store, std::path::PathBuf, TempDir) {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().to_path_buf();
         let store = Store::open_memory().unwrap();
-        let content = "# Person\n\n## Role\n\nEngineer\n\n## Interactions\n\nMet on 2026-03-26. See [[colleague]].\n";
+        let content = "---\ntags:\n  - person\n---\n# Person\n\n## Role\n\nEngineer\n\n## Interactions\n\nMet on 2026-03-26. See [[colleague]].\n";
         std::fs::write(root.join("person.md"), content).unwrap();
         std::fs::write(root.join("colleague.md"), "# Colleague\n").unwrap();
         store
@@ -1210,19 +1240,18 @@ mod tests {
             .unwrap();
         let f1 = store.get_file("person.md").unwrap().unwrap().id;
         let f2 = store.get_file("colleague.md").unwrap().unwrap().id;
+        store.reconcile_file_tags(f1, &[tag("person")]).unwrap();
         store
             .insert_edge(f1, DOC_LEVEL, f2, DOC_LEVEL, "wikilink")
             .unwrap();
-        // `tmp` must outlive the test but the helper returns only two
-        // values, so leak the directory rather than the whole TempDir.
-        (store, tmp.keep())
+        (store, root, tmp)
     }
 
     #[test]
     fn reading_a_section_narrows_the_content_and_keeps_the_file_facts() {
         // Reuse whatever fixture `test_read_section` builds: a store, a vault
         // root and a `person.md` holding an `Interactions` section.
-        let (store, root) = section_fixture();
+        let (store, root, _tmp) = section_fixture();
         let params = ContextParams {
             store: &store,
             vault_path: &root,
@@ -1236,15 +1265,36 @@ mod tests {
         assert!(whole.content.contains(part.content.trim()));
         assert!(part.content.len() < whole.content.len());
 
-        // A section carries its own span.
+        // A section carries its own span, measured against the whole file
+        // `find_section` reads — not the frontmatter-stripped body, four
+        // lines shorter in this fixture.
         let span = part.section.expect("a section read reports its span");
         assert_eq!(span.heading, "Interactions");
-        assert!(span.line_end > span.line_start);
+        assert_eq!(span.line_start, 11);
+        assert_eq!(span.line_end, 13);
         assert!(whole.section.is_none());
 
         // The file-level facts are the file's, whichever way it is read.
         assert_eq!(part.path, whole.path);
         assert_eq!(part.tags, whole.tags);
+        assert!(!part.tags.is_empty(), "the fixture's tag must round-trip");
         assert_eq!(part.outgoing_links, whole.outgoing_links);
+
+        // A heading the note does not have is an error, not an empty section.
+        assert!(context_read(&params, "person.md", Some("Nope")).is_err());
+    }
+
+    #[test]
+    fn a_link_carries_the_docid_the_graph_view_used_to_print() {
+        let (store, root, _tmp) = section_fixture();
+        let params = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+        let note = context_read(&params, "person.md", None).unwrap();
+        let first = note.outgoing_links.first().expect("a link");
+        assert!(!first.path.is_empty());
+        assert!(first.docid.is_some(), "a link names the file's docid");
     }
 }

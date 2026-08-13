@@ -241,7 +241,6 @@ pub const PENDING_CLI: &[Pending] = &[
     Pending::NotYetAdded("archive"),
     Pending::NotYetRemoved("context"),
     Pending::NotYetRemoved("write"),
-    Pending::NotYetRemoved("graph"),
 ];
 
 /// What the MCP server has yet to bring onto the table (#62).

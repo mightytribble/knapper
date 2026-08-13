@@ -9,7 +9,7 @@ use crate::fusion::{self, FusedResult, RankedResult};
 use crate::graph;
 use crate::llm::{self, EmbedModel, RerankModel};
 use crate::ranking;
-use crate::store::{Store, StoreStats};
+use crate::store::{EdgeStats, Store, StoreStats};
 
 /// A single search result with metadata.
 pub struct SearchResult {
@@ -1260,6 +1260,7 @@ pub fn run_status(json: bool, data_dir: &Path) -> Result<()> {
     let db_path = data_dir.join("engraph.db");
     let store = Store::open(&db_path).context("opening store")?;
     let stats = store.stats()?;
+    let edges = store.get_edge_stats()?;
     let date_count = store.count_files_with_dates().unwrap_or(0);
 
     // Compute index size on disk (sqlite db file).
@@ -1276,6 +1277,7 @@ pub fn run_status(json: bool, data_dir: &Path) -> Result<()> {
 
     let output = format_status(
         &stats,
+        &edges,
         index_size,
         model_name,
         intelligence,
@@ -1351,8 +1353,13 @@ pub fn format_results(results: &[SearchResult], json: bool) -> String {
 }
 
 /// Format status information for display (pure function, no I/O).
+///
+/// `edges` folds in `graph stats` (#62): `status` is what answers "what is in
+/// the index", so the connectivity counts belong beside the file and chunk
+/// counts rather than behind a second command.
 pub fn format_status(
     stats: &StoreStats,
+    edges: &EdgeStats,
     index_size: u64,
     model_name: &str,
     intelligence: &str,
@@ -1361,6 +1368,13 @@ pub fn format_status(
 ) -> String {
     let vault = stats.vault_path.as_deref().unwrap_or("<not set>");
     let last_indexed = stats.last_indexed_at.as_deref().unwrap_or("never");
+    let wikilink_pairs = edges.wikilink_count / 2;
+    let total_files = edges.connected_file_count + edges.isolated_file_count;
+    let connected_pct = if total_files > 0 {
+        edges.connected_file_count as f64 / total_files as f64 * 100.0
+    } else {
+        0.0
+    };
 
     if json {
         let mut obj = json!({
@@ -1374,13 +1388,17 @@ pub fn format_status(
             "intelligence": intelligence,
             "files_with_dates": date_count,
         });
-        if let (Some(edges), Some(wl), Some(mn)) =
+        if let (Some(edge_count), Some(wl), Some(mn)) =
             (stats.edge_count, stats.wikilink_count, stats.mention_count)
         {
-            obj["edges"] = json!(edges);
+            obj["edges"] = json!(edge_count);
             obj["wikilink_edges"] = json!(wl);
             obj["mention_edges"] = json!(mn);
         }
+        obj["wikilink_pairs"] = json!(wikilink_pairs);
+        obj["connected_files"] = json!(edges.connected_file_count);
+        obj["total_files"] = json!(total_files);
+        obj["isolated_files"] = json!(edges.isolated_file_count);
         format!("{}\n", serde_json::to_string_pretty(&obj).unwrap())
     } else {
         let mut out = format!(
@@ -1389,14 +1407,27 @@ pub fn format_status(
              Chunks:     {}\n",
             vault, stats.file_count, stats.chunk_count,
         );
-        if let (Some(edges), Some(wl), Some(mn)) =
+        if let (Some(edge_count), Some(wl), Some(mn)) =
             (stats.edge_count, stats.wikilink_count, stats.mention_count)
         {
             out.push_str(&format!(
                 "Edges:      {} ({} wikilinks, {} mentions)\n",
-                edges, wl, mn
+                edge_count, wl, mn
             ));
         }
+        out.push_str(&format!(
+            "  Wikilink edges:  {} ({} bidirectional pairs)\n",
+            edges.wikilink_count, wikilink_pairs
+        ));
+        out.push_str(&format!("  Mention edges:   {}\n", edges.mention_count));
+        out.push_str(&format!(
+            "  Connected files: {} / {} ({:.1}%)\n",
+            edges.connected_file_count, total_files, connected_pct
+        ));
+        out.push_str(&format!(
+            "  Isolated files:  {}\n",
+            edges.isolated_file_count
+        ));
         out.push_str(&format!(
             "Dates:      {}/{} files\n\
              Tombstones: {} (pending cleanup)\n\
@@ -1527,6 +1558,16 @@ mod tests {
         assert_eq!(json_output, "[]\n", "the array channel keeps its shape");
     }
 
+    fn sample_edge_stats() -> EdgeStats {
+        EdgeStats {
+            total_edges: 10,
+            wikilink_count: 6,
+            mention_count: 4,
+            connected_file_count: 8,
+            isolated_file_count: 2,
+        }
+    }
+
     #[test]
     fn test_format_status_human() {
         let stats = StoreStats {
@@ -1539,7 +1580,15 @@ mod tests {
             wikilink_count: None,
             mention_count: None,
         };
-        let output = format_status(&stats, 2_516_582, "all-MiniLM-L6-v2", "disabled", 30, false);
+        let output = format_status(
+            &stats,
+            &sample_edge_stats(),
+            2_516_582,
+            "all-MiniLM-L6-v2",
+            "disabled",
+            30,
+            false,
+        );
 
         assert!(output.contains("/path/to/vault"), "missing vault path");
         assert!(output.contains("42"), "missing file count");
@@ -1550,6 +1599,40 @@ mod tests {
         assert!(output.contains("2.4 MB"), "missing index size");
         assert!(output.contains("all-MiniLM-L6-v2"), "missing model");
         assert!(output.contains("disabled"), "missing intelligence");
+    }
+
+    /// `status` absorbs `graph stats` (#62): the connectivity counts that
+    /// used to need a second command are printed here.
+    #[test]
+    fn status_reports_the_edge_counts_graph_stats_used_to_own() {
+        let stats = StoreStats {
+            file_count: 10,
+            chunk_count: 20,
+            tombstone_count: 0,
+            last_indexed_at: Some("2026-03-19 14:30:00".to_string()),
+            vault_path: Some("/path/to/vault".to_string()),
+            edge_count: Some(10),
+            wikilink_count: Some(6),
+            mention_count: Some(4),
+        };
+        let output = format_status(
+            &stats,
+            &sample_edge_stats(),
+            2_516_582,
+            "all-MiniLM-L6-v2",
+            "disabled",
+            10,
+            false,
+        );
+
+        assert!(
+            output.contains("Wikilink edges:"),
+            "graph stats's wikilink line is missing: {output}"
+        );
+        assert!(output.contains("6 (3 bidirectional pairs)"));
+        assert!(output.contains("Mention edges:   4"));
+        assert!(output.contains("Connected files: 8 / 10 (80.0%)"));
+        assert!(output.contains("Isolated files:  2"));
     }
 
     #[test]
@@ -1564,7 +1647,15 @@ mod tests {
             wikilink_count: None,
             mention_count: None,
         };
-        let output = format_status(&stats, 2_516_582, "all-MiniLM-L6-v2", "enabled", 30, true);
+        let output = format_status(
+            &stats,
+            &sample_edge_stats(),
+            2_516_582,
+            "all-MiniLM-L6-v2",
+            "enabled",
+            30,
+            true,
+        );
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
 
         assert_eq!(parsed["vault"], "/path/to/vault");
@@ -1576,6 +1667,11 @@ mod tests {
         assert_eq!(parsed["model"], "all-MiniLM-L6-v2");
         assert_eq!(parsed["intelligence"], "enabled");
         assert_eq!(parsed["files_with_dates"], 30);
+        // The printed and JSON views report the same numbers.
+        assert_eq!(parsed["wikilink_pairs"], 3);
+        assert_eq!(parsed["connected_files"], 8);
+        assert_eq!(parsed["total_files"], 10);
+        assert_eq!(parsed["isolated_files"], 2);
     }
 
     #[test]
