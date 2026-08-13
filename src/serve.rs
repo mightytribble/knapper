@@ -50,14 +50,6 @@ pub struct UnarchiveParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct ReadSectionParams {
-    /// Target note: file path, basename, or #docid.
-    pub file: String,
-    /// Section heading to read (case-insensitive).
-    pub heading: String,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
 pub struct HealthParams {}
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -358,7 +350,8 @@ impl EngraphServer {
             vault_path: &self.vault_path,
             profile: self.profile.as_ref().as_ref(),
         };
-        let note = context::context_read(&ctx, &params.0.file).map_err(|e| mcp_err(&e))?;
+        let note = context::context_read(&ctx, &params.0.file, params.0.section.as_deref())
+            .map_err(|e| mcp_err(&e))?;
         to_json_result(&note)
     }
 
@@ -650,21 +643,6 @@ impl EngraphServer {
             &self.vault_path,
         )
         .map_err(|e| mcp_err(&e))?;
-        to_json_result(&result)
-    }
-
-    #[tool(
-        name = "read_section",
-        description = "Read a specific heading section from a note. Returns content from that heading to the next same-level heading."
-    )]
-    async fn read_section(
-        &self,
-        params: Parameters<ReadSectionParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let store = self.store.lock().await;
-        let result =
-            context::read_section(&store, &self.vault_path, &params.0.file, &params.0.heading)
-                .map_err(|e| mcp_err(&e))?;
         to_json_result(&result)
     }
 
@@ -979,7 +957,7 @@ impl rmcp::handler::server::ServerHandler for EngraphServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "engraph: vault intelligence for Obsidian. \
-                 Read: vault_map to orient, tags for the tag vocabulary, search to find, read/read_section for content, who/project for context bundles, health for vault diagnostics. \
+                 Read: vault_map to orient, tags for the tag vocabulary, search to find, read for content (a section parameter narrows it), who/project for context bundles, health for vault diagnostics. \
                  Write: create for new notes, append to add content, edit to modify a section, rewrite to replace body, \
                  edit_frontmatter for tags/properties, update_metadata for bulk tag/alias replacement. \
                  Lifecycle: move_note to relocate, archive to soft-delete, unarchive to restore, delete for permanent removal. \

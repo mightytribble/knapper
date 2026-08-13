@@ -8,7 +8,6 @@ pub fn build_openapi_spec(server_url: &str) -> serde_json::Value {
     paths.insert("/api/health-check".into(), build_health_check());
     paths.insert("/api/search".into(), build_search());
     paths.insert("/api/read".into(), build_read());
-    paths.insert("/api/read-section".into(), build_read_section());
     paths.insert("/api/list".into(), build_list());
     paths.insert("/api/tags".into(), build_tags());
     paths.insert("/api/vault-map".into(), build_vault_map());
@@ -104,26 +103,19 @@ fn build_read() -> serde_json::Value {
         "get": {
             "operationId": "readNote",
             "summary": "Read a note's full content with metadata and graph connections.",
-            "parameters": [{
-                "name": "file", "in": "query", "required": true,
-                "description": "File path, basename, or #docid",
-                "schema": { "type": "string" }
-            }],
-            "responses": { "200": { "description": "Note content with metadata" } }
-        }
-    })
-}
-
-fn build_read_section() -> serde_json::Value {
-    serde_json::json!({
-        "get": {
-            "operationId": "readSection",
-            "summary": "Read a specific section of a note by heading name.",
             "parameters": [
-                { "name": "file", "in": "query", "required": true, "description": "File path, basename, or #docid", "schema": { "type": "string" } },
-                { "name": "heading", "in": "query", "required": true, "description": "Section heading (case-insensitive)", "schema": { "type": "string" } }
+                {
+                    "name": "file", "in": "query", "required": true,
+                    "description": "File path, basename, or #docid",
+                    "schema": { "type": "string" }
+                },
+                {
+                    "name": "section", "in": "query", "required": false,
+                    "description": "Read one section by its heading. Omit for the whole note.",
+                    "schema": { "type": "string" }
+                }
             ],
-            "responses": { "200": { "description": "Section content" } }
+            "responses": { "200": { "description": "Note content with metadata" } }
         }
     })
 }
@@ -654,7 +646,6 @@ mod tests {
             "healthCheck",
             "searchVault",
             "readNote",
-            "readSection",
             "listNotes",
             "listTags",
             "getVaultMap",

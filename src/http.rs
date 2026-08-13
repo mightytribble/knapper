@@ -248,12 +248,6 @@ pub fn generate_api_key() -> String {
 // Request body / query structs
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
-struct ReadSectionQuery {
-    file: String,
-    heading: String,
-}
-
 // -- Write request bodies --
 
 #[derive(Debug, Deserialize)]
@@ -334,7 +328,6 @@ pub fn routes() -> Vec<(&'static str, MethodRouter<ApiState>)> {
         ("/api/health-check", get(health_check)),
         ("/api/search", post(handle_search)),
         ("/api/read", get(handle_read)),
-        ("/api/read-section", get(handle_read_section)),
         ("/api/list", get(handle_list)),
         ("/api/tags", get(handle_tags)),
         ("/api/vault-map", get(handle_vault_map)),
@@ -474,21 +467,9 @@ async fn handle_read(
         vault_path: &state.vault_path,
         profile: state.profile.as_ref().as_ref(),
     };
-    let note =
-        context::context_read(&ctx, &p.file).map_err(|e| ApiError::internal(&format!("{e:#}")))?;
-    Ok(Json(serde_json::json!(note)))
-}
-
-async fn handle_read_section(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Query(params): Query<ReadSectionQuery>,
-) -> Result<impl IntoResponse, ApiError> {
-    authorize(&headers, &state, false)?;
-    let store = state.store.lock().await;
-    let result = context::read_section(&store, &state.vault_path, &params.file, &params.heading)
+    let note = context::context_read(&ctx, &p.file, p.section.as_deref())
         .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
-    Ok(Json(serde_json::json!(result)))
+    Ok(Json(serde_json::json!(note)))
 }
 
 async fn handle_list(

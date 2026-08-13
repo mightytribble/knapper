@@ -648,7 +648,7 @@ async fn main() -> Result<()> {
 
             match action {
                 ContextAction::Read { file } => {
-                    let note = engraph::context::context_read(&params, &file)?;
+                    let note = engraph::context::context_read(&params, &file, None)?;
                     if cli.json {
                         println!("{}", serde_json::to_string_pretty(&note)?);
                     } else {
