@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased — List the vault's files ([#68](https://github.com/mightytribble/engraph/issues/68))
+
+`engraph list` is the call an agent makes to see a vault it cannot read: every note the scope admits, in path order, one bare path per line, and each note's heading outline under `--detailed`.
+
+### Removed
+
+- **`list --folder`**, and the `folder` parameter on the MCP `list` tool and `GET /api/list`. A directory filter is a scope term: `--scope /lore/` — a leading `/` reads a term as a directory path, a trailing `/` its subtree — which is a case-sensitive range anchored at the path boundary, where `--folder lore` was a `LIKE 'lore%'` that folded case, read `_` as a wildcard and matched `lorekeeper.md`. `store::list_files` keeps its `folder` argument for `project`'s sibling gather, which is not a caller-typed filter.
+
+### Added
+
+- **`list --detailed`** answers each note's ATX heading outline beneath its path. The outline is read from the file, because the index cannot hold it: a short section merges into the chunk before it, an empty heading emits no chunk, and a promoted bold line sits in `chunks.heading` beside real headings. `NoteListItem` gains `headings: Option<Vec<Heading>>` — level, text, and a 1-based line — absent unless `detailed` is set, so an undetailed listing serialises as it did before. On the CLI the headings print as their own `#` markers under the path; over MCP and HTTP they are structured. `detailed=true` is required on the HTTP query string, because `serde_urlencoded` reads no bare flag. A note whose file is missing on disk lists with an empty outline and no error.
+
+### Changed
+
+- **`list` answers in path order** (`ORDER BY f.path`, SQLite `BINARY` collation, so `Lore/` sorts before `lore/`), where it answered most-recently-indexed first. A folder's notes now arrive together and a subtree scope reads as one block. `project`'s sibling gather takes the same ordering: the first 50 of the folder in path order.
+- **`list`'s limit is unbounded by default.** It was capped at 20. An absent `--limit` now emits no `LIMIT` clause, so a bare `engraph list` answers every note the scope admits, and a caller that wants less names a scope or a `--limit`; `--limit 0` answers none. The default is the same on every surface, so no one surface silently caps the whole vault.
+- **The CLI's plain `list` output is one bare path per line** and nothing else — no docid, tags, edge count, or trailing total — so it pipes and `wc -l` is the total. The path is relative to the vault root, the form `read`, `update` and `move` take, so a listed path pastes into the next call. `--json` still answers the full `NoteListItem` array.
+- **Test count: 877 → 893.**
+
 ## Unreleased — One name per capability ([#62](https://github.com/mightytribble/engraph/issues/62))
 
 Every capability now has one name and one parameter set on the CLI, the MCP server and the HTTP API. The name is one word in `kebab-case`, and each surface spells it its own way: the CLI command as written, the MCP tool with `-` as `_`, and the HTTP route under `/api/` and the name. One transform gets from any spelling to any other.
