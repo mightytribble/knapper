@@ -40,7 +40,7 @@ engraph search "warding" --all type/undead      # Only notes carrying the tag
 | `-n, --top-n <N>` | Number of results (default: `top_n` in `config.toml`) |
 | `--explain`       | Show per-lane RRF score breakdown              |
 | `--json`          | Machine-readable JSON output                   |
-| `--all`/`--any`/`--none` | Answer from the notes these tag terms admit. `--tags` is an alias of `--all` |
+| `--all`/`--any`/`--none` | Answer from the notes these tag terms admit. `--scope` is an alias of `--all` |
 
 ### Query Tips
 
@@ -66,7 +66,7 @@ engraph project "Project Name"
 engraph vault-map                 # Collection structure overview
 engraph read "path/to/note.md"    # Full content + metadata
 engraph read "path/to/note.md" --section "Action Items"   # One section
-engraph list --tags architecture  # Filter by tags, folder, created_by, etc.
+engraph list --scope architecture  # Filter by tags, folder, created_by, etc.
 engraph tags --under type/        # The tag vocabulary, whole or under one term
 ```
 
@@ -83,7 +83,7 @@ engraph archive "Old Draft"          # --undo restores it
 engraph delete "Old Draft" --mode soft
 ```
 
-> One capability, one name, three surfaces: `engraph tags` is the MCP `tags` tool and `GET /api/tags`; `engraph list` is the MCP `list` tool and `GET /api/list`. A CLI command's name becomes the MCP tool by writing `-` as `_`, and the HTTP route by putting it under `/api/`. The tag operators are `--all`/`--any`/`--none` on the CLI, spelled `all`/`any`/`none` on both other surfaces, with `tags` an alias of `all`.
+> One capability, one name, three surfaces: `engraph tags` is the MCP `tags` tool and `GET /api/tags`; `engraph list` is the MCP `list` tool and `GET /api/list`. A CLI command's name becomes the MCP tool by writing `-` as `_`, and the HTTP route by putting it under `/api/`. The tag operators are `--all`/`--any`/`--none` on the CLI, spelled `all`/`any`/`none` on both other surfaces, with `scope` an alias of `all`.
 
 > Health diagnostics (orphans, broken links, stale notes, tag hygiene) are `engraph health`, the MCP `health` tool and the HTTP `GET /api/health` endpoint — see `references/http-rest-api.md`.
 

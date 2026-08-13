@@ -127,7 +127,7 @@ pub struct SearchConfig<'a> {
     /// blocks this path when they are not.
     pub fts: crate::config::FtsConfig,
     /// The notes this query may answer from (#60). Empty means the whole vault.
-    pub scope: crate::tags::TagFilter,
+    pub scope: crate::tags::Scope,
 }
 
 impl<'a> SearchConfig<'a> {
@@ -143,7 +143,7 @@ impl<'a> SearchConfig<'a> {
             ranking: config.ranking,
             lane_weights: config.lane_weights,
             fts: config.fts,
-            scope: crate::tags::TagFilter::default(),
+            scope: crate::tags::Scope::default(),
         }
     }
 }
@@ -159,7 +159,7 @@ pub fn search_internal(
     store: &Store,
     embedder: &mut impl EmbedModel,
     group_by: GroupBy,
-    scope: &crate::tags::TagFilter,
+    scope: &crate::tags::Scope,
 ) -> Result<SearchOutput> {
     let mut config = SearchConfig {
         reranker: None,
@@ -1185,7 +1185,7 @@ pub fn run_search(
     json: bool,
     explain: bool,
     group_by: GroupBy,
-    scope: &crate::tags::TagFilter,
+    scope: &crate::tags::Scope,
     data_dir: &Path,
     config: &crate::config::Config,
 ) -> Result<()> {
@@ -1905,7 +1905,7 @@ mod tests {
             &store,
             &mut embedder,
             GroupBy::Chunk,
-            &crate::tags::TagFilter::default(),
+            &crate::tags::Scope::default(),
         )
         .unwrap();
 
@@ -1971,7 +1971,7 @@ mod tests {
                 retrieval_width,
                 ..crate::config::RankingConfig::default()
             },
-            scope: crate::tags::TagFilter::default(),
+            scope: crate::tags::Scope::default(),
         };
         search_with_intelligence(query, top_n, embedder, &mut config).unwrap()
     }
@@ -2032,7 +2032,7 @@ mod tests {
     /// Run a search under one tag scope, at the shipped defaults.
     fn search_scoped(
         query: &str,
-        scope: crate::tags::TagFilter,
+        scope: crate::tags::Scope,
         store: &Store,
         embedder: &mut impl llm::EmbedModel,
     ) -> Result<SearchOutput> {
@@ -2046,11 +2046,11 @@ mod tests {
     #[test]
     fn a_scope_keeps_the_results_inside_the_tagged_notes() {
         let (_tmp, store, mut embedder) = tagged_vault();
-        let filter = crate::tags::TagFilter::parse(&["type/undead".to_string()], &[], &[]).unwrap();
+        let filter = crate::tags::Scope::parse(&["type/undead".to_string()], &[], &[]).unwrap();
 
         let unscoped = search_scoped(
             "warding",
-            crate::tags::TagFilter::default(),
+            crate::tags::Scope::default(),
             &store,
             &mut embedder,
         )
@@ -2093,7 +2093,7 @@ mod tests {
 
         let a = search_scoped(
             "warding",
-            crate::tags::TagFilter::default(),
+            crate::tags::Scope::default(),
             &store,
             &mut embedder,
         )
@@ -2117,7 +2117,7 @@ mod tests {
             inner: embedder,
             calls: 0,
         };
-        let filter = crate::tags::TagFilter::parse(
+        let filter = crate::tags::Scope::parse(
             &["type/undead".to_string(), "type/beast".to_string()],
             &[],
             &[],
@@ -2141,7 +2141,7 @@ mod tests {
     #[test]
     fn a_scope_naming_no_tag_fails_the_search() {
         let (_tmp, store, mut embedder) = tagged_vault();
-        let filter = crate::tags::TagFilter::parse(&["type/undeed".to_string()], &[], &[]).unwrap();
+        let filter = crate::tags::Scope::parse(&["type/undeed".to_string()], &[], &[]).unwrap();
         // Not `unwrap_err`: a `SearchOutput` is not `Debug`, and giving it one
         // for a test would be the tail wagging the dog.
         let err = match search_scoped("warding", filter, &store, &mut embedder) {
@@ -2221,25 +2221,64 @@ mod tests {
                 .collect()
         };
 
-        let unscoped = search_scoped(
-            query,
-            crate::tags::TagFilter::default(),
-            &store,
-            &mut embedder,
-        )
-        .unwrap();
+        let unscoped =
+            search_scoped(query, crate::tags::Scope::default(), &store, &mut embedder).unwrap();
         assert!(
             graph_credits(&unscoped).contains(&"ledger.md".to_string()),
             "unscoped, the dated note seeds the walk that credits its target"
         );
 
-        let filter = crate::tags::TagFilter::parse(&["type/undead".to_string()], &[], &[]).unwrap();
+        let filter = crate::tags::Scope::parse(&["type/undead".to_string()], &[], &[]).unwrap();
         let scoped = search_scoped(query, filter, &store, &mut embedder).unwrap();
         assert!(
             graph_credits(&scoped).is_empty(),
             "an out-of-scope dated note restarted the walk: {:?}",
             graph_credits(&scoped)
         );
+    }
+
+    /// Two notes on one subject in two folders, so a directory scope has one
+    /// to include and one to exclude.
+    fn foldered_vault() -> (tempfile::TempDir, Store, llm::MockLlm) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("Locations")).unwrap();
+        std::fs::create_dir_all(root.join("People")).unwrap();
+        std::fs::write(
+            root.join("Locations/wight.md"),
+            "# Wight\n\n## Warding\n\nA warding effect that pins an undead creature \
+             in the space it stands in.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("People/wolf.md"),
+            "# Wolf\n\n## Warding\n\nA warding effect that pins a beast in the space \
+             it stands in.\n",
+        )
+        .unwrap();
+        let store = Store::open_memory().unwrap();
+        let mut embedder = llm::MockLlm::new(256);
+        let config = crate::config::Config::default();
+        crate::indexer::run_index_shared(root, &config, &store, &mut embedder, false, None)
+            .unwrap();
+        (tmp, store, embedder)
+    }
+
+    #[test]
+    fn a_directory_scope_keeps_the_search_results_inside_the_folder() {
+        // #65. Reach test: `search_scoped` is #60's wiring, unchanged here.
+        // This proves it already carries a directory term with no production
+        // change.
+        let (_tmp, store, mut embedder) = foldered_vault();
+        let scope = crate::tags::Scope::parse(&["/Locations/".to_string()], &[], &[]).unwrap();
+        let out = search_scoped("warding", scope, &store, &mut embedder).unwrap();
+        assert!(!out.results.is_empty(), "the in-folder note answers");
+        for r in &out.results {
+            assert_eq!(
+                r.file_path, "Locations/wight.md",
+                "an out-of-folder note answered a directory-scoped search"
+            );
+        }
     }
 
     #[test]
@@ -2338,7 +2377,7 @@ mod tests {
         {
             let mut config = SearchConfig {
                 fts: crate::config::FtsConfig::default(),
-                scope: crate::tags::TagFilter::default(),
+                scope: crate::tags::Scope::default(),
                 reranker: Some(&mut reranker),
                 store,
                 rerank_candidates: 30,
@@ -2562,7 +2601,7 @@ mod tests {
         {
             let mut config = SearchConfig {
                 fts: crate::config::FtsConfig::default(),
-                scope: crate::tags::TagFilter::default(),
+                scope: crate::tags::Scope::default(),
                 reranker: Some(&mut reranker),
                 store: &store,
                 rerank_candidates: 30,
@@ -2595,7 +2634,7 @@ mod tests {
         for cap in [1, 2] {
             let mut config = SearchConfig {
                 fts: crate::config::FtsConfig::default(),
-                scope: crate::tags::TagFilter::default(),
+                scope: crate::tags::Scope::default(),
                 reranker: None,
                 store: &store,
                 rerank_candidates: 30,
@@ -2683,7 +2722,7 @@ mod tests {
             let mut reranker = CountingReranker::new();
             let mut config = SearchConfig {
                 fts: crate::config::FtsConfig::default(),
-                scope: crate::tags::TagFilter::default(),
+                scope: crate::tags::Scope::default(),
                 reranker: Some(&mut reranker),
                 store: &store,
                 rerank_candidates: 30,
@@ -2742,7 +2781,7 @@ mod tests {
             let mut reranker = CountingReranker::new();
             let mut config = SearchConfig {
                 fts: crate::config::FtsConfig::default(),
-                scope: crate::tags::TagFilter::default(),
+                scope: crate::tags::Scope::default(),
                 reranker: Some(&mut reranker),
                 store: &store,
                 rerank_candidates: 30,
@@ -2789,7 +2828,7 @@ mod tests {
             let mut reranker = CountingReranker::new();
             let mut config = SearchConfig {
                 fts: crate::config::FtsConfig::default(),
-                scope: crate::tags::TagFilter::default(),
+                scope: crate::tags::Scope::default(),
                 reranker: Some(&mut reranker),
                 store: &store,
                 rerank_candidates: 30,
@@ -2831,7 +2870,7 @@ mod tests {
         {
             let mut config = SearchConfig {
                 fts: crate::config::FtsConfig::default(),
-                scope: crate::tags::TagFilter::default(),
+                scope: crate::tags::Scope::default(),
                 reranker: Some(&mut reranker),
                 store: &store,
                 rerank_candidates: 30,
@@ -2898,7 +2937,7 @@ mod tests {
         let mut reranker = BrokenReranker;
         let mut config = SearchConfig {
             fts: crate::config::FtsConfig::default(),
-            scope: crate::tags::TagFilter::default(),
+            scope: crate::tags::Scope::default(),
             reranker: Some(&mut reranker),
             store: &store,
             rerank_candidates: 30,
@@ -2922,7 +2961,7 @@ mod tests {
 
         let mut config = SearchConfig {
             fts: crate::config::FtsConfig::default(),
-            scope: crate::tags::TagFilter::default(),
+            scope: crate::tags::Scope::default(),
             reranker: None,
             store: &store,
             rerank_candidates: 30,
@@ -2958,7 +2997,7 @@ mod tests {
         let mut reranker = CountingReranker::new();
         let mut config = SearchConfig {
             fts: crate::config::FtsConfig::default(),
-            scope: crate::tags::TagFilter::default(),
+            scope: crate::tags::Scope::default(),
             reranker: Some(&mut reranker),
             store: &store,
             rerank_candidates: 30,
@@ -2984,7 +3023,7 @@ mod tests {
 
         let mut config = SearchConfig {
             fts: crate::config::FtsConfig::default(),
-            scope: crate::tags::TagFilter::default(),
+            scope: crate::tags::Scope::default(),
             reranker: None,
             store: &store,
             rerank_candidates: 30,
@@ -3019,7 +3058,7 @@ mod tests {
             &store,
             &mut embedder,
             GroupBy::File,
-            &crate::tags::TagFilter::default(),
+            &crate::tags::Scope::default(),
         )
         .unwrap();
 
@@ -3046,7 +3085,7 @@ mod tests {
             &store,
             &mut embedder,
             GroupBy::Chunk,
-            &crate::tags::TagFilter::default(),
+            &crate::tags::Scope::default(),
         )
         .unwrap();
         let hit = output

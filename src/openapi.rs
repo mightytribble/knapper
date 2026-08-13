@@ -83,10 +83,10 @@ fn build_search() -> serde_json::Value {
                         "top_n": { "type": "integer", "description": "Number of results. Defaults to the configured top_n, the same number on every surface" },
                         "explain": { "type": "boolean", "description": "Return the per-lane score breakdown in the response's explain field" },
                         "group_by": { "type": "string", "enum": ["chunk", "file"], "description": "One result per matching section, or one per document. Defaults to the server's setting" },
-                        "tags": { "type": "array", "items": { "type": "string" }, "description": "Tag terms; a trailing / matches the tag and its descendants. Alias of all" },
-                        "all": { "type": "array", "items": { "type": "string" }, "description": "Tag terms a note carries every one of" },
-                        "any": { "type": "array", "items": { "type": "string" }, "description": "Tag terms a note carries at least one of" },
-                        "none": { "type": "array", "items": { "type": "string" }, "description": "Tag terms a note carries none of" }
+                        "scope": { "type": "array", "items": { "type": "string" }, "description": "Tag terms; a trailing / matches the tag and its descendants. A term starting with / is a directory path from the vault root instead, case-sensitive, with a trailing / its subtree. Alias of all" },
+                        "all": { "type": "array", "items": { "type": "string" }, "description": "Tag terms a note carries every one of, or directory terms (starting with /, case-sensitive, a trailing / its subtree) it lies under" },
+                        "any": { "type": "array", "items": { "type": "string" }, "description": "Tag terms a note carries at least one of, or directory terms (starting with /, case-sensitive, a trailing / its subtree) it lies under" },
+                        "none": { "type": "array", "items": { "type": "string" }, "description": "Tag terms a note carries none of, or directory terms (starting with /, case-sensitive, a trailing / its subtree) it does not lie under" }
                     }
                 }}}
             },
@@ -124,10 +124,10 @@ fn build_list() -> serde_json::Value {
             "summary": "List notes filtered by folder, tags, creator, or limit.",
             "parameters": [
                 { "name": "folder", "in": "query", "required": false, "description": "Folder path prefix filter", "schema": { "type": "string" } },
-                { "name": "tags", "in": "query", "required": false, "description": "Comma-separated tag terms; a trailing / matches the tag and its descendants. Alias of all", "schema": { "type": "string" } },
-                { "name": "all", "in": "query", "required": false, "description": "Comma-separated tag terms a note carries every one of", "schema": { "type": "string" } },
-                { "name": "any", "in": "query", "required": false, "description": "Comma-separated tag terms a note carries at least one of", "schema": { "type": "string" } },
-                { "name": "none", "in": "query", "required": false, "description": "Comma-separated tag terms a note carries none of", "schema": { "type": "string" } },
+                { "name": "scope", "in": "query", "required": false, "description": "Comma-separated tag terms; a trailing / matches the tag and its descendants. A term starting with / is a directory path from the vault root instead, case-sensitive, with a trailing / its subtree. Alias of all", "schema": { "type": "string" } },
+                { "name": "all", "in": "query", "required": false, "description": "Comma-separated tag terms a note carries every one of, or directory terms (starting with /, case-sensitive, a trailing / its subtree) it lies under", "schema": { "type": "string" } },
+                { "name": "any", "in": "query", "required": false, "description": "Comma-separated tag terms a note carries at least one of, or directory terms (starting with /, case-sensitive, a trailing / its subtree) it lies under", "schema": { "type": "string" } },
+                { "name": "none", "in": "query", "required": false, "description": "Comma-separated tag terms a note carries none of, or directory terms (starting with /, case-sensitive, a trailing / its subtree) it does not lie under", "schema": { "type": "string" } },
                 { "name": "created_by", "in": "query", "required": false, "description": "Agent filter", "schema": { "type": "string" } },
                 { "name": "limit", "in": "query", "required": false, "description": "Max results (default 20)", "schema": { "type": "integer" } }
             ],
@@ -202,10 +202,10 @@ fn build_topic() -> serde_json::Value {
                     "properties": {
                         "query": { "type": "string", "description": "Topic or question" },
                         "budget": { "type": "integer", "description": "Character budget (default 32000, about 8000 tokens)" },
-                        "tags": { "type": "array", "items": { "type": "string" }, "description": "Tag terms; a trailing / matches the tag and its descendants. Alias of all" },
-                        "all": { "type": "array", "items": { "type": "string" }, "description": "Gather context from notes carrying every one of these terms" },
-                        "any": { "type": "array", "items": { "type": "string" }, "description": "Gather context from notes carrying at least one of these terms" },
-                        "none": { "type": "array", "items": { "type": "string" }, "description": "Leave out notes carrying any of these terms" }
+                        "scope": { "type": "array", "items": { "type": "string" }, "description": "Tag terms; a trailing / matches the tag and its descendants. A term starting with / is a directory path from the vault root instead, case-sensitive, with a trailing / its subtree. Alias of all" },
+                        "all": { "type": "array", "items": { "type": "string" }, "description": "Gather context from notes carrying every one of these terms, tags or directory terms (starting with /, case-sensitive, a trailing / its subtree) alike" },
+                        "any": { "type": "array", "items": { "type": "string" }, "description": "Gather context from notes carrying at least one of these terms, tags or directory terms (starting with /, case-sensitive, a trailing / its subtree) alike" },
+                        "none": { "type": "array", "items": { "type": "string" }, "description": "Leave out notes carrying any of these terms, tags or directory terms (starting with /, case-sensitive, a trailing / its subtree) alike" }
                     }
                 }}}
             },
@@ -547,7 +547,7 @@ mod tests {
             .iter()
             .map(|p| p["name"].as_str().unwrap())
             .collect();
-        for operator in ["tags", "all", "any", "none"] {
+        for operator in ["scope", "all", "any", "none"] {
             assert!(named.contains(&operator), "missing parameter: {operator}");
         }
     }

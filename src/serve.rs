@@ -114,8 +114,8 @@ impl EngraphServer {
     ) -> Result<CallToolResult, McpError> {
         // Per call, with the configured default behind it (#62).
         let top_n = params.0.top_n.unwrap_or(self.top_n);
-        let all_terms = crate::tags::merge_all_alias(params.0.tags, params.0.all);
-        let scope = crate::tags::TagFilter::parse(&all_terms, &params.0.any, &params.0.none)
+        let all_terms = crate::tags::merge_scope_alias(params.0.scope, params.0.all);
+        let scope = crate::tags::Scope::parse(&all_terms, &params.0.any, &params.0.none)
             .map_err(|e| mcp_err(&e))?;
         let store = self.store.lock().await;
         let mut embedder = self.embedder.lock().await;
@@ -194,7 +194,7 @@ impl EngraphServer {
 
     #[tool(
         name = "list",
-        description = "List notes filtered by folder prefix and tag operators (all/any/none). A term is a tag path; a trailing `/` matches the tag and its descendants. Returns paths, docids, tags, and edge counts."
+        description = "List notes filtered by folder prefix and scope operators (all/any/none). A term is a tag path, or a directory path when it starts with `/`; a trailing `/` matches the tag's descendants or the directory's subtree. Returns paths, docids, tags, and edge counts."
     )]
     async fn list(
         &self,
@@ -206,8 +206,8 @@ impl EngraphServer {
             vault_path: &self.vault_path,
             profile: self.profile.as_ref().as_ref(),
         };
-        let all_terms = crate::tags::merge_all_alias(params.0.tags, params.0.all);
-        let tags = crate::tags::TagFilter::parse(&all_terms, &params.0.any, &params.0.none)
+        let all_terms = crate::tags::merge_scope_alias(params.0.scope, params.0.all);
+        let tags = crate::tags::Scope::parse(&all_terms, &params.0.any, &params.0.none)
             .map_err(|e| mcp_err(&e))?;
         let items = context::context_list(
             &ctx,
@@ -287,14 +287,14 @@ impl EngraphServer {
 
     #[tool(
         name = "topic",
-        description = "Topic context bundle to paste into a prompt: the five notes that best match the query, each read whole, and then the notes one wikilink hop from the top three, all trimmed to a character budget. It returns whole note bodies and not sections, and it runs no cross-encoder, so `search` ranks more accurately. Tag terms (all/any/none) hold both steps to the notes they admit."
+        description = "Topic context bundle to paste into a prompt: the five notes that best match the query, each read whole, and then the notes one wikilink hop from the top three, all trimmed to a character budget. It returns whole note bodies and not sections, and it runs no cross-encoder, so `search` ranks more accurately. Scope terms (all/any/none) hold both steps to the notes they admit; a term is a tag path or, starting with `/`, a directory path from the vault root."
     )]
     async fn topic(
         &self,
         params: Parameters<crate::params::Topic>,
     ) -> Result<CallToolResult, McpError> {
-        let all_terms = crate::tags::merge_all_alias(params.0.tags, params.0.all);
-        let scope = crate::tags::TagFilter::parse(&all_terms, &params.0.any, &params.0.none)
+        let all_terms = crate::tags::merge_scope_alias(params.0.scope, params.0.all);
+        let scope = crate::tags::Scope::parse(&all_terms, &params.0.any, &params.0.none)
             .map_err(|e| mcp_err(&e))?;
         let store = self.store.lock().await;
         let mut embedder = self.embedder.lock().await;
@@ -1223,7 +1223,7 @@ mod tests {
         crate::params::Topic {
             query: "warding".to_string(),
             budget: 32000,
-            tags: vec![],
+            scope: vec![],
             all,
             any: vec![],
             none: vec![],
@@ -1446,7 +1446,7 @@ mod tests {
             top_n: None,
             explain,
             group_by,
-            tags: vec![],
+            scope: vec![],
             all: vec![],
             any: vec![],
             none: vec![],

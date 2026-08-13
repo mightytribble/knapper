@@ -1730,47 +1730,56 @@ impl Store {
     }
 }
 
-/// The tag half of a note query: SQL over a `files` row aliased `f`, and its
-/// arguments in the order the SQL binds them.
+/// A scope over a note query: SQL over a `files` row aliased `f`, and its
+/// arguments in the order the SQL binds them (#65).
 ///
-/// One author for the three operators, because `list_files` and
-/// `files_in_scope` ask the same question of the same junction and a second
-/// copy of the rule is a second thing to keep right (#60). The per-term rule
-/// stays in `tags::predicate`.
-fn tag_clauses(tags: &crate::tags::TagFilter) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
+/// One author for the three operators over both kinds of term, because
+/// `list_files` and `files_in_scope` ask the same question and a second copy is
+/// a second thing to keep right. A tag term is an `EXISTS` over the junction; a
+/// directory term is a range predicate on `files.path`, which needs no join.
+fn scope_clauses(scope: &crate::tags::Scope) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
+    use crate::tags::ScopeTerm;
+
+    fn fragment(term: &ScopeTerm, args: &mut Vec<Box<dyn rusqlite::types::ToSql>>) -> String {
+        match term {
+            ScopeTerm::Tag(tag) => {
+                let (pred, values) = crate::tags::predicate(tag);
+                for value in values {
+                    args.push(Box::new(value));
+                }
+                format!(
+                    "EXISTS (SELECT 1 FROM file_tags ft JOIN tags t ON t.id = ft.tag_id
+                             WHERE ft.file_id = f.id AND {pred})"
+                )
+            }
+            ScopeTerm::Folder(folder) => {
+                let (pred, values) = crate::tags::folder_sql(folder);
+                for value in values {
+                    args.push(Box::new(value));
+                }
+                format!("({pred})")
+            }
+        }
+    }
+
     let mut sql = String::new();
     let mut args: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
-    // The junction, not `json_each` over a JSON column: the old test scanned
-    // `files` and parsed JSON for each row (#60). A term folds its own path, so
-    // a folded query side meets a folded column.
-    for term in &tags.all {
-        let (pred, values) = crate::tags::predicate(term);
-        sql.push_str(&format!(
-            " AND EXISTS (SELECT 1 FROM file_tags ft JOIN tags t ON t.id = ft.tag_id
-                            WHERE ft.file_id = f.id AND {pred})"
-        ));
-        for value in values {
-            args.push(Box::new(value));
-        }
+    for term in &scope.all {
+        let frag = fragment(term, &mut args);
+        sql.push_str(&format!(" AND {frag}"));
     }
-    for (field, keyword) in [(&tags.any, "EXISTS"), (&tags.none, "NOT EXISTS")] {
+    for (field, negate) in [(&scope.any, false), (&scope.none, true)] {
         if field.is_empty() {
             continue;
         }
-        let mut ors: Vec<String> = Vec::new();
-        for term in field {
-            let (pred, values) = crate::tags::predicate(term);
-            ors.push(pred);
-            for value in values {
-                args.push(Box::new(value));
-            }
+        let ors: Vec<String> = field.iter().map(|t| fragment(t, &mut args)).collect();
+        let group = ors.join(" OR ");
+        if negate {
+            sql.push_str(&format!(" AND NOT ({group})"));
+        } else {
+            sql.push_str(&format!(" AND ({group})"));
         }
-        sql.push_str(&format!(
-            " AND {keyword} (SELECT 1 FROM file_tags ft JOIN tags t ON t.id = ft.tag_id
-                               WHERE ft.file_id = f.id AND ({}))",
-            ors.join(" OR ")
-        ));
     }
     (sql, args)
 }
@@ -1780,12 +1789,13 @@ impl Store {
     pub fn list_files(
         &self,
         folder: Option<&str>,
-        tags: &crate::tags::TagFilter,
+        tags: &crate::tags::Scope,
         created_by: Option<&str>,
         limit: usize,
     ) -> Result<Vec<FileRecord>> {
         // `none` is not checked: excluding a tag no note carries is a no-op.
-        let checked: Vec<&crate::tags::TagTerm> = tags.all.iter().chain(tags.any.iter()).collect();
+        let checked: Vec<&crate::tags::ScopeTerm> =
+            tags.all.iter().chain(tags.any.iter()).collect();
         crate::tags::check_terms(&self.conn, &checked)?;
 
         let mut sql = format!("SELECT {FILE_COLUMNS} FROM files f WHERE 1=1");
@@ -1794,7 +1804,7 @@ impl Store {
             sql.push_str(" AND f.path LIKE ?");
             param_values.push(Box::new(format!("{}%", folder)));
         }
-        let (tag_sql, tag_args) = tag_clauses(tags);
+        let (tag_sql, tag_args) = scope_clauses(tags);
         sql.push_str(&tag_sql);
         param_values.extend(tag_args);
         if let Some(cb) = created_by {
@@ -1823,12 +1833,12 @@ impl Store {
     /// the one the lanes saw. `none` is not checked, for the reason
     /// `list_files` does not check it: excluding a tag no note carries is a
     /// no-op, and erroring on it would refuse a correct query.
-    pub fn files_in_scope(&self, filter: &crate::tags::TagFilter) -> Result<Vec<i64>> {
-        let checked: Vec<&crate::tags::TagTerm> =
+    pub fn files_in_scope(&self, filter: &crate::tags::Scope) -> Result<Vec<i64>> {
+        let checked: Vec<&crate::tags::ScopeTerm> =
             filter.all.iter().chain(filter.any.iter()).collect();
         crate::tags::check_terms(&self.conn, &checked)?;
 
-        let (tag_sql, args) = tag_clauses(filter);
+        let (tag_sql, args) = scope_clauses(filter);
         let mut stmt = self
             .conn
             .prepare(&format!("SELECT f.id FROM files f WHERE 1=1{tag_sql}"))?;
@@ -3968,7 +3978,7 @@ mod tests {
             .insert_file("01-Projects/c.md", "h3", 300, "ccc333", None, None)
             .unwrap();
         let files = store
-            .list_files(None, &crate::tags::TagFilter::default(), None, 20)
+            .list_files(None, &crate::tags::Scope::default(), None, 20)
             .unwrap();
         assert_eq!(files.len(), 3);
     }
@@ -3985,7 +3995,7 @@ mod tests {
         let files = store
             .list_files(
                 Some("01-Projects"),
-                &crate::tags::TagFilter::default(),
+                &crate::tags::Scope::default(),
                 None,
                 20,
             )
@@ -4018,7 +4028,7 @@ mod tests {
         let files = store
             .list_files(
                 None,
-                &crate::tags::TagFilter::parse(&["rust".to_string()], &[], &[]).unwrap(),
+                &crate::tags::Scope::parse(&["rust".to_string()], &[], &[]).unwrap(),
                 None,
                 20,
             )
@@ -4027,7 +4037,7 @@ mod tests {
         let files = store
             .list_files(
                 None,
-                &crate::tags::TagFilter::parse(&["rust".to_string(), "cli".to_string()], &[], &[])
+                &crate::tags::Scope::parse(&["rust".to_string(), "cli".to_string()], &[], &[])
                     .unwrap(),
                 None,
                 20,
@@ -4052,7 +4062,7 @@ mod tests {
 
         // Filter by "cli" → only the cli-created file
         let files = store
-            .list_files(None, &crate::tags::TagFilter::default(), Some("cli"), 20)
+            .list_files(None, &crate::tags::Scope::default(), Some("cli"), 20)
             .unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, "a.md");
@@ -4060,14 +4070,14 @@ mod tests {
 
         // Filter by "mcp" → only the mcp-created file
         let files = store
-            .list_files(None, &crate::tags::TagFilter::default(), Some("mcp"), 20)
+            .list_files(None, &crate::tags::Scope::default(), Some("mcp"), 20)
             .unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, "b.md");
 
         // Filter by None → all 3
         let files = store
-            .list_files(None, &crate::tags::TagFilter::default(), None, 20)
+            .list_files(None, &crate::tags::Scope::default(), None, 20)
             .unwrap();
         assert_eq!(files.len(), 3);
     }
@@ -5421,7 +5431,7 @@ mod tests {
             store
                 .list_files(
                     None,
-                    &crate::tags::TagFilter::parse(&["type/".to_string()], &[], &[]).unwrap(),
+                    &crate::tags::Scope::parse(&["type/".to_string()], &[], &[]).unwrap(),
                     None,
                     10,
                 )
@@ -5434,7 +5444,7 @@ mod tests {
             store
                 .list_files(
                     None,
-                    &crate::tags::TagFilter::parse(&["TYPE/UNDEAD".to_string()], &[], &[]).unwrap(),
+                    &crate::tags::Scope::parse(&["TYPE/UNDEAD".to_string()], &[], &[]).unwrap(),
                     None,
                     10,
                 )
@@ -5525,12 +5535,8 @@ mod tests {
         let hits = store
             .list_files(
                 None,
-                &crate::tags::TagFilter::parse(
-                    &["alpha".to_string(), "beta".to_string()],
-                    &[],
-                    &[],
-                )
-                .unwrap(),
+                &crate::tags::Scope::parse(&["alpha".to_string(), "beta".to_string()], &[], &[])
+                    .unwrap(),
                 None,
                 10,
             )
@@ -5542,7 +5548,7 @@ mod tests {
         let folded = store
             .list_files(
                 None,
-                &crate::tags::TagFilter::parse(&["ALPHA".to_string()], &[], &[]).unwrap(),
+                &crate::tags::Scope::parse(&["ALPHA".to_string()], &[], &[]).unwrap(),
                 None,
                 10,
             )
@@ -5579,7 +5585,7 @@ mod tests {
         store
     }
 
-    fn listed_paths(store: &Store, filter: &crate::tags::TagFilter) -> Vec<String> {
+    fn listed_paths(store: &Store, filter: &crate::tags::Scope) -> Vec<String> {
         let mut paths: Vec<String> = store
             .list_files(None, filter, None, 20)
             .unwrap()
@@ -5591,7 +5597,7 @@ mod tests {
     }
 
     /// The scoped file ids as paths, sorted, so an assertion reads as notes.
-    fn scoped_paths(store: &Store, filter: &crate::tags::TagFilter) -> Vec<String> {
+    fn scoped_paths(store: &Store, filter: &crate::tags::Scope) -> Vec<String> {
         let mut paths: Vec<String> = store
             .files_in_scope(filter)
             .unwrap()
@@ -5602,11 +5608,191 @@ mod tests {
         paths
     }
 
+    fn folder_fixture() -> Store {
+        let store = Store::open_memory().unwrap();
+        for (i, path) in [
+            "Locations.md",
+            "Locations/aurelian-empire.md",
+            "Locations/cities/varenholt.md",
+            "People/marcus.md",
+        ]
+        .iter()
+        .enumerate()
+        {
+            store
+                .insert_file(path, "h", i as i64, &format!("d00000{i}"), None, None)
+                .unwrap();
+        }
+        store
+    }
+
+    fn folder_scope(all: &[&str], any: &[&str], none: &[&str]) -> crate::tags::Scope {
+        crate::tags::Scope::parse(
+            &all.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            &any.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            &none.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_directory_subtree_takes_everything_beneath_it() {
+        let store = folder_fixture();
+        assert_eq!(
+            scoped_paths(&store, &folder_scope(&["/Locations/"], &[], &[])),
+            vec![
+                "Locations/aurelian-empire.md",
+                "Locations/cities/varenholt.md"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_directory_exact_takes_only_direct_children() {
+        let store = folder_fixture();
+        assert_eq!(
+            scoped_paths(&store, &folder_scope(&["/Locations"], &[], &[])),
+            vec!["Locations/aurelian-empire.md"]
+        );
+    }
+
+    #[test]
+    fn a_directory_subtree_excludes_a_root_note_of_the_same_name() {
+        let store = folder_fixture();
+        let paths = scoped_paths(&store, &folder_scope(&["/Locations/"], &[], &[]));
+        assert!(
+            !paths.contains(&"Locations.md".to_string()),
+            "a root note is not under the folder that shares its stem"
+        );
+    }
+
+    #[test]
+    fn list_files_filters_by_a_directory_scope() {
+        // #65. Reach test: `list_files` already takes a `Scope` (Task 3), so
+        // this proves the wiring carries a directory term with no
+        // production change.
+        let store = folder_fixture();
+        assert_eq!(
+            listed_paths(&store, &folder_scope(&["/People/"], &[], &[])),
+            vec!["People/marcus.md"]
+        );
+    }
+
+    #[test]
+    fn a_directory_scope_is_case_sensitive() {
+        // Two folders differ only in case, so both validate; the range on
+        // files.path keeps case, so /Locations/ resolves to the capitalized
+        // folder alone, and a LOWER() comparison would fail this (#65).
+        let store = Store::open_memory().unwrap();
+        store
+            .insert_file("Locations/a.md", "h", 1, "d000001", None, None)
+            .unwrap();
+        store
+            .insert_file("locations/b.md", "h", 2, "d000002", None, None)
+            .unwrap();
+        assert_eq!(
+            scoped_paths(&store, &folder_scope(&["/Locations/"], &[], &[])),
+            vec!["Locations/a.md"]
+        );
+    }
+
+    #[test]
+    fn a_scope_mixes_a_tag_and_a_directory_term() {
+        let store = Store::open_memory().unwrap();
+        let tag = |p: &str| crate::tags::Tag {
+            path: p.into(),
+            display: p.into(),
+        };
+        let empire = store
+            .insert_file(
+                "Locations/aurelian-empire.md",
+                "h",
+                1,
+                "d000001",
+                None,
+                None,
+            )
+            .unwrap();
+        store
+            .insert_file(
+                "Locations/cities/varenholt.md",
+                "h",
+                2,
+                "d000002",
+                None,
+                None,
+            )
+            .unwrap();
+        let marcus = store
+            .insert_file("People/marcus.md", "h", 3, "d000003", None, None)
+            .unwrap();
+        store
+            .reconcile_file_tags(empire, &[tag("type/place")])
+            .unwrap();
+        store
+            .reconcile_file_tags(marcus, &[tag("type/person")])
+            .unwrap();
+
+        // all: under Locations/ AND tagged type/place -> the empire alone.
+        assert_eq!(
+            scoped_paths(
+                &store,
+                &folder_scope(&["/Locations/", "type/place"], &[], &[])
+            ),
+            vec!["Locations/aurelian-empire.md"]
+        );
+        // any: under People/ OR tagged type/place -> the empire and marcus.
+        assert_eq!(
+            scoped_paths(&store, &folder_scope(&[], &["/People/", "type/place"], &[])),
+            vec!["Locations/aurelian-empire.md", "People/marcus.md"]
+        );
+    }
+
+    #[test]
+    fn a_directory_naming_no_note_errors_and_names_the_nearest_ancestor() {
+        let store = folder_fixture();
+        let err = store
+            .files_in_scope(&folder_scope(&["/Locations/atlantis/"], &[], &[]))
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "no such folder '/Locations/atlantis/'; nearest: '/Locations/'"
+        );
+    }
+
+    #[test]
+    fn an_exact_directory_with_only_deeper_notes_suggests_the_subtree() {
+        let store = Store::open_memory().unwrap();
+        store
+            .insert_file("Deep/inner/note.md", "h", 1, "d000001", None, None)
+            .unwrap();
+        let err = store
+            .files_in_scope(&folder_scope(&["/Deep"], &[], &[]))
+            .unwrap_err();
+        assert_eq!(err.to_string(), "no such folder '/Deep'; nearest: '/Deep/'");
+    }
+
+    #[test]
+    fn a_wholly_unknown_directory_errors_without_a_nearest() {
+        let store = folder_fixture();
+        let err = store
+            .files_in_scope(&folder_scope(&["/Nowhere/"], &[], &[]))
+            .unwrap_err();
+        assert_eq!(err.to_string(), "no such folder '/Nowhere/'");
+    }
+
+    #[test]
+    fn excluding_an_unknown_directory_is_not_an_error() {
+        let store = folder_fixture();
+        let paths = scoped_paths(&store, &folder_scope(&[], &[], &["/Nowhere/"]));
+        assert!(!paths.is_empty(), "none is not checked, so this resolves");
+    }
+
     #[test]
     fn a_scope_resolves_each_operator_the_way_list_does() {
         let store = operator_fixture();
         let parse = |all: &[&str], any: &[&str], none: &[&str]| {
-            crate::tags::TagFilter::parse(
+            crate::tags::Scope::parse(
                 &all.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
                 &any.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
                 &none.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
@@ -5637,20 +5823,19 @@ mod tests {
         let store = operator_fixture();
         // `type/` takes the descendants; the bare `type` is a tag no note
         // carries, and its own subtree is what the error names instead.
-        let subtree = crate::tags::TagFilter::parse(&["TYPE/".to_string()], &[], &[]).unwrap();
+        let subtree = crate::tags::Scope::parse(&["TYPE/".to_string()], &[], &[]).unwrap();
         assert_eq!(
             scoped_paths(&store, &subtree),
             vec!["draft.md", "wight.md", "wolf.md"]
         );
-        let folded =
-            crate::tags::TagFilter::parse(&["Habitat/Swamp".to_string()], &[], &[]).unwrap();
+        let folded = crate::tags::Scope::parse(&["Habitat/Swamp".to_string()], &[], &[]).unwrap();
         assert_eq!(scoped_paths(&store, &folded), vec!["wight.md"]);
     }
 
     #[test]
     fn a_scope_naming_no_tag_errors_and_names_the_nearest() {
         let store = operator_fixture();
-        let filter = crate::tags::TagFilter::parse(&["type/undeed".to_string()], &[], &[]).unwrap();
+        let filter = crate::tags::Scope::parse(&["type/undeed".to_string()], &[], &[]).unwrap();
         let err = store.files_in_scope(&filter).unwrap_err();
         assert_eq!(
             err.to_string(),
@@ -5662,7 +5847,7 @@ mod tests {
     fn a_scope_excluding_an_unknown_tag_is_not_an_error() {
         let store = operator_fixture();
         let filter =
-            crate::tags::TagFilter::parse(&["type/".to_string()], &[], &["nowhere".to_string()])
+            crate::tags::Scope::parse(&["type/".to_string()], &[], &["nowhere".to_string()])
                 .unwrap();
         assert_eq!(
             scoped_paths(&store, &filter),
@@ -5673,7 +5858,7 @@ mod tests {
     #[test]
     fn a_scope_that_no_note_satisfies_is_empty_and_not_an_error() {
         let store = operator_fixture();
-        let filter = crate::tags::TagFilter::parse(
+        let filter = crate::tags::Scope::parse(
             &["type/undead".to_string(), "status/draft".to_string()],
             &[],
             &[],
@@ -5685,7 +5870,7 @@ mod tests {
     #[test]
     fn an_unknown_all_term_errors_and_names_the_nearest_tag() {
         let store = operator_fixture();
-        let filter = crate::tags::TagFilter::parse(&["type/undeed".to_string()], &[], &[]).unwrap();
+        let filter = crate::tags::Scope::parse(&["type/undeed".to_string()], &[], &[]).unwrap();
         let err = store.list_files(None, &filter, None, 20).unwrap_err();
         assert_eq!(
             err.to_string(),
@@ -5700,7 +5885,7 @@ mod tests {
         // for the fuzzy tier, which compares one segment against tags that
         // share a parent, to reach first.
         let filter =
-            crate::tags::TagFilter::parse(&["type/undead/wight/banshee".to_string()], &[], &[])
+            crate::tags::Scope::parse(&["type/undead/wight/banshee".to_string()], &[], &[])
                 .unwrap();
         let err = store.list_files(None, &filter, None, 20).unwrap_err();
         assert_eq!(
@@ -5712,7 +5897,7 @@ mod tests {
     #[test]
     fn an_unknown_term_with_no_near_neighbour_errors_without_a_suggestion() {
         let store = operator_fixture();
-        let filter = crate::tags::TagFilter::parse(&[], &["zzzzz".to_string()], &[]).unwrap();
+        let filter = crate::tags::Scope::parse(&[], &["zzzzz".to_string()], &[]).unwrap();
         let err = store.list_files(None, &filter, None, 20).unwrap_err();
         assert_eq!(err.to_string(), "no such tag 'zzzzz'");
     }
@@ -5720,7 +5905,7 @@ mod tests {
     #[test]
     fn an_unknown_subtree_term_prints_its_marker() {
         let store = operator_fixture();
-        let filter = crate::tags::TagFilter::parse(&["nowhere/".to_string()], &[], &[]).unwrap();
+        let filter = crate::tags::Scope::parse(&["nowhere/".to_string()], &[], &[]).unwrap();
         let err = store.list_files(None, &filter, None, 20).unwrap_err();
         assert_eq!(err.to_string(), "no such tag 'nowhere/'");
     }
@@ -5729,7 +5914,7 @@ mod tests {
     fn an_unknown_none_term_is_not_an_error() {
         let store = operator_fixture();
         let filter =
-            crate::tags::TagFilter::parse(&["type/".to_string()], &[], &["nowhere".to_string()])
+            crate::tags::Scope::parse(&["type/".to_string()], &[], &["nowhere".to_string()])
                 .unwrap();
         assert_eq!(
             listed_paths(&store, &filter),
@@ -5743,11 +5928,11 @@ mod tests {
         // The fixture holds `type/undead` and `type/beast`, never bare `type`.
         // The likeliest mistake is forgetting the subtree marker, so the
         // suggestion is the term with it added, not an unrelated fuzzy match.
-        let exact = crate::tags::TagFilter::parse(&["type".to_string()], &[], &[]).unwrap();
+        let exact = crate::tags::Scope::parse(&["type".to_string()], &[], &[]).unwrap();
         let err = store.list_files(None, &exact, None, 20).unwrap_err();
         assert_eq!(err.to_string(), "no such tag 'type'; nearest: 'type/'");
 
-        let subtree = crate::tags::TagFilter::parse(&["type/".to_string()], &[], &[]).unwrap();
+        let subtree = crate::tags::Scope::parse(&["type/".to_string()], &[], &[]).unwrap();
         assert_eq!(
             listed_paths(&store, &subtree),
             vec!["draft.md", "wight.md", "wolf.md"]
@@ -5759,7 +5944,7 @@ mod tests {
         let store = operator_fixture();
         // `habitat/swamp` is the fixture's only `habitat` tag, one segment
         // under an axis no fuzzy match would reach.
-        let filter = crate::tags::TagFilter::parse(&["habitat".to_string()], &[], &[]).unwrap();
+        let filter = crate::tags::Scope::parse(&["habitat".to_string()], &[], &[]).unwrap();
         let err = store.list_files(None, &filter, None, 20).unwrap_err();
         assert_eq!(
             err.to_string(),
@@ -5770,7 +5955,7 @@ mod tests {
     #[test]
     fn all_terms_intersect_and_any_terms_union() {
         let store = operator_fixture();
-        let all = crate::tags::TagFilter::parse(
+        let all = crate::tags::Scope::parse(
             &["type/undead".to_string(), "habitat/swamp".to_string()],
             &[],
             &[],
@@ -5778,7 +5963,7 @@ mod tests {
         .unwrap();
         assert_eq!(listed_paths(&store, &all), vec!["wight.md"]);
 
-        let any = crate::tags::TagFilter::parse(
+        let any = crate::tags::Scope::parse(
             &[],
             &["type/undead".to_string(), "status/draft".to_string()],
             &[],
@@ -5790,19 +5975,16 @@ mod tests {
     #[test]
     fn a_none_term_removes_a_note_the_other_fields_returned() {
         let store = operator_fixture();
-        let filter = crate::tags::TagFilter::parse(
-            &["type/".to_string()],
-            &[],
-            &["status/draft".to_string()],
-        )
-        .unwrap();
+        let filter =
+            crate::tags::Scope::parse(&["type/".to_string()], &[], &["status/draft".to_string()])
+                .unwrap();
         assert_eq!(listed_paths(&store, &filter), vec!["wight.md", "wolf.md"]);
     }
 
     #[test]
     fn the_three_fields_combine_in_one_query() {
         let store = operator_fixture();
-        let filter = crate::tags::TagFilter::parse(
+        let filter = crate::tags::Scope::parse(
             &["type/".to_string()],
             &["habitat/swamp".to_string(), "status/draft".to_string()],
             &["status/draft".to_string()],
@@ -5829,14 +6011,14 @@ mod tests {
             .unwrap();
         // `type_a` sorts after `type/` and must not fall inside the range.
         store.reconcile_file_tags(beside, &[tag("type_a")]).unwrap();
-        let filter = crate::tags::TagFilter::parse(&["type/".to_string()], &[], &[]).unwrap();
+        let filter = crate::tags::Scope::parse(&["type/".to_string()], &[], &[]).unwrap();
         assert_eq!(listed_paths(&store, &filter), vec!["inside.md"]);
     }
 
     #[test]
     fn an_empty_filter_returns_every_note() {
         let store = operator_fixture();
-        let filter = crate::tags::TagFilter::default();
+        let filter = crate::tags::Scope::default();
         assert_eq!(listed_paths(&store, &filter).len(), 3);
     }
 
@@ -5984,14 +6166,14 @@ mod tests {
     fn the_descendant_query_returns_what_obsidians_tag_search_returns() {
         let store = axis_fixture();
         // `tag:type` matches `type` and every descendant of it.
-        let subtree = crate::tags::TagFilter::parse(&["type/".to_string()], &[], &[]).unwrap();
+        let subtree = crate::tags::Scope::parse(&["type/".to_string()], &[], &[]).unwrap();
         assert_eq!(
             listed_paths(&store, &subtree),
             vec!["beast.md", "plain.md", "undead.md"]
         );
 
         // The exact query is the tag a note carries and no descendant.
-        let exact = crate::tags::TagFilter::parse(&["type".to_string()], &[], &[]).unwrap();
+        let exact = crate::tags::Scope::parse(&["type".to_string()], &[], &[]).unwrap();
         assert_eq!(listed_paths(&store, &exact), vec!["plain.md"]);
     }
 
@@ -6023,11 +6205,11 @@ mod tests {
             .reconcile_file_tags(exact_note, &[tag("type_a")])
             .unwrap();
 
-        let subtree = crate::tags::TagFilter::parse(&["type_a/".to_string()], &[], &[]).unwrap();
+        let subtree = crate::tags::Scope::parse(&["type_a/".to_string()], &[], &[]).unwrap();
         assert_eq!(listed_paths(&store, &subtree), vec!["exact.md", "one.md"]);
 
         // The exact arm still answers for the tag itself.
-        let exact = crate::tags::TagFilter::parse(&["type_a".to_string()], &[], &[]).unwrap();
+        let exact = crate::tags::Scope::parse(&["type_a".to_string()], &[], &[]).unwrap();
         assert_eq!(listed_paths(&store, &exact), vec!["exact.md"]);
     }
 

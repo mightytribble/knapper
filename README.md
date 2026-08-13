@@ -208,7 +208,7 @@ The reranker scored each result for relevance as the 4th RRF lane.
 engraph topic "authentication" --budget 8000
 ```
 
-Returns a context bundle to paste into a prompt or serve over MCP: the five notes that best match the query, each read whole, and then the notes one wikilink hop from the top three. The budget is characters, so 8000 of them are about 2000 tokens, and a note that overruns it is cut and marked. A bundle holds whole notes, so the query runs at one result per note, and no cross-encoder scores it: `engraph search` is the sharper ranking. Tag terms hold both steps to the notes they admit:
+Returns a context bundle to paste into a prompt or serve over MCP: the five notes that best match the query, each read whole, and then the notes one wikilink hop from the top three. The budget is characters, so 8000 of them are about 2000 tokens, and a note that overruns it is cut and marked. A bundle holds whole notes, so the query runs at one result per note, and no cross-encoder scores it: `engraph search` is the sharper ranking. Tag terms hold both steps to the notes they admit, and a term starting with `/` is a directory path from the vault root instead, a trailing `/` its subtree:
 
 ```bash
 engraph topic "warding" --all type/undead --budget 8000
@@ -288,9 +288,9 @@ Every capability is one route, and the route is the CLI command's name under `/a
 | Method | Endpoint | Permission | Description |
 |--------|----------|------------|-------------|
 | GET | `/api/health-check` | read | Server health check |
-| POST | `/api/search` | read | Hybrid search (semantic + FTS5 + graph + reranker + temporal), scoped by tag terms (`tags`/`all`, `any`, `none`) |
+| POST | `/api/search` | read | Hybrid search (semantic + FTS5 + graph + reranker + temporal), scoped by tag or directory terms — a leading `/` reads a term as a directory path (`scope`/`all`, `any`, `none`) |
 | GET | `/api/read` | read | Read a note (`file`), or one of its sections (`section`) |
-| GET | `/api/list` | read | List notes by folder and tag terms (`tags`/`all`, `any`, `none`), creator, limit |
+| GET | `/api/list` | read | List notes by folder and tag or directory terms — a leading `/` reads a term as a directory path (`scope`/`all`, `any`, `none`), creator, limit |
 | GET | `/api/tags` | read | The tag vocabulary, whole or under one term (`under`) |
 | GET | `/api/vault-map` | read | Vault structure overview (folders, tags, recent files) |
 | GET | `/api/who` | read | Person context bundle (`name`) |
@@ -328,11 +328,12 @@ curl -X POST http://localhost:3000/api/search \
   -H "Content-Type: application/json" \
   -d '{"query": "authentication architecture", "top_n": 5}'
 
-# Search, scoped to a tag filter (tags/all, any, none)
+# Search, scoped to a tag or directory filter (scope/all, any, none; a
+# leading / reads a term as a directory path from the vault root)
 curl -X POST http://localhost:3000/api/search \
   -H "Authorization: Bearer eg_..." \
   -H "Content-Type: application/json" \
-  -d '{"query": "authentication architecture", "top_n": 5, "tags": ["project/auth"], "all": ["type/decision"], "any": ["status/reviewed", "status/draft"], "none": ["status/archived"]}'
+  -d '{"query": "authentication architecture", "top_n": 5, "scope": ["project/auth", "/01-Projects/"], "all": ["type/decision"], "any": ["status/reviewed", "status/draft"], "none": ["status/archived"]}'
 
 # Read a note, or one of its sections
 curl "http://localhost:3000/api/read?file=01-Projects/API-Design.md" \
