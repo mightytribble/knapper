@@ -734,14 +734,12 @@ async fn handle_migrate(
     Json(body): Json<crate::params::Migrate>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
-    if state.read_only {
-        return Err(ApiError::forbidden(
-            "Write operations disabled in read-only mode",
-        ));
-    }
     let store = state.store.lock().await;
     // The CLI already took a mode. MCP and HTTP split it into three names,
-    // which is the same capability spelled three ways (#62).
+    // which is the same capability spelled three ways (#62). The mode is read
+    // before the read-only guard, so that one word means the same thing on
+    // both servers: `preview` writes nothing and runs, and a word that names
+    // no operation is answered as such rather than as a refused write.
     match body.mode.as_str() {
         "preview" => {
             let profile_ref = state.profile.as_ref().as_ref();
@@ -750,6 +748,11 @@ async fn handle_migrate(
             Ok(Json(serde_json::to_value(&preview).unwrap()))
         }
         "apply" => {
+            if state.read_only {
+                return Err(ApiError::forbidden(
+                    "Write operations disabled in read-only mode",
+                ));
+            }
             let data_dir = crate::config::Config::data_dir()
                 .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
             let preview = crate::migrate::resolve_preview(body.preview, &data_dir)
@@ -759,6 +762,11 @@ async fn handle_migrate(
             Ok(Json(serde_json::to_value(&result).unwrap()))
         }
         "undo" => {
+            if state.read_only {
+                return Err(ApiError::forbidden(
+                    "Write operations disabled in read-only mode",
+                ));
+            }
             let result = crate::migrate::undo_last(&store, &state.vault_path)
                 .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
             Ok(Json(serde_json::to_value(&result).unwrap()))
@@ -1584,6 +1592,42 @@ mod tests {
                 .unwrap()
                 .contains("No migration to undo"),
             "not the undo path: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_refuses_the_migrate_modes_that_write_and_no_others() {
+        // One name now carries all three modes, so the guard belongs to the
+        // modes that write and not to the route. `preview` writes nothing, so
+        // it runs here as it does on MCP, and an unknown mode is still
+        // answered as an unknown mode (#62).
+        let mut state = test_api_state();
+        state.read_only = true;
+        let (status, _) = post_json(state, "/api/migrate", r#"{"mode":"preview"}"#).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let mut state = test_api_state();
+        state.read_only = true;
+        let (status, _) = post_json(
+            state,
+            "/api/migrate",
+            r#"{"mode":"apply","preview":{"migration_id":"m","files":[],"uncertain":[],"skipped":0}}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let mut state = test_api_state();
+        state.read_only = true;
+        let (status, _) = post_json(state, "/api/migrate", r#"{"mode":"undo"}"#).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let mut state = test_api_state();
+        state.read_only = true;
+        let (status, body) = post_json(state, "/api/migrate", r#"{"mode":"sideways"}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body["error"],
+            "Unknown mode: sideways. Use 'preview', 'apply' or 'undo'."
         );
     }
 

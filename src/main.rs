@@ -224,7 +224,16 @@ async fn main() -> Result<()> {
             // same two, and both reach the same code (#62).
             let (detect, json) = match mode.as_deref() {
                 Some("detect") => (true, json),
-                Some("apply") => (detect, true),
+                Some("apply") => {
+                    // `--detect` is the older spelling of the other mode, so
+                    // the two together name two modes. Which one the caller
+                    // meant is not for this arm to guess.
+                    if detect {
+                        eprintln!("--mode apply and --detect name different modes. Use one.");
+                        std::process::exit(1);
+                    }
+                    (detect, true)
+                }
                 Some(other) => {
                     eprintln!("Unknown mode: {other}. Use 'detect' or 'apply'.");
                     std::process::exit(1);

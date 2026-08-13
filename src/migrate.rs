@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -565,7 +565,19 @@ pub fn resolve_preview(
         Some(value) => {
             serde_json::from_value(value).map_err(|e| anyhow::anyhow!("Invalid preview JSON: {e}"))
         }
-        None => load_preview(data_dir),
+        // `apply` moves files. When no preview arrives the saved one is the
+        // caller's own last plan, but when none is saved either, the bare
+        // errno from `load_preview` names a file the caller never heard of.
+        // Say what is missing instead (#62).
+        None => {
+            let path = data_dir.join("migration-preview.json");
+            load_preview(data_dir).with_context(|| {
+                format!(
+                    "apply needs a preview: none was supplied and none is saved at {}",
+                    path.display()
+                )
+            })
+        }
     }
 }
 
@@ -936,5 +948,51 @@ mod tests {
         let loaded = load_preview(tmp.path()).unwrap();
         assert_eq!(loaded.migration_id, "test-001");
         assert_eq!(loaded.skipped, 5);
+    }
+
+    /// `apply` moves files, so the three ways a preview can reach it — sent,
+    /// saved, or absent — must each say plainly which one happened (#62).
+    #[test]
+    fn resolve_preview_reads_the_sent_one_then_the_saved_one() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Sent: the caller's own JSON, and the disk is not read.
+        let sent = serde_json::json!({
+            "migration_id": "sent-001",
+            "files": [],
+            "uncertain": [],
+            "skipped": 0,
+        });
+        let got = resolve_preview(Some(sent), tmp.path()).unwrap();
+        assert_eq!(got.migration_id, "sent-001");
+
+        // Sent but not a preview: the caller's own text is at fault, and the
+        // message says which text.
+        let err = resolve_preview(Some(serde_json::json!({"files": 3})), tmp.path()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("Invalid preview JSON"),
+            "got {err:#}"
+        );
+
+        // Absent with nothing saved: an errno naming a file the caller never
+        // heard of is not an answer. Name what is missing.
+        let err = resolve_preview(None, tmp.path()).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("apply needs a preview: none was supplied and none is saved at"),
+            "got {text}"
+        );
+        assert!(text.contains("migration-preview.json"), "got {text}");
+
+        // Absent with one saved: that is the plan the caller last made.
+        let saved = MigrationPreview {
+            migration_id: "saved-001".into(),
+            files: vec![],
+            uncertain: vec![],
+            skipped: 0,
+        };
+        save_preview(&saved, tmp.path()).unwrap();
+        let got = resolve_preview(None, tmp.path()).unwrap();
+        assert_eq!(got.migration_id, "saved-001");
     }
 }
