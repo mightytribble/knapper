@@ -26,80 +26,6 @@ use crate::writer::FrontmatterOp;
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct SearchParams {
-    /// The search query.
-    pub query: String,
-    /// Number of results (default 10).
-    pub top_n: Option<usize>,
-    /// Filter to notes with all listed tags. Alias of `all`.
-    pub tags: Option<Vec<String>>,
-    /// Notes carrying every term. A term is a tag path; a trailing `/` or
-    /// `/*` matches the tag and its descendants. An unknown term is an error
-    /// naming the nearest tag the vault holds.
-    pub all: Option<Vec<String>>,
-    /// Notes carrying at least one of these terms. An unknown term is an
-    /// error naming the nearest tag the vault holds.
-    pub any: Option<Vec<String>>,
-    /// Notes carrying none of these terms. An unknown term here is ignored.
-    pub none: Option<Vec<String>>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct ReadParams {
-    /// File path, basename, or #docid.
-    pub file: String,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct ListParams {
-    /// Filter to folder path prefix.
-    pub folder: Option<String>,
-    /// Filter to notes with all listed tags. Alias of `all`.
-    pub tags: Option<Vec<String>>,
-    /// Notes carrying every term. A term is a tag path; a trailing `/` or
-    /// `/*` matches the tag and its descendants. An unknown term is an error
-    /// naming the nearest tag the vault holds.
-    pub all: Option<Vec<String>>,
-    /// Notes carrying at least one of these terms. An unknown term is an
-    /// error naming the nearest tag the vault holds.
-    pub any: Option<Vec<String>>,
-    /// Notes carrying none of these terms. An unknown term here is ignored.
-    pub none: Option<Vec<String>>,
-    /// Filter to notes created by a specific agent.
-    pub created_by: Option<String>,
-    /// Maximum results (default 20). Raising it adds results below the same
-    /// ranking; it does not change what the top of the ranking holds.
-    pub limit: Option<usize>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct TagsParams {
-    /// Limit to one tag and its descendants, as `type/` or `type/*`. Omit
-    /// for the whole vocabulary.
-    pub under: Option<String>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct WhoParams {
-    /// Person name (matches filename in People folder).
-    pub name: String,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct ProjectParams {
-    /// Project name (matches filename).
-    pub name: String,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct ContextToolParams {
-    /// Search query for the topic.
-    pub topic: String,
-    /// Character budget (default 32000).
-    pub budget: Option<usize>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
 pub struct CreateParams {
     /// Note content (markdown body).
     pub content: String,
@@ -422,18 +348,14 @@ impl EngraphServer {
         name = "search",
         description = "Semantic + keyword hybrid search across the vault. Returns ranked results with file paths, scores, headings, and snippets."
     )]
-    async fn search(&self, params: Parameters<SearchParams>) -> Result<CallToolResult, McpError> {
+    async fn search(
+        &self,
+        params: Parameters<crate::params::Search>,
+    ) -> Result<CallToolResult, McpError> {
         let top_n = params.0.top_n.unwrap_or(10);
-        let all_terms = crate::tags::merge_all_alias(
-            params.0.tags.unwrap_or_default(),
-            params.0.all.unwrap_or_default(),
-        );
-        let scope = crate::tags::TagFilter::parse(
-            &all_terms,
-            &params.0.any.unwrap_or_default(),
-            &params.0.none.unwrap_or_default(),
-        )
-        .map_err(|e| mcp_err(&e))?;
+        let all_terms = crate::tags::merge_all_alias(params.0.tags, params.0.all);
+        let scope = crate::tags::TagFilter::parse(&all_terms, &params.0.any, &params.0.none)
+            .map_err(|e| mcp_err(&e))?;
         let store = self.store.lock().await;
         let mut embedder = self.embedder.lock().await;
 
@@ -482,7 +404,10 @@ impl EngraphServer {
         name = "read",
         description = "Read a note's full content with metadata, tags, and graph edges. Accepts file path, basename, or #docid."
     )]
-    async fn read(&self, params: Parameters<ReadParams>) -> Result<CallToolResult, McpError> {
+    async fn read(
+        &self,
+        params: Parameters<crate::params::Read>,
+    ) -> Result<CallToolResult, McpError> {
         let store = self.store.lock().await;
         let ctx = ContextParams {
             store: &store,
@@ -497,30 +422,25 @@ impl EngraphServer {
         name = "list",
         description = "List notes filtered by folder prefix and tag operators (all/any/none). A term is a tag path; a trailing `/` matches the tag and its descendants. Returns paths, docids, tags, and edge counts."
     )]
-    async fn list(&self, params: Parameters<ListParams>) -> Result<CallToolResult, McpError> {
+    async fn list(
+        &self,
+        params: Parameters<crate::params::List>,
+    ) -> Result<CallToolResult, McpError> {
         let store = self.store.lock().await;
         let ctx = ContextParams {
             store: &store,
             vault_path: &self.vault_path,
             profile: self.profile.as_ref().as_ref(),
         };
-        let all_terms = crate::tags::merge_all_alias(
-            params.0.tags.unwrap_or_default(),
-            params.0.all.unwrap_or_default(),
-        );
-        let tags = crate::tags::TagFilter::parse(
-            &all_terms,
-            &params.0.any.unwrap_or_default(),
-            &params.0.none.unwrap_or_default(),
-        )
-        .map_err(|e| mcp_err(&e))?;
-        let limit = params.0.limit.unwrap_or(20);
+        let all_terms = crate::tags::merge_all_alias(params.0.tags, params.0.all);
+        let tags = crate::tags::TagFilter::parse(&all_terms, &params.0.any, &params.0.none)
+            .map_err(|e| mcp_err(&e))?;
         let items = context::context_list(
             &ctx,
             params.0.folder.as_deref(),
             &tags,
             params.0.created_by.as_deref(),
-            limit,
+            params.0.limit,
         )
         .map_err(|e| mcp_err(&e))?;
         to_json_result(&items)
@@ -530,7 +450,10 @@ impl EngraphServer {
         name = "tags",
         description = "The vault's tag vocabulary: every tag, or the subtree under one term, each with the notes carrying it. Call before filtering with list."
     )]
-    async fn tags(&self, params: Parameters<TagsParams>) -> Result<CallToolResult, McpError> {
+    async fn tags(
+        &self,
+        params: Parameters<crate::params::Tags>,
+    ) -> Result<CallToolResult, McpError> {
         let store = self.store.lock().await;
         let prefix = params.0.under.as_deref().and_then(crate::tags::parse_term);
         let rows = store.tags_under(prefix.as_ref()).map_err(|e| mcp_err(&e))?;
@@ -556,7 +479,10 @@ impl EngraphServer {
         name = "who",
         description = "Person context bundle: their note, mentions across the vault, and graph connections."
     )]
-    async fn who(&self, params: Parameters<WhoParams>) -> Result<CallToolResult, McpError> {
+    async fn who(
+        &self,
+        params: Parameters<crate::params::Who>,
+    ) -> Result<CallToolResult, McpError> {
         let store = self.store.lock().await;
         let ctx = ContextParams {
             store: &store,
@@ -571,7 +497,10 @@ impl EngraphServer {
         name = "project",
         description = "Project context bundle: project note, child notes, active tasks, team members, and recent daily mentions."
     )]
-    async fn project(&self, params: Parameters<ProjectParams>) -> Result<CallToolResult, McpError> {
+    async fn project(
+        &self,
+        params: Parameters<crate::params::Project>,
+    ) -> Result<CallToolResult, McpError> {
         let store = self.store.lock().await;
         let ctx = ContextParams {
             store: &store,
@@ -588,9 +517,8 @@ impl EngraphServer {
     )]
     async fn context(
         &self,
-        params: Parameters<ContextToolParams>,
+        params: Parameters<crate::params::Topic>,
     ) -> Result<CallToolResult, McpError> {
-        let budget = params.0.budget.unwrap_or(32000);
         let store = self.store.lock().await;
         let mut embedder = self.embedder.lock().await;
         let ctx = ContextParams {
@@ -598,9 +526,13 @@ impl EngraphServer {
             vault_path: &self.vault_path,
             profile: self.profile.as_ref().as_ref(),
         };
-        let bundle =
-            context::context_topic_with_search(&ctx, &params.0.topic, budget, &mut *embedder)
-                .map_err(|e| mcp_err(&e))?;
+        let bundle = context::context_topic_with_search(
+            &ctx,
+            &params.0.query,
+            params.0.budget,
+            &mut *embedder,
+        )
+        .map_err(|e| mcp_err(&e))?;
         to_json_result(&bundle)
     }
 

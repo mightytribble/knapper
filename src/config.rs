@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -129,7 +130,18 @@ pub struct ApiKeyConfig {
 }
 
 /// Granularity of search results.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, clap::ValueEnum)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    Serialize,
+    Deserialize,
+    clap::ValueEnum,
+    schemars::JsonSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum GroupBy {
     /// One result per matching section — a document may appear more than once,

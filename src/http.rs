@@ -249,70 +249,9 @@ pub fn generate_api_key() -> String {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
-struct SearchBody {
-    query: String,
-    top_n: Option<usize>,
-    /// The tag scope (#60). A JSON body reads an array, unlike `/api/list`,
-    /// whose query string reads one comma-separated value because
-    /// `serde_urlencoded` has no sequence support. `Option` rather than a
-    /// bare `Vec` with `#[serde(default)]`, because `#[serde(default)]`
-    /// covers a missing field only — a caller that serialises an absent
-    /// optional as an explicit JSON `null` (routine in JavaScript and
-    /// Python) would fail deserialization and never reach `handle_search`.
-    tags: Option<Vec<String>>,
-    all: Option<Vec<String>>,
-    any: Option<Vec<String>>,
-    none: Option<Vec<String>>,
-}
-
-#[derive(Debug, Deserialize)]
 struct ReadSectionQuery {
     file: String,
     heading: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ListQuery {
-    folder: Option<String>,
-    /// One comma-separated string, per the OpenAPI description: `serde_urlencoded`
-    /// has no sequence support, so a repeated `tags=` key is never read here.
-    /// The same encoding carries `all`, `any` and `none` (#61); `tags` is the
-    /// alias of `all` that the CLI and MCP also take.
-    #[serde(default, deserialize_with = "deserialize_comma_separated")]
-    tags: Vec<String>,
-    #[serde(default, deserialize_with = "deserialize_comma_separated")]
-    all: Vec<String>,
-    #[serde(default, deserialize_with = "deserialize_comma_separated")]
-    any: Vec<String>,
-    #[serde(default, deserialize_with = "deserialize_comma_separated")]
-    none: Vec<String>,
-    limit: Option<usize>,
-    created_by: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TagsQuery {
-    /// One tag term. Omit for the whole vocabulary.
-    under: Option<String>,
-}
-
-/// `?tags=a,b` split on commas. An absent parameter stays empty; the split
-/// terms reach `TagFilter::parse`, which drops the ones with no path.
-fn deserialize_comma_separated<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let raw: Option<String> = Option::deserialize(deserializer)?;
-    Ok(match raw {
-        Some(s) if !s.is_empty() => s.split(',').map(str::to_string).collect(),
-        _ => Vec::new(),
-    })
-}
-
-#[derive(Debug, Deserialize)]
-struct ContextBody {
-    topic: String,
-    budget: Option<usize>,
 }
 
 // -- Write request bodies --
@@ -515,18 +454,13 @@ async fn handle_plugin_manifest(State(state): State<ApiState>) -> impl IntoRespo
 async fn handle_search(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(body): Json<SearchBody>,
+    Json(body): Json<crate::params::Search>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, false)?;
     let top_n = body.top_n.unwrap_or(10);
-    let all_terms =
-        crate::tags::merge_all_alias(body.tags.unwrap_or_default(), body.all.unwrap_or_default());
-    let scope = crate::tags::TagFilter::parse(
-        &all_terms,
-        &body.any.unwrap_or_default(),
-        &body.none.unwrap_or_default(),
-    )
-    .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
+    let all_terms = crate::tags::merge_all_alias(body.tags, body.all);
+    let scope = crate::tags::TagFilter::parse(&all_terms, &body.any, &body.none)
+        .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
     let store = state.store.lock().await;
     let mut embedder = state.embedder.lock().await;
 
@@ -596,7 +530,7 @@ async fn handle_read_section(
 async fn handle_list(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Query(params): Query<ListQuery>,
+    Query(params): Query<crate::params::List>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, false)?;
     let store = state.store.lock().await;
@@ -605,7 +539,6 @@ async fn handle_list(
         vault_path: &state.vault_path,
         profile: state.profile.as_ref().as_ref(),
     };
-    let limit = params.limit.unwrap_or(20);
     let all_terms = crate::tags::merge_all_alias(params.tags, params.all);
     let filter = crate::tags::TagFilter::parse(&all_terms, &params.any, &params.none)
         .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
@@ -614,7 +547,7 @@ async fn handle_list(
         params.folder.as_deref(),
         &filter,
         params.created_by.as_deref(),
-        limit,
+        params.limit,
     )
     .map_err(|e| {
         // An unknown tag is a caller's typo, not a server fault. The message
@@ -634,7 +567,7 @@ async fn handle_list(
 async fn handle_tags(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Query(params): Query<TagsQuery>,
+    Query(params): Query<crate::params::Tags>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, false)?;
     let store = state.store.lock().await;
@@ -697,10 +630,9 @@ async fn handle_project(
 async fn handle_context(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(body): Json<ContextBody>,
+    Json(body): Json<crate::params::Topic>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, false)?;
-    let budget = body.budget.unwrap_or(32000);
     let store = state.store.lock().await;
     let mut embedder = state.embedder.lock().await;
     let ctx = ContextParams {
@@ -708,7 +640,7 @@ async fn handle_context(
         vault_path: &state.vault_path,
         profile: state.profile.as_ref().as_ref(),
     };
-    let bundle = context::context_topic_with_search(&ctx, &body.topic, budget, &mut *embedder)
+    let bundle = context::context_topic_with_search(&ctx, &body.query, body.budget, &mut *embedder)
         .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
     Ok(Json(serde_json::json!(bundle)))
 }
