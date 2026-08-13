@@ -386,4 +386,29 @@ mod tests {
             want.difference(&actual).collect::<Vec<_>>()
         );
     }
+
+    #[test]
+    fn the_http_api_registers_what_the_table_names() {
+        let actual: BTreeSet<String> = crate::http::routes()
+            .into_iter()
+            .map(|(path, _)| path.to_string())
+            .collect();
+
+        let mut want = expected(
+            |c| !matches!(c.http, Http::Exempt(_)),
+            |c| c.http_path(),
+            PENDING_HTTP,
+        );
+        for (path, _reason) in HTTP_TRANSPORT_ROUTES {
+            want.insert((*path).to_string());
+        }
+
+        assert_eq!(
+            actual,
+            want,
+            "\nonly on the router: {:?}\nonly in the table: {:?}",
+            actual.difference(&want).collect::<Vec<_>>(),
+            want.difference(&actual).collect::<Vec<_>>()
+        );
+    }
 }

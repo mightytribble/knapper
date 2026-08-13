@@ -8,7 +8,7 @@ use axum::{
     Json, Router,
     http::StatusCode,
     response::IntoResponse,
-    routing::{get, post},
+    routing::{MethodRouter, get, post},
 };
 use serde::Deserialize;
 use tokio::sync::Mutex;
@@ -426,46 +426,52 @@ fn cors_layer(origins: &[String]) -> CorsLayer {
 // Router
 // ---------------------------------------------------------------------------
 
-/// Build the axum router with all API endpoints.
+/// Every route the API serves, as data. `build_router` folds this list into
+/// the `Router`, and `surface.rs`'s parity test reads it — an axum `Router`
+/// cannot be inspected once built, so the list is the only way the test can
+/// see what is served (#62). `openapi.rs` reads it too, so the spec and the
+/// router cannot describe different APIs.
+pub fn routes() -> Vec<(&'static str, MethodRouter<ApiState>)> {
+    vec![
+        ("/api/health-check", get(health_check)),
+        ("/api/search", post(handle_search)),
+        ("/api/read/{*file}", get(handle_read)),
+        ("/api/read-section", get(handle_read_section)),
+        ("/api/list", get(handle_list)),
+        ("/api/tags", get(handle_tags)),
+        ("/api/vault-map", get(handle_vault_map)),
+        ("/api/who/{name}", get(handle_who)),
+        ("/api/project/{name}", get(handle_project)),
+        ("/api/context", post(handle_context)),
+        ("/api/health", get(handle_health)),
+        ("/api/create", post(handle_create)),
+        ("/api/append", post(handle_append)),
+        ("/api/edit", post(handle_edit)),
+        ("/api/rewrite", post(handle_rewrite)),
+        ("/api/edit-frontmatter", post(handle_edit_frontmatter)),
+        ("/api/move", post(handle_move)),
+        ("/api/archive", post(handle_archive)),
+        ("/api/unarchive", post(handle_unarchive)),
+        ("/api/update-metadata", post(handle_update_metadata)),
+        ("/api/delete", post(handle_delete)),
+        ("/api/reindex-file", post(handle_reindex_file)),
+        ("/api/identity", get(handle_identity)),
+        ("/api/setup", post(handle_setup)),
+        ("/api/migrate/preview", post(handle_migrate_preview)),
+        ("/api/migrate/apply", post(handle_migrate_apply)),
+        ("/api/migrate/undo", post(handle_migrate_undo)),
+        ("/openapi.json", get(handle_openapi)),
+        ("/.well-known/ai-plugin.json", get(handle_plugin_manifest)),
+    ]
+}
+
 pub fn build_router(state: ApiState) -> Router {
     let cors = cors_layer(&state.http_config.cors_origins);
-    Router::new()
-        .route("/api/health-check", get(health_check))
-        .route("/api/search", post(handle_search))
-        .route("/api/read/{*file}", get(handle_read))
-        .route("/api/read-section", get(handle_read_section))
-        .route("/api/list", get(handle_list))
-        .route("/api/tags", get(handle_tags))
-        .route("/api/vault-map", get(handle_vault_map))
-        .route("/api/who/{name}", get(handle_who))
-        .route("/api/project/{name}", get(handle_project))
-        .route("/api/context", post(handle_context))
-        .route("/api/health", get(handle_health))
-        // Write endpoints
-        .route("/api/create", post(handle_create))
-        .route("/api/append", post(handle_append))
-        .route("/api/edit", post(handle_edit))
-        .route("/api/rewrite", post(handle_rewrite))
-        .route("/api/edit-frontmatter", post(handle_edit_frontmatter))
-        .route("/api/move", post(handle_move))
-        .route("/api/archive", post(handle_archive))
-        .route("/api/unarchive", post(handle_unarchive))
-        .route("/api/update-metadata", post(handle_update_metadata))
-        .route("/api/delete", post(handle_delete))
-        // Index maintenance
-        .route("/api/reindex-file", post(handle_reindex_file))
-        // Identity endpoints
-        .route("/api/identity", get(handle_identity))
-        .route("/api/setup", post(handle_setup))
-        // Migration endpoints
-        .route("/api/migrate/preview", post(handle_migrate_preview))
-        .route("/api/migrate/apply", post(handle_migrate_apply))
-        .route("/api/migrate/undo", post(handle_migrate_undo))
-        // OpenAPI / ChatGPT plugin discovery (no auth required)
-        .route("/openapi.json", get(handle_openapi))
-        .route("/.well-known/ai-plugin.json", get(handle_plugin_manifest))
-        .layer(cors)
-        .with_state(state)
+    let mut router = Router::new();
+    for (path, handler) in routes() {
+        router = router.route(path, handler);
+    }
+    router.layer(cors).with_state(state)
 }
 
 async fn health_check() -> &'static str {
