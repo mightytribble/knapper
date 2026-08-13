@@ -32,6 +32,7 @@ engraph clear                           # Drop the index (--all also removes mod
 engraph search "how does the auth flow work"
 engraph search "performance regressions last month" --explain
 engraph search "architecture decisions" -n 5 --json
+engraph search "warding" --all type/undead      # Only notes carrying the tag
 ```
 
 | Flag              | Description                                    |
@@ -39,6 +40,7 @@ engraph search "architecture decisions" -n 5 --json
 | `-n, --top-n <N>` | Number of results (default: `top_n` in `config.toml`) |
 | `--explain`       | Show per-lane RRF score breakdown              |
 | `--json`          | Machine-readable JSON output                   |
+| `--all`/`--any`/`--none` | Answer from the notes these tag terms admit. `--tags` is an alias of `--all` |
 
 ### Query Tips
 
@@ -58,6 +60,7 @@ engraph status                          # Files, chunks, edges, wikilinks, menti
 
 ```bash
 engraph topic "authentication" --budget 8000
+engraph topic "warding" --all type/undead   # Gather the bundle from tagged notes only
 engraph who "Person Name"
 engraph project "Project Name"
 engraph vault-map                 # Collection structure overview
