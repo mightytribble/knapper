@@ -313,6 +313,50 @@ impl std::fmt::Display for TagTerm {
     }
 }
 
+/// A directory term, from the vault root. `Subtree` is the folder and
+/// everything beneath it; `Exact` is the folder's own notes, direct children
+/// only (#65).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FolderTerm {
+    Exact(String),
+    Subtree(String),
+}
+
+impl FolderTerm {
+    /// The path the term names, without the subtree marker or a leading slash.
+    pub fn path(&self) -> &str {
+        match self {
+            FolderTerm::Exact(p) | FolderTerm::Subtree(p) => p,
+        }
+    }
+}
+
+impl std::fmt::Display for FolderTerm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FolderTerm::Exact(p) => write!(f, "/{p}"),
+            FolderTerm::Subtree(p) => write!(f, "/{p}/"),
+        }
+    }
+}
+
+/// One scope term: a tag or a directory. A term that opens with `/` is a
+/// directory path; every other term is a tag path, the grammar #61 settled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScopeTerm {
+    Tag(TagTerm),
+    Folder(FolderTerm),
+}
+
+impl std::fmt::Display for ScopeTerm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ScopeTerm::Tag(t) => write!(f, "{t}"),
+            ScopeTerm::Folder(fl) => write!(f, "{fl}"),
+        }
+    }
+}
+
 /// Read a term the way a caller writes one.
 ///
 /// One leading `#` is dropped, a trailing `/*` folds to a trailing `/`, a
@@ -338,6 +382,36 @@ pub fn parse_term(written: &str) -> Option<TagTerm> {
     } else {
         TagTerm::Exact(path)
     })
+}
+
+/// Read one scope term the way a caller writes it (#65).
+///
+/// A leading `/` marks a directory path from the vault root: its case is kept,
+/// because `files.path` keeps its case, and a trailing `/` or `/*` is the
+/// subtree marker, the same rule tags use. A term with no leading slash is a
+/// tag, folded by `parse_term`. A term that empties after the markers are
+/// stripped returns `None`, so a bare `/` in a list is dropped, not an error.
+pub fn parse_scope_term(written: &str) -> Option<ScopeTerm> {
+    let trimmed = written.trim();
+    if let Some(rest) = trimmed.strip_prefix('/') {
+        let (head, subtree) = match rest.strip_suffix("/*") {
+            Some(head) => (head, true),
+            None => match rest.strip_suffix('/') {
+                Some(head) => (head, true),
+                None => (rest, false),
+            },
+        };
+        let path = head.trim_end_matches('/').to_string();
+        if path.is_empty() {
+            return None;
+        }
+        return Some(ScopeTerm::Folder(if subtree {
+            FolderTerm::Subtree(path)
+        } else {
+            FolderTerm::Exact(path)
+        }));
+    }
+    parse_term(trimmed).map(ScopeTerm::Tag)
 }
 
 /// The SQL predicate over a `tags` row aliased `t`, and its arguments in order.
@@ -369,34 +443,57 @@ fn tag_exists(conn: &Connection, term: &TagTerm) -> Result<bool> {
 ///
 /// A silent empty result leaves a caller unable to tell a typo from an empty
 /// set, and an agent retries the call unchanged. The error carries the repair.
-pub fn check_terms(conn: &Connection, terms: &[&TagTerm]) -> Result<()> {
+pub fn check_terms(conn: &Connection, terms: &[&ScopeTerm]) -> Result<()> {
     for term in terms {
-        if tag_exists(conn, term)? {
-            continue;
-        }
-        // Naming an ancestor and forgetting the subtree marker is the
-        // likeliest mistake, so an `Exact` term gets a second chance: its own
-        // subtree may match even though the exact tag does not. A `Subtree`
-        // term that matched nothing has no such chance, because its subtree
-        // is what already failed.
-        let nearest = match term {
-            TagTerm::Exact(p) if tag_exists(conn, &TagTerm::Subtree(p.clone()))? => {
-                Some(TagTerm::Subtree(p.clone()).to_string())
+        match term {
+            ScopeTerm::Tag(tag) => {
+                if tag_exists(conn, tag)? {
+                    continue;
+                }
+                // Naming an ancestor and forgetting the subtree marker is the
+                // likeliest mistake, so an `Exact` term gets a second chance:
+                // its own subtree may match even though the exact tag does
+                // not. A `Subtree` term that matched nothing has no such
+                // chance, because its subtree is what already failed.
+                let nearest = match tag {
+                    TagTerm::Exact(p) if tag_exists(conn, &TagTerm::Subtree(p.clone()))? => {
+                        Some(TagTerm::Subtree(p.clone()).to_string())
+                    }
+                    _ => match resolve_tag(conn, tag.path())? {
+                        // `tag_exists` above is already true whenever
+                        // `resolve_tag` would return `Exact` for this path,
+                        // so this arm cannot fire.
+                        TagResolution::Exact(display) => Some(display),
+                        TagResolution::Fuzzy { resolved, .. } => Some(resolved),
+                        // `Extension` echoes the proposed path back, not an
+                        // existing one — the term runs past a real tag, so
+                        // name that ancestor.
+                        TagResolution::Extension(_) => longest_existing_ancestor(conn, tag.path())?,
+                        TagResolution::New(_) => None,
+                    },
+                };
+                match nearest {
+                    Some(near) => anyhow::bail!("no such tag '{tag}'; nearest: '{near}'"),
+                    None => anyhow::bail!("no such tag '{tag}'"),
+                }
             }
-            _ => match resolve_tag(conn, term.path())? {
-                // `tag_exists` above is already true whenever `resolve_tag`
-                // would return `Exact` for this path, so this arm cannot fire.
-                TagResolution::Exact(display) => Some(display),
-                TagResolution::Fuzzy { resolved, .. } => Some(resolved),
-                // `Extension` echoes the proposed path back, not an existing
-                // one — the term runs past a real tag, so name that ancestor.
-                TagResolution::Extension(_) => longest_existing_ancestor(conn, term.path())?,
-                TagResolution::New(_) => None,
-            },
-        };
-        match nearest {
-            Some(near) => anyhow::bail!("no such tag '{term}'; nearest: '{near}'"),
-            None => anyhow::bail!("no such tag '{term}'"),
+            ScopeTerm::Folder(folder) => {
+                if folder_exists(conn, folder)? {
+                    continue;
+                }
+                let nearest = match folder {
+                    FolderTerm::Exact(p)
+                        if folder_exists(conn, &FolderTerm::Subtree(p.clone()))? =>
+                    {
+                        Some(FolderTerm::Subtree(p.clone()).to_string())
+                    }
+                    _ => longest_existing_folder_ancestor(conn, folder.path())?,
+                };
+                match nearest {
+                    Some(near) => anyhow::bail!("no such folder '{folder}'; nearest: '{near}'"),
+                    None => anyhow::bail!("no such folder '{folder}'"),
+                }
+            }
         }
     }
     Ok(())
@@ -426,15 +523,62 @@ fn longest_existing_ancestor(conn: &Connection, path: &str) -> Result<Option<Str
     Ok(None)
 }
 
-/// The tag side of a note query: three fields that combine with AND.
+/// The SQL predicate over a `files` row aliased `f` for a directory term, and
+/// its arguments in order (#65).
 ///
-/// A note is returned when it carries every `all` term, at least one `any`
-/// term, and no `none` term. An empty field constrains nothing.
+/// A range, so the path index serves it and a `/` or `%` in a path is a
+/// literal rather than a `LIKE` wildcard. `Subtree` bounds the paths under
+/// `path/`; `Exact` adds a clause rejecting a path with a further `/`, which is
+/// what separates a direct child from a note in a subfolder. `length()` counts
+/// characters in SQLite, so the exact clause is right for a multibyte path.
+pub fn folder_sql(term: &FolderTerm) -> (String, Vec<String>) {
+    match term {
+        FolderTerm::Subtree(path) => (
+            "f.path >= ? AND f.path < ?".to_string(),
+            vec![format!("{path}/"), format!("{path}0")],
+        ),
+        FolderTerm::Exact(path) => (
+            "f.path >= ? AND f.path < ? AND instr(substr(f.path, length(?) + 1), '/') = 0"
+                .to_string(),
+            vec![format!("{path}/"), format!("{path}0"), format!("{path}/")],
+        ),
+    }
+}
+
+/// Whether any file lives where a directory term names.
+fn folder_exists(conn: &Connection, term: &FolderTerm) -> Result<bool> {
+    let (pred, args) = folder_sql(term);
+    Ok(conn.query_row(
+        &format!("SELECT EXISTS (SELECT 1 FROM files f WHERE {pred})"),
+        rusqlite::params_from_iter(args.iter()),
+        |row| row.get(0),
+    )?)
+}
+
+/// The longest ancestor folder of `path` that holds any note, as its subtree
+/// spelling `/ancestor/`, if any. The directory analogue of
+/// `longest_existing_ancestor` (#65).
+fn longest_existing_folder_ancestor(conn: &Connection, path: &str) -> Result<Option<String>> {
+    let segments: Vec<&str> = path.split('/').collect();
+    for end in (1..segments.len()).rev() {
+        let prefix = segments[..end].join("/");
+        if folder_exists(conn, &FolderTerm::Subtree(prefix.clone()))? {
+            return Ok(Some(FolderTerm::Subtree(prefix).to_string()));
+        }
+    }
+    Ok(None)
+}
+
+/// A scope over a note query: three fields that combine with AND (#65).
+///
+/// A note is admitted when it matches every `all` term, at least one `any`
+/// term, and no `none` term. Each term is a tag or a directory. An empty
+/// field constrains nothing.
 #[derive(Debug, Clone, Default)]
 pub struct Scope {
-    pub all: Vec<TagTerm>,
-    pub any: Vec<TagTerm>,
-    pub none: Vec<TagTerm>,
+    pub all: Vec<ScopeTerm>,
+    pub any: Vec<ScopeTerm>,
+    pub none: Vec<ScopeTerm>,
 }
 
 impl Scope {
@@ -445,10 +589,10 @@ impl Scope {
     /// error naming the field, because a silent empty field would constrain
     /// nothing and list every note the caller meant to filter.
     pub fn parse(all: &[String], any: &[String], none: &[String]) -> Result<Self> {
-        let read = |name: &str, field: &[String]| -> Result<Vec<TagTerm>> {
-            let terms: Vec<TagTerm> = field.iter().filter_map(|t| parse_term(t)).collect();
+        let read = |name: &str, field: &[String]| -> Result<Vec<ScopeTerm>> {
+            let terms: Vec<ScopeTerm> = field.iter().filter_map(|t| parse_scope_term(t)).collect();
             if !field.is_empty() && terms.is_empty() {
-                anyhow::bail!("'{name}' names no tag");
+                anyhow::bail!("'{name}' names no scope term");
             }
             Ok(terms)
         };
@@ -473,7 +617,7 @@ impl Scope {
     /// named — an empty field constrains nothing and printing it would read as
     /// though it did.
     pub fn describe(&self) -> String {
-        let field = |name: &str, terms: &[TagTerm]| -> Option<String> {
+        let field = |name: &str, terms: &[ScopeTerm]| -> Option<String> {
             if terms.is_empty() {
                 return None;
             }
@@ -861,21 +1005,77 @@ mod tests {
     }
 
     #[test]
+    fn a_leading_slash_parses_a_directory_and_a_trailing_slash_its_subtree() {
+        assert_eq!(
+            parse_scope_term("/locations/"),
+            Some(ScopeTerm::Folder(FolderTerm::Subtree("locations".into())))
+        );
+        assert_eq!(
+            parse_scope_term("/locations"),
+            Some(ScopeTerm::Folder(FolderTerm::Exact("locations".into())))
+        );
+        assert_eq!(
+            parse_scope_term("/locations/*"),
+            Some(ScopeTerm::Folder(FolderTerm::Subtree("locations".into())))
+        );
+        assert_eq!(
+            parse_scope_term("type/undead"),
+            Some(ScopeTerm::Tag(TagTerm::Exact("type/undead".into())))
+        );
+        assert_eq!(
+            parse_scope_term("type/undead/"),
+            Some(ScopeTerm::Tag(TagTerm::Subtree("type/undead".into())))
+        );
+    }
+
+    #[test]
+    fn a_directory_term_keeps_its_case_while_a_tag_folds() {
+        assert_eq!(
+            parse_scope_term("/Locations/"),
+            Some(ScopeTerm::Folder(FolderTerm::Subtree("Locations".into())))
+        );
+        assert_eq!(
+            parse_scope_term("Type/Undead"),
+            Some(ScopeTerm::Tag(TagTerm::Exact("type/undead".into())))
+        );
+    }
+
+    #[test]
+    fn a_bare_slash_is_dropped_like_a_trailing_comma() {
+        assert_eq!(parse_scope_term("/"), None);
+        assert_eq!(parse_scope_term("//"), None);
+    }
+
+    #[test]
+    fn describe_renders_directories_with_slashes_and_tags_without() {
+        let scope = Scope::parse(
+            &["/Locations/".to_string()],
+            &["type/undead".to_string(), "/places/".to_string()],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(scope.describe(), "all=/Locations/ any=type/undead,/places/");
+    }
+
+    #[test]
     fn a_trailing_comma_drops_one_term_and_keeps_the_rest() {
         let filter = Scope::parse(&["type/undead".to_string(), "".to_string()], &[], &[]).unwrap();
-        assert_eq!(filter.all, vec![TagTerm::Exact("type/undead".into())]);
+        assert_eq!(
+            filter.all,
+            vec![ScopeTerm::Tag(TagTerm::Exact("type/undead".into()))]
+        );
     }
 
     #[test]
     fn a_field_that_is_all_empty_terms_is_an_error() {
         let err = Scope::parse(&["".to_string()], &[], &[]).unwrap_err();
-        assert_eq!(err.to_string(), "'all' names no tag");
+        assert_eq!(err.to_string(), "'all' names no scope term");
 
         let err = Scope::parse(&[], &["".to_string()], &[]).unwrap_err();
-        assert_eq!(err.to_string(), "'any' names no tag");
+        assert_eq!(err.to_string(), "'any' names no scope term");
 
         let err = Scope::parse(&[], &[], &["".to_string()]).unwrap_err();
-        assert_eq!(err.to_string(), "'none' names no tag");
+        assert_eq!(err.to_string(), "'none' names no scope term");
     }
 
     #[test]

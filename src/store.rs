@@ -1730,47 +1730,56 @@ impl Store {
     }
 }
 
-/// The tag half of a note query: SQL over a `files` row aliased `f`, and its
-/// arguments in the order the SQL binds them.
+/// A scope over a note query: SQL over a `files` row aliased `f`, and its
+/// arguments in the order the SQL binds them (#65).
 ///
-/// One author for the three operators, because `list_files` and
-/// `files_in_scope` ask the same question of the same junction and a second
-/// copy of the rule is a second thing to keep right (#60). The per-term rule
-/// stays in `tags::predicate`.
-fn scope_clauses(tags: &crate::tags::Scope) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
+/// One author for the three operators over both kinds of term, because
+/// `list_files` and `files_in_scope` ask the same question and a second copy is
+/// a second thing to keep right. A tag term is an `EXISTS` over the junction; a
+/// directory term is a range predicate on `files.path`, which needs no join.
+fn scope_clauses(scope: &crate::tags::Scope) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
+    use crate::tags::ScopeTerm;
+
+    fn fragment(term: &ScopeTerm, args: &mut Vec<Box<dyn rusqlite::types::ToSql>>) -> String {
+        match term {
+            ScopeTerm::Tag(tag) => {
+                let (pred, values) = crate::tags::predicate(tag);
+                for value in values {
+                    args.push(Box::new(value));
+                }
+                format!(
+                    "EXISTS (SELECT 1 FROM file_tags ft JOIN tags t ON t.id = ft.tag_id
+                             WHERE ft.file_id = f.id AND {pred})"
+                )
+            }
+            ScopeTerm::Folder(folder) => {
+                let (pred, values) = crate::tags::folder_sql(folder);
+                for value in values {
+                    args.push(Box::new(value));
+                }
+                format!("({pred})")
+            }
+        }
+    }
+
     let mut sql = String::new();
     let mut args: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
-    // The junction, not `json_each` over a JSON column: the old test scanned
-    // `files` and parsed JSON for each row (#60). A term folds its own path, so
-    // a folded query side meets a folded column.
-    for term in &tags.all {
-        let (pred, values) = crate::tags::predicate(term);
-        sql.push_str(&format!(
-            " AND EXISTS (SELECT 1 FROM file_tags ft JOIN tags t ON t.id = ft.tag_id
-                            WHERE ft.file_id = f.id AND {pred})"
-        ));
-        for value in values {
-            args.push(Box::new(value));
-        }
+    for term in &scope.all {
+        let frag = fragment(term, &mut args);
+        sql.push_str(&format!(" AND {frag}"));
     }
-    for (field, keyword) in [(&tags.any, "EXISTS"), (&tags.none, "NOT EXISTS")] {
+    for (field, negate) in [(&scope.any, false), (&scope.none, true)] {
         if field.is_empty() {
             continue;
         }
-        let mut ors: Vec<String> = Vec::new();
-        for term in field {
-            let (pred, values) = crate::tags::predicate(term);
-            ors.push(pred);
-            for value in values {
-                args.push(Box::new(value));
-            }
+        let ors: Vec<String> = field.iter().map(|t| fragment(t, &mut args)).collect();
+        let group = ors.join(" OR ");
+        if negate {
+            sql.push_str(&format!(" AND NOT ({group})"));
+        } else {
+            sql.push_str(&format!(" AND ({group})"));
         }
-        sql.push_str(&format!(
-            " AND {keyword} (SELECT 1 FROM file_tags ft JOIN tags t ON t.id = ft.tag_id
-                               WHERE ft.file_id = f.id AND ({}))",
-            ors.join(" OR ")
-        ));
     }
     (sql, args)
 }
@@ -1785,7 +1794,8 @@ impl Store {
         limit: usize,
     ) -> Result<Vec<FileRecord>> {
         // `none` is not checked: excluding a tag no note carries is a no-op.
-        let checked: Vec<&crate::tags::TagTerm> = tags.all.iter().chain(tags.any.iter()).collect();
+        let checked: Vec<&crate::tags::ScopeTerm> =
+            tags.all.iter().chain(tags.any.iter()).collect();
         crate::tags::check_terms(&self.conn, &checked)?;
 
         let mut sql = format!("SELECT {FILE_COLUMNS} FROM files f WHERE 1=1");
@@ -1824,7 +1834,7 @@ impl Store {
     /// `list_files` does not check it: excluding a tag no note carries is a
     /// no-op, and erroring on it would refuse a correct query.
     pub fn files_in_scope(&self, filter: &crate::tags::Scope) -> Result<Vec<i64>> {
-        let checked: Vec<&crate::tags::TagTerm> =
+        let checked: Vec<&crate::tags::ScopeTerm> =
             filter.all.iter().chain(filter.any.iter()).collect();
         crate::tags::check_terms(&self.conn, &checked)?;
 
@@ -5596,6 +5606,174 @@ mod tests {
             .collect();
         paths.sort();
         paths
+    }
+
+    fn folder_fixture() -> Store {
+        let store = Store::open_memory().unwrap();
+        for (i, path) in [
+            "Locations.md",
+            "Locations/aurelian-empire.md",
+            "Locations/cities/varenholt.md",
+            "People/marcus.md",
+        ]
+        .iter()
+        .enumerate()
+        {
+            store
+                .insert_file(path, "h", i as i64, &format!("d00000{i}"), None, None)
+                .unwrap();
+        }
+        store
+    }
+
+    fn folder_scope(all: &[&str], any: &[&str], none: &[&str]) -> crate::tags::Scope {
+        crate::tags::Scope::parse(
+            &all.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            &any.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            &none.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_directory_subtree_takes_everything_beneath_it() {
+        let store = folder_fixture();
+        assert_eq!(
+            scoped_paths(&store, &folder_scope(&["/Locations/"], &[], &[])),
+            vec![
+                "Locations/aurelian-empire.md",
+                "Locations/cities/varenholt.md"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_directory_exact_takes_only_direct_children() {
+        let store = folder_fixture();
+        assert_eq!(
+            scoped_paths(&store, &folder_scope(&["/Locations"], &[], &[])),
+            vec!["Locations/aurelian-empire.md"]
+        );
+    }
+
+    #[test]
+    fn a_directory_subtree_excludes_a_root_note_of_the_same_name() {
+        let store = folder_fixture();
+        let paths = scoped_paths(&store, &folder_scope(&["/Locations/"], &[], &[]));
+        assert!(
+            !paths.contains(&"Locations.md".to_string()),
+            "a root note is not under the folder that shares its stem"
+        );
+    }
+
+    #[test]
+    fn a_directory_scope_is_case_sensitive() {
+        // Two folders differ only in case, so both validate; the range on
+        // files.path keeps case, so /Locations/ resolves to the capitalized
+        // folder alone, and a LOWER() comparison would fail this (#65).
+        let store = Store::open_memory().unwrap();
+        store
+            .insert_file("Locations/a.md", "h", 1, "d000001", None, None)
+            .unwrap();
+        store
+            .insert_file("locations/b.md", "h", 2, "d000002", None, None)
+            .unwrap();
+        assert_eq!(
+            scoped_paths(&store, &folder_scope(&["/Locations/"], &[], &[])),
+            vec!["Locations/a.md"]
+        );
+    }
+
+    #[test]
+    fn a_scope_mixes_a_tag_and_a_directory_term() {
+        let store = Store::open_memory().unwrap();
+        let tag = |p: &str| crate::tags::Tag {
+            path: p.into(),
+            display: p.into(),
+        };
+        let empire = store
+            .insert_file(
+                "Locations/aurelian-empire.md",
+                "h",
+                1,
+                "d000001",
+                None,
+                None,
+            )
+            .unwrap();
+        store
+            .insert_file(
+                "Locations/cities/varenholt.md",
+                "h",
+                2,
+                "d000002",
+                None,
+                None,
+            )
+            .unwrap();
+        let marcus = store
+            .insert_file("People/marcus.md", "h", 3, "d000003", None, None)
+            .unwrap();
+        store
+            .reconcile_file_tags(empire, &[tag("type/place")])
+            .unwrap();
+        store
+            .reconcile_file_tags(marcus, &[tag("type/person")])
+            .unwrap();
+
+        // all: under Locations/ AND tagged type/place -> the empire alone.
+        assert_eq!(
+            scoped_paths(
+                &store,
+                &folder_scope(&["/Locations/", "type/place"], &[], &[])
+            ),
+            vec!["Locations/aurelian-empire.md"]
+        );
+        // any: under People/ OR tagged type/place -> the empire and marcus.
+        assert_eq!(
+            scoped_paths(&store, &folder_scope(&[], &["/People/", "type/place"], &[])),
+            vec!["Locations/aurelian-empire.md", "People/marcus.md"]
+        );
+    }
+
+    #[test]
+    fn a_directory_naming_no_note_errors_and_names_the_nearest_ancestor() {
+        let store = folder_fixture();
+        let err = store
+            .files_in_scope(&folder_scope(&["/Locations/atlantis/"], &[], &[]))
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "no such folder '/Locations/atlantis/'; nearest: '/Locations/'"
+        );
+    }
+
+    #[test]
+    fn an_exact_directory_with_only_deeper_notes_suggests_the_subtree() {
+        let store = Store::open_memory().unwrap();
+        store
+            .insert_file("Deep/inner/note.md", "h", 1, "d000001", None, None)
+            .unwrap();
+        let err = store
+            .files_in_scope(&folder_scope(&["/Deep"], &[], &[]))
+            .unwrap_err();
+        assert_eq!(err.to_string(), "no such folder '/Deep'; nearest: '/Deep/'");
+    }
+
+    #[test]
+    fn a_wholly_unknown_directory_errors_without_a_nearest() {
+        let store = folder_fixture();
+        let err = store
+            .files_in_scope(&folder_scope(&["/Nowhere/"], &[], &[]))
+            .unwrap_err();
+        assert_eq!(err.to_string(), "no such folder '/Nowhere/'");
+    }
+
+    #[test]
+    fn excluding_an_unknown_directory_is_not_an_error() {
+        let store = folder_fixture();
+        let paths = scoped_paths(&store, &folder_scope(&[], &[], &["/Nowhere/"]));
+        assert!(!paths.is_empty(), "none is not checked, so this resolves");
     }
 
     #[test]
