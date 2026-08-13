@@ -249,14 +249,8 @@ pub const PENDING_MCP: &[Pending] = &[
     Pending::NotYetAdded("status"),
     Pending::NotYetAdded("topic"),
     Pending::NotYetAdded("move"),
-    Pending::NotYetAdded("init"),
-    Pending::NotYetAdded("migrate"),
     Pending::NotYetRemoved("context"),
     Pending::NotYetRemoved("move_note"),
-    Pending::NotYetRemoved("setup"),
-    Pending::NotYetRemoved("migrate_preview"),
-    Pending::NotYetRemoved("migrate_apply"),
-    Pending::NotYetRemoved("migrate_undo"),
 ];
 
 /// What the HTTP API has yet to bring onto the table (#62). Entries are
@@ -265,13 +259,7 @@ pub const PENDING_HTTP: &[Pending] = &[
     Pending::NotYetAdded("/api/index"),
     Pending::NotYetAdded("/api/status"),
     Pending::NotYetAdded("/api/topic"),
-    Pending::NotYetAdded("/api/init"),
-    Pending::NotYetAdded("/api/migrate"),
     Pending::NotYetRemoved("/api/context"),
-    Pending::NotYetRemoved("/api/setup"),
-    Pending::NotYetRemoved("/api/migrate/preview"),
-    Pending::NotYetRemoved("/api/migrate/apply"),
-    Pending::NotYetRemoved("/api/migrate/undo"),
 ];
 
 /// Capabilities whose CLI arguments are declared apart from the shared

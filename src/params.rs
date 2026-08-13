@@ -475,6 +475,12 @@ pub struct Migrate {
     /// `preview`, `apply` or `undo`.
     #[arg(long)]
     pub mode: String,
+    /// The preview `apply` acts on. A server caller holds the JSON that
+    /// `preview` returned it and passes it back here; the CLI reads the copy
+    /// `preview` saved, so this has no command line spelling (#62).
+    #[arg(skip)]
+    #[serde(default)]
+    pub preview: Option<serde_json::Value>,
 }
 
 #[cfg(test)]

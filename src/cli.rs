@@ -89,6 +89,11 @@ pub enum Command {
     Init {
         /// Path to vault directory.
         path: Option<PathBuf>,
+        /// `detect` inspects the vault and writes nothing; `apply` configures
+        /// identity and indexes. Omit it to run the interactive flow, which
+        /// is the one thing the other surfaces cannot do (#62).
+        #[arg(long)]
+        mode: Option<String>,
         /// Only run identity setup (skip indexing).
         #[arg(long)]
         identity: bool,
@@ -213,10 +218,13 @@ pub enum Command {
         action: WriteAction,
     },
 
-    /// Migrate vault structure.
+    /// Migrate vault structure into PARA.
     Migrate {
-        #[command(subcommand)]
-        action: MigrateAction,
+        /// `preview` classifies every note and saves the proposed moves;
+        /// `apply` performs them; `undo` reverses the last migration. PARA
+        /// is the one strategy, so it is not a leaf of its own (#62).
+        #[arg(long)]
+        mode: String,
     },
 }
 
@@ -375,19 +383,6 @@ pub enum ModelsAction {
     Info { name: String },
 }
 
-#[derive(Subcommand, Debug)]
-pub enum MigrateAction {
-    /// Classify notes and generate PARA migration preview.
-    Para {
-        /// Apply a previously generated preview.
-        #[arg(long)]
-        apply: bool,
-        /// Undo the last migration.
-        #[arg(long, conflicts_with = "apply")]
-        undo: bool,
-    },
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,5 +394,40 @@ mod tests {
         let names: Vec<&str> = cmd.get_subcommands().map(|s| s.get_name()).collect();
         assert!(names.contains(&"search"), "got {names:?}");
         assert!(names.contains(&"index"), "got {names:?}");
+    }
+
+    #[test]
+    fn migrate_takes_the_mode_the_servers_take() {
+        // PARA is the only strategy, so `migrate` is a leaf that takes the
+        // same three words every surface takes (#62).
+        let cli = Cli::try_parse_from(["engraph", "migrate", "--mode", "apply"]).unwrap();
+        match cli.command {
+            Command::Migrate { mode } => assert_eq!(mode, "apply"),
+            other => panic!("got {other:?}"),
+        }
+        assert!(
+            Cli::try_parse_from(["engraph", "migrate", "para", "--apply"]).is_err(),
+            "the PARA leaf is gone"
+        );
+        assert!(
+            Cli::try_parse_from(["engraph", "migrate"]).is_err(),
+            "the mode is required"
+        );
+    }
+
+    #[test]
+    fn init_takes_a_mode_and_runs_the_prompts_without_one() {
+        // `init` is one capability: `--mode` on every surface, and the
+        // interactive flow when the CLI is given none (#62).
+        let cli = Cli::try_parse_from(["engraph", "init", "--mode", "detect"]).unwrap();
+        match cli.command {
+            Command::Init { mode, .. } => assert_eq!(mode.as_deref(), Some("detect")),
+            other => panic!("got {other:?}"),
+        }
+        let cli = Cli::try_parse_from(["engraph", "init"]).unwrap();
+        match cli.command {
+            Command::Init { mode, .. } => assert_eq!(mode, None),
+            other => panic!("got {other:?}"),
+        }
     }
 }

@@ -553,6 +553,22 @@ pub fn save_preview(preview: &MigrationPreview, data_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The preview an `apply` acts on: the one the caller passed, or the one the
+/// last `preview` saved. The two surfaces differ in where the JSON waits —
+/// a server caller holds it, a CLI caller has the file — and not in what
+/// `apply` then does with it (#62).
+pub fn resolve_preview(
+    supplied: Option<serde_json::Value>,
+    data_dir: &Path,
+) -> Result<MigrationPreview> {
+    match supplied {
+        Some(value) => {
+            serde_json::from_value(value).map_err(|e| anyhow::anyhow!("Invalid preview JSON: {e}"))
+        }
+        None => load_preview(data_dir),
+    }
+}
+
 /// Load a previously saved migration preview from disk.
 pub fn load_preview(data_dir: &Path) -> Result<MigrationPreview> {
     let json = std::fs::read_to_string(data_dir.join("migration-preview.json"))?;

@@ -26,12 +26,10 @@ pub fn build_openapi_spec(server_url: &str) -> serde_json::Value {
 
     // Identity endpoints
     paths.insert("/api/identity".into(), build_identity_endpoint());
-    paths.insert("/api/setup".into(), build_setup_endpoint());
+    paths.insert("/api/init".into(), build_init_endpoint());
 
     // Migration endpoints
-    paths.insert("/api/migrate/preview".into(), build_migrate_preview());
-    paths.insert("/api/migrate/apply".into(), build_migrate_apply());
-    paths.insert("/api/migrate/undo".into(), build_migrate_undo());
+    paths.insert("/api/migrate".into(), build_migrate());
 
     serde_json::json!({
         "openapi": "3.1.0",
@@ -379,10 +377,10 @@ fn build_identity_endpoint() -> serde_json::Value {
     })
 }
 
-fn build_setup_endpoint() -> serde_json::Value {
+fn build_init_endpoint() -> serde_json::Value {
     serde_json::json!({
         "post": {
-            "operationId": "setup",
+            "operationId": "init",
             "summary": "Run first-time setup or update identity. Use 'detect' to inspect, 'apply' to configure.",
             "requestBody": {
                 "required": true,
@@ -402,48 +400,23 @@ fn build_setup_endpoint() -> serde_json::Value {
     })
 }
 
-fn build_migrate_preview() -> serde_json::Value {
+fn build_migrate() -> serde_json::Value {
     serde_json::json!({
         "post": {
-            "operationId": "migratePreview",
-            "summary": "Generate a PARA migration preview. Classifies notes and suggests folder moves.",
-            "requestBody": {
-                "content": { "application/json": { "schema": { "type": "object", "properties": {} } } }
-            },
-            "responses": { "200": { "description": "Migration preview with proposed moves" } }
-        }
-    })
-}
-
-fn build_migrate_apply() -> serde_json::Value {
-    serde_json::json!({
-        "post": {
-            "operationId": "migrateApply",
-            "summary": "Apply a previously generated migration preview. Moves notes to suggested PARA folders.",
+            "operationId": "migrate",
+            "summary": "Restructure the vault into PARA. 'preview' classifies notes and suggests folder moves, 'apply' performs them, 'undo' restores the last migration.",
             "requestBody": {
                 "required": true,
                 "content": { "application/json": { "schema": {
                     "type": "object",
-                    "required": ["preview"],
+                    "required": ["mode"],
                     "properties": {
-                        "preview": { "type": "object", "description": "Migration preview from migratePreview" }
+                        "mode": { "type": "string", "description": "'preview', 'apply' or 'undo'" },
+                        "preview": { "type": "object", "description": "The preview to apply (apply mode). Omit it to apply the last saved preview." }
                     }
                 }}}
             },
-            "responses": { "200": { "description": "Migration result with moved files count" } }
-        }
-    })
-}
-
-fn build_migrate_undo() -> serde_json::Value {
-    serde_json::json!({
-        "post": {
-            "operationId": "migrateUndo",
-            "summary": "Undo the last applied migration, restoring notes to original locations.",
-            "requestBody": {
-                "content": { "application/json": { "schema": { "type": "object", "properties": {} } } }
-            },
-            "responses": { "200": { "description": "Undo result with restored files count" } }
+            "responses": { "200": { "description": "Migration preview, migration result or undo result, per mode" } }
         }
     })
 }
@@ -480,7 +453,20 @@ mod tests {
     fn test_openapi_spec_structure() {
         let spec = build_openapi_spec("http://localhost:3000");
         assert_eq!(spec["openapi"], "3.1.0");
-        assert!(spec["paths"].as_object().unwrap().len() >= 20);
+        // How many paths there are is the router's business, and
+        // `the_spec_describes_every_route_the_router_serves` reads it from
+        // there. A count here is a second declaration that falls out of step
+        // every time one name absorbs another (#62). Assert the shape
+        // instead: every path item declares a method.
+        let paths = spec["paths"].as_object().unwrap();
+        assert!(!paths.is_empty());
+        for (path, item) in paths {
+            let methods = item.as_object().unwrap();
+            assert!(
+                methods.contains_key("get") || methods.contains_key("post"),
+                "{path} declares no method"
+            );
+        }
         assert_eq!(spec["servers"][0]["url"], "http://localhost:3000");
     }
 
@@ -575,9 +561,8 @@ mod tests {
             "moveNote",
             "archiveNote",
             "deleteNote",
-            "migratePreview",
-            "migrateApply",
-            "migrateUndo",
+            "init",
+            "migrate",
         ];
         for id in &expected {
             assert!(

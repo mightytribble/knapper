@@ -11,7 +11,6 @@ use axum::{
     response::IntoResponse,
     routing::{MethodRouter, get, post},
 };
-use serde::Deserialize;
 use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
 
@@ -298,11 +297,9 @@ pub fn routes() -> Vec<(&'static str, MethodRouter<ApiState>)> {
         ("/api/reindex-file", post(handle_reindex_file)),
         // Identity endpoints
         ("/api/identity", get(handle_identity)),
-        ("/api/setup", post(handle_setup)),
+        ("/api/init", post(handle_init)),
         // Migration endpoints
-        ("/api/migrate/preview", post(handle_migrate_preview)),
-        ("/api/migrate/apply", post(handle_migrate_apply)),
-        ("/api/migrate/undo", post(handle_migrate_undo)),
+        ("/api/migrate", post(handle_migrate)),
         // OpenAPI / ChatGPT plugin discovery (no auth required)
         ("/openapi.json", get(handle_openapi)),
         ("/.well-known/ai-plugin.json", get(handle_plugin_manifest)),
@@ -731,9 +728,10 @@ async fn handle_archive(
 // Migration endpoint handlers
 // ---------------------------------------------------------------------------
 
-async fn handle_migrate_preview(
+async fn handle_migrate(
     State(state): State<ApiState>,
     headers: HeaderMap,
+    Json(body): Json<crate::params::Migrate>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
     if state.read_only {
@@ -742,50 +740,35 @@ async fn handle_migrate_preview(
         ));
     }
     let store = state.store.lock().await;
-    let profile_ref = state.profile.as_ref().as_ref();
-    let preview = crate::migrate::generate_preview(&store, &state.vault_path, profile_ref)
-        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
-    Ok(Json(serde_json::to_value(&preview).unwrap()))
-}
-
-#[derive(Deserialize)]
-struct MigrateApplyBody {
-    preview: serde_json::Value,
-}
-
-async fn handle_migrate_apply(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Json(body): Json<MigrateApplyBody>,
-) -> Result<impl IntoResponse, ApiError> {
-    authorize(&headers, &state, true)?;
-    if state.read_only {
-        return Err(ApiError::forbidden(
-            "Write operations disabled in read-only mode",
-        ));
+    // The CLI already took a mode. MCP and HTTP split it into three names,
+    // which is the same capability spelled three ways (#62).
+    match body.mode.as_str() {
+        "preview" => {
+            let profile_ref = state.profile.as_ref().as_ref();
+            let preview = crate::migrate::generate_preview(&store, &state.vault_path, profile_ref)
+                .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+            Ok(Json(serde_json::to_value(&preview).unwrap()))
+        }
+        "apply" => {
+            let data_dir = crate::config::Config::data_dir()
+                .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+            let preview = crate::migrate::resolve_preview(body.preview, &data_dir)
+                .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
+            let result = crate::migrate::apply_preview(&preview, &store, &state.vault_path)
+                .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+            Ok(Json(serde_json::to_value(&result).unwrap()))
+        }
+        "undo" => {
+            let result = crate::migrate::undo_last(&store, &state.vault_path)
+                .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+            Ok(Json(serde_json::to_value(&result).unwrap()))
+        }
+        // The mode is the caller's own text, so a word that names no
+        // operation is a bad request and not an internal fault.
+        other => Err(ApiError::bad_request(&format!(
+            "Unknown mode: {other}. Use 'preview', 'apply' or 'undo'."
+        ))),
     }
-    let store = state.store.lock().await;
-    let preview: crate::migrate::MigrationPreview = serde_json::from_value(body.preview)
-        .map_err(|e| ApiError::bad_request(&format!("Invalid preview: {e}")))?;
-    let result = crate::migrate::apply_preview(&preview, &store, &state.vault_path)
-        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
-    Ok(Json(serde_json::to_value(&result).unwrap()))
-}
-
-async fn handle_migrate_undo(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-) -> Result<impl IntoResponse, ApiError> {
-    authorize(&headers, &state, true)?;
-    if state.read_only {
-        return Err(ApiError::forbidden(
-            "Write operations disabled in read-only mode",
-        ));
-    }
-    let store = state.store.lock().await;
-    let result = crate::migrate::undo_last(&store, &state.vault_path)
-        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
-    Ok(Json(serde_json::to_value(&result).unwrap()))
 }
 
 async fn handle_delete(
@@ -872,7 +855,7 @@ async fn handle_reindex_file(
 }
 
 // ---------------------------------------------------------------------------
-// Identity / setup endpoint handlers
+// Identity / init endpoint handlers
 // ---------------------------------------------------------------------------
 
 async fn handle_identity(
@@ -887,7 +870,7 @@ async fn handle_identity(
     Ok(Json(serde_json::json!({ "identity": block })))
 }
 
-async fn handle_setup(
+async fn handle_init(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Json(body): Json<crate::params::Init>,
@@ -918,10 +901,11 @@ async fn handle_setup(
         Some(other) => Err(ApiError::bad_request(&format!(
             "Unknown mode: {other}. Use 'detect' or 'apply'."
         ))),
-        // A server has no interactive flow to fall back to, so an omitted
-        // mode is an error here where the CLI would prompt.
+        // A server has no interactive flow, so `init` there needs a mode.
+        // The CLI's no-mode form is its own prompt sequence and reaches no
+        // surface but the CLI (#62).
         None => Err(ApiError::bad_request(
-            "Unknown mode: use 'detect' or 'apply'",
+            "init needs mode=detect or mode=apply",
         )),
     }
 }
@@ -984,6 +968,10 @@ mod tests {
     }
 
     fn test_api_state() -> ApiState {
+        test_api_state_at(PathBuf::from("/tmp/test-vault"))
+    }
+
+    fn test_api_state_at(vault_path: PathBuf) -> ApiState {
         let store = Store::open_memory().expect("in-memory store");
         let config = test_http_config();
         let rate_limiter = Arc::new(RateLimiter::new(config.rate_limit));
@@ -992,7 +980,7 @@ mod tests {
             embedder: Arc::new(Mutex::new(
                 Box::new(DummyEmbedder) as Box<dyn EmbedModel + Send>
             )),
-            vault_path: Arc::new(PathBuf::from("/tmp/test-vault")),
+            vault_path: Arc::new(vault_path),
             profile: Arc::new(None),
             reranker: None,
             http_config: Arc::new(config),
@@ -1531,5 +1519,125 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // -----------------------------------------------------------------------
+    // Mode routing (#62)
+    // -----------------------------------------------------------------------
+
+    /// POST `body` to `path` as a writer, and return the status and the body.
+    async fn post_json(state: ApiState, path: &str, body: &str) -> (StatusCode, serde_json::Value) {
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer eg_writekey")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn each_migrate_mode_reaches_the_operation_it_names() {
+        // One name takes three modes (#62), so the one thing worth proving is
+        // that each mode string still arrives at the operation it names.
+        // Each answer below can come from one of the three and no other.
+
+        // `preview` classifies: an empty index proposes no move, and the
+        // response is a preview and not a result.
+        let (status, body) =
+            post_json(test_api_state(), "/api/migrate", r#"{"mode":"preview"}"#).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.get("files").is_some(), "not a preview: {body}");
+        assert_eq!(body["files"].as_array().unwrap().len(), 0);
+
+        // `apply` executes the preview it is given: this one moves nothing,
+        // and it answers with that preview's own id.
+        let (status, body) = post_json(
+            test_api_state(),
+            "/api/migrate",
+            r#"{"mode":"apply","preview":{"migration_id":"m-14","files":[],"uncertain":[],"skipped":0}}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["migration_id"], "m-14");
+        assert_eq!(body["moved"], 0);
+
+        // `undo` reads the migration log, which this store has no row in.
+        let (status, body) =
+            post_json(test_api_state(), "/api/migrate", r#"{"mode":"undo"}"#).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("No migration to undo"),
+            "not the undo path: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_migrate_mode_naming_nothing_is_a_bad_request() {
+        // The mode is the caller's own text, so a word that names no
+        // operation is a 400 and not a 500 (#62).
+        let (status, body) =
+            post_json(test_api_state(), "/api/migrate", r#"{"mode":"sideways"}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body["error"],
+            "Unknown mode: sideways. Use 'preview', 'apply' or 'undo'."
+        );
+    }
+
+    #[tokio::test]
+    async fn init_detect_reaches_detection_and_writes_nothing() {
+        // `detect` is the half of `init` a server can run without touching
+        // the vault (#62): it reports what it found and leaves no file.
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(vault.path().join("note.md"), "# Note\n").unwrap();
+        let (status, body) = post_json(
+            test_api_state_at(vault.path().to_path_buf()),
+            "/api/init",
+            r#"{"mode":"detect"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.get("structure").is_some(), "not a detection: {body}");
+        let left: Vec<_> = std::fs::read_dir(vault.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left.len(), 1, "detect wrote something: {left:?}");
+    }
+
+    #[tokio::test]
+    async fn init_without_a_mode_is_a_bad_request() {
+        // A server has no interactive flow, so the CLI's no-mode form has no
+        // meaning here (#62).
+        let (status, body) = post_json(test_api_state(), "/api/init", r#"{}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "init needs mode=detect or mode=apply");
+    }
+
+    #[tokio::test]
+    async fn an_init_mode_naming_nothing_is_a_bad_request() {
+        let (status, body) =
+            post_json(test_api_state(), "/api/init", r#"{"mode":"sideways"}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body["error"],
+            "Unknown mode: sideways. Use 'detect' or 'apply'."
+        );
     }
 }

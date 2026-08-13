@@ -1,4 +1,4 @@
-use engraph::cli::{Cli, Command, ContextAction, MigrateAction, ModelsAction, WriteAction};
+use engraph::cli::{Cli, Command, ContextAction, ModelsAction, WriteAction};
 use engraph::config;
 use engraph::indexer;
 use engraph::search;
@@ -209,6 +209,7 @@ async fn main() -> Result<()> {
 
         Command::Init {
             path,
+            mode,
             identity,
             reindex,
             detect,
@@ -218,6 +219,18 @@ async fn main() -> Result<()> {
             role,
             purpose,
         } => {
+            // `--mode` is the name the servers call these two paths by;
+            // `--detect` and `--json` are the CLI's older spelling of the
+            // same two, and both reach the same code (#62).
+            let (detect, json) = match mode.as_deref() {
+                Some("detect") => (true, json),
+                Some("apply") => (detect, true),
+                Some(other) => {
+                    eprintln!("Unknown mode: {other}. Use 'detect' or 'apply'.");
+                    std::process::exit(1);
+                }
+                None => (detect, json),
+            };
             cfg.merge_vault_path(path);
             let vault_path = match &cfg.vault_path {
                 Some(p) => p.clone(),
@@ -1056,7 +1069,7 @@ async fn main() -> Result<()> {
             }
         }
 
-        Command::Migrate { action } => {
+        Command::Migrate { mode } => {
             let data_dir = Config::data_dir()?;
             if !index_exists(&data_dir) {
                 eprintln!("No index found. Run 'engraph index <path>' first.");
@@ -1070,55 +1083,56 @@ async fn main() -> Result<()> {
             let vault_path = PathBuf::from(&vault_path_str);
             let profile = Config::load_vault_profile().ok().flatten();
 
-            match action {
-                MigrateAction::Para { apply, undo } => {
-                    if undo {
-                        let result = engraph::migrate::undo_last(&store, &vault_path)?;
-                        println!(
-                            "Migration {} undone: {} files restored",
-                            result.migration_id, result.restored
-                        );
-                        if !result.errors.is_empty() {
-                            eprintln!("Errors:");
-                            for e in &result.errors {
-                                eprintln!("  {}", e);
-                            }
+            // PARA is the only strategy, so the mode names the operation and
+            // nothing spells PARA any more (#62).
+            match mode.as_str() {
+                "preview" => {
+                    println!("Scanning vault for PARA classification...");
+                    let preview =
+                        engraph::migrate::generate_preview(&store, &vault_path, profile.as_ref())?;
+                    engraph::migrate::save_preview(&preview, &data_dir)?;
+                    println!();
+                    println!("Preview generated:");
+                    println!("  Files to move: {}", preview.files.len());
+                    println!("  Uncertain:     {}", preview.uncertain.len());
+                    println!("  Skipped:       {}", preview.skipped);
+                    println!();
+                    println!("Preview saved to:");
+                    println!("  {}", data_dir.join("migration-preview.md").display());
+                    println!("  {}", data_dir.join("migration-preview.json").display());
+                    println!();
+                    println!("Review the preview, then run: engraph migrate --mode apply");
+                }
+                "apply" => {
+                    let preview = engraph::migrate::load_preview(&data_dir)?;
+                    let result = engraph::migrate::apply_preview(&preview, &store, &vault_path)?;
+                    println!(
+                        "Migration {} applied: {} files moved",
+                        result.migration_id, result.moved
+                    );
+                    if !result.errors.is_empty() {
+                        eprintln!("Errors:");
+                        for e in &result.errors {
+                            eprintln!("  {}", e);
                         }
-                    } else if apply {
-                        let preview = engraph::migrate::load_preview(&data_dir)?;
-                        let result =
-                            engraph::migrate::apply_preview(&preview, &store, &vault_path)?;
-                        println!(
-                            "Migration {} applied: {} files moved",
-                            result.migration_id, result.moved
-                        );
-                        if !result.errors.is_empty() {
-                            eprintln!("Errors:");
-                            for e in &result.errors {
-                                eprintln!("  {}", e);
-                            }
-                        }
-                    } else {
-                        // Generate preview
-                        println!("Scanning vault for PARA classification...");
-                        let preview = engraph::migrate::generate_preview(
-                            &store,
-                            &vault_path,
-                            profile.as_ref(),
-                        )?;
-                        engraph::migrate::save_preview(&preview, &data_dir)?;
-                        println!();
-                        println!("Preview generated:");
-                        println!("  Files to move: {}", preview.files.len());
-                        println!("  Uncertain:     {}", preview.uncertain.len());
-                        println!("  Skipped:       {}", preview.skipped);
-                        println!();
-                        println!("Preview saved to:");
-                        println!("  {}", data_dir.join("migration-preview.md").display());
-                        println!("  {}", data_dir.join("migration-preview.json").display());
-                        println!();
-                        println!("Review the preview, then run: engraph migrate para --apply");
                     }
+                }
+                "undo" => {
+                    let result = engraph::migrate::undo_last(&store, &vault_path)?;
+                    println!(
+                        "Migration {} undone: {} files restored",
+                        result.migration_id, result.restored
+                    );
+                    if !result.errors.is_empty() {
+                        eprintln!("Errors:");
+                        for e in &result.errors {
+                            eprintln!("  {}", e);
+                        }
+                    }
+                }
+                other => {
+                    eprintln!("Unknown mode: {other}. Use 'preview', 'apply' or 'undo'.");
+                    std::process::exit(1);
                 }
             }
         }

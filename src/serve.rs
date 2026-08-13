@@ -27,18 +27,6 @@ use crate::store::Store;
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct HealthParams {}
 
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct MigratePreviewParams {}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct MigrateApplyParams {
-    /// Migration preview JSON (from migrate_preview).
-    pub preview: serde_json::Value,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct MigrateUndoParams {}
-
 // ---------------------------------------------------------------------------
 // Server
 // ---------------------------------------------------------------------------
@@ -502,54 +490,53 @@ impl EngraphServer {
     }
 
     #[tool(
-        name = "migrate_preview",
-        description = "Generate PARA migration preview. Classifies all notes into Projects/Areas/Resources/Archive and returns proposed moves with confidence scores."
+        name = "migrate",
+        description = "Restructure the vault into PARA. Mode 'preview' classifies every note into Projects/Areas/Resources/Archive and returns the proposed moves with confidence scores; 'apply' performs the moves of a preview; 'undo' reverses the last migration."
     )]
-    async fn migrate_preview(
+    async fn migrate(
         &self,
-        _params: Parameters<MigratePreviewParams>,
+        params: Parameters<crate::params::Migrate>,
     ) -> Result<CallToolResult, McpError> {
-        let store = self.store.lock().await;
-        let profile_ref = self.profile.as_ref().as_ref();
-        let preview = crate::migrate::generate_preview(&store, &self.vault_path, profile_ref)
-            .map_err(|e| mcp_err(&e))?;
-        to_json_result(&preview)
-    }
-
-    #[tool(
-        name = "migrate_apply",
-        description = "Apply a PARA migration preview. Moves files to their classified PARA locations. Reversible via migrate_undo."
-    )]
-    async fn migrate_apply(
-        &self,
-        params: Parameters<MigrateApplyParams>,
-    ) -> Result<CallToolResult, McpError> {
-        if self.read_only {
-            return Err(read_only_err());
+        // The CLI already took a mode. MCP and HTTP split it into three
+        // names, which is the same capability spelled three ways (#62).
+        match params.0.mode.as_str() {
+            "preview" => {
+                let store = self.store.lock().await;
+                let profile_ref = self.profile.as_ref().as_ref();
+                let preview =
+                    crate::migrate::generate_preview(&store, &self.vault_path, profile_ref)
+                        .map_err(|e| mcp_err(&e))?;
+                to_json_result(&preview)
+            }
+            "apply" => {
+                if self.read_only {
+                    return Err(read_only_err());
+                }
+                let store = self.store.lock().await;
+                let data_dir = crate::config::Config::data_dir().map_err(|e| mcp_err(&e))?;
+                let preview = crate::migrate::resolve_preview(params.0.preview, &data_dir)
+                    .map_err(|e| mcp_err(&e))?;
+                let result = crate::migrate::apply_preview(&preview, &store, &self.vault_path)
+                    .map_err(|e| mcp_err(&e))?;
+                to_json_result(&result)
+            }
+            "undo" => {
+                if self.read_only {
+                    return Err(read_only_err());
+                }
+                let store = self.store.lock().await;
+                let result =
+                    crate::migrate::undo_last(&store, &self.vault_path).map_err(|e| mcp_err(&e))?;
+                to_json_result(&result)
+            }
+            // The mode is the caller's own text, so a word that names no
+            // operation is an invalid parameter and not an internal fault.
+            other => Err(McpError::new(
+                rmcp::model::ErrorCode::INVALID_PARAMS,
+                format!("Unknown mode: {other}. Use 'preview', 'apply' or 'undo'."),
+                None::<serde_json::Value>,
+            )),
         }
-        let store = self.store.lock().await;
-        let preview: crate::migrate::MigrationPreview = serde_json::from_value(params.0.preview)
-            .map_err(|e| mcp_err(&anyhow::anyhow!("Invalid preview JSON: {e}")))?;
-        let result = crate::migrate::apply_preview(&preview, &store, &self.vault_path)
-            .map_err(|e| mcp_err(&e))?;
-        to_json_result(&result)
-    }
-
-    #[tool(
-        name = "migrate_undo",
-        description = "Undo the most recent PARA migration, restoring all moved files to their original locations."
-    )]
-    async fn migrate_undo(
-        &self,
-        _params: Parameters<MigrateUndoParams>,
-    ) -> Result<CallToolResult, McpError> {
-        if self.read_only {
-            return Err(read_only_err());
-        }
-        let store = self.store.lock().await;
-        let result =
-            crate::migrate::undo_last(&store, &self.vault_path).map_err(|e| mcp_err(&e))?;
-        to_json_result(&result)
     }
 
     #[tool(
@@ -667,10 +654,10 @@ impl EngraphServer {
     }
 
     #[tool(
-        name = "setup",
+        name = "init",
         description = "Run first-time setup or update identity. Use 'detect' mode to inspect the vault without changes, 'apply' mode to configure identity and index. Returns JSON."
     )]
-    async fn setup(
+    async fn init(
         &self,
         params: Parameters<crate::params::Init>,
     ) -> Result<CallToolResult, McpError> {
@@ -704,11 +691,12 @@ impl EngraphServer {
                 format!("Unknown mode: {other}. Use 'detect' or 'apply'."),
                 None::<serde_json::Value>,
             )),
-            // A server has no interactive flow to fall back to, so an
-            // omitted mode is an error here where the CLI would prompt.
+            // A server has no interactive flow, so `init` there needs a
+            // mode. The CLI's no-mode form is its own prompt sequence and
+            // reaches no surface but the CLI (#62).
             None => Err(McpError::new(
                 rmcp::model::ErrorCode::INVALID_PARAMS,
-                "Unknown mode: use 'detect' or 'apply'",
+                "init needs mode=detect or mode=apply",
                 None::<serde_json::Value>,
             )),
         }
@@ -724,8 +712,8 @@ impl rmcp::handler::server::ServerHandler for EngraphServer {
                  Write: create for new notes, update for every change to an existing one — a list of edits over the body, a section or a frontmatter property, applied in one write. \
                  Lifecycle: move_note to relocate, archive to soft-delete (`undo: true` to restore), delete for permanent removal. \
                  Index: reindex_file to refresh a single file's index after external edits. \
-                 Identity: identity for user context at session start, setup to run first-time onboarding (detect/apply). \
-                 Migration: migrate_preview to classify notes into PARA folders, migrate_apply to execute the migration, migrate_undo to revert.",
+                 Identity: identity for user context at session start, init to run first-time onboarding (`mode: detect` or `mode: apply`). \
+                 Migration: migrate with `mode: preview` to classify notes into PARA folders, `mode: apply` to execute the migration, `mode: undo` to revert.",
         )
     }
 }
@@ -985,6 +973,25 @@ mod tests {
         assert!(
             has_properties || has_ref,
             "edits.items must define properties or $ref, got: {items}"
+        );
+    }
+
+    /// `migrate` is one tool for three operations (#62), so the mode is the
+    /// one parameter a caller must always send, and the preview it may hold
+    /// from a `preview` call stays reachable.
+    #[test]
+    fn the_migrate_schema_requires_a_mode_and_still_accepts_a_preview() {
+        let schema = schemars::schema_for!(crate::params::Migrate);
+        let json = serde_json::to_value(&schema).unwrap();
+
+        let required: Vec<&str> = json["required"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        assert_eq!(required, vec!["mode"], "got {json}");
+        assert!(
+            json["properties"].get("preview").is_some(),
+            "the preview an apply acts on is not in the schema: {json}"
         );
     }
 }
