@@ -127,14 +127,67 @@ pub struct Section {
     pub content: String,
 }
 
+/// The section a caller named, or `None`.
+///
+/// `heading_text` is one heading's own text, or the heading's full path from
+/// its own root with the segments joined by `>` (issue #69). Both fold case.
+/// A single segment resolves the first heading with that text at any depth,
+/// which is what this function has always answered; a path resolves the one
+/// heading whose ancestry is exactly it, so a note that repeats a heading
+/// text is addressable at every occurrence whose ancestry differs.
+///
+/// A partial path resolves nothing. A path that must be complete matches one
+/// heading or none, so a wrong guess is an error rather than an edit to the
+/// wrong section.
 pub fn find_section(content: &str, heading_text: &str) -> Option<Section> {
     let headings = parse_headings(content);
-    let target = heading_text.trim().to_lowercase();
-    let lines: Vec<&str> = content.lines().collect();
+    let idx = by_text(&headings, heading_text).or_else(|| by_path(&headings, heading_text))?;
+    Some(section_at(content, &headings, idx))
+}
 
-    let idx = headings
-        .iter()
-        .position(|h| h.text.to_lowercase() == target)?;
+/// The first heading whose own text is `query`.
+fn by_text(headings: &[HeadingInfo], query: &str) -> Option<usize> {
+    let target = normalise(query);
+    headings.iter().position(|h| normalise(&h.text) == target)
+}
+
+/// The heading whose path is `query`.
+///
+/// One segment is not a path: [`by_text`] answers that form, and it runs
+/// first, so a heading whose own text holds a `>` resolves by name.
+fn by_path(headings: &[HeadingInfo], query: &str) -> Option<usize> {
+    let segments: Vec<String> = query.split('>').map(normalise).collect();
+    if segments.len() < 2 || segments.iter().any(String::is_empty) {
+        return None;
+    }
+    (0..headings.len()).find(|&i| path_of(headings, i) == segments)
+}
+
+/// A heading's ancestors from its own root, its own text last.
+///
+/// The walk pops an open heading of equal or greater level, which is the rule
+/// the chunker's ancestor stack follows, so a skipped level does not break an
+/// ancestry and a promoted line is an ancestor of nothing (issue #44).
+fn path_of(headings: &[HeadingInfo], idx: usize) -> Vec<String> {
+    let mut stack: Vec<(u8, String)> = Vec::new();
+    for h in &headings[..=idx] {
+        while stack.last().is_some_and(|(level, _)| *level >= h.level) {
+            stack.pop();
+        }
+        stack.push((h.level, normalise(&h.text)));
+    }
+    stack.into_iter().map(|(_, text)| text).collect()
+}
+
+/// One segment as it is compared: trimmed and folded.
+fn normalise(segment: &str) -> String {
+    segment.trim().to_lowercase()
+}
+
+/// The span a heading owns: from the line after it to the next heading at or
+/// above its own level, or the end of the file.
+fn section_at(content: &str, headings: &[HeadingInfo], idx: usize) -> Section {
+    let lines: Vec<&str> = content.lines().collect();
     let h = &headings[idx];
     let body_start = h.line + 1;
     let body_end = headings[idx + 1..]
@@ -143,18 +196,12 @@ pub fn find_section(content: &str, heading_text: &str) -> Option<Section> {
         .map(|next| next.line)
         .unwrap_or(lines.len());
 
-    let content_str = lines[body_start..body_end].join("\n");
-    Some(Section {
-        heading: HeadingInfo {
-            line: h.line,
-            level: h.level,
-            text: h.text.clone(),
-            promoted: h.promoted,
-        },
+    Section {
+        heading: h.clone(),
         body_start,
         body_end,
-        content: content_str,
-    })
+        content: lines[body_start..body_end].join("\n"),
+    }
 }
 
 pub fn split_frontmatter(content: &str) -> (Option<String>, String) {
@@ -328,5 +375,95 @@ mod tests {
         assert_eq!(bold_heading_text("****"), None);
         // Bold wrapping an italic span is emphasis, not a label.
         assert_eq!(bold_heading_text("***Spells***"), None);
+    }
+
+    /// A note that repeats a heading text: the bare form takes the first,
+    /// and a path takes the one whose ancestry it names (#69).
+    #[test]
+    fn a_path_addresses_the_repeat_a_bare_heading_cannot() {
+        let content = "# About the Empire\n\n## History\n\nFounding\n\n## Current Events\n\n### History\n\nRecent\n";
+        assert!(
+            find_section(content, "History")
+                .unwrap()
+                .content
+                .contains("Founding")
+        );
+        assert!(
+            find_section(content, "About the Empire > Current Events > History")
+                .unwrap()
+                .content
+                .contains("Recent")
+        );
+        assert!(
+            find_section(content, "About the Empire > History")
+                .unwrap()
+                .content
+                .contains("Founding")
+        );
+    }
+
+    /// A path is the whole ancestry or it is nothing. A partial path names no
+    /// heading, so a caller that guesses gets an error rather than another
+    /// note's section (#69).
+    #[test]
+    fn a_partial_path_resolves_nothing() {
+        let content = "# About the Empire\n\n## Current Events\n\n### History\n\nRecent\n";
+        assert!(find_section(content, "Current Events > History").is_none());
+    }
+
+    /// An empty segment is not a heading text, so a path holding one names
+    /// nothing (#69).
+    #[test]
+    fn an_empty_segment_resolves_nothing() {
+        let content = "# A\n\n## B\n\nBody\n";
+        assert!(find_section(content, "A >  > B").is_none());
+        assert!(find_section(content, "A > B > ").is_none());
+    }
+
+    /// The text form runs before the path form, so a heading whose own text
+    /// holds a `>` is still addressable by name (#69).
+    #[test]
+    fn a_heading_whose_text_holds_an_angle_bracket_resolves_by_name() {
+        let content = "## A > B\n\nBody\n";
+        assert!(
+            find_section(content, "A > B")
+                .unwrap()
+                .content
+                .contains("Body")
+        );
+    }
+
+    /// A skipped level does not break the ancestry: a `###` under a `#` is
+    /// that heading's child (#69).
+    #[test]
+    fn a_skipped_level_is_still_the_parent() {
+        let content = "# A\n\n### B\n\nBody\n";
+        assert!(
+            find_section(content, "A > B")
+                .unwrap()
+                .content
+                .contains("Body")
+        );
+    }
+
+    /// Two same-named siblings under one parent share a path, so the first in
+    /// document order is the one that resolves — the rule the bare form has
+    /// always followed (#69).
+    #[test]
+    fn twin_siblings_resolve_the_first() {
+        let content = "# A\n\n## Notes\n\nFirst\n\n## Notes\n\nSecond\n";
+        assert!(
+            find_section(content, "A > Notes")
+                .unwrap()
+                .content
+                .contains("First")
+        );
+    }
+
+    /// Every segment folds case, as the bare form has always folded it (#69).
+    #[test]
+    fn a_path_folds_case_segment_by_segment() {
+        let content = "# About the Empire\n\n## History\n\nFounding\n";
+        assert!(find_section(content, "about the empire > HISTORY").is_some());
     }
 }
