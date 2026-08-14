@@ -73,9 +73,9 @@ pub struct NoteListItem {
     pub tags: Vec<String>,
     pub indexed_at: String,
     pub edge_count: usize,
-    /// The note's ATX headings, when the caller asked for them. Absent
-    /// otherwise, so an undetailed listing serialises as it did before
-    /// this field existed (#68).
+    /// The note's headings, ATX and promoted bold lines alike, when the
+    /// caller asked for them. Absent otherwise, so an undetailed listing
+    /// serialises as it did before this field existed (#68, #69).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub headings: Option<Vec<Heading>>,
 }
@@ -242,7 +242,7 @@ fn split_frontmatter(content: &str) -> (String, String) {
 // ---------------------------------------------------------------------------
 
 /// Read a single note with full content, metadata, and graph edges. A
-/// section narrows `content` to one ATX heading's body and reports its span;
+/// section narrows `content` to one heading's body and reports its span;
 /// the file-level fields — tags, links, mentions — are the file's either way,
 /// because a section's tags and backlinks are its file's (#62).
 pub fn context_read(
@@ -267,8 +267,8 @@ pub fn context_read(
 
     // A section read narrows the content and nothing else: a section's tags
     // and backlinks are its file's, so those fields are the same either way
-    // (#62). A section is an ATX heading, which is what `find_section` reads;
-    // a chunk is the retrieval unit and is not addressable (#53).
+    // (#62). `find_section` resolves a section by its heading text or its full
+    // heading path, and a promoted bold line is one it reaches (#53, #69).
     let (content, body, span) = match section {
         None => (content, body, None),
         Some(heading) => {
@@ -341,7 +341,7 @@ pub fn context_read(
     })
 }
 
-/// A note's ATX headings, read from disk.
+/// A note's headings, read from disk.
 ///
 /// The index cannot answer this. A section under `chunk_min_chars` merges
 /// into the chunk before it and keeps no heading row of its own, a heading
