@@ -420,46 +420,6 @@ pub struct ChunkOptions {
     pub promote_bold: bool,
 }
 
-/// The text of a bold-only line, or `None` when the line is not one.
-///
-/// A promoted heading is one bold span and nothing else: `**Text**`,
-/// `__Text__`, or either with a single colon directly after the closing marker
-/// (issue #44). A table row, a list item and the bestiary's
-/// `**Rank**: S • **Levels**: …` preamble all carry text outside the span, so
-/// the content test rejects them. So does a bold span wrapping an italic one,
-/// which is emphasis rather than a label.
-fn bold_heading_text(line: &str) -> Option<&str> {
-    let trimmed = line.trim();
-    let body = trimmed.strip_suffix(':').unwrap_or(trimmed).trim_end();
-    let inner = body
-        .strip_prefix("**")
-        .and_then(|rest| rest.strip_suffix("**"))
-        .or_else(|| {
-            body.strip_prefix("__")
-                .and_then(|rest| rest.strip_suffix("__"))
-        })?;
-    let inner = inner.trim();
-    if inner.is_empty()
-        || inner.contains("**")
-        || inner.contains("__")
-        || inner.starts_with('*')
-        || inner.ends_with('*')
-        || inner.starts_with('_')
-        || inner.ends_with('_')
-    {
-        return None;
-    }
-    Some(inner)
-}
-
-/// The level a promoted line takes (issue #44).
-///
-/// It is deeper than every `#` level, so `structure_chunk`'s ancestor stack pops
-/// it for the next heading of any depth and for the next promoted line, and it
-/// is an ancestor of nothing. The value never leaves the chunker: it decides the
-/// breadcrumb and is not written to a row or rendered as markdown.
-const PROMOTED_LEVEL: u8 = u8::MAX;
-
 /// Drop a promoted line whose section body is empty.
 ///
 /// `structure_chunk` skips a `#` heading with no body of its own, because its
@@ -467,17 +427,21 @@ const PROMOTED_LEVEL: u8 = u8::MAX;
 /// flat and has no descendants — the next one pops it off the ancestor stack —
 /// so the same skip would delete the line from the corpus. It stays in the
 /// enclosing section's body instead (issue #44).
-fn drop_bodyless_promotions(content: &str, entries: Vec<(HeadingInfo, bool)>) -> Vec<HeadingInfo> {
+///
+/// This is the one place the chunker's set differs from
+/// `markdown::headings_with_promotions`, which keeps such a line because a
+/// caller addresses an empty section to fill it (issue #69).
+fn drop_bodyless_promotions(content: &str, entries: Vec<HeadingInfo>) -> Vec<HeadingInfo> {
     let offsets = line_offsets(content);
     let line_start = |line: usize| offsets.get(line).copied().unwrap_or(content.len());
 
     let mut out = Vec::with_capacity(entries.len());
-    for (i, (info, promoted)) in entries.iter().enumerate() {
-        if *promoted {
+    for (i, info) in entries.iter().enumerate() {
+        if info.promoted {
             let body_start = line_start(info.line + 1);
             let body_end = entries
                 .get(i + 1)
-                .map(|(next, _)| line_start(next.line))
+                .map(|next| line_start(next.line))
                 .unwrap_or(content.len());
             if content[body_start..body_end.max(body_start)]
                 .trim()
@@ -491,53 +455,18 @@ fn drop_bodyless_promotions(content: &str, entries: Vec<(HeadingInfo, bool)>) ->
     out
 }
 
-/// The structure lines of `content`: every `#` heading, and — when promotion is
-/// on — every bold-only line, in line order (issue #44).
+/// What counts as a heading for chunking (issue #44).
 ///
-/// A promoted line is **deeper than any `#` heading and an ancestor of
-/// nothing**, which is what flat means for a construct that carries no level of
-/// its own. `structure_chunk` pops an ancestor of equal or greater level, so
-/// [`PROMOTED_LEVEL`] gives all three properties the rule needs at once: the
-/// enclosing heading stays in the breadcrumb, the next promoted line ends this
-/// one, and any later `#` heading of any depth ends it too.
+/// It is `markdown::headings_with_promotions` with the bodyless promotions
+/// dropped: what the parser calls a heading, narrowed to what starts a chunk.
+/// With `promote_bold` off, a bold-only line is not a heading at all and the
+/// answer is the ATX headings alone, which reproduces the pre-#44 chunking
+/// exactly.
 fn structure_headings(content: &str, promote_bold: bool) -> Vec<HeadingInfo> {
-    let headings = crate::markdown::parse_headings(content);
     if !promote_bold {
-        return headings;
+        return crate::markdown::parse_headings(content);
     }
-
-    // `true` marks a promoted entry, which is what the bodyless rule reads.
-    let mut merged: Vec<(HeadingInfo, bool)> = Vec::with_capacity(headings.len());
-    let mut next = 0usize;
-    let mut in_fence = false;
-
-    for (i, line) in content.lines().enumerate() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            in_fence = !in_fence;
-            continue;
-        }
-        if next < headings.len() && headings[next].line == i {
-            merged.push((headings[next].clone(), false));
-            next += 1;
-            continue;
-        }
-        if in_fence {
-            continue;
-        }
-        if let Some(text) = bold_heading_text(line) {
-            merged.push((
-                HeadingInfo {
-                    line: i,
-                    level: PROMOTED_LEVEL,
-                    text: text.to_string(),
-                },
-                true,
-            ));
-        }
-    }
-
-    drop_bodyless_promotions(content, merged)
+    drop_bodyless_promotions(content, crate::markdown::headings_with_promotions(content))
 }
 
 /// Structure-first chunking: a chunk boundary is placed at every ATX heading,
@@ -631,10 +560,7 @@ pub fn structure_chunk(
         // instead, and only when that section is a promoted one: a heading
         // with `#` descendants keeps the behaviour above (issue #44).
         if body.trim().is_empty() {
-            if headings
-                .get(i + 1)
-                .is_some_and(|next| next.level == PROMOTED_LEVEL)
-            {
+            if headings.get(i + 1).is_some_and(|next| next.promoted) {
                 carried = Some(heading_line.to_string());
             }
             continue;
@@ -1291,35 +1217,6 @@ mod tests {
     }
 
     #[test]
-    fn bold_only_lines_are_recognised() {
-        assert_eq!(bold_heading_text("**Spells**"), Some("Spells"));
-        assert_eq!(bold_heading_text("__Spells__"), Some("Spells"));
-        assert_eq!(bold_heading_text("**Spells**:"), Some("Spells"));
-        assert_eq!(bold_heading_text("  **Spells**  "), Some("Spells"));
-        assert_eq!(bold_heading_text("**Human Forms**"), Some("Human Forms"));
-    }
-
-    #[test]
-    fn a_line_with_anything_outside_the_bold_span_is_not_a_heading() {
-        // The bestiary preamble: one per file, and it is data, not structure.
-        assert_eq!(
-            bold_heading_text(
-                "**Rank**: S • **Levels**: 110-255 • **Threat**: peer of a Demon Lord"
-            ),
-            None
-        );
-        assert_eq!(bold_heading_text("- **Spells**"), None);
-        assert_eq!(bold_heading_text("| **Spells** |"), None);
-        assert_eq!(bold_heading_text("**Spells** and more"), None);
-        assert_eq!(bold_heading_text("Spells"), None);
-        assert_eq!(bold_heading_text(""), None);
-        assert_eq!(bold_heading_text("**"), None);
-        assert_eq!(bold_heading_text("****"), None);
-        // Bold wrapping an italic span is emphasis, not a label.
-        assert_eq!(bold_heading_text("***Spells***"), None);
-    }
-
-    #[test]
     fn test_structure_chunk_one_chunk_per_section() {
         let md = "## Alpha\nA body.\n\n## Beta\nB body.\n\n## Gamma\nG body.\n";
         let chunks = structure_chunk(md, 512, 15, opts(0));
@@ -1628,6 +1525,21 @@ mod tests {
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].heading_path, vec!["Stat Block"]);
         assert_eq!(chunks[1].heading_path, vec!["Stat Block", "Spells"]);
+    }
+
+    /// The chunker's set is the parser's with the bodyless promotions
+    /// dropped, and that is the whole of the difference between them. A
+    /// promoted line with no body starts no chunk, and `find_section` still
+    /// addresses it (#69).
+    #[test]
+    fn the_chunkers_set_drops_a_bodyless_promotion_the_parser_keeps() {
+        let md = "## Stat Block\n\n**Spells**\n**Notes**\n\nSee below\n";
+        let chunker_headings = structure_headings(md, true);
+        let chunker: Vec<&str> = chunker_headings.iter().map(|h| h.text.as_str()).collect();
+        assert_eq!(chunker, vec!["Stat Block", "Notes"]);
+        let parser_headings = crate::markdown::headings_with_promotions(md);
+        let parser: Vec<&str> = parser_headings.iter().map(|h| h.text.as_str()).collect();
+        assert_eq!(parser, vec!["Stat Block", "Spells", "Notes"]);
     }
 
     #[test]
