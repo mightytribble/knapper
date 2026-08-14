@@ -916,9 +916,11 @@ async fn handle_index(
     let store = state.store.lock().await;
     let mut embedder = state.embedder.lock().await;
     let mut config = crate::config::Config::load().unwrap_or_default();
-    // The chunker settings come from the session, for the reason
-    // `handle_reindex_file` gives: one store holds one chunking.
+    // The chunker settings and the embedding composition come from the
+    // session, for the reason `handle_reindex_file` gives: one store holds one
+    // chunking and one embedding space (#55, #72).
     config.set_chunk_options(state.chunk_opts);
+    config.set_embed_composition(state.embed);
     if body.no_gitignore {
         config.respect_gitignore = false;
     }
@@ -1033,14 +1035,17 @@ async fn handle_init(
                 ));
             }
             let mut config = crate::config::Config::load().unwrap_or_default();
-            // The chunker settings come from the session, not from this load.
-            // `apply` indexes the whole vault, and every later write tool and
-            // `reindex_file` chunk at the captured `chunk_opts`. A fresh load
-            // that fell back to the defaults, or drifted from disk, would build
-            // the index at settings the rest of the session does not use, and
-            // nothing downstream can tell the two sets of rows apart. Carrying
-            // the captured value is what `ChunkOptions` exists to give (#55).
+            // The chunker settings and the embedding composition come from the
+            // session, not from this load. `apply` indexes the whole vault, and
+            // every later write tool and `reindex_file` chunk and embed at the
+            // captured `chunk_opts` and `embed`. A fresh load that fell back to
+            // the defaults, or drifted from disk, would build the index at
+            // settings the rest of the session does not use, and nothing
+            // downstream can tell the two sets of rows apart. Carrying the
+            // captured values is what `ChunkOptions` and `EmbedComposition`
+            // exist to give (#55, #72).
             config.set_chunk_options(state.chunk_opts);
+            config.set_embed_composition(state.embed);
             let data_dir = crate::config::Config::data_dir()
                 .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
             let flags = crate::onboarding::ApplyFlags {
