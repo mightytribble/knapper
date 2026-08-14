@@ -140,9 +140,17 @@ pub struct Section {
 /// heading or none, so a wrong guess is an error rather than an edit to the
 /// wrong section.
 pub fn find_section(content: &str, heading_text: &str) -> Option<Section> {
-    let headings = parse_headings(content);
-    let idx = by_text(&headings, heading_text).or_else(|| by_path(&headings, heading_text))?;
-    Some(section_at(content, &headings, idx))
+    // ATX first, then the same two lookups over the merged set, so an ATX
+    // `### History` keeps precedence over a `**History**` under the same
+    // parent: the second pass runs only when the first answered nothing
+    // (issue #69).
+    [parse_headings(content), headings_with_promotions(content)]
+        .into_iter()
+        .find_map(|headings| {
+            let idx =
+                by_text(&headings, heading_text).or_else(|| by_path(&headings, heading_text))?;
+            Some(section_at(content, &headings, idx))
+        })
 }
 
 /// The first heading whose own text is `query`.
@@ -179,9 +187,19 @@ fn path_of(headings: &[HeadingInfo], idx: usize) -> Vec<String> {
     stack.into_iter().map(|(_, text)| text).collect()
 }
 
-/// One segment as it is compared: trimmed and folded.
+/// One segment as it is compared: the bold markers of a promoted heading
+/// removed, then trimmed and folded.
+///
+/// `chunks.heading` holds the raw `**Spells**` and `chunks.heading_path` holds
+/// the stripped `Spells`, so both spellings are in circulation and a caller
+/// may paste either. `bold_heading_text` is what defines the marker on both
+/// sides, so the comparison and the merge cannot disagree (issue #69).
 fn normalise(segment: &str) -> String {
-    segment.trim().to_lowercase()
+    let trimmed = segment.trim();
+    bold_heading_text(trimmed)
+        .unwrap_or(trimmed)
+        .trim()
+        .to_lowercase()
 }
 
 /// The span a heading owns: from the line after it to the next heading at or
@@ -465,5 +483,82 @@ mod tests {
     fn a_path_folds_case_segment_by_segment() {
         let content = "# About the Empire\n\n## History\n\nFounding\n";
         assert!(find_section(content, "about the empire > HISTORY").is_some());
+    }
+
+    /// A promoted bold line is a section the resolver reaches, so the section
+    /// a search result names is a section a caller can read (#53, #69).
+    #[test]
+    fn a_promoted_line_is_addressable_bare_and_by_path() {
+        let content = "## Stat Block\n\nAC 20\n\n**Spells**\n\nFireball\n\n## Lore\n\nOld\n";
+        let bare = find_section(content, "Spells").unwrap();
+        assert!(bare.content.contains("Fireball"));
+        assert!(!bare.content.contains("Old"));
+        let path = find_section(content, "Stat Block > Spells").unwrap();
+        assert_eq!(path.heading.line, bare.heading.line);
+        assert!(path.heading.promoted);
+    }
+
+    /// `chunks.heading` holds the raw line and `chunks.heading_path` holds
+    /// the stripped text, so a caller may paste either spelling (#69).
+    #[test]
+    fn every_spelling_of_a_promoted_heading_resolves() {
+        let content = "## Stat Block\n\nAC 20\n\n**Spells**\n\nFireball\n";
+        for named in ["Spells", "**Spells**", "__Spells__", "**Spells**:"] {
+            assert!(
+                find_section(content, named).is_some(),
+                "{named} resolved nothing"
+            );
+        }
+        assert!(
+            find_section(content, "Stat Block > **Spells**")
+                .unwrap()
+                .content
+                .contains("Fireball")
+        );
+    }
+
+    /// The ATX pass runs first, so a `###` wins over a `**bold**` of the same
+    /// name under the same parent (#69).
+    #[test]
+    fn an_atx_heading_wins_over_a_promoted_one_of_the_same_name() {
+        let content = "## Stat Block\n\n**History**\n\nBold body\n\n### History\n\nAtx body\n";
+        assert!(
+            find_section(content, "History")
+                .unwrap()
+                .content
+                .contains("Atx body")
+        );
+    }
+
+    /// A promoted section ends where #44 says it does: at the next promoted
+    /// line, or at the next `#` heading of any depth (#69).
+    #[test]
+    fn a_promoted_section_ends_at_the_next_promotion_or_heading() {
+        let content =
+            "## Stat Block\n\n**Abilities**\n\nFlight\n\n**Spells**\n\nFireball\n\n# Lore\n\nOld\n";
+        let abilities = find_section(content, "Abilities").unwrap();
+        assert!(abilities.content.contains("Flight"));
+        assert!(!abilities.content.contains("Fireball"));
+        let spells = find_section(content, "Spells").unwrap();
+        assert!(spells.content.contains("Fireball"));
+        assert!(!spells.content.contains("Old"));
+    }
+
+    /// An empty section is addressable, because addressing it is how a caller
+    /// fills it. The chunker drops a bodyless promoted line from its own set;
+    /// the resolver reads the set before that drop (#69).
+    #[test]
+    fn a_bodyless_promoted_line_is_addressable() {
+        let content = "## Stat Block\n\n**Spells**\n**Notes**\n\nSee below\n";
+        let spells = find_section(content, "Spells").unwrap();
+        assert_eq!(spells.content, "");
+        assert_eq!(spells.body_start, spells.body_end);
+    }
+
+    /// A bold-only line inside a fence is not a section on either pass (#69).
+    #[test]
+    fn a_bold_line_inside_a_fence_is_not_addressable() {
+        let content = "## Stat Block\n\n```md\n**Spells**\n\nFireball\n```\n";
+        assert!(find_section(content, "Spells").is_none());
     }
 }

@@ -1597,6 +1597,50 @@ mod tests {
         assert!(out.contains("## Rank"), "the rest of the note survives");
     }
 
+    /// A promoted section is edited the way an ATX one is: the transform
+    /// works from `body_start` and `body_end`, so the bold line stays where
+    /// it is and the body under it is what changes (#69).
+    #[test]
+    fn a_replace_under_a_promoted_heading_keeps_the_bold_line() {
+        let doc = "## Stat Block\n\nAC 20\n\n**Spells**\n\nFireball\n\n## Lore\n\nOld\n";
+        let out = apply_section_edit(doc, "Spells", "Meteor", EditMode::Replace).unwrap();
+        assert!(out.contains("**Spells**"));
+        assert!(out.contains("Meteor"));
+        assert!(!out.contains("Fireball"));
+        assert!(out.contains("Old"));
+        assert!(out.contains("AC 20"));
+    }
+
+    /// An empty section is what a caller fills, so an append to a bodyless
+    /// promoted heading writes the first content under it (#69).
+    #[test]
+    fn an_append_fills_a_bodyless_promoted_section() {
+        let doc = "## Stat Block\n\n**Spells**\n**Notes**\n\nSee below\n";
+        let out = apply_section_edit(doc, "Spells", "Fireball", EditMode::Append).unwrap();
+        let spells_at = out.find("**Spells**").expect("the bold line survives");
+        let fireball_at = out.find("Fireball").expect("the new body is written");
+        let notes_at = out.find("**Notes**").expect("the next section survives");
+        assert!(spells_at < fireball_at && fireball_at < notes_at);
+        assert!(out.contains("See below"));
+    }
+
+    /// A section the caller names by path is the section that is edited (#69).
+    #[test]
+    fn a_path_names_the_section_an_edit_reaches() {
+        let doc =
+            "# Empire\n\n## History\n\nFounding\n\n## Current Events\n\n### History\n\nRecent\n";
+        let out = apply_section_edit(
+            doc,
+            "Empire > Current Events > History",
+            "Newer",
+            EditMode::Replace,
+        )
+        .unwrap();
+        assert!(out.contains("Founding"));
+        assert!(out.contains("Newer"));
+        assert!(!out.contains("Recent"));
+    }
+
     #[test]
     fn a_missing_section_is_an_error_and_not_a_silent_append() {
         let doc = "# Note\n\n## Spells\n\nbody\n";
