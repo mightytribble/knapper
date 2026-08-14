@@ -56,7 +56,12 @@ pub struct SectionSpan {
 /// conventions apart (#68).
 #[derive(Debug, Serialize)]
 pub struct Heading {
-    pub level: u8,
+    /// The `#` depth of an ATX heading, and absent for a promoted bold line,
+    /// which has no depth of its own. The absence is what the CLI renders as
+    /// the bold form, and `markdown::PROMOTED_LEVEL` reaches no surface
+    /// (#44, #69).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub level: Option<u8>,
     pub text: String,
     pub line: usize,
 }
@@ -348,6 +353,10 @@ pub fn context_read(
 /// A file the store holds and the disk does not answers an empty outline
 /// and no error: the row is transient, and `writer::verify_index_integrity`
 /// drops it at the start of the next index.
+///
+/// The set is `markdown::headings_with_promotions`, which is what
+/// `find_section` addresses, so every entry listed here can be read and
+/// written by name (#69).
 fn outline(vault_path: &Path, path: &str) -> Vec<Heading> {
     let Ok(content) = std::fs::read_to_string(vault_path.join(path)) else {
         return Vec::new();
@@ -357,10 +366,10 @@ fn outline(vault_path: &Path, path: &str) -> Vec<Heading> {
     // are added back, so the numbers are the file's own.
     let (_, body) = crate::markdown::split_frontmatter(&content);
     let offset = content.lines().count().saturating_sub(body.lines().count());
-    crate::markdown::parse_headings(&body)
+    crate::markdown::headings_with_promotions(&body)
         .into_iter()
         .map(|h| Heading {
-            level: h.level,
+            level: (!h.promoted).then_some(h.level),
             text: h.text,
             line: h.line + offset + 1,
         })
@@ -1089,17 +1098,17 @@ mod tests {
         let headings = outline_of(
             "# About the Empire\n\n## History\n\n### The founding\n\nText.\n\n## Current Events\n",
         );
-        let got: Vec<(u8, &str, usize)> = headings
+        let got: Vec<(Option<u8>, &str, usize)> = headings
             .iter()
             .map(|h| (h.level, h.text.as_str(), h.line))
             .collect();
         assert_eq!(
             got,
             vec![
-                (1, "About the Empire", 1),
-                (2, "History", 3),
-                (3, "The founding", 5),
-                (2, "Current Events", 9),
+                (Some(1), "About the Empire", 1),
+                (Some(2), "History", 3),
+                (Some(3), "The founding", 5),
+                (Some(2), "Current Events", 9),
             ]
         );
     }
@@ -1111,6 +1120,61 @@ mod tests {
         let headings = outline_of("# Real\n\n```bash\n# not a heading\n```\n\n## Also real\n");
         let got: Vec<&str> = headings.iter().map(|h| h.text.as_str()).collect();
         assert_eq!(got, vec!["Real", "Also real"]);
+    }
+
+    /// The outline lists what `--section` can address, promoted bold lines
+    /// included, because it is where a caller reads the path it then names
+    /// (#69).
+    #[test]
+    fn an_outline_lists_promoted_headings_beside_atx_ones() {
+        let headings =
+            outline_of("# Archdragon\n\n## Stat Block\n\nAC 20\n\n**Spells**\n\nFireball\n");
+        let got: Vec<(Option<u8>, &str)> = headings
+            .iter()
+            .map(|h| (h.level, h.text.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (Some(1), "Archdragon"),
+                (Some(2), "Stat Block"),
+                (None, "Spells"),
+            ]
+        );
+    }
+
+    /// A promoted line with no body is listed, because addressing an empty
+    /// section is how a caller fills it (#69).
+    #[test]
+    fn an_outline_lists_a_bodyless_promoted_heading() {
+        let headings = outline_of("## Stat Block\n\n**Spells**\n**Notes**\n\nSee below\n");
+        let got: Vec<&str> = headings.iter().map(|h| h.text.as_str()).collect();
+        assert_eq!(got, vec!["Stat Block", "Spells", "Notes"]);
+    }
+
+    /// Every entry the outline lists is a section `find_section` resolves.
+    /// The two read one set, and this is what holds them to it (#69).
+    #[test]
+    fn every_outline_entry_is_addressable() {
+        let content = "# Archdragon\n\n## Stat Block\n\nAC 20\n\n**Spells**\n\nFireball\n\n**Notes**\n**Tail**\n\nEnd\n";
+        for h in outline_of(content) {
+            assert!(
+                crate::markdown::find_section(content, &h.text).is_some(),
+                "the outline lists {} and find_section resolves nothing",
+                h.text
+            );
+        }
+    }
+
+    /// A promoted line carries no `level` key, so an ATX heading serialises
+    /// as it did and a consumer reads the absence rather than a sentinel
+    /// (#69).
+    #[test]
+    fn a_promoted_heading_serialises_without_a_level() {
+        let headings = outline_of("## Stat Block\n\n**Spells**\n\nFireball\n");
+        let json = serde_json::to_string(&headings).unwrap();
+        assert!(json.contains(r#"{"level":2,"text":"Stat Block""#));
+        assert!(json.contains(r#"{"text":"Spells""#));
     }
 
     /// The frontmatter is stripped before parsing, because a YAML comment

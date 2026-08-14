@@ -296,7 +296,13 @@ async fn main() -> Result<()> {
                     }
                     println!("{}", item.path);
                     for h in item.headings.iter().flatten() {
-                        println!("{} {}", "#".repeat(h.level as usize), h.text);
+                        match h.level {
+                            Some(level) => println!("{} {}", "#".repeat(level as usize), h.text),
+                            // A promoted line has no `#` depth, so it prints
+                            // in the bold form the file holds, which is one of
+                            // the spellings `--section` takes (#69).
+                            None => println!("**{}**", h.text),
+                        }
                     }
                 }
             } else {
