@@ -87,7 +87,8 @@ pub enum Command {
     Update {
         /// File path, basename, or #docid.
         file: String,
-        /// The section to edit. Omit for the note's body.
+        /// The section to edit: a heading's text, or its full path joined
+        /// with ` > `. Omit for the note's body.
         #[arg(long)]
         section: Option<String>,
         /// The frontmatter property to edit.

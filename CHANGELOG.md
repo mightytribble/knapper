@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased — Address a section by its heading path ([#69](https://github.com/mightytribble/engraph/issues/69))
+
+`--section` names a section by its heading text or by its full heading path, and a promoted bold line is one of the sections it reaches. `list --detailed` enumerates the same set, so what the outline prints is what `read` and `update` can name.
+
+### Added
+
+- **`--section` takes a heading path.** `read` and `update` accept a heading's own text, as before, or its full path from its own root joined with ` > `: `--section "About the Empire > Current Events > History"` reaches the second `History` of a note that holds two. A partial path resolves nothing, so a wrong guess is an error and never an edit to another section. Two same-named siblings under one parent share a path, and the first in document order is the one that resolves.
+- **A promoted bold heading is addressable** ([#53](https://github.com/mightytribble/engraph/issues/53)). `--section "Spells"`, `--section "**Spells**"` and `--section "Stat Block > Spells"` all reach a `**Spells**` section, which is 107 of the 1559 chunks in the pinned corpus and was reachable by no name at all. The section ends where the chunker ends it: at the next promoted line, or the next `#` heading of any depth. An ATX heading keeps precedence over a promoted one of the same name under the same parent. The fallback runs whatever `promote_bold_headings` says, because what a caller may name is a property of the file and not of what the indexer chunks.
+- **An empty section is addressable**, promoted or ATX, because addressing one is how a caller fills it.
+
+### Changed
+
+- **`list --detailed` lists promoted headings** beside the ATX ones, and lists a bodyless promoted heading too, so every entry of an outline is a section `read` and `update` can name. `Heading.level` is now absent for a promoted line rather than carrying a depth it does not have; on the CLI such a line prints in its bold form, `**Spells**`.
+- **`markdown.rs` owns what a heading is** and `chunker.rs` owns which headings start a chunk. The chunker's set is unchanged, so no fingerprint moves and no store re-indexes.
+- **Test count: 893 → 918.**
+
 ## Unreleased — List the vault's files ([#68](https://github.com/mightytribble/engraph/issues/68))
 
 `engraph list` is the call an agent makes to see a vault it cannot read: every note the scope admits, in path order, one bare path per line, and each note's heading outline under `--detailed`.

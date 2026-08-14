@@ -73,10 +73,16 @@ pub struct Read {
     pub file: String,
     /// Read one section by its heading. Omit for the whole note.
     ///
-    /// The heading is an ATX `#` heading and the match folds case, so
-    /// `spells` finds `## Spells`. A section read narrows `content` and
-    /// `byte_count` to that section; the note's tags and links are reported
-    /// either way, because a section's are its file's (#62).
+    /// The heading is one heading's own text, or its full path from the
+    /// note's top heading down, joined with ` > `: `Spells` finds the first
+    /// section of that name, and `Stat Block > Spells` finds the one under
+    /// `Stat Block`. A partial path finds nothing. The match folds case, and
+    /// a bold-only line is a section too, in either spelling — `**Spells**`
+    /// and `Spells` name the same one (#69).
+    ///
+    /// A section read narrows `content` and `byte_count` to that section; the
+    /// note's tags and links are reported either way, because a section's are
+    /// its file's (#62).
     #[arg(long)]
     pub section: Option<String>,
 }
@@ -330,7 +336,8 @@ impl From<EditMode> for crate::writer::EditMode {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Edit {
-    /// The heading of the section to edit.
+    /// The section to edit: a heading's own text, or its full path from the
+    /// note's top heading down, joined with ` > ` (#69).
     pub section: Option<String>,
     /// The frontmatter property to edit.
     pub property: Option<String>,
