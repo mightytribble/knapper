@@ -951,7 +951,7 @@ pub async fn run_serve(
         fts,
         embed,
         chunk_opts,
-        output,
+        output: output.clone(),
     };
 
     // Cancellation token for coordinated shutdown of HTTP + MCP
@@ -980,6 +980,7 @@ pub async fn run_serve(
             fts,
             embed,
             chunk_opts,
+            output,
         };
         let router = crate::http::build_router(api_state);
         let addr = format!("{}:{}", opts.host, opts.port);

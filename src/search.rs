@@ -12,18 +12,6 @@ use crate::packaging::est_tokens_fallback;
 use crate::ranking;
 use crate::store::{EdgeStats, Store, StoreStats};
 
-/// A single search result with metadata.
-pub struct SearchResult {
-    pub score: f32,
-    pub confidence: f64,
-    pub file_path: String,
-    /// Which section of the file this result is, 0-based.
-    pub chunk_seq: i64,
-    pub heading: Option<String>,
-    pub snippet: String,
-    pub docid: Option<String>,
-}
-
 /// Structured search result for internal use (no I/O).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct InternalSearchResult {
@@ -46,22 +34,6 @@ pub struct InternalSearchResult {
     pub truncated: bool,
     /// Which lanes account for this result, in place of a numeric score (#35).
     pub provenance: crate::packaging::Provenance,
-}
-
-impl SearchResult {
-    /// The pipeline's row as the CLI formats it. What a result item holds on
-    /// each surface is issue #35's question, not this one's (#62).
-    pub fn from_internal(r: &InternalSearchResult) -> Self {
-        SearchResult {
-            score: r.score as f32,
-            confidence: r.confidence,
-            file_path: r.file_path.clone(),
-            chunk_seq: r.chunk_seq,
-            heading: r.heading.clone(),
-            snippet: r.snippet.clone(),
-            docid: r.docid.clone(),
-        }
-    }
 }
 
 /// Output from the search pipeline: structured results plus raw fused data for --explain.
@@ -1221,17 +1193,23 @@ fn merge_seeds(semantic: &[RankedResult], fts: &[RankedResult]) -> Vec<RankedRes
     seeds.into_iter().map(|(r, _)| r).collect()
 }
 
-/// Run a search query and print results.
+/// Run a search query and print the envelope (#35).
 ///
 /// Performs both semantic (sqlite-vec) and keyword (FTS5) search, then fuses
-/// results using Reciprocal Rank Fusion. When `explain` is true, each
-/// result includes per-lane score breakdown.
+/// results using Reciprocal Rank Fusion, packages the ranked results into a
+/// `SearchEnvelope`, and renders it: JSON for `--json`, text otherwise. When
+/// `explain` is true, the per-lane score breakdown prints after the text
+/// rendering — clap's `conflicts_with` keeps it from ever running with `json`.
 #[allow(clippy::too_many_arguments)]
 pub fn run_search(
     query: &str,
     top_n: usize,
     json: bool,
     explain: bool,
+    budget_tokens: Option<u32>,
+    full: bool,
+    summaries: bool,
+    scores: bool,
     group_by: GroupBy,
     scope: &crate::tags::Scope,
     data_dir: &Path,
@@ -1282,21 +1260,40 @@ pub fn run_search(
         search_with_intelligence(query, top_n, &mut embedder, &mut search_config)?
     };
 
-    let results: Vec<SearchResult> = output
-        .results
-        .iter()
-        .map(SearchResult::from_internal)
-        .collect();
-
-    let mut out = format_results(&results, json);
-
-    // The order came from the interleave, not from a model. Said on stdout
-    // beside the results rather than logged: stderr is where a warning goes to
-    // be discarded, and a degraded ranking that looks ranked is the failure.
-    // The structured contract carries this in layer 2 of the convergence plan.
-    if output.degraded && !json {
-        out.push_str("\n(degraded ordering: no cross-encoder available)\n");
+    // `full` and `summaries` both name the whole result set and disagree on
+    // its shape, so asking for both is a usage error rather than one flag
+    // silently winning (#35).
+    if full && summaries {
+        anyhow::bail!("--full and --summaries are mutually exclusive");
     }
+
+    // Per call, with the configured default behind it, the same pattern
+    // `top_n` follows (#35, #62).
+    let budget = budget_tokens.unwrap_or(config.output.budget_tokens);
+    let mut env = crate::packaging::assemble(
+        &output.results,
+        crate::packaging::AssembleParams {
+            budget_tokens: budget,
+            full,
+            summaries,
+            degraded: output.degraded,
+            per_note_cap: config.ranking.per_note_cap,
+        },
+    );
+    // A number invites a caller to trust it as ground truth rather than as a
+    // reranker's opinion, so it ships only when asked (#35).
+    if scores {
+        crate::packaging::apply_scores(&mut env, &output.results);
+    }
+
+    // JSON is the CLI's machine channel and carries the envelope alone; the
+    // text rendering — including the degraded banner — is design §9.3's form
+    // and is what `--explain` appends to (#35, #62).
+    let mut out = if json {
+        format!("{}\n", serde_json::to_string_pretty(&env)?)
+    } else {
+        crate::packaging::render_text(&env, scores)
+    };
 
     if explain && !json {
         out.push_str(&explain_report(&output, top_n));
@@ -1402,70 +1399,6 @@ pub fn status_json(store: &Store, data_dir: &Path) -> Result<serde_json::Value> 
         s.intelligence,
         s.date_count,
     ))
-}
-
-/// Format search results for display (pure function, no I/O).
-pub fn format_results(results: &[SearchResult], json: bool) -> String {
-    // An empty result set means the same thing for both of its causes (#34):
-    // the floor removed every candidate, or retrieval found none. The reader
-    // asked about the vault, so one message covers both. A message that told
-    // "nothing scored high enough" apart from "nothing was found" would report
-    // on the engine instead.
-    //
-    // The JSON channel keeps the empty array. The message is text, and an array
-    // has no field for it. #35 owns the machine-facing contract.
-    if results.is_empty() {
-        return if json {
-            "[]\n".to_string()
-        } else {
-            format!("{}\n", crate::ranking::NO_RELEVANT_CONTENT)
-        };
-    }
-
-    if json {
-        let items: Vec<serde_json::Value> = results
-            .iter()
-            .enumerate()
-            .map(|(i, r)| {
-                // Round score to 2 decimal places via f64 to avoid f32 precision artifacts.
-                let score_rounded = ((r.score as f64) * 100.0).round() / 100.0;
-                json!({
-                    "rank": i + 1,
-                    "score": score_rounded,
-                    "confidence": r.confidence,
-                    "file": r.file_path,
-                    "section": r.chunk_seq,
-                    "heading": r.heading,
-                    "snippet": r.snippet,
-                    "docid": r.docid,
-                })
-            })
-            .collect();
-        format!("{}\n", serde_json::to_string_pretty(&items).unwrap())
-    } else {
-        let mut out = String::new();
-        for (i, r) in results.iter().enumerate() {
-            let heading_part = match &r.heading {
-                Some(h) => format!(" > {h}"),
-                None => String::new(),
-            };
-            let docid_part = match &r.docid {
-                Some(d) => format!(" #{d}"),
-                None => String::new(),
-            };
-            let snippet = truncate_snippet(&r.snippet, 200);
-            out.push_str(&format!(
-                "{:>2}. [{:>3.0}%] {}{}{}\n    {}\n",
-                i + 1,
-                r.confidence,
-                r.file_path,
-                heading_part,
-                docid_part,
-                snippet,
-            ));
-        }
-        out
-    }
 }
 
 /// The fields `status` reports, composed once (pure function, no I/O).
@@ -1580,20 +1513,6 @@ pub fn format_status(
     }
 }
 
-/// Truncate a string to at most `max_len` characters, appending "..." if truncated.
-fn truncate_snippet(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
-        s.to_string()
-    } else {
-        // Find a char boundary near max_len.
-        let mut end = max_len;
-        while end > 0 && !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}...", &s[..end])
-    }
-}
-
 /// Format a byte count as a human-readable string.
 fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
@@ -1614,82 +1533,6 @@ fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_format_human_result() {
-        let results = vec![SearchResult {
-            score: 0.87,
-            confidence: 100.0,
-            file_path: "foo.md".to_string(),
-            chunk_seq: 0,
-            heading: Some("## Bar".to_string()),
-            snippet: "Some text...".to_string(),
-            docid: Some("ab12cd".to_string()),
-        }];
-        let output = format_results(&results, false);
-        assert_eq!(
-            output,
-            " 1. [100%] foo.md > ## Bar #ab12cd\n    Some text...\n"
-        );
-    }
-
-    #[test]
-    fn test_format_human_result_no_docid() {
-        let results = vec![SearchResult {
-            score: 0.87,
-            confidence: 100.0,
-            file_path: "foo.md".to_string(),
-            chunk_seq: 0,
-            heading: Some("## Bar".to_string()),
-            snippet: "Some text...".to_string(),
-            docid: None,
-        }];
-        let output = format_results(&results, false);
-        assert_eq!(output, " 1. [100%] foo.md > ## Bar\n    Some text...\n");
-    }
-
-    #[test]
-    fn test_format_json_result() {
-        let results = vec![SearchResult {
-            score: 0.87,
-            confidence: 100.0,
-            file_path: "foo.md".to_string(),
-            chunk_seq: 0,
-            heading: Some("## Bar".to_string()),
-            snippet: "Some text...".to_string(),
-            docid: Some("ab12cd".to_string()),
-        }];
-        let output = format_results(&results, true);
-        let parsed: Vec<serde_json::Value> = serde_json::from_str(&output).unwrap();
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0]["rank"], 1);
-        assert_eq!(parsed[0]["score"], 0.87);
-        assert_eq!(parsed[0]["confidence"], 100.0);
-        assert_eq!(parsed[0]["file"], "foo.md");
-        assert_eq!(
-            parsed[0]["section"], 0,
-            "results address a section, not a file"
-        );
-        assert_eq!(parsed[0]["heading"], "## Bar");
-        assert_eq!(parsed[0]["snippet"], "Some text...");
-        assert_eq!(parsed[0]["docid"], "ab12cd");
-    }
-
-    /// An empty result set reports that the vault has no answer (#34). One
-    /// message covers both causes: the floor removed everything, or retrieval
-    /// found nothing. The difference is about the engine, and the message is
-    /// about the vault.
-    #[test]
-    fn test_no_results_message() {
-        let output = format_results(&[], false);
-        assert_eq!(
-            output,
-            "No relevant content found for this query in the vault.\n"
-        );
-
-        let json_output = format_results(&[], true);
-        assert_eq!(json_output, "[]\n", "the array channel keeps its shape");
-    }
 
     fn sample_edge_stats() -> EdgeStats {
         EdgeStats {
@@ -1800,17 +1643,6 @@ mod tests {
         // them.
         assert_eq!(parsed["edges"], 10);
         assert_eq!(parsed["wikilink_edges"], 6);
-    }
-
-    #[test]
-    fn test_truncate_snippet() {
-        let short = "hello";
-        assert_eq!(truncate_snippet(short, 200), "hello");
-
-        let long = "a".repeat(300);
-        let truncated = truncate_snippet(&long, 200);
-        assert!(truncated.ends_with("..."));
-        assert_eq!(truncated.len(), 203); // 200 + "..."
     }
 
     #[test]
@@ -2957,8 +2789,22 @@ mod tests {
             "no candidate was above the floor, but the engine returned {} results",
             gated.len()
         );
+        // The floor's empty response reaches the envelope as `NoResults`, and
+        // the CLI's text rendering is the same literal message #34 always
+        // gave — through the real packaging path, not a hardcoded slice (#35).
+        let env = crate::packaging::assemble(
+            &gated,
+            crate::packaging::AssembleParams {
+                budget_tokens: 8192,
+                full: false,
+                summaries: false,
+                degraded: false,
+                per_note_cap: 0,
+            },
+        );
+        assert_eq!(env.status, crate::packaging::SearchStatus::NoResults);
         assert_eq!(
-            format_results(&[], false),
+            crate::packaging::render_text(&env, false),
             format!("{}\n", crate::ranking::NO_RELEVANT_CONTENT)
         );
 

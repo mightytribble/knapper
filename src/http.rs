@@ -62,6 +62,9 @@ pub struct ApiState {
     /// would produce (issue #43), and the same now holds for where a section
     /// starts (issue #44).
     pub chunk_opts: crate::chunker::ChunkOptions,
+    /// Output-packaging settings from `config.toml` (#35): the default token
+    /// budget a request's `budget_tokens` overrides.
+    pub output: crate::config::OutputConfig,
 }
 
 // ---------------------------------------------------------------------------
@@ -356,30 +359,6 @@ async fn handle_plugin_manifest(State(state): State<ApiState>) -> impl IntoRespo
 // Read endpoint handlers
 // ---------------------------------------------------------------------------
 
-/// A search response is an envelope, because HTTP is the one surface with
-/// nowhere else to put the answer-floor signal — the CLI prints it and MCP
-/// sends a second content block (#34, #62). #35 owns what a result item
-/// holds; this owns the envelope around it, all three of its keys.
-///
-/// `explain` is the per-lane detail, and it is absent when the caller did not
-/// ask for it: an agent that did not ask must not have to read past it.
-fn search_response(
-    results: &[search::InternalSearchResult],
-    explain: Option<String>,
-) -> serde_json::Value {
-    let mut envelope = serde_json::json!({
-        "results": results,
-        "message": match results.is_empty() {
-            true => Some(crate::ranking::NO_RELEVANT_CONTENT),
-            false => None,
-        },
-    });
-    if let Some(detail) = explain {
-        envelope["explain"] = serde_json::Value::String(detail);
-    }
-    envelope
-}
-
 /// Whether an error message is a caller's own scope typo, which is a bad
 /// request rather than a server fault. `check_terms` gives the caller the
 /// nearest tag or folder in the message, the cheapest honest signal this far
@@ -437,10 +416,44 @@ async fn handle_search(
                 ApiError::internal(&format!("{e:#}"))
             }
         })?;
-    // The per-lane detail rides in the envelope, next to the results it
-    // explains, and is built only for the call that asked for it (#62).
-    let explain = body.explain.then(|| search::explain_report(&output, top_n));
-    Ok(Json(search_response(&output.results, explain)))
+
+    // `full` and `summaries` both name the whole result set and disagree on
+    // its shape, so asking for both is a usage error rather than one flag
+    // silently winning (#35).
+    if body.full && body.summaries {
+        return Err(ApiError::bad_request(
+            "--full and --summaries are mutually exclusive",
+        ));
+    }
+
+    // Per call, with the configured default behind it, the same pattern
+    // `top_n` follows (#35, #62).
+    let budget = body.budget_tokens.unwrap_or(state.output.budget_tokens);
+    let mut env = crate::packaging::assemble(
+        &output.results,
+        crate::packaging::AssembleParams {
+            budget_tokens: budget,
+            full: body.full,
+            summaries: body.summaries,
+            degraded: output.degraded,
+            per_note_cap: state.ranking.per_note_cap,
+        },
+    );
+    // A number invites a caller to trust it as ground truth rather than as a
+    // reranker's opinion, so it ships only when asked (#35).
+    if body.scores {
+        crate::packaging::apply_scores(&mut env, &output.results);
+    }
+    let mut value =
+        serde_json::to_value(&env).map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    // The per-lane detail rides beside the envelope, the way the CLI prints
+    // it after the rendered results and MCP sends it as a second content
+    // block. It is present only when the caller asked, because an agent
+    // that did not ask must not have to read past it (#62).
+    if body.explain {
+        value["explain"] = serde_json::Value::String(search::explain_report(&output, top_n));
+    }
+    Ok(Json(value))
 }
 
 async fn handle_read(
@@ -1094,6 +1107,7 @@ mod tests {
                 min_chars: 0,
                 promote_bold: false,
             },
+            output: crate::config::OutputConfig::default(),
         }
     }
 
@@ -1832,52 +1846,6 @@ mod tests {
         );
     }
 
-    /// One result with every field filled. The envelope is what the test
-    /// asserts on, so the values themselves carry no meaning (#62).
-    fn sample_result() -> search::InternalSearchResult {
-        search::InternalSearchResult {
-            file_path: "Notes/Warding.md".to_string(),
-            file_id: 7,
-            chunk_seq: 2,
-            score: 0.5,
-            confidence: 0.75,
-            heading: Some("Level 4 Silence".to_string()),
-            snippet: "a snippet".to_string(),
-            docid: Some("a1b2c3".to_string()),
-            text: "a snippet, past its 200-character cut".to_string(),
-            heading_path: "Warding > Level 4 Silence".to_string(),
-            token_count: 8,
-            truncated: false,
-            provenance: crate::packaging::Provenance {
-                keyword: true,
-                semantic: true,
-                graph: false,
-                linked_from: Vec::new(),
-            },
-        }
-    }
-
-    #[test]
-    fn a_search_response_carries_its_results_and_its_message() {
-        let empty = search_response(&[], None);
-        assert_eq!(empty["results"].as_array().unwrap().len(), 0);
-        assert_eq!(
-            empty["message"].as_str().unwrap(),
-            crate::ranking::NO_RELEVANT_CONTENT
-        );
-        assert!(empty.get("explain").is_none());
-
-        let one = search_response(std::slice::from_ref(&sample_result()), None);
-        assert_eq!(one["results"].as_array().unwrap().len(), 1);
-        assert!(one["message"].is_null());
-
-        let explained = search_response(&[], Some("--- Query run ---\n".to_string()));
-        assert_eq!(
-            explained["explain"].as_str().unwrap(),
-            "--- Query run ---\n"
-        );
-    }
-
     /// A vault of two notes, indexed in memory. The mock's vectors are hashes,
     /// so the keyword lane carries the meaning here — which is all a
     /// granularity assertion needs.
@@ -1923,14 +1891,18 @@ mod tests {
     }
 
     /// How many sections of the one file that holds three matching ones came
-    /// back.
+    /// back, across the included blocks and the budget's overflow alike —
+    /// this counts answers, not what fit under the default budget.
     fn sections_of_the_abjuration_note(body: &serde_json::Value) -> usize {
-        body["results"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|r| r["file_path"] == "rules/abjuration-spells.md")
-            .count()
+        let in_array = |key: &str| {
+            body[key]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|r| r["path"] == "rules/abjuration-spells.md")
+                .count()
+        };
+        in_array("blocks") + in_array("overflow")
     }
 
     #[tokio::test]
@@ -2194,21 +2166,77 @@ mod tests {
         let (_tmp, mut state) = state_over_five_answering_notes();
         state.top_n = 3;
 
+        // The count is blocks plus overflow: `top_n` bounds how many answers
+        // the pipeline returns, before the budget decides which of them carry
+        // text.
+        let count = |body: &serde_json::Value| {
+            body["blocks"].as_array().unwrap().len() + body["overflow"].as_array().unwrap().len()
+        };
+
         let (status, body) =
             post_json(state.clone(), "/api/search", r#"{"query":"warding"}"#).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(
-            body["results"].as_array().unwrap().len(),
-            3,
-            "the configured top_n is 3, got {body}"
-        );
+        assert_eq!(count(&body), 3, "the configured top_n is 3, got {body}");
 
         let (status, body) =
             post_json(state, "/api/search", r#"{"query":"warding","top_n":5}"#).await;
         assert_eq!(status, StatusCode::OK);
         assert!(
-            body["results"].as_array().unwrap().len() > 3,
+            count(&body) > 3,
             "the corpus holds more than three answers, got {body}"
+        );
+    }
+
+    /// `full` and `summaries` both name the whole result set and disagree on
+    /// its shape, so asking for both is the caller's own contradiction and a
+    /// 400, not one flag silently winning (#35).
+    #[tokio::test]
+    async fn full_and_summaries_together_is_a_bad_request() {
+        let (_tmp, state) = indexed_state();
+        let (status, _body) = post_json(
+            state,
+            "/api/search",
+            r#"{"query":"warding","full":true,"summaries":true}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// No numeric score reaches the wire by default; `scores` restores it on
+    /// every block and overflow row (#35). A reranker is wired in so the run
+    /// is not degraded — a degraded row reports no probability at all, and
+    /// asserting against one here would pass whether or not `scores` worked.
+    #[tokio::test]
+    async fn scores_is_absent_by_default_and_present_when_asked() {
+        let (_tmp, mut state) = indexed_state();
+        state.reranker = Some(Arc::new(Mutex::new(
+            Box::new(crate::llm::MockLlm::new(256)) as Box<dyn RerankModel + Send>,
+        )));
+        // The mock's Jaccard scores run well under the real cross-encoder's
+        // range, and the default answer floor exists to gate a real model's
+        // probability — not this fixture's stand-in. Zero it so the query
+        // still answers (#34's floor is exercised in its own tests).
+        state.ranking.answer_floor = 0.0;
+
+        let (status, body) =
+            post_json(state.clone(), "/api/search", r#"{"query":"warding"}"#).await;
+        assert_eq!(status, StatusCode::OK);
+        let blocks = body["blocks"].as_array().unwrap();
+        assert!(!blocks.is_empty(), "got {body}");
+        assert!(
+            blocks.iter().all(|b| b.get("score").is_none()),
+            "a block carried a score with no --scores, got {body}"
+        );
+
+        let (status, body) =
+            post_json(state, "/api/search", r#"{"query":"warding","scores":true}"#).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["degraded"], false, "got {body}");
+        let blocks = body["blocks"].as_array().unwrap();
+        assert!(!blocks.is_empty(), "got {body}");
+        assert!(
+            blocks.iter().all(|b| b["score"].is_number()),
+            "--scores must fill a number on every block, got {body}"
         );
     }
 }
