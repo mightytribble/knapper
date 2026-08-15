@@ -494,6 +494,15 @@ pub trait RerankModel: Send {
             .map(|document| self.rerank_score(query, document))
             .collect()
     }
+
+    /// Count the tokens in `text` for the budget in `packaging` (#35).
+    ///
+    /// The default is the documented `chars / 3.33` estimate, which a model
+    /// with no tokenizer of its own falls back to. `LlamaRerank` overrides it
+    /// with its own vocabulary, so the count is the model's own.
+    fn count_tokens(&self, text: &str) -> usize {
+        (text.chars().count() * 100).div_ceil(333)
+    }
 }
 
 // ── MockLlm ──────────────────────────────────────────────────────────────────
@@ -1516,6 +1525,15 @@ impl RerankModel for LlamaRerank {
 
         Ok(scores)
     }
+
+    fn count_tokens(&self, text: &str) -> usize {
+        // The reranker's own vocabulary, not an estimate — AddBos::Never for
+        // the same reason the yes/no ids are read that way.
+        self.model
+            .str_to_token(text, llama_cpp_2::model::AddBos::Never)
+            .map(|t| t.len())
+            .unwrap_or_else(|_| (text.chars().count() * 100).div_ceil(333))
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1688,6 +1706,14 @@ mod tests {
         let mut mock = MockLlm::new(256);
         let score = mock.rerank_score("", "document text").unwrap();
         assert_eq!(score, 0.0, "empty query should score 0.0");
+    }
+
+    #[test]
+    fn mock_rerank_counts_tokens_by_the_documented_ratio() {
+        let mock = MockLlm::new(256);
+        // 40 characters -> ceil(40 / 3.33) = 13 tokens on the fallback path.
+        let text = "a".repeat(40);
+        assert_eq!(mock.count_tokens(&text), 13);
     }
 
     #[test]
