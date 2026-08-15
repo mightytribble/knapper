@@ -1269,6 +1269,10 @@ mod tests {
             all: vec![],
             any: vec![],
             none: vec![],
+            budget_tokens: None,
+            full: false,
+            summaries: false,
+            scores: false,
         }
     }
 

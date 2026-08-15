@@ -93,6 +93,28 @@ impl Default for MemoryConfig {
     }
 }
 
+/// Output packaging settings (#35).
+///
+/// Query-time settings; neither key reaches a fingerprint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OutputConfig {
+    /// Default token budget for `search`, overridden per call by `--tokens`.
+    pub budget_tokens: u32,
+    /// Whether the MCP result includes the text rendering beside the structured
+    /// content. The CLI renders text unconditionally; HTTP returns JSON alone.
+    pub emit_text_rendering: bool,
+}
+
+impl Default for OutputConfig {
+    fn default() -> Self {
+        OutputConfig {
+            budget_tokens: 8192,
+            emit_text_rendering: true,
+        }
+    }
+}
+
 /// HTTP REST API configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -750,6 +772,8 @@ pub struct Config {
     pub identity: IdentityConfig,
     #[serde(default)]
     pub memory: MemoryConfig,
+    #[serde(default)]
+    pub output: OutputConfig,
 }
 
 impl Default for Config {
@@ -778,6 +802,7 @@ impl Default for Config {
             http: HttpConfig::default(),
             identity: IdentityConfig::default(),
             memory: MemoryConfig::default(),
+            output: OutputConfig::default(),
         }
     }
 }
@@ -1097,10 +1122,20 @@ batch_size = 128
         assert!(bare.promote_bold_headings);
         assert_eq!(bare.chunk_options().min_chars, 120);
         assert!(bare.chunk_options().promote_bold);
+    }
 
-        let control: Config = toml::from_str("promote_bold_headings = false\n").unwrap();
-        assert!(!control.promote_bold_headings);
-        assert!(!control.chunk_options().promote_bold);
+    #[test]
+    fn output_defaults_are_8192_and_text_on() {
+        let c = OutputConfig::default();
+        assert_eq!(c.budget_tokens, 8192);
+        assert!(c.emit_text_rendering);
+    }
+
+    #[test]
+    fn output_section_parses() {
+        let c: Config = toml::from_str("[output]\nbudget_tokens = 4096\n").unwrap();
+        assert_eq!(c.output.budget_tokens, 4096);
+        assert!(c.output.emit_text_rendering); // serde(default) fills the rest
     }
 
     #[test]

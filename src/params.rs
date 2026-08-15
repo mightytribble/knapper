@@ -65,6 +65,22 @@ pub struct Search {
     #[arg(long, value_delimiter = ',')]
     #[serde(default, deserialize_with = "deserialize_tag_list")]
     pub none: Vec<String>,
+    /// Token budget for the returned text. Fill is greedy in rank order; the
+    /// first result is always included. Omit for the configured default (#35).
+    #[arg(long = "tokens")]
+    pub budget_tokens: Option<u32>,
+    /// Return every result's full text, ignoring the token budget (#35).
+    #[arg(long, conflicts_with = "summaries")]
+    #[serde(default)]
+    pub full: bool,
+    /// Return breadcrumb and provenance only, no text, for every result (#35).
+    #[arg(long)]
+    #[serde(default)]
+    pub summaries: bool,
+    /// Include the cross-encoder's relevance score on each result (#35).
+    #[arg(long)]
+    #[serde(default)]
+    pub scores: bool,
 }
 
 #[derive(Debug, Args, Deserialize, JsonSchema)]
