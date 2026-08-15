@@ -144,7 +144,12 @@ pub fn assemble(results: &[InternalSearchResult], p: AssembleParams) -> SearchEn
         };
     }
 
-    // Results cap on the assembled set; 0 is unbounded (#30, #34).
+    // Results cap on the assembled set; 0 is unbounded (#30, #34). This is
+    // the spec-mandated cap read here, inert at its shipped 0. The pipeline
+    // already applies `cap_per_file` before `take(top_n)`, so on the normal
+    // call path this cap is redundant and idempotent; it stays as the guard
+    // for a direct or future `assemble` caller that skips the pipeline cap
+    // (#35).
     let capped: Vec<&InternalSearchResult> = if p.per_note_cap == 0 {
         results.iter().collect()
     } else {
@@ -403,6 +408,40 @@ mod assemble_tests {
         apply_scores(&mut env, &rs);
         assert!(env.blocks.iter().all(|b| b.score.is_none()));
         assert!(env.overflow.iter().all(|s| s.score.is_none()));
+    }
+
+    #[test]
+    fn block_and_summary_wire_shape_matches_the_contract() {
+        // This locks the wire contract of #35: what serde emits on the JSON
+        // wire, not just what the Rust struct holds. Budget 260 admits the
+        // first two 80-token blocks (130+130); rank 3 overflows.
+        let rs = vec![result(1, 80), result(2, 80), result(3, 80)];
+        let mut env = assemble(&rs, params(260));
+
+        let block_json = serde_json::to_value(&env.blocks[0]).unwrap();
+        assert_eq!(block_json["id"], "000001#1");
+        assert_eq!(block_json["path"], "n1.md");
+        assert_eq!(block_json["heading_path"], "n1.md > H");
+        assert_eq!(block_json["text"], "x".repeat(80 * 3));
+        assert_eq!(block_json["untrusted_content"], true);
+        assert_eq!(block_json["truncated"], false);
+        let prov = &block_json["provenance"];
+        assert_eq!(prov["keyword"], true);
+        assert_eq!(prov["semantic"], false);
+        assert_eq!(prov["graph"], false);
+        assert_eq!(prov["linked_from"], serde_json::json!([]));
+        // No score requested: the field is absent from the wire, not null.
+        assert!(!block_json.as_object().unwrap().contains_key("score"));
+
+        // A Summary carries no text at all.
+        let summary_json = serde_json::to_value(&env.overflow[0]).unwrap();
+        assert!(!summary_json.as_object().unwrap().contains_key("text"));
+
+        // Once scores are asked for, the field appears and carries a number.
+        apply_scores(&mut env, &rs);
+        let scored_block_json = serde_json::to_value(&env.blocks[0]).unwrap();
+        assert!(scored_block_json["score"].is_number());
+        assert_eq!(scored_block_json["score"], 90.0);
     }
 }
 

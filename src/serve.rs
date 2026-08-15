@@ -116,6 +116,17 @@ impl EngraphServer {
         &self,
         params: Parameters<crate::params::Search>,
     ) -> Result<CallToolResult, McpError> {
+        // `full` and `summaries` both name the whole result set and disagree on
+        // its shape, so asking for both is a usage error rather than one flag
+        // silently winning. Checked before the pipeline runs, so a caller's
+        // typo fails fast instead of paying for embed+retrieve+rerank first
+        // (#35).
+        if params.0.full && params.0.summaries {
+            return Err(mcp_err(&anyhow::anyhow!(
+                "--full and --summaries are mutually exclusive"
+            )));
+        }
+
         // Per call, with the configured default behind it (#62).
         let top_n = params.0.top_n.unwrap_or(self.top_n);
         let all_terms = crate::tags::merge_scope_alias(params.0.scope, params.0.all);
@@ -153,17 +164,8 @@ impl EngraphServer {
             search::search_with_intelligence(&params.0.query, top_n, &mut *embedder, &mut config)
                 .map_err(|e| mcp_err(&e))?;
 
-        // `full` and `summaries` both name the whole result set and disagree on
-        // its shape, so asking for both is a usage error rather than one flag
-        // silently winning (#35).
-        if params.0.full && params.0.summaries {
-            return Err(mcp_err(&anyhow::anyhow!(
-                "--full and --summaries are mutually exclusive"
-            )));
-        }
-
-        // Per call, with the configured default behind it, the same pattern
-        // `top_n` follows (#35, #62).
+        // `top_n` follows the same pattern: the call's value, or the
+        // configured default (#35, #62).
         let budget = params.0.budget_tokens.unwrap_or(self.output.budget_tokens);
         let mut env = crate::packaging::assemble(
             &output.results,

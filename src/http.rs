@@ -373,6 +373,18 @@ async fn handle_search(
     Json(body): Json<crate::params::Search>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, false)?;
+
+    // `full` and `summaries` both name the whole result set and disagree on
+    // its shape, so asking for both is a usage error rather than one flag
+    // silently winning. Checked before the pipeline runs, so a caller's
+    // typo fails fast instead of paying for embed+retrieve+rerank first
+    // (#35).
+    if body.full && body.summaries {
+        return Err(ApiError::bad_request(
+            "--full and --summaries are mutually exclusive",
+        ));
+    }
+
     // Per call, with the configured default behind it (#62).
     let top_n = body.top_n.unwrap_or(state.top_n);
     let all_terms = crate::tags::merge_scope_alias(body.scope, body.all);
@@ -416,15 +428,6 @@ async fn handle_search(
                 ApiError::internal(&format!("{e:#}"))
             }
         })?;
-
-    // `full` and `summaries` both name the whole result set and disagree on
-    // its shape, so asking for both is a usage error rather than one flag
-    // silently winning (#35).
-    if body.full && body.summaries {
-        return Err(ApiError::bad_request(
-            "--full and --summaries are mutually exclusive",
-        ));
-    }
 
     // Per call, with the configured default behind it, the same pattern
     // `top_n` follows (#35, #62).
