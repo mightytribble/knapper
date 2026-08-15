@@ -87,7 +87,7 @@ fn build_search() -> serde_json::Value {
                         "budget_tokens": { "type": "integer", "description": "Token budget for the returned text. Fill is greedy in rank order and the first result is always included. Defaults to the configured output budget" },
                         "full": { "type": "boolean", "description": "Return every result's full text, ignoring the token budget. Conflicts with summaries" },
                         "summaries": { "type": "boolean", "description": "Return breadcrumb and provenance only, no text, for every result. Conflicts with full" },
-                        "scores": { "type": "boolean", "description": "Include the cross-encoder's relevance score on each block and overflow row. Absent by default; null on a degraded row, which has no probability to report" }
+                        "scores": { "type": "boolean", "description": "Include the cross-encoder's relevance score on each block and overflow row. Absent by default; the field itself is omitted on a degraded row, which has no probability to report" }
                     }
                 }}}
             },
