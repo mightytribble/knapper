@@ -370,6 +370,40 @@ mod assemble_tests {
         assert_eq!(env.status, SearchStatus::NoResults);
         assert!(env.blocks.is_empty() && env.overflow.is_empty());
     }
+
+    #[test]
+    fn apply_scores_fills_matching_confidence_when_not_degraded() {
+        // Budget 200 admits one 80-token block (130) and overflows the next.
+        let mut r1 = result(1, 80);
+        r1.confidence = 77.0;
+        let mut r2 = result(2, 80);
+        r2.confidence = 42.0;
+        let rs = vec![r1, r2];
+        let mut env = assemble(&rs, params(200));
+        assert_eq!(env.blocks.len(), 1);
+        assert_eq!(env.overflow.len(), 1);
+        apply_scores(&mut env, &rs);
+        assert_eq!(env.blocks[0].score, Some(77.0));
+        assert_eq!(env.overflow[0].score, Some(42.0));
+    }
+
+    #[test]
+    fn apply_scores_leaves_scores_none_when_degraded() {
+        let mut r1 = result(1, 80);
+        r1.confidence = 77.0;
+        let mut r2 = result(2, 80);
+        r2.confidence = 42.0;
+        let rs = vec![r1, r2];
+        let mut p = params(200);
+        p.degraded = true;
+        let mut env = assemble(&rs, p);
+        assert!(env.degraded);
+        assert_eq!(env.blocks.len(), 1);
+        assert_eq!(env.overflow.len(), 1);
+        apply_scores(&mut env, &rs);
+        assert!(env.blocks.iter().all(|b| b.score.is_none()));
+        assert!(env.overflow.iter().all(|s| s.score.is_none()));
+    }
 }
 
 #[cfg(test)]
@@ -467,6 +501,47 @@ mod render_tests {
         assert_eq!(
             render_text(&env, false).trim(),
             crate::ranking::NO_RELEVANT_CONTENT
+        );
+    }
+
+    #[test]
+    fn text_render_includes_the_percentage_only_when_scores_is_requested() {
+        let env = SearchEnvelope {
+            status: SearchStatus::Ok,
+            degraded: false,
+            warnings: vec![],
+            blocks: vec![Block {
+                id: "abc#0".into(),
+                path: "n.md".into(),
+                heading_path: "n.md > H".into(),
+                provenance: Provenance {
+                    keyword: true,
+                    semantic: true,
+                    graph: false,
+                    linked_from: vec![],
+                },
+                text: "body".into(),
+                untrusted_content: true,
+                truncated: false,
+                score: Some(83.0),
+            }],
+            overflow: vec![],
+        };
+        assert!(render_text(&env, true).contains("[83%]"));
+        assert!(!render_text(&env, false).contains('%'));
+    }
+
+    #[test]
+    fn text_render_shows_the_degraded_banner() {
+        let env = SearchEnvelope {
+            status: SearchStatus::Ok,
+            degraded: true,
+            warnings: vec![],
+            blocks: vec![],
+            overflow: vec![],
+        };
+        assert!(
+            render_text(&env, false).contains("(degraded ordering: no cross-encoder available)")
         );
     }
 }
