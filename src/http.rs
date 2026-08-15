@@ -287,9 +287,6 @@ pub fn routes() -> Vec<(&'static str, MethodRouter<ApiState>)> {
         ("/api/list", get(handle_list)),
         ("/api/tags", get(handle_tags)),
         ("/api/vault-map", get(handle_vault_map)),
-        ("/api/who", get(handle_who)),
-        ("/api/project", get(handle_project)),
-        ("/api/topic", post(handle_topic)),
         ("/api/health", get(handle_health)),
         ("/api/status", get(handle_status)),
         // Write endpoints
@@ -538,71 +535,6 @@ async fn handle_vault_map(
     };
     let map = context::vault_map(&ctx).map_err(|e| ApiError::internal(&format!("{e:#}")))?;
     Ok(Json(serde_json::json!(map)))
-}
-
-async fn handle_who(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Query(p): Query<crate::params::Who>,
-) -> Result<impl IntoResponse, ApiError> {
-    authorize(&headers, &state, false)?;
-    let store = state.store.lock().await;
-    let ctx = ContextParams {
-        store: &store,
-        vault_path: &state.vault_path,
-        profile: state.profile.as_ref().as_ref(),
-    };
-    let person =
-        context::context_who(&ctx, &p.name).map_err(|e| ApiError::internal(&format!("{e:#}")))?;
-    Ok(Json(serde_json::json!(person)))
-}
-
-async fn handle_project(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Query(p): Query<crate::params::Project>,
-) -> Result<impl IntoResponse, ApiError> {
-    authorize(&headers, &state, false)?;
-    let store = state.store.lock().await;
-    let ctx = ContextParams {
-        store: &store,
-        vault_path: &state.vault_path,
-        profile: state.profile.as_ref().as_ref(),
-    };
-    let proj = context::context_project(&ctx, &p.name)
-        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
-    Ok(Json(serde_json::json!(proj)))
-}
-
-async fn handle_topic(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Json(body): Json<crate::params::Topic>,
-) -> Result<impl IntoResponse, ApiError> {
-    authorize(&headers, &state, false)?;
-    let all_terms = crate::tags::merge_scope_alias(body.scope, body.all);
-    let scope = crate::tags::Scope::parse(&all_terms, &body.any, &body.none)
-        .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
-    let store = state.store.lock().await;
-    let mut embedder = state.embedder.lock().await;
-    let ctx = ContextParams {
-        store: &store,
-        vault_path: &state.vault_path,
-        profile: state.profile.as_ref().as_ref(),
-    };
-    let bundle =
-        context::context_topic_with_search(&ctx, &body.query, body.budget, &mut *embedder, &scope)
-            .map_err(|e| {
-                // An unknown tag or folder is a caller's typo, not a server
-                // fault, which is the reading the search route already takes
-                // (#60, #64, #65).
-                if is_scope_typo(&e.to_string()) {
-                    ApiError::bad_request(&format!("{e:#}"))
-                } else {
-                    ApiError::internal(&format!("{e:#}"))
-                }
-            })?;
-    Ok(Json(serde_json::json!(bundle)))
 }
 
 async fn handle_health(
@@ -1390,53 +1322,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn a_topic_scope_naming_no_tag_is_a_bad_request() {
-        // #64. `topic` takes the scope `search` takes, so it answers an
-        // unknown term the same way: the caller's own text named nothing, and
-        // that is a 400 rather than the 500 this route answers for a fault of
-        // its own.
-        let state = test_api_state();
-        let app = build_router(state);
-        let response = app
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/api/topic")
-                    .header("content-type", "application/json")
-                    .header("authorization", "Bearer eg_readkey")
-                    .body(Body::from(r#"{"query":"warding","all":["type/undead"]}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn a_topic_body_with_an_explicit_null_scope_field_is_not_rejected() {
-        // The same client behaviour the search route already covers: an absent
-        // optional serialised as JSON `null` must read as an unscoped call and
-        // not as a deserialization failure (#60, #64).
-        let state = test_api_state();
-        let app = build_router(state);
-        let response = app
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/api/topic")
-                    .header("content-type", "application/json")
-                    .header("authorization", "Bearer eg_readkey")
-                    .body(Body::from(
-                        r#"{"query":"warding","all":null,"any":null,"none":null,"scope":null}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

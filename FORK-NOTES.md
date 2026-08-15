@@ -64,8 +64,8 @@ The divergence is significant and likely to get worse.
 | one tag vocabulary on three surfaces | the filter and the vocabulary each carry one name and one parameter set across `engraph list`/`engraph tags`, MCP `list`/`tags` and `GET /api/list`/`GET /api/tags`. A term is a tag path, a trailing `/` names the subtree, `scope` is the alias of `all`, and an unmatched `all`/`any` term is an error naming the nearest tag. Only the container encoding is per-surface: a JSON body reads an array, and a query string reads one comma-separated value, because `serde_urlencoded` reads no sequence | this fork, issue #61 |
 | `Store::files_in_scope` / `rarray` scoping | a search can be scoped to the notes a tag filter admits. The scope resolves once to a set of file ids and every lane pre-filters on it: the KNN through vec0's `rowid IN`, the keyword lane through its own join, and the graph lane by dropping out-of-scope candidates before its quota truncation, so the walk still passes through untagged notes. An empty filter emits no clause and reproduces the unscoped pipeline exactly | this fork, issue #60 |
 | `src/surface.rs` | every capability has one name and one parameter set on all three surfaces, and a test fails when one does not | this fork, issue #62 |
-| the tag scope on `topic` | a context bundle is gathered from the notes a tag filter admits, by the same four operators and the same grammar `search` takes. `search_internal` carries the caller's filter and nothing else of the caller's settings, and the assembly applies it to both of its steps, so the 1-hop expansion does not carry in a note the scope excludes — #60's rule for the graph lane | this fork, issue #64 |
-| directory terms in the scope | a scope term can name a directory as well as a tag: a leading `/` marks a path from the vault root, a trailing `/` its subtree, and the two mix in the same `all`/`any`/`none` operators. A directory resolves to a range predicate on `files.path` beside the tag's junction `EXISTS`, case-sensitive, and reaches `search`, `topic` and `list`. The single-field alias of `all` is spelled `scope` | this fork, issue #65 |
+| directory terms in the scope | a scope term can name a directory as well as a tag: a leading `/` marks a path from the vault root, a trailing `/` its subtree, and the two mix in the same `all`/`any`/`none` operators. A directory resolves to a range predicate on `files.path` beside the tag's junction `EXISTS`, case-sensitive, and reaches `search` and `list`. The single-field alias of `all` is spelled `scope` | this fork, issue #65 |
+| `topic` / `who` / `project` removed | the three composite bundles are gone from all three surfaces, and `build_people_edges` with them — the indexer writes no mention edges, and `LINK_RESOLVER_VERSION = 2` clears the stale rows out of an existing store on its next index run. Composites return as vault-defined commands (#71) once #35 defines what a bundle may emit | this fork, issue #73 |
 | `.github/workflows/ci.yml` | manual dispatch only — upstream runs it on push and PR | this fork, Actions minutes |
 
 Cherry-picked rather than merged: PR #41 branched before upstream's #40 graph fix, so merging the
@@ -202,9 +202,8 @@ has never executed on this box.
   fills `tags` and `file_tags`, and until that index runs the two tables are empty. The paths that
   call `fingerprint::verify` refuse to run at all — `engraph search`, `engraph serve` and the write
   commands (`engraph create/update/move/archive/delete`) all answer "Run 'engraph index'".
-  `engraph read/list/who/project` and `engraph status` do not verify, so they answer from the
-  empty tables with no warning: `who` finds nobody through its tag pass, and `health` reports every
-  note as missing its tags. Run `engraph index` once on an upgraded store before reading any of
+  `engraph read/list` and `engraph status` do not verify, so they answer from the
+  empty tables with no warning: `health` reports every note as missing its tags. Run `engraph index` once on an upgraded store before reading any of
   them.
 - **A promoted heading is not addressable by `read --section` or `update --section`.** Promotion
   (#44) puts a bold-only line in `chunks.heading`, so a search result prints

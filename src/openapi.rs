@@ -11,9 +11,6 @@ pub fn build_openapi_spec(server_url: &str) -> serde_json::Value {
     paths.insert("/api/list".into(), build_list());
     paths.insert("/api/tags".into(), build_tags());
     paths.insert("/api/vault-map".into(), build_vault_map());
-    paths.insert("/api/who".into(), build_who());
-    paths.insert("/api/project".into(), build_project());
-    paths.insert("/api/topic".into(), build_topic());
     paths.insert("/api/health".into(), build_health());
     paths.insert("/api/status".into(), build_status());
 
@@ -112,7 +109,7 @@ fn build_read() -> serde_json::Value {
                     "schema": { "type": "string" }
                 }
             ],
-            "responses": { "200": { "description": "Note content with metadata; outgoing_links, incoming_links, mentions_people and mentioned_by are arrays of {path, docid}" } }
+            "responses": { "200": { "description": "Note content with metadata; outgoing_links and incoming_links are arrays of {path, docid}" } }
         }
     })
 }
@@ -155,61 +152,6 @@ fn build_vault_map() -> serde_json::Value {
             "operationId": "getVaultMap",
             "summary": "Get vault structure overview with folder tree, tag cloud, and statistics.",
             "responses": { "200": { "description": "Vault structure map" } }
-        }
-    })
-}
-
-fn build_who() -> serde_json::Value {
-    serde_json::json!({
-        "get": {
-            "operationId": "getWho",
-            "summary": "Person context bundle: the person's note, the notes that mention them, and their wikilinks in both directions.",
-            "parameters": [{
-                "name": "name", "in": "query", "required": true,
-                "description": "Person name. A docid, a path or a basename first, then a keyword search that prefers a hit under the People folder",
-                "schema": { "type": "string" }
-            }],
-            "responses": { "200": { "description": "Person context bundle" } }
-        }
-    })
-}
-
-fn build_project() -> serde_json::Value {
-    serde_json::json!({
-        "get": {
-            "operationId": "getProject",
-            "summary": "Get a project context bundle with project note, related files, and graph connections.",
-            "parameters": [{
-                "name": "name", "in": "query", "required": true,
-                "description": "Project name (matches filename)",
-                "schema": { "type": "string" }
-            }],
-            "responses": { "200": { "description": "Project context bundle" } }
-        }
-    })
-}
-
-fn build_topic() -> serde_json::Value {
-    serde_json::json!({
-        "post": {
-            "operationId": "getTopic",
-            "summary": "Topic context bundle: the five notes that best match the query, read whole, plus the notes one wikilink hop from the top three, trimmed to a character budget.",
-            "requestBody": {
-                "required": true,
-                "content": { "application/json": { "schema": {
-                    "type": "object",
-                    "required": ["query"],
-                    "properties": {
-                        "query": { "type": "string", "description": "Topic or question" },
-                        "budget": { "type": "integer", "description": "Character budget (default 32000, about 8000 tokens)" },
-                        "scope": { "type": "array", "items": { "type": "string" }, "description": "Tag terms; a trailing / matches the tag and its descendants. A term starting with / is a directory path from the vault root instead, case-sensitive, with a trailing / its subtree. Alias of all" },
-                        "all": { "type": "array", "items": { "type": "string" }, "description": "Gather context from notes carrying every one of these terms, tags or directory terms (starting with /, case-sensitive, a trailing / its subtree) alike" },
-                        "any": { "type": "array", "items": { "type": "string" }, "description": "Gather context from notes carrying at least one of these terms, tags or directory terms (starting with /, case-sensitive, a trailing / its subtree) alike" },
-                        "none": { "type": "array", "items": { "type": "string" }, "description": "Leave out notes carrying any of these terms, tags or directory terms (starting with /, case-sensitive, a trailing / its subtree) alike" }
-                    }
-                }}}
-            },
-            "responses": { "200": { "description": "Context bundle with notes and metadata" } }
         }
     })
 }
@@ -623,9 +565,6 @@ mod tests {
             "listNotes",
             "listTags",
             "getVaultMap",
-            "getWho",
-            "getProject",
-            "getTopic",
             "getHealth",
             "getStatus",
             "createNote",

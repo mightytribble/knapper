@@ -65,17 +65,6 @@ pub enum Command {
     /// Vault structure overview.
     VaultMap(crate::params::VaultMap),
 
-    /// Person context bundle: their note, the notes that mention them, and
-    /// their wikilinks both ways.
-    Who(crate::params::Who),
-
-    /// Project context bundle.
-    Project(crate::params::Project),
-
-    /// Topic context bundle: whole notes and their one-hop neighbours, within
-    /// a character budget.
-    Topic(crate::params::Topic),
-
     /// Create a new note.
     Create(crate::params::Create),
 

@@ -1,9 +1,48 @@
 use anyhow::Result;
 use std::path::Path;
 
-use crate::indexer::extract_aliases_from_frontmatter;
 use crate::store::Store;
 use strsim::normalized_levenshtein;
+
+/// Extract aliases from YAML frontmatter.
+fn extract_aliases_from_frontmatter(content: &str) -> Option<Vec<String>> {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with("---") {
+        return None;
+    }
+    let after = trimmed[3..].trim_start_matches('-').strip_prefix('\n')?;
+    let end = after.find("\n---")?;
+    let yaml = &after[..end];
+
+    let lines: Vec<&str> = yaml.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim();
+        if t.starts_with("aliases:") {
+            let after_colon = t.strip_prefix("aliases:")?.trim();
+            let mut aliases = Vec::new();
+            if after_colon.starts_with('[') {
+                let inner = after_colon.trim_start_matches('[').trim_end_matches(']');
+                for a in inner.split(',') {
+                    let a = a.trim().trim_matches('"').trim_matches('\'').to_string();
+                    if !a.is_empty() {
+                        aliases.push(a);
+                    }
+                }
+            } else if after_colon.is_empty() {
+                for sub in &lines[i + 1..] {
+                    let st = sub.trim();
+                    if st.starts_with("- ") {
+                        aliases.push(st.strip_prefix("- ").unwrap().trim().to_string());
+                    } else if !st.is_empty() {
+                        break;
+                    }
+                }
+            }
+            return Some(aliases);
+        }
+    }
+    None
+}
 
 /// A potential wikilink discovered in note content.
 #[derive(Debug, Clone, PartialEq)]
@@ -714,6 +753,25 @@ pub fn apply_links(content: &str, links: &[DiscoveredLink]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_extract_aliases_from_frontmatter() {
+        let content = "---\ntags:\n  - person\naliases:\n  - Johnny\n  - JN\n---\n# John Nelson";
+        let aliases = extract_aliases_from_frontmatter(content).unwrap();
+        assert_eq!(aliases, vec!["Johnny", "JN"]);
+    }
+
+    #[test]
+    fn test_extract_aliases_inline() {
+        let content = "---\naliases: [Max, MD]\n---\n# Max Darski";
+        let aliases = extract_aliases_from_frontmatter(content).unwrap();
+        assert_eq!(aliases, vec!["Max", "MD"]);
+    }
+
+    #[test]
+    fn test_extract_aliases_no_frontmatter() {
+        assert!(extract_aliases_from_frontmatter("# Just a heading").is_none());
+    }
     use crate::store::Store;
 
     fn setup_store_and_vault() -> (Store, tempfile::TempDir) {

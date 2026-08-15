@@ -77,7 +77,11 @@ pub const CHUNK_RECORD_VERSION: u32 = 2;
 
 /// Bump when wikilink resolution changes: extraction, the exact → basename →
 /// shortest-path ladder, or how an end that names no passage is stored.
-pub const LINK_RESOLVER_VERSION: u32 = 1;
+///
+/// Version 2 is issue #73: the edge builder writes no mention edges, and the
+/// rebuild this bump declares is what clears the stale rows out of a store an
+/// earlier binary built.
+pub const LINK_RESOLVER_VERSION: u32 = 2;
 
 /// Bump when the *text* of a [`crate::llm::PromptFormat`] template changes
 /// while the template keeps its name.

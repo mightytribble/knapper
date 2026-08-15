@@ -53,7 +53,7 @@ impl SearchResult {
     }
 }
 
-/// Output from `search_internal`: structured results plus raw fused data for --explain.
+/// Output from the search pipeline: structured results plus raw fused data for --explain.
 pub struct SearchOutput {
     pub results: Vec<InternalSearchResult>,
     pub fused: Vec<fusion::FusedResult>,
@@ -146,40 +146,6 @@ impl<'a> SearchConfig<'a> {
             scope: crate::tags::Scope::default(),
         }
     }
-}
-
-/// Run hybrid search and return structured results (no I/O).
-/// Used by both `run_search` (CLI) and context engine.
-///
-/// Thin wrapper around `search_with_intelligence` with no intelligence models,
-/// preserving the existing heuristic-only behavior.
-pub fn search_internal(
-    query: &str,
-    top_n: usize,
-    store: &Store,
-    embedder: &mut impl EmbedModel,
-    group_by: GroupBy,
-    scope: &crate::tags::Scope,
-) -> Result<SearchOutput> {
-    let mut config = SearchConfig {
-        reranker: None,
-        store,
-        rerank_candidates: 30,
-        rerank: crate::config::RerankConfig::default(),
-        max_chunks_per_file: crate::config::default_max_chunks_per_file(),
-        group_by,
-        // Defaults, like every other setting on this path. The weights are
-        // truncated to the store's declared columns, so a store built at some
-        // other `[fts]` gives this lane fewer weights rather than an error.
-        fts: crate::config::FtsConfig::default(),
-        ranking: crate::config::RankingConfig::default(),
-        lane_weights: crate::config::LaneWeights::default(),
-        // The caller's, not a default: this is the one setting on this path a
-        // caller states per call, and an empty filter is the whole vault, so
-        // an unscoped call runs the pipeline it ran before #64.
-        scope: scope.clone(),
-    };
-    search_with_intelligence(query, top_n, embedder, &mut config)
 }
 
 /// The text the cross-encoder is asked to judge, one string per candidate.
@@ -1450,7 +1416,6 @@ pub fn status_object(
         "files_with_dates": date_count,
         "edges": edges.total_edges,
         "wikilink_edges": edges.wikilink_count,
-        "mention_edges": edges.mention_count,
         "wikilink_pairs": edges.wikilink_count / 2,
         "connected_files": edges.connected_file_count,
         "isolated_files": edges.isolated_file_count,
@@ -1506,7 +1471,6 @@ pub fn format_status(
             "  Wikilink edges:  {} ({} bidirectional pairs)\n",
             edges.wikilink_count, wikilink_pairs
         ));
-        out.push_str(&format!("  Mention edges:   {}\n", edges.mention_count));
         out.push_str(&format!(
             "  Connected files: {} / {} ({:.1}%)\n",
             edges.connected_file_count, total_files, connected_pct
@@ -1649,7 +1613,6 @@ mod tests {
         EdgeStats {
             total_edges: 10,
             wikilink_count: 6,
-            mention_count: 4,
             connected_file_count: 8,
             isolated_file_count: 2,
         }
@@ -1711,7 +1674,6 @@ mod tests {
             "graph stats's wikilink line is missing: {output}"
         );
         assert!(output.contains("6 (3 bidirectional pairs)"));
-        assert!(output.contains("Mention edges:   4"));
         assert!(output.contains("Connected files: 8 / 10 (80.0%)"));
         assert!(output.contains("Isolated files:  2"));
     }
@@ -1756,7 +1718,6 @@ mod tests {
         // them.
         assert_eq!(parsed["edges"], 10);
         assert_eq!(parsed["wikilink_edges"], 6);
-        assert_eq!(parsed["mention_edges"], 4);
     }
 
     #[test]
@@ -1893,21 +1854,36 @@ mod tests {
         (tmp, store, embedder)
     }
 
+    /// Run the pipeline with default settings and no intelligence models.
+    fn heuristic_search(
+        query: &str,
+        top_n: usize,
+        store: &Store,
+        embedder: &mut impl EmbedModel,
+        group_by: GroupBy,
+    ) -> SearchOutput {
+        let mut config = SearchConfig {
+            reranker: None,
+            store,
+            rerank_candidates: 30,
+            rerank: crate::config::RerankConfig::default(),
+            max_chunks_per_file: crate::config::default_max_chunks_per_file(),
+            group_by,
+            fts: crate::config::FtsConfig::default(),
+            ranking: crate::config::RankingConfig::default(),
+            lane_weights: crate::config::LaneWeights::default(),
+            scope: crate::tags::Scope::default(),
+        };
+        search_with_intelligence(query, top_n, embedder, &mut config).unwrap()
+    }
+
     #[test]
     fn one_document_can_contribute_several_sections() {
         // #6's acceptance criterion. Three sections of one file match "warding";
         // before chunk-level fusion only one of them could ever be returned.
         let (_tmp, store, mut embedder) = indexed_vault();
 
-        let output = search_internal(
-            "warding",
-            10,
-            &store,
-            &mut embedder,
-            GroupBy::Chunk,
-            &crate::tags::Scope::default(),
-        )
-        .unwrap();
+        let output = heuristic_search("warding", 10, &store, &mut embedder, GroupBy::Chunk);
 
         let hits: Vec<&InternalSearchResult> = output
             .results
@@ -3052,15 +3028,7 @@ mod tests {
     fn group_by_file_returns_one_result_per_document() {
         let (_tmp, store, mut embedder) = indexed_vault();
 
-        let output = search_internal(
-            "warding",
-            10,
-            &store,
-            &mut embedder,
-            GroupBy::File,
-            &crate::tags::Scope::default(),
-        )
-        .unwrap();
+        let output = heuristic_search("warding", 10, &store, &mut embedder, GroupBy::File);
 
         let mut seen = std::collections::HashSet::new();
         for r in &output.results {
@@ -3079,15 +3047,7 @@ mod tests {
         // no headings; `(file_id, chunk_seq)` is what recovers them.
         let (_tmp, store, mut embedder) = indexed_vault();
 
-        let output = search_internal(
-            "mid-cast",
-            10,
-            &store,
-            &mut embedder,
-            GroupBy::Chunk,
-            &crate::tags::Scope::default(),
-        )
-        .unwrap();
+        let output = heuristic_search("mid-cast", 10, &store, &mut embedder, GroupBy::Chunk);
         let hit = output
             .results
             .iter()

@@ -117,30 +117,6 @@ pub const CAPABILITIES: &[Capability] = &[
         cli_only_args: &[],
         server_only_args: &[],
     },
-    Capability {
-        name: "who",
-        cli: Presence::On,
-        mcp: Presence::On,
-        http: Http::Get,
-        cli_only_args: &[],
-        server_only_args: &[],
-    },
-    Capability {
-        name: "project",
-        cli: Presence::On,
-        mcp: Presence::On,
-        http: Http::Get,
-        cli_only_args: &[],
-        server_only_args: &[],
-    },
-    Capability {
-        name: "topic",
-        cli: Presence::On,
-        mcp: Presence::On,
-        http: Http::Post,
-        cli_only_args: &[],
-        server_only_args: &[],
-    },
     // ── Writing ──
     Capability {
         name: "create",
@@ -663,8 +639,8 @@ mod tests {
     }
 
     #[test]
-    fn there_are_twenty_capabilities() {
-        assert_eq!(CAPABILITIES.len(), 20);
+    fn there_are_seventeen_capabilities() {
+        assert_eq!(CAPABILITIES.len(), 17);
     }
 
     #[test]

@@ -323,101 +323,6 @@ pub fn backfill_edges_from_chunks(store: &Store) -> Result<usize> {
     Ok(restored)
 }
 
-/// Load people entities from the People folder.
-/// Returns (file_id, [name, aliases...]) for each person note.
-pub fn load_people_entities(
-    store: &Store,
-    people_folder: &str,
-    content_by_path: &HashMap<String, String>,
-) -> Result<Vec<(i64, Vec<String>)>> {
-    let all_files = store.get_all_files()?;
-    let mut people = Vec::new();
-    for file in &all_files {
-        if file.path.contains(people_folder) {
-            let basename = file.path.rsplit('/').next().unwrap_or(&file.path);
-            let name = basename.trim_end_matches(".md").to_string();
-            let mut names = vec![name];
-
-            // Extract aliases from frontmatter
-            if let Some(content) = content_by_path.get(&file.path)
-                && let Some(aliases) = extract_aliases_from_frontmatter(content)
-            {
-                names.extend(aliases);
-            }
-
-            people.push((file.id, names));
-        }
-    }
-    Ok(people)
-}
-
-/// Extract aliases from YAML frontmatter.
-pub fn extract_aliases_from_frontmatter(content: &str) -> Option<Vec<String>> {
-    let trimmed = content.trim_start();
-    if !trimmed.starts_with("---") {
-        return None;
-    }
-    let after = trimmed[3..].trim_start_matches('-').strip_prefix('\n')?;
-    let end = after.find("\n---")?;
-    let yaml = &after[..end];
-
-    let lines: Vec<&str> = yaml.lines().collect();
-    for (i, line) in lines.iter().enumerate() {
-        let t = line.trim();
-        if t.starts_with("aliases:") {
-            let after_colon = t.strip_prefix("aliases:")?.trim();
-            let mut aliases = Vec::new();
-            if after_colon.starts_with('[') {
-                let inner = after_colon.trim_start_matches('[').trim_end_matches(']');
-                for a in inner.split(',') {
-                    let a = a.trim().trim_matches('"').trim_matches('\'').to_string();
-                    if !a.is_empty() {
-                        aliases.push(a);
-                    }
-                }
-            } else if after_colon.is_empty() {
-                for sub in &lines[i + 1..] {
-                    let st = sub.trim();
-                    if st.starts_with("- ") {
-                        aliases.push(st.strip_prefix("- ").unwrap().trim().to_string());
-                    } else if !st.is_empty() {
-                        break;
-                    }
-                }
-            }
-            return Some(aliases);
-        }
-    }
-    None
-}
-
-/// Detect people mentions and create edges.
-///
-/// These stay at [`DOC_LEVEL`] on both ends. A mention is a name appearing
-/// somewhere in the file, and nothing here narrows it to a passage; #28 gave
-/// the fine grain to wikilinks, which are the only edges graph expansion
-/// follows.
-pub fn build_people_edges(
-    store: &Store,
-    file_id: i64,
-    content: &str,
-    people: &[(i64, Vec<String>)],
-) -> Result<()> {
-    let content_lower = content.to_lowercase();
-    for (person_id, names) in people {
-        if *person_id == file_id {
-            continue;
-        }
-        let mentioned = names
-            .iter()
-            .any(|name| content_lower.contains(&name.to_lowercase()));
-        if mentioned {
-            store.insert_edge(file_id, DOC_LEVEL, *person_id, DOC_LEVEL, "mention")?;
-        }
-    }
-    Ok(())
-}
-
 /// Re-derive one file's index rows from what a write left on disk: chunks,
 /// vectors, keyword rows, tag rows and outgoing edges.
 ///
@@ -930,26 +835,6 @@ fn run_index_inner(
                 unattributed,
                 "edges re-derived; the remainder are links no chunk contains"
             );
-        }
-    }
-
-    // People detection (if configured via vault profile)
-    if let Some(p) = profile
-        && let Some(people_folder) = &p.structure.folders.people
-    {
-        let people = load_people_entities(store, people_folder, &content_by_path)?;
-        if !people.is_empty() {
-            info!(people_count = people.len(), "detecting people mentions");
-            for rel_path in &indexed_rel_paths {
-                if let Some(file_record) = store.get_file(rel_path)?
-                    && let Some(content) = content_by_path.get(rel_path)
-                {
-                    // Skip files in the People folder itself
-                    if !rel_path.contains(people_folder.as_str()) {
-                        build_people_edges(store, file_record.id, content, &people)?;
-                    }
-                }
-            }
         }
     }
 
@@ -2003,45 +1888,6 @@ mod tests {
             0,
             "Stale unresolved entry should be cleared after re-index"
         );
-    }
-
-    #[test]
-    fn test_extract_aliases_from_frontmatter() {
-        let content = "---\ntags:\n  - person\naliases:\n  - Johnny\n  - JN\n---\n# John Nelson";
-        let aliases = extract_aliases_from_frontmatter(content).unwrap();
-        assert_eq!(aliases, vec!["Johnny", "JN"]);
-    }
-
-    #[test]
-    fn test_extract_aliases_inline() {
-        let content = "---\naliases: [Max, MD]\n---\n# Max Darski";
-        let aliases = extract_aliases_from_frontmatter(content).unwrap();
-        assert_eq!(aliases, vec!["Max", "MD"]);
-    }
-
-    #[test]
-    fn test_extract_aliases_no_frontmatter() {
-        assert!(extract_aliases_from_frontmatter("# Just a heading").is_none());
-    }
-
-    #[test]
-    fn test_people_mention_detection() {
-        let store = Store::open_memory().unwrap();
-        let person = store
-            .insert_file("People/John Nelson.md", "h1", 100, "aaa111", None, None)
-            .unwrap();
-        let note = store
-            .insert_file("daily.md", "h2", 100, "bbb222", None, None)
-            .unwrap();
-
-        let people = vec![(person, vec!["John Nelson".to_string()])];
-        let content = "Discussed with John Nelson about the architecture.";
-
-        build_people_edges(&store, note, content, &people).unwrap();
-
-        let mentions = store.get_outgoing(note, Some("mention")).unwrap();
-        assert_eq!(mentions.len(), 1);
-        assert_eq!(mentions[0].0, person);
     }
 
     /// Wraps an embedder and keeps every string it was asked to embed, so a
