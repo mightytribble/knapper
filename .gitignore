@@ -11,3 +11,4 @@ docs/superpowers/
 # Positioning and visual asset TODOs (not part of the distributed package)
 PROJECT_POSITIONING.md
 VISUAL_ASSETS_TODO.md
+target-cuda/
