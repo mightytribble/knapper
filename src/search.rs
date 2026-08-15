@@ -174,11 +174,24 @@ struct RerankTarget<'a> {
     snippet: &'a str,
 }
 
+/// One rerank candidate, as two strings and a flag (#35).
+///
+/// `document` is what the model scores: the body, with the title prepended
+/// when `[rerank] document_title` is on. `body` is the emitted window — the
+/// text `Candidate::emit_text` carries forward, so the result the caller reads
+/// is the same text the model judged. `truncated` records whether
+/// `max_document_chars` cut the window below its section.
+struct RerankUnit {
+    document: String,
+    body: String,
+    truncated: bool,
+}
+
 fn rerank_documents(
     store: &Store,
     candidates: &[RerankTarget<'_>],
     settings: crate::config::RerankConfig,
-) -> Vec<String> {
+) -> Vec<RerankUnit> {
     let keys: Vec<(i64, i64)> = candidates
         .iter()
         .map(|c| (c.file_id, c.chunk_seq))
@@ -188,18 +201,25 @@ fn rerank_documents(
         vec![None; keys.len()]
     });
 
-    let documents: Vec<String> = candidates
+    let units: Vec<RerankUnit> = candidates
         .iter()
         .zip(texts)
         .map(|(candidate, text)| {
             let text = text.unwrap_or_else(|| candidate.snippet.to_string());
+            let raw_chars = text.chars().count();
             // Truncate first, then prepend the title, so a title can never be
             // the thing the cap cuts off.
             let body = truncate_chars(text, settings.max_document_chars);
-            if settings.document_title {
+            let truncated = settings.max_document_chars > 0 && body.chars().count() < raw_chars;
+            let document = if settings.document_title {
                 format!("{}\n\n{body}", document_title(candidate.file_path))
             } else {
-                body
+                body.clone()
+            };
+            RerankUnit {
+                document,
+                body,
+                truncated,
             }
         })
         .collect();
@@ -209,14 +229,14 @@ fn rerank_documents(
     // exist, and end-to-end timings cannot separate "more candidates" from
     // "longer candidates".
     tracing::debug!(
-        candidates = documents.len(),
-        chars = documents.iter().map(|d| d.len()).sum::<usize>(),
-        longest_chars = documents.iter().map(|d| d.len()).max().unwrap_or(0),
+        candidates = units.len(),
+        chars = units.iter().map(|u| u.document.len()).sum::<usize>(),
+        longest_chars = units.iter().map(|u| u.document.len()).max().unwrap_or(0),
         cap = settings.max_document_chars,
         "rerank input assembled"
     );
 
-    documents
+    units
 }
 
 /// Keep at most `max_chars` characters of `text`; 0 means keep all of it.
@@ -582,8 +602,8 @@ pub fn search_with_intelligence(
     let reranker_used = if let Some(reranker) = &mut config.reranker {
         let candidates: Vec<_> = fused_pass1.iter().take(config.rerank_candidates).collect();
         let targets: Vec<RerankTarget<'_>> = candidates.iter().map(|c| target_of(c)).collect();
-        let owned_documents = rerank_documents(config.store, &targets, config.rerank);
-        let documents: Vec<&str> = owned_documents.iter().map(String::as_str).collect();
+        let units = rerank_documents(config.store, &targets, config.rerank);
+        let documents: Vec<&str> = units.iter().map(|u| u.document.as_str()).collect();
 
         // One call for all thirty pairs, so the reranker sets up once instead of
         // once per candidate (issue #13). A failure now costs the whole lane
@@ -822,20 +842,26 @@ fn sorted_stage(
                 snippet: &c.snippet,
             })
             .collect();
-        let owned_documents = rerank_documents(config.store, &targets, config.rerank);
-        let documents: Vec<&str> = owned_documents.iter().map(String::as_str).collect();
+        let units = rerank_documents(config.store, &targets, config.rerank);
+        let documents: Vec<&str> = units.iter().map(|u| u.document.as_str()).collect();
         drop(targets);
 
         let started = std::time::Instant::now();
         let scores = reranker.rerank_batch(query, &documents);
         let elapsed_us = started.elapsed().as_micros() as u64;
+        let candidate_count = documents.len();
+        drop(documents);
         match scores {
             Ok(scores) => {
-                for (candidate, score) in pool.iter_mut().zip(scores) {
+                for (candidate, (unit, score)) in pool.iter_mut().zip(units.into_iter().zip(scores))
+                {
                     candidate.rerank_score = Some(score as f64);
+                    candidate.emit_token_count = Some(reranker.count_tokens(&unit.body));
+                    candidate.emit_text = Some(unit.body);
+                    candidate.emit_truncated = unit.truncated;
                 }
                 tracing::debug!(
-                    candidates = documents.len(),
+                    candidates = candidate_count,
                     elapsed_us,
                     "cross-encoder sorted the shortlist"
                 );

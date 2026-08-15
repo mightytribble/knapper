@@ -73,6 +73,14 @@ pub struct Candidate {
     pub lane_contributions: Vec<LaneContribution>,
     /// The cross-encoder's probability, once it has run.
     pub rerank_score: Option<f64>,
+    /// The exact window the cross-encoder scored, once it has run (#35).
+    /// `None` under the legacy and degraded stages, which score no window and
+    /// let `packaging` re-derive the capped chunk text.
+    pub emit_text: Option<String>,
+    /// The reranker's own token count of `emit_text`.
+    pub emit_token_count: Option<usize>,
+    /// Whether `[rerank] max_document_chars` cut the window below its section.
+    pub emit_truncated: bool,
 }
 
 impl Candidate {
@@ -430,6 +438,9 @@ fn from_fused(fused: FusedResult, rank: usize) -> Candidate {
         admitted_by: Source::Rrf,
         lane_contributions: fused.lane_contributions,
         rerank_score: None,
+        emit_text: None,
+        emit_token_count: None,
+        emit_truncated: false,
     }
 }
 
@@ -448,6 +459,9 @@ fn from_ranked(result: &RankedResult, source: Source) -> Candidate {
         admitted_by: source,
         lane_contributions: Vec::new(),
         rerank_score: None,
+        emit_text: None,
+        emit_token_count: None,
+        emit_truncated: false,
     }
 }
 
