@@ -746,21 +746,12 @@ fn emit_section(
 pub mod limits {
     /// Chunk size the break-point search aims for.
     pub const TARGET_TOKENS: usize = 512;
-    /// How much of the preceding section a continuation chunk repeats, as a
-    /// percentage of [`TARGET_TOKENS`].
-    pub const OVERLAP_PCT: usize = 15;
-    /// Hard ceiling. A chunk over this is split again on sentence boundaries by
-    /// [`super::split_oversized_chunks`], which is where the *model's* input
-    /// limit enters the pipeline — an embedding model silently truncates
-    /// anything longer, so this is a chunking constant and a model-input limit
-    /// at the same time.
-    pub const MAX_TOKENS: usize = 512;
     /// Tokens of the previous sub-chunk repeated at the head of each piece a
-    /// [`MAX_TOKENS`] split produces.
+    /// [`super::split_oversized_chunks`] split produces.
     pub const OVERLAP_TOKENS: usize = 50;
 }
 
-pub use limits::{MAX_TOKENS, OVERLAP_PCT, OVERLAP_TOKENS, TARGET_TOKENS};
+pub use limits::{OVERLAP_TOKENS, TARGET_TOKENS};
 
 /// Parse markdown content into frontmatter tags and structure-first chunks.
 ///

@@ -62,7 +62,11 @@ pub const PARSER_VERSION: u32 = 2;
 /// forward into the following paragraph instead of being flushed as a stub row
 /// of its own. The `chunk_min_chars` minimum now reaches a section's pieces, not
 /// only its whole body, so the boundaries move where such a piece existed.
-pub const CHUNKER_VERSION: u32 = 3;
+///
+/// Version 4 is issue #75: a single over-budget paragraph or table is emitted
+/// whole up to the embed model's input wall, instead of torn at a fixed 512.
+/// The boundaries move where such a block existed.
+pub const CHUNKER_VERSION: u32 = 4;
 
 /// Bump when what a chunk **row** holds changes, even though the chunk
 /// boundaries do not.
@@ -222,8 +226,6 @@ impl Fingerprints {
                 // minimum, and the same action.
                 &config.promote_bold_headings.to_string(),
                 &limits::TARGET_TOKENS.to_string(),
-                &limits::OVERLAP_PCT.to_string(),
-                &limits::MAX_TOKENS.to_string(),
                 &limits::OVERLAP_TOKENS.to_string(),
             ]),
             link: digest(&[
@@ -879,12 +881,29 @@ mod tests {
                     &CHUNKER_VERSION.to_string(),
                     &(CHUNK_RECORD_VERSION + 1).to_string(),
                     &crate::chunker::limits::TARGET_TOKENS.to_string(),
-                    &crate::chunker::limits::OVERLAP_PCT.to_string(),
-                    &crate::chunker::limits::MAX_TOKENS.to_string(),
                     &crate::chunker::limits::OVERLAP_TOKENS.to_string(),
                 ]),
         );
         assert_eq!(CHUNKER.action, Action::Reindex);
+    }
+
+    /// Bumping `CHUNKER_VERSION` alone must move the chunker digest, since the
+    /// version is a hand-carried stand-in for what `compute` cannot see: the
+    /// algorithm itself (issue #75).
+    #[test]
+    fn bumping_chunker_version_changes_the_chunker_digest() {
+        let a = Fingerprints::compute(&Config::default(), "embed-model-abc", None).chunker;
+        // Reconstruct with the version one higher; it must differ.
+        let b = digest(&[
+            &(CHUNKER_VERSION + 1).to_string(),
+            &CHUNK_RECORD_VERSION.to_string(),
+            &format!("{:?}", Config::default().breadcrumb_root),
+            &Config::default().chunk_min_chars.to_string(),
+            &Config::default().promote_bold_headings.to_string(),
+            &crate::chunker::limits::TARGET_TOKENS.to_string(),
+            &crate::chunker::limits::OVERLAP_TOKENS.to_string(),
+        ]);
+        assert_ne!(a, b);
     }
 
     #[test]
