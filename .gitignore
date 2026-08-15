@@ -12,3 +12,6 @@ docs/superpowers/
 PROJECT_POSITIONING.md
 VISUAL_ASSETS_TODO.md
 target-cuda/
+
+# SDD scratch workspace (ledger, briefs, review packages)
+.superpowers/
