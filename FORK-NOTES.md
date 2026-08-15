@@ -205,15 +205,6 @@ has never executed on this box.
   `engraph read/list` and `engraph status` do not verify, so they answer from the
   empty tables with no warning: `health` reports every note as missing its tags. Run `engraph index` once on an upgraded store before reading any of
   them.
-- **A promoted heading is not addressable by `read --section` or `update --section`.** Promotion
-  (#44) puts a bold-only line in `chunks.heading`, so a search result prints
-  `lore/bestiary/archdragon.md > **Spells**` — 107 of the shipped arm's 1559 chunks are labelled this
-  way, `**Abilities**` 67 times and `**Spells**` 22. `markdown::find_section` reads ATX headings only,
-  which is deliberate and is what the section editor writes against, so `engraph read --section` with
-  `**Spells**` and with `Spells` both answer "Section not found", and `engraph update --section`
-  cannot target the passage either. Read the whole note instead, or name the enclosing `#` heading.
-  The breadcrumb the result prints is the way back: the ancestor before the bold line is an ATX
-  heading and does resolve.
 - **Do not add a top-level config key with `>>`.** Every arm home's `config.toml` ends in a
   `[section]` table, so a line appended to the end of the file lands **inside that table**. TOML
   parses `promote_bold_headings = true` after `[memory]` as `memory.promote_bold_headings`, serde
