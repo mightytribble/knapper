@@ -604,6 +604,15 @@ struct SectionHeading<'a> {
 /// by row length, so a section holding one line scores enormously on any query
 /// term it happens to carry, and the vault's template scaffolding — `## Rank`,
 /// `## Threads`, `## Player Disposition` — is full of them.
+///
+/// The same minimum applies to a *piece* of a split section, not only to the
+/// whole body. A short leading paragraph flushed by an oversized one would
+/// otherwise become a stub row of its own. It is folded forward into the
+/// following paragraph and the combination is size-split, so `smart_chunk`
+/// sizes the piece to the budget and the heading leads real section content
+/// (issue #51). The fold is forward, never backward: a first piece's preceding
+/// chunk is a different section, so a backward merge would orphan this section's
+/// heading at that section's tail.
 fn emit_section(
     body: &str,
     heading: SectionHeading<'_>,
@@ -672,13 +681,25 @@ fn emit_section(
             continue;
         }
 
+        // A short leader must not be flushed as a stub row of its own. When it
+        // would be, fold it forward into the following paragraph so the size
+        // split re-places it (issue #51). "Short" is a body under `min_chars`,
+        // the same test the whole-section merge uses (#43); `min_chars == 0`
+        // makes it unreachable and reproduces the pre-#51 pieces exactly.
+        let short_leader = !current.is_empty() && current.len() < min_chars;
+
         // A single paragraph over budget: flush what we have, then fall back to
         // size-based splitting with overlap for this paragraph alone.
         if approx_tokens(paragraph) > budget {
-            if !current.is_empty() {
-                pieces.push(std::mem::take(&mut current));
-            }
-            for chunk in smart_chunk(paragraph, budget, overlap_pct) {
+            let unit = if short_leader {
+                format!("{}\n\n{paragraph}", std::mem::take(&mut current))
+            } else {
+                if !current.is_empty() {
+                    pieces.push(std::mem::take(&mut current));
+                }
+                paragraph.to_string()
+            };
+            for chunk in smart_chunk(&unit, budget, overlap_pct) {
                 pieces.push(chunk.text);
             }
             continue;
@@ -690,7 +711,18 @@ fn emit_section(
             format!("{current}\n\n{paragraph}")
         };
         if !current.is_empty() && approx_tokens(&candidate) > budget {
-            pieces.push(std::mem::replace(&mut current, paragraph.to_string()));
+            if short_leader {
+                // The short leader and this paragraph together bust the budget,
+                // so the combination is size-split rather than flushed as two
+                // rows. `smart_chunk` sizes it to the budget, and the leader
+                // rides the front of the first piece (issue #51).
+                for chunk in smart_chunk(&candidate, budget, overlap_pct) {
+                    pieces.push(chunk.text);
+                }
+                current.clear();
+            } else {
+                pieces.push(std::mem::replace(&mut current, paragraph.to_string()));
+            }
         } else {
             current = candidate;
         }
@@ -1458,6 +1490,53 @@ mod tests {
 
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[1].text, "## Threads\n_None yet._");
+    }
+
+    #[test]
+    fn a_short_leader_of_a_split_section_folds_forward_not_into_a_stub() {
+        // `## NPC Activity` opens with a one-line lead-in, then a bullet list
+        // that alone busts the budget. The split flushed the lead-in as a row
+        // of its own — under the minimum, and not the file's first chunk. It
+        // must instead ride the front of the section's first real chunk (#51).
+        let leader = "**Tandi** — the session's sole active NPC.";
+        let bullets: String = (0..40)
+            .map(|i| {
+                format!("- Bullet {i:02} records an action the NPC took this session, in full.\n")
+            })
+            .collect();
+        let md = format!(
+            "## Overview\n{}\n\n## NPC Activity\n{leader}\n\n{bullets}",
+            host_body()
+        );
+        let chunks = structure_chunk(&md, 512, 15, opts(120));
+
+        // The section's first piece keeps the plain heading and carries both the
+        // lead-in and real section content: the leader was folded forward, not
+        // emitted as a stub.
+        let npc = chunks
+            .iter()
+            .find(|c| c.heading.as_deref() == Some("## NPC Activity"))
+            .expect("the section's first piece keeps the plain heading");
+        assert!(
+            npc.text.contains("sole active NPC"),
+            "the lead-in was dropped:\n{}",
+            npc.text
+        );
+        assert!(
+            npc.text.contains("Bullet 00"),
+            "the lead-in is a stub, not folded into the following content:\n{}",
+            npc.text
+        );
+
+        // No chunk but the file's first falls under the minimum.
+        for (i, c) in chunks.iter().enumerate() {
+            assert!(
+                i == 0 || c.text.len() >= 120,
+                "chunk {i} is a {}-char stub:\n{}",
+                c.text.len(),
+                c.text
+            );
+        }
     }
 
     #[test]

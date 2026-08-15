@@ -57,7 +57,12 @@ pub const PARSER_VERSION: u32 = 2;
 /// nothing, so the skipped heading has no descendant breadcrumb to survive in,
 /// and a promoted section under `chunk_min_chars` merges into a chunk that keeps
 /// the host's breadcrumb. Without the carry the heading is in no row at all.
-pub const CHUNKER_VERSION: u32 = 2;
+///
+/// Version 3 is issue #51: a short leading piece of a split section is folded
+/// forward into the following paragraph instead of being flushed as a stub row
+/// of its own. The `chunk_min_chars` minimum now reaches a section's pieces, not
+/// only its whole body, so the boundaries move where such a piece existed.
+pub const CHUNKER_VERSION: u32 = 3;
 
 /// Bump when what a chunk **row** holds changes, even though the chunk
 /// boundaries do not.
