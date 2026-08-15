@@ -4,6 +4,62 @@
 //! budget, with provenance in place of numeric scores on the machine channels.
 
 use crate::fusion::LaneContribution;
+use crate::search::InternalSearchResult;
+
+const PER_BLOCK_OVERHEAD: usize = 50; // §9.1: the framing a block costs beyond its text.
+
+/// Whether a search found anything to return (#35).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchStatus {
+    Ok,
+    NoResults,
+}
+
+/// A result included in full, with its scored text (#35).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Block {
+    pub id: String,
+    pub path: String,
+    pub heading_path: String,
+    pub provenance: Provenance,
+    pub text: String,
+    pub untrusted_content: bool,
+    pub truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
+}
+
+/// A result named but not included, because the budget ran out (#35).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Summary {
+    pub id: String,
+    pub path: String,
+    pub heading_path: String,
+    pub provenance: Provenance,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
+}
+
+/// The one shape every surface renders a search through (#35).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SearchEnvelope {
+    pub status: SearchStatus,
+    pub degraded: bool,
+    pub warnings: Vec<String>,
+    pub blocks: Vec<Block>,
+    pub overflow: Vec<Summary>,
+}
+
+/// The knobs `assemble` reads; everything else about a search stays in
+/// `InternalSearchResult` (#35).
+pub struct AssembleParams {
+    pub budget_tokens: u32,
+    pub full: bool,
+    pub summaries: bool,
+    pub degraded: bool,
+    pub per_note_cap: usize,
+}
 
 /// Which lanes account for a result, the machine channels' answer in place of
 /// a number.
@@ -40,6 +96,203 @@ impl Provenance {
 /// `llm.rs` must not depend on `packaging`.
 pub fn est_tokens_fallback(text: &str) -> usize {
     (text.chars().count() * 100).div_ceil(333)
+}
+
+/// `<docid>#<seq>`, the stable handle for a result (#35).
+fn result_id(r: &InternalSearchResult) -> String {
+    let docid = r.docid.clone().unwrap_or_else(|| "000000".to_string());
+    format!("{docid}#{}", r.chunk_seq)
+}
+
+fn summary_of(r: &InternalSearchResult) -> Summary {
+    Summary {
+        id: result_id(r),
+        path: r.file_path.clone(),
+        heading_path: r.heading_path.clone(),
+        provenance: r.provenance.clone(),
+        score: None,
+    }
+}
+
+fn block_of(r: &InternalSearchResult) -> Block {
+    Block {
+        id: result_id(r),
+        path: r.file_path.clone(),
+        heading_path: r.heading_path.clone(),
+        provenance: r.provenance.clone(),
+        text: r.text.clone(),
+        untrusted_content: true,
+        truncated: r.truncated,
+        score: None,
+    }
+}
+
+/// Assemble the ranked results into the envelope (#35).
+///
+/// The included set is a prefix: fill stops at the first result that would
+/// break the budget, and that result and every one after it become overflow.
+/// The first result is always included. `full` skips the budget; `summaries`
+/// emits every rank as a text-less row. `per_note_cap` is inert at 0.
+pub fn assemble(results: &[InternalSearchResult], p: AssembleParams) -> SearchEnvelope {
+    if results.is_empty() {
+        return SearchEnvelope {
+            status: SearchStatus::NoResults,
+            degraded: p.degraded,
+            warnings: Vec::new(),
+            blocks: Vec::new(),
+            overflow: Vec::new(),
+        };
+    }
+
+    // Results cap on the assembled set; 0 is unbounded (#30, #34).
+    let capped: Vec<&InternalSearchResult> = if p.per_note_cap == 0 {
+        results.iter().collect()
+    } else {
+        let mut per_note: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
+        results
+            .iter()
+            .filter(|r| {
+                let n = per_note.entry(r.file_id).or_insert(0);
+                *n += 1;
+                *n <= p.per_note_cap
+            })
+            .collect()
+    };
+
+    let mut blocks = Vec::new();
+    let mut overflow = Vec::new();
+
+    if p.summaries {
+        overflow = capped.iter().map(|r| summary_of(r)).collect();
+        return SearchEnvelope {
+            status: SearchStatus::Ok,
+            degraded: p.degraded,
+            warnings: Vec::new(),
+            blocks,
+            overflow,
+        };
+    }
+
+    let mut used = 0usize;
+    let mut stopped = false;
+    for r in &capped {
+        let cost = r.token_count + PER_BLOCK_OVERHEAD;
+        if !p.full && !blocks.is_empty() && used + cost > p.budget_tokens as usize {
+            stopped = true;
+        }
+        if stopped {
+            overflow.push(summary_of(r));
+        } else {
+            blocks.push(block_of(r));
+            used += cost;
+        }
+    }
+
+    SearchEnvelope {
+        status: SearchStatus::Ok,
+        degraded: p.degraded,
+        warnings: Vec::new(),
+        blocks,
+        overflow,
+    }
+}
+
+#[cfg(test)]
+mod assemble_tests {
+    use super::*;
+    use crate::search::InternalSearchResult;
+
+    fn result(seq: i64, tokens: usize) -> InternalSearchResult {
+        InternalSearchResult {
+            file_path: format!("n{seq}.md"),
+            file_id: seq,
+            chunk_seq: seq,
+            score: 0.9,
+            confidence: 90.0,
+            heading: None,
+            snippet: String::new(),
+            docid: Some(format!("{seq:06x}")),
+            text: "x".repeat(tokens * 3),
+            heading_path: format!("n{seq}.md > H"),
+            token_count: tokens,
+            truncated: false,
+            provenance: Provenance {
+                keyword: true,
+                semantic: false,
+                graph: false,
+                linked_from: vec![],
+            },
+        }
+    }
+    fn params(budget: u32) -> AssembleParams {
+        AssembleParams {
+            budget_tokens: budget,
+            full: false,
+            summaries: false,
+            degraded: false,
+            per_note_cap: 0,
+        }
+    }
+
+    #[test]
+    fn fills_greedily_and_overflows_the_rest() {
+        // Each block costs tokens + 50. Budget 260 fits two 80s (130+130=260), third overflows.
+        let rs = vec![result(1, 80), result(2, 80), result(3, 80)];
+        let env = assemble(&rs, params(260));
+        assert_eq!(env.blocks.len(), 2);
+        assert_eq!(env.overflow.len(), 1);
+        assert_eq!(env.overflow[0].id, "000003#3");
+    }
+
+    #[test]
+    fn drop_is_a_suffix_not_a_skip() {
+        // A big block at rank 2 stops the fill; rank 3 does not sneak in.
+        let rs = vec![result(1, 80), result(2, 10_000), result(3, 10)];
+        let env = assemble(&rs, params(260));
+        assert_eq!(env.blocks.len(), 1);
+        assert_eq!(
+            env.overflow
+                .iter()
+                .map(|s| s.id.clone())
+                .collect::<Vec<_>>(),
+            vec!["000002#2".to_string(), "000003#3".to_string()]
+        );
+    }
+
+    #[test]
+    fn the_first_result_is_always_included() {
+        let rs = vec![result(1, 10_000), result(2, 10)];
+        let env = assemble(&rs, params(1));
+        assert_eq!(env.blocks.len(), 1);
+        assert_eq!(env.blocks[0].id, "000001#1");
+    }
+
+    #[test]
+    fn full_ignores_the_budget() {
+        let rs = vec![result(1, 10_000), result(2, 10_000)];
+        let mut p = params(100);
+        p.full = true;
+        let env = assemble(&rs, p);
+        assert_eq!(env.blocks.len(), 2);
+        assert!(env.overflow.is_empty());
+    }
+
+    #[test]
+    fn summaries_emits_no_text() {
+        let rs = vec![result(1, 10), result(2, 10)];
+        let mut p = params(10_000);
+        p.summaries = true;
+        let env = assemble(&rs, p);
+        assert!(env.blocks.is_empty());
+        assert_eq!(env.overflow.len(), 2);
+    }
+
+    #[test]
+    fn no_results_is_its_own_status() {
+        let env = assemble(&[], params(8192));
+        assert_eq!(env.status, SearchStatus::NoResults);
+        assert!(env.blocks.is_empty() && env.overflow.is_empty());
+    }
 }
 
 #[cfg(test)]
