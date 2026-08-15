@@ -774,6 +774,12 @@ pub fn chunk_markdown(content: &str, opts: ChunkOptions) -> ParsedMarkdown {
 
 /// Split oversized chunks into sub-chunks that fit within `max_tokens`.
 ///
+/// This is the sole place a block is torn. `structure_chunk` packs whole
+/// paragraphs to [`TARGET_TOKENS`] and emits a single over-budget block whole;
+/// `max_tokens` here is the embed model's real input wall
+/// ([`crate::llm::EmbedModel::max_context`]), not that packing target, so a
+/// call site passes the model's own ceiling, not a fixed constant.
+///
 /// - `token_count` counts tokens in a string (closure for testability).
 /// - Chunks under `max_tokens` pass through unchanged.
 /// - Over-sized chunks are split on sentence boundaries (`. ` or `\n`).

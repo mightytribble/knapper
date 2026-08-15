@@ -67,6 +67,7 @@ The divergence is significant and likely to get worse.
 | directory terms in the scope | a scope term can name a directory as well as a tag: a leading `/` marks a path from the vault root, a trailing `/` its subtree, and the two mix in the same `all`/`any`/`none` operators. A directory resolves to a range predicate on `files.path` beside the tag's junction `EXISTS`, case-sensitive, and reaches `search` and `list`. The single-field alias of `all` is spelled `scope` | this fork, issue #65 |
 | `topic` / `who` / `project` removed | the three composite bundles are gone from all three surfaces, and `build_people_edges` with them — the indexer writes no mention edges, and `LINK_RESOLVER_VERSION = 2` clears the stale rows out of an existing store on its next index run. Composites return as vault-defined commands (#71) once #35 defines what a bundle may emit | this fork, issue #73 |
 | `.github/workflows/ci.yml` | manual dispatch only — upstream runs it on push and PR | this fork, Actions minutes |
+| model-wall chunk cap | a single paragraph or table is embedded whole up to the model's `n_ctx_train`, not torn at 512; the target stays 512 and packing is unchanged | this fork, issue #75 |
 
 Cherry-picked rather than merged: PR #41 branched before upstream's #40 graph fix, so merging the
 branch wholesale would have silently reverted `src/graph.rs`.
