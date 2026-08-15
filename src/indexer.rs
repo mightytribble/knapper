@@ -393,14 +393,13 @@ pub fn index_file(
     vault_path: &Path,
     config: &Config,
 ) -> Result<IndexFileResult> {
-    let max_tokens = crate::chunker::MAX_TOKENS;
     let overlap_tokens = crate::chunker::OVERLAP_TOKENS;
 
     // 1. Parse frontmatter for created_by
     let parsed = chunk_markdown(content, config.chunk_options());
     let chunks = {
         let tc = |s: &str| embedder.token_count(s);
-        split_oversized_chunks(parsed.chunks, &tc, max_tokens, overlap_tokens)
+        split_oversized_chunks(parsed.chunks, &tc, embedder.max_context(), overlap_tokens)
     };
 
     // Extract created_by from frontmatter

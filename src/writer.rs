@@ -490,7 +490,12 @@ fn precompute_chunks(
     chunk_opts: ChunkOptions,
 ) -> Result<Vec<ChunkData>> {
     let parsed = chunk_markdown(content, chunk_opts);
-    let chunks = split_oversized_chunks(parsed.chunks, &|s| s.split_whitespace().count(), 512, 50);
+    let chunks = split_oversized_chunks(
+        parsed.chunks,
+        &|s| embedder.token_count(s),
+        embedder.max_context(),
+        crate::chunker::OVERLAP_TOKENS,
+    );
 
     let doc = DocContext::from_file(rel_path, content);
     let inputs = crate::prefix::embed_inputs(&doc, &chunks, embed);
@@ -2232,6 +2237,33 @@ mod tests {
             "snippet should still stop at 200 characters"
         );
         assert!(stored.snippet.len() <= 203);
+    }
+
+    /// Issue #75. The word-count split at a hardcoded 512 tears a block the
+    /// model itself would accept whole. `precompute_chunks` must size-split
+    /// against the embedder's own `token_count` and `max_context`, the same
+    /// wall `index_file` reads.
+    #[test]
+    fn a_mid_size_block_is_one_chunk_through_the_write_pipeline() {
+        use crate::llm::MockLlm;
+
+        let mut embedder = MockLlm::new(8);
+        // ~3200 chars => ~800 approx tokens: over 512, under the 2048 wall.
+        let body = "alpha bravo charlie delta ".repeat(128);
+        let content = format!("## Note\n{body}");
+        let chunks = precompute_chunks(
+            "notes/mid.md",
+            &content,
+            &mut embedder,
+            EmbedComposition::default(),
+            test_chunk_opts(),
+        )
+        .unwrap();
+        assert_eq!(
+            chunks.len(),
+            1,
+            "a single block under the wall is one chunk"
+        );
     }
 
     // ── The tag store (#60) ──────────────────────────────────────
