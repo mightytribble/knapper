@@ -744,7 +744,7 @@ fn emit_section(
 /// was used. Changing one here is enough to make the next `engraph index`
 /// rebuild; there is no second place to remember to edit.
 pub mod limits {
-    /// Chunk size the break-point search aims for.
+    /// The packing budget `structure_chunk` aims for.
     pub const TARGET_TOKENS: usize = 512;
     /// Tokens of the previous sub-chunk repeated at the head of each piece a
     /// [`super::split_oversized_chunks`] split produces.

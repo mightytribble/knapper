@@ -875,14 +875,17 @@ mod tests {
     /// read again to satisfy (issue #37).
     #[test]
     fn the_chunk_record_version_is_part_of_the_chunker_fingerprint() {
-        assert!(
-            fps().chunker
-                != digest(&[
-                    &CHUNKER_VERSION.to_string(),
-                    &(CHUNK_RECORD_VERSION + 1).to_string(),
-                    &crate::chunker::limits::TARGET_TOKENS.to_string(),
-                    &crate::chunker::limits::OVERLAP_TOKENS.to_string(),
-                ]),
+        assert_ne!(
+            fps().chunker,
+            digest(&[
+                &CHUNKER_VERSION.to_string(),
+                &(CHUNK_RECORD_VERSION + 1).to_string(),
+                &format!("{:?}", Config::default().breadcrumb_root),
+                &Config::default().chunk_min_chars.to_string(),
+                &Config::default().promote_bold_headings.to_string(),
+                &crate::chunker::limits::TARGET_TOKENS.to_string(),
+                &crate::chunker::limits::OVERLAP_TOKENS.to_string(),
+            ]),
         );
         assert_eq!(CHUNKER.action, Action::Reindex);
     }
