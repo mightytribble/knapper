@@ -481,18 +481,13 @@ fn structure_headings(content: &str, promote_bold: bool) -> Vec<HeadingInfo> {
 /// Splitting order, per section:
 /// 1. whole section, if it fits in `target_tokens`
 /// 2. otherwise pack whole paragraphs (blank-line separated) up to the budget
-/// 3. a single paragraph still too large falls back to `smart_chunk`
+/// 3. a single paragraph over the budget is emitted whole
 ///
 /// The heading line is re-emitted at the head of every piece, so no chunk is
 /// ever labelled with a heading that begins partway through it. Sizes here use
-/// the `chars/4` approximation; `split_oversized_chunks` enforces the real
-/// tokenizer limit downstream.
-pub fn structure_chunk(
-    content: &str,
-    target_tokens: usize,
-    overlap_pct: usize,
-    opts: ChunkOptions,
-) -> Vec<Chunk> {
+/// the `chars/4` approximation; the real-token wall is enforced by
+/// `split_oversized_chunks` downstream.
+pub fn structure_chunk(content: &str, target_tokens: usize, opts: ChunkOptions) -> Vec<Chunk> {
     if content.trim().is_empty() {
         return Vec::new();
     }
@@ -516,7 +511,6 @@ pub fn structure_chunk(
             carried: None,
         },
         target_tokens,
-        overlap_pct,
         opts.min_chars,
         &mut chunks,
     );
@@ -574,7 +568,6 @@ pub fn structure_chunk(
                 carried: carried.as_deref(),
             },
             target_tokens,
-            overlap_pct,
             opts.min_chars,
             &mut chunks,
         );
@@ -597,7 +590,8 @@ struct SectionHeading<'a> {
 }
 
 /// Emit one or more chunks for a single section body, splitting on paragraph
-/// boundaries and then on size only when a paragraph alone busts the budget.
+/// boundaries. A paragraph over the budget, alone or combined with a folded
+/// short leader, is emitted whole rather than torn.
 ///
 /// A section whose body is shorter than `min_chars` is not a chunk of its own:
 /// it joins the preceding chunk of the same file (issue #43). BM25 normalises
@@ -608,16 +602,14 @@ struct SectionHeading<'a> {
 /// The same minimum applies to a *piece* of a split section, not only to the
 /// whole body. A short leading paragraph flushed by an oversized one would
 /// otherwise become a stub row of its own. It is folded forward into the
-/// following paragraph and the combination is size-split, so `smart_chunk`
-/// sizes the piece to the budget and the heading leads real section content
-/// (issue #51). The fold is forward, never backward: a first piece's preceding
-/// chunk is a different section, so a backward merge would orphan this section's
-/// heading at that section's tail.
+/// following paragraph and the combination is emitted whole, so the heading
+/// leads real section content (issue #51). The fold is forward, never
+/// backward: a first piece's preceding chunk is a different section, so a
+/// backward merge would orphan this section's heading at that section's tail.
 fn emit_section(
     body: &str,
     heading: SectionHeading<'_>,
     target_tokens: usize,
-    overlap_pct: usize,
     min_chars: usize,
     out: &mut Vec<Chunk>,
 ) {
@@ -649,7 +641,13 @@ fn emit_section(
         // These sections run in streaks, so the host is not grown past the
         // target: at the budget the stub becomes a chunk and hosts the rest.
         let merged = format!("{}\n\n{addition}", host.text);
-        if approx_tokens(&merged) <= target_tokens {
+        // Allow the merge to overrun the target by up to one shorty's worth
+        // (min_chars), so a trailing short section with nothing after it to
+        // host it merges rather than becoming a sub-minimum row (issue #75,
+        // the #51 end-shorty residual). The unit is the chunker's own: a body
+        // under min_chars chars is under min_chars/4 approx tokens.
+        let shorty_slack = min_chars / 4;
+        if approx_tokens(&merged) <= target_tokens + shorty_slack {
             // The host keeps its own heading and heading_path: no breadcrumb
             // is invented for the section that merged in.
             host.snippet = make_snippet(&merged);
@@ -688,8 +686,10 @@ fn emit_section(
         // makes it unreachable and reproduces the pre-#51 pieces exactly.
         let short_leader = !current.is_empty() && current.len() < min_chars;
 
-        // A single paragraph over budget: flush what we have, then fall back to
-        // size-based splitting with overlap for this paragraph alone.
+        // A single paragraph or table over the packing budget is emitted whole:
+        // it is one coherent unit, so tearing it splits one theme across two
+        // vectors. The real-token wall is enforced downstream in
+        // `split_oversized_chunks` (issue #75).
         if approx_tokens(paragraph) > budget {
             let unit = if short_leader {
                 format!("{}\n\n{paragraph}", std::mem::take(&mut current))
@@ -699,9 +699,7 @@ fn emit_section(
                 }
                 paragraph.to_string()
             };
-            for chunk in smart_chunk(&unit, budget, overlap_pct) {
-                pieces.push(chunk.text);
-            }
+            pieces.push(unit);
             continue;
         }
 
@@ -712,13 +710,9 @@ fn emit_section(
         };
         if !current.is_empty() && approx_tokens(&candidate) > budget {
             if short_leader {
-                // The short leader and this paragraph together bust the budget,
-                // so the combination is size-split rather than flushed as two
-                // rows. `smart_chunk` sizes it to the budget, and the leader
-                // rides the front of the first piece (issue #51).
-                for chunk in smart_chunk(&candidate, budget, overlap_pct) {
-                    pieces.push(chunk.text);
-                }
+                // The short leader rides the front of this paragraph as one
+                // whole piece rather than being size-split (issue #51, #75).
+                pieces.push(candidate);
                 current.clear();
             } else {
                 pieces.push(std::mem::replace(&mut current, paragraph.to_string()));
@@ -771,7 +765,7 @@ pub use limits::{MAX_TOKENS, OVERLAP_PCT, OVERLAP_TOKENS, TARGET_TOKENS};
 /// Parse markdown content into frontmatter tags and structure-first chunks.
 ///
 /// 1. Strip YAML frontmatter (between `---` at start), parse `tags` if present.
-/// 2. Run `structure_chunk` on the body at [`TARGET_TOKENS`] / [`OVERLAP_PCT`].
+/// 2. Run `structure_chunk` on the body at [`TARGET_TOKENS`].
 /// 3. Return `ParsedMarkdown { tags, chunks }`.
 ///
 /// `opts` carries `[chunk_min_chars]` and `[promote_bold_headings]`, the config
@@ -782,7 +776,7 @@ pub use limits::{MAX_TOKENS, OVERLAP_PCT, OVERLAP_TOKENS, TARGET_TOKENS};
 pub fn chunk_markdown(content: &str, opts: ChunkOptions) -> ParsedMarkdown {
     let (tags, body) = parse_frontmatter(content);
 
-    let chunks = structure_chunk(body, TARGET_TOKENS, OVERLAP_PCT, opts);
+    let chunks = structure_chunk(body, TARGET_TOKENS, opts);
 
     ParsedMarkdown { tags, chunks }
 }
@@ -1251,7 +1245,7 @@ mod tests {
     #[test]
     fn test_structure_chunk_one_chunk_per_section() {
         let md = "## Alpha\nA body.\n\n## Beta\nB body.\n\n## Gamma\nG body.\n";
-        let chunks = structure_chunk(md, 512, 15, opts(0));
+        let chunks = structure_chunk(md, 512, opts(0));
         assert_eq!(chunks.len(), 3);
         for (chunk, expected) in chunks.iter().zip(["Alpha", "Beta", "Gamma"]) {
             assert_eq!(chunk.heading.as_deref(), Some(&*format!("## {expected}")));
@@ -1265,7 +1259,7 @@ mod tests {
         let md: String = (0..6)
             .map(|i| format!("## Section {i}\nBody of section {i}.\n\n"))
             .collect();
-        let chunks = structure_chunk(&md, 512, 15, opts(0));
+        let chunks = structure_chunk(&md, 512, opts(0));
 
         assert_eq!(chunks.len(), 6);
         for chunk in &chunks {
@@ -1283,7 +1277,7 @@ mod tests {
         // Long enough to force a split inside a section.
         let filler = "Sentence of prose padding this section out. ".repeat(60);
         let md = format!("## First\n{filler}\n\n{filler}\n\n## Second\nShort.\n");
-        let chunks = structure_chunk(&md, 128, 15, opts(0));
+        let chunks = structure_chunk(&md, 128, opts(0));
 
         assert!(chunks.len() > 2, "expected the first section to split");
         for chunk in &chunks {
@@ -1309,7 +1303,7 @@ mod tests {
         // them one per chunk rather than cutting a paragraph in half.
         let para = |n: usize| format!("Paragraph {n} {}", "word ".repeat(30));
         let md = format!("## Body\n{}\n\n{}\n\n{}\n", para(1), para(2), para(3));
-        let chunks = structure_chunk(&md, 64, 15, opts(0));
+        let chunks = structure_chunk(&md, 64, opts(0));
 
         assert_eq!(chunks.len(), 3);
         for (i, chunk) in chunks.iter().enumerate() {
@@ -1322,38 +1316,101 @@ mod tests {
     }
 
     #[test]
-    fn test_structure_chunk_oversized_paragraph_falls_back_to_size_split() {
-        // A single paragraph — no blank lines to split on — well over budget.
-        let giant = "This is one very long unbroken paragraph. ".repeat(80);
-        let md = format!("## Wall\n{giant}");
-        let chunks = structure_chunk(&md, 64, 15, opts(0));
+    fn a_single_oversized_paragraph_is_emitted_whole() {
+        // One paragraph well over the 512 chars/4 budget, no blank lines inside.
+        let para = "word ".repeat(700); // ~3500 chars ~= 875 approx tokens
+        let md = format!("## Note\n{para}");
+        let chunks = structure_chunk(&md, 512, opts(0));
+        assert_eq!(chunks.len(), 1, "an atomic block must not be torn here");
+        assert!(chunks[0].text.contains("## Note"));
+    }
 
+    #[test]
+    fn a_trailing_short_section_merges_into_the_previous_chunk() {
+        // A full first section, then a section whose body is under min_chars with
+        // nothing after it to host it.
+        let big = "sentence. ".repeat(60); // comfortably over min_chars
+        let md = format!("## Body\n{big}\n\n## Coda\nshort tail line");
+        let chunks = structure_chunk(&md, 512, opts(120));
         assert!(
-            chunks.len() > 3,
-            "expected the oversized paragraph to be size-split, got {}",
+            chunks
+                .iter()
+                .all(|c| c.text.len() >= 120 || c.text.contains("## Body")),
+            "no non-first chunk may be under min_chars"
+        );
+        assert!(
+            chunks.last().unwrap().text.contains("short tail line"),
+            "the trailing shorty is kept, merged into the body chunk"
+        );
+    }
+
+    #[test]
+    fn a_short_leader_and_a_fitting_paragraph_emit_as_one_whole_piece() {
+        // A short leader paragraph (under min_chars) followed by a second
+        // paragraph that fits the budget alone but busts it combined with the
+        // leader. The combination must still land as one whole piece: no
+        // content lost, no sub-minimum row produced.
+        let leader = "Short lead-in.";
+        assert!(leader.len() < 120, "leader must be under min_chars");
+        // Sized so leader + blank lines + this paragraph together exceed the
+        // 64-token budget (64 approx tokens), but the paragraph alone does not
+        // (60 approx tokens, budget 61 after the heading's share).
+        let second = "distinctiveword ".repeat(15);
+        let md = format!("## Overview\n{leader}\n\n{second}");
+        let chunks = structure_chunk(&md, 64, opts(120));
+
+        assert_eq!(
+            chunks.len(),
+            1,
+            "the leader and the paragraph must emit as one whole piece, got {}",
             chunks.len()
         );
-        for chunk in &chunks {
-            assert!(chunk.heading.as_deref().unwrap().starts_with("## Wall"));
-            assert_eq!(chunk.heading_path, vec!["Wall".to_string()]);
-        }
-        // No content is lost.
-        let recovered: String = chunks
-            .iter()
-            .map(|c| {
+        assert!(
+            chunks[0].text.contains("Short lead-in."),
+            "the leader's words were dropped:\n{}",
+            chunks[0].text
+        );
+        assert!(
+            chunks[0].text.contains("distinctiveword"),
+            "the paragraph's words were dropped:\n{}",
+            chunks[0].text
+        );
+        for (i, c) in chunks.iter().enumerate() {
+            assert!(
+                i == 0 || c.text.len() >= 120,
+                "chunk {i} is a {}-char stub:\n{}",
+                c.text.len(),
                 c.text
-                    .replace("## Wall (cont.)\n", "")
-                    .replace("## Wall\n", "")
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert!(recovered.contains("one very long unbroken paragraph"));
+            );
+        }
+    }
+
+    #[test]
+    fn an_oversized_single_paragraph_is_emitted_whole() {
+        // A single paragraph — no blank lines to split on — well over budget.
+        // It is emitted as one whole chunk; the real-token wall is enforced
+        // downstream by `split_oversized_chunks` (issue #75).
+        let giant = "This is one very long unbroken paragraph. ".repeat(80);
+        let md = format!("## Wall\n{giant}");
+        let chunks = structure_chunk(&md, 64, opts(0));
+
+        assert_eq!(
+            chunks.len(),
+            1,
+            "an atomic block must not be torn here, got {}",
+            chunks.len()
+        );
+        assert_eq!(chunks[0].heading.as_deref(), Some("## Wall"));
+        assert_eq!(chunks[0].heading_path, vec!["Wall".to_string()]);
+        // No content is lost.
+        assert!(chunks[0].text.contains("one very long unbroken paragraph"));
+        assert!(chunks[0].text.trim_end().ends_with("paragraph."));
     }
 
     #[test]
     fn test_structure_chunk_subsections_are_siblings_with_ancestor_path() {
         let md = "## Abilities\nOverview text.\n\n### Combat\nSword work.\n\n### Magic\nSpell work.\n\n## Gear\nA sword.\n";
-        let chunks = structure_chunk(md, 512, 15, opts(0));
+        let chunks = structure_chunk(md, 512, opts(0));
 
         assert_eq!(chunks.len(), 4);
         // A parent does not swallow its subsections...
@@ -1374,7 +1431,7 @@ mod tests {
     #[test]
     fn test_structure_chunk_skips_bodyless_heading() {
         let md = "## Parent\n### Child\nOnly real content.\n";
-        let chunks = structure_chunk(md, 512, 15, opts(0));
+        let chunks = structure_chunk(md, 512, opts(0));
 
         // `## Parent` has no body of its own, so it produces no title-only chunk.
         assert_eq!(chunks.len(), 1);
@@ -1388,7 +1445,7 @@ mod tests {
     #[test]
     fn test_structure_chunk_preamble_before_first_heading() {
         let md = "Intro prose with no heading.\n\n## Section\nBody.\n";
-        let chunks = structure_chunk(md, 512, 15, opts(0));
+        let chunks = structure_chunk(md, 512, opts(0));
 
         assert_eq!(chunks.len(), 2);
         assert!(chunks[0].heading.is_none());
@@ -1409,7 +1466,7 @@ mod tests {
             "## Stat Block\n{}\n\n## Threads\n_None yet._\n",
             host_body()
         );
-        let chunks = structure_chunk(&md, 512, 15, opts(120));
+        let chunks = structure_chunk(&md, 512, opts(120));
 
         assert_eq!(chunks.len(), 1);
         // The host's own label and breadcrumb: no breadcrumb is invented.
@@ -1432,7 +1489,7 @@ mod tests {
             "## Stat Block\n{}\n\n## Threads\n_None yet._\n",
             host_body()
         );
-        let chunks = structure_chunk(&md, 512, 15, opts(120));
+        let chunks = structure_chunk(&md, 512, opts(120));
 
         assert_eq!(chunks[0].snippet, make_snippet(&chunks[0].text));
     }
@@ -1442,7 +1499,7 @@ mod tests {
         // A file that is one short section is one chunk. Dropping it would make
         // the file unfindable, which is not the case a minimum is for.
         let md = "## Threads\n_None yet._\n";
-        let chunks = structure_chunk(md, 512, 15, opts(120));
+        let chunks = structure_chunk(md, 512, opts(120));
 
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].text, "## Threads\n_None yet._");
@@ -1453,7 +1510,7 @@ mod tests {
     fn test_structure_chunk_body_at_the_minimum_is_not_a_stub() {
         let exact = "x".repeat(120);
         let md = format!("## Host\n{}\n\n## Exact\n{exact}\n", host_body());
-        let chunks = structure_chunk(&md, 512, 15, opts(120));
+        let chunks = structure_chunk(&md, 512, opts(120));
 
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[1].heading.as_deref(), Some("## Exact"));
@@ -1467,17 +1524,22 @@ mod tests {
             .map(|i| format!("\n\n## Stub {i}\nNone yet.\n"))
             .collect();
         let md = format!("## Host\n{}{stubs}", host_body());
-        let chunks = structure_chunk(&md, 64, 15, opts(120));
+        let target_tokens = 64;
+        let min_chars = 120;
+        let chunks = structure_chunk(&md, target_tokens, opts(min_chars));
 
         assert!(
             chunks.len() > 1 && chunks.len() < 13,
             "expected the streak to collapse into bounded chunks, got {}",
             chunks.len()
         );
+        // The merge may overrun the target by up to one shorty's worth of
+        // headroom (issue #75), never past it.
+        let bound = target_tokens + min_chars / 4;
         for chunk in &chunks {
             assert!(
-                approx_tokens(&chunk.text) <= 64,
-                "merged chunk busts the target:\n{}",
+                approx_tokens(&chunk.text) <= bound,
+                "merged chunk busts the target plus shorty headroom ({bound}):\n{}",
                 chunk.text
             );
         }
@@ -1486,7 +1548,7 @@ mod tests {
     #[test]
     fn test_structure_chunk_minimum_of_zero_keeps_every_section() {
         let md = "## Alpha\nA body.\n\n## Threads\n_None yet._\n";
-        let chunks = structure_chunk(md, 512, 15, opts(0));
+        let chunks = structure_chunk(md, 512, opts(0));
 
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[1].text, "## Threads\n_None yet._");
@@ -1508,7 +1570,7 @@ mod tests {
             "## Overview\n{}\n\n## NPC Activity\n{leader}\n\n{bullets}",
             host_body()
         );
-        let chunks = structure_chunk(&md, 512, 15, opts(120));
+        let chunks = structure_chunk(&md, 512, opts(120));
 
         // The section's first piece keeps the plain heading and carries both the
         // lead-in and real section content: the leader was folded forward, not
@@ -1555,7 +1617,7 @@ mod tests {
     #[test]
     fn test_structure_chunk_ignores_headings_in_code_fences() {
         let md = "## Real\nSee below:\n\n```md\n## Not A Heading\n```\n\n## Also Real\nBody.\n";
-        let chunks = structure_chunk(md, 512, 15, opts(0));
+        let chunks = structure_chunk(md, 512, opts(0));
 
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].heading.as_deref(), Some("## Real"));
@@ -1567,7 +1629,7 @@ mod tests {
     fn test_structure_chunk_handles_multibyte_headings() {
         // Byte offsets, not char counts: a mis-slice here would panic.
         let md = "## Ríoghán's Résumé\nBody — with an em dash.\n\n## 日本語\n本文です。\n";
-        let chunks = structure_chunk(md, 512, 15, opts(0));
+        let chunks = structure_chunk(md, 512, opts(0));
 
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].heading.as_deref(), Some("## Ríoghán's Résumé"));
@@ -1600,7 +1662,7 @@ mod tests {
             body(200),
             body(200)
         );
-        let chunks = structure_chunk(&md, 512, 15, promoting(120));
+        let chunks = structure_chunk(&md, 512, promoting(120));
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].heading_path, vec!["Stat Block"]);
         assert_eq!(chunks[1].heading_path, vec!["Stat Block", "Spells"]);
@@ -1628,7 +1690,7 @@ mod tests {
             body(200),
             body(200)
         );
-        let chunks = structure_chunk(&md, 512, 15, promoting(120));
+        let chunks = structure_chunk(&md, 512, promoting(120));
         assert!(chunks[1].text.starts_with("**Spells**"));
         assert_eq!(chunks[1].heading.as_deref(), Some("**Spells**"));
     }
@@ -1641,7 +1703,7 @@ mod tests {
             body(200),
             body(200)
         );
-        let chunks = structure_chunk(&md, 512, 15, promoting(120));
+        let chunks = structure_chunk(&md, 512, promoting(120));
         assert_eq!(chunks.len(), 3);
         assert_eq!(chunks[1].heading_path, vec!["Stat Block", "Spells"]);
         assert_eq!(chunks[2].heading_path, vec!["Stat Block", "Notes"]);
@@ -1655,7 +1717,7 @@ mod tests {
             body(200),
             body(200)
         );
-        let chunks = structure_chunk(&md, 512, 15, promoting(120));
+        let chunks = structure_chunk(&md, 512, promoting(120));
         assert_eq!(chunks.len(), 3);
         assert!(chunks[0].heading_path.is_empty());
         assert_eq!(chunks[1].heading_path, vec!["Summary"]);
@@ -1670,7 +1732,7 @@ mod tests {
             body(200),
             body(200)
         );
-        let chunks = structure_chunk(&md, 512, 15, promoting(120));
+        let chunks = structure_chunk(&md, 512, promoting(120));
         assert_eq!(chunks.len(), 3);
         assert_eq!(chunks[1].heading_path, vec!["Stat Block", "Spells"]);
         // A promoted line is an ancestor of nothing, so the deeper heading
@@ -1685,7 +1747,7 @@ mod tests {
             body(200),
             body(200)
         );
-        let chunks = structure_chunk(&md, 512, 15, promoting(120));
+        let chunks = structure_chunk(&md, 512, promoting(120));
         assert_eq!(chunks.len(), 2);
         // The line is not a section, and it is not lost either: a flat promoted
         // line has no descendant to carry it in a heading_path.
@@ -1700,7 +1762,7 @@ mod tests {
             body(200),
             body(200)
         );
-        let chunks = structure_chunk(&md, 512, 15, promoting(120));
+        let chunks = structure_chunk(&md, 512, promoting(120));
         // The well-bodied `**Notes**` section proves promotion ran at all; if
         // it did not, the whole document would still be one `## Stat Block`
         // chunk and this assertion would fail.
@@ -1721,7 +1783,7 @@ mod tests {
             "## Abilities\n{}\n\n## Spells\n**Spells**\nN/A\n",
             body(350)
         );
-        let chunks = structure_chunk(&md, 512, 15, promoting(120));
+        let chunks = structure_chunk(&md, 512, promoting(120));
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].heading_path, vec!["Abilities"]);
         assert!(chunks[0].text.contains("## Spells\n**Spells**\nN/A"));
@@ -1729,7 +1791,7 @@ mod tests {
         // The control merges the whole `## Spells` section into the chunk
         // before it, heading line included, so the corpus holds the heading at
         // both settings.
-        let control = structure_chunk(&md, 512, 15, opts(120));
+        let control = structure_chunk(&md, 512, opts(120));
         assert_eq!(control.len(), 1);
         assert!(control[0].text.contains("## Spells\n**Spells**\nN/A"));
     }
@@ -1742,7 +1804,7 @@ mod tests {
             body(350),
             body(350)
         );
-        let chunks = structure_chunk(&md, 512, 15, promoting(120));
+        let chunks = structure_chunk(&md, 512, promoting(120));
         assert_eq!(chunks.len(), 2);
         assert!(chunks[1].text.starts_with("## Spells\n**Spells**"));
         // The carried line labels nothing: the chunk is still the promoted one.
@@ -1757,7 +1819,7 @@ mod tests {
         // behaving as it did before the carry — at both settings.
         let md = format!("## Spells\n### Level 1\n{}\n", body(350));
         for options in [promoting(120), opts(120)] {
-            let chunks = structure_chunk(&md, 512, 15, options);
+            let chunks = structure_chunk(&md, 512, options);
             assert_eq!(chunks.len(), 1);
             assert_eq!(chunks[0].heading_path, vec!["Spells", "Level 1"]);
             assert!(chunks[0].text.starts_with("### Level 1"));
@@ -1773,7 +1835,7 @@ mod tests {
             body(200),
             body(200)
         );
-        let chunks = structure_chunk(&md, 512, 15, promoting(120));
+        let chunks = structure_chunk(&md, 512, promoting(120));
         // The trailing `**Notes**` section proves promotion was active; the
         // fenced `**Spells**` line still did not open a section of its own.
         assert_eq!(chunks.len(), 2);
@@ -1789,7 +1851,7 @@ mod tests {
             body(200),
             body(200)
         );
-        let off = structure_chunk(&md, 512, 15, opts(120));
+        let off = structure_chunk(&md, 512, opts(120));
         assert_eq!(off.len(), 1);
         assert_eq!(off[0].heading_path, vec!["Stat Block"]);
     }
