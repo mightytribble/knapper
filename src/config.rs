@@ -1138,8 +1138,10 @@ batch_size = 128
 
     #[test]
     fn merge_preserves_when_none() {
-        let mut cfg = Config::default();
-        cfg.top_n = 10;
+        let mut cfg = Config {
+            top_n: 10,
+            ..Config::default()
+        };
         cfg.merge_top_n(None);
         assert_eq!(cfg.top_n, 10);
     }
@@ -1285,8 +1287,10 @@ permissions = "read"
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
 
-        let mut cfg = Config::default();
-        cfg.intelligence = Some(true);
+        let mut cfg = Config {
+            intelligence: Some(true),
+            ..Config::default()
+        };
         cfg.models.embed = Some("hf:custom/model/embed.gguf".into());
 
         cfg.save_to(&config_path).unwrap();

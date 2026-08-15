@@ -629,7 +629,7 @@ mod tests {
         let tool = crate::serve::EngraphServer::tool_router()
             .list_all()
             .into_iter()
-            .find(|t| t.name.to_string() == "list")
+            .find(|t| t.name == "list")
             .expect("list is an MCP tool");
         let properties = tool
             .input_schema

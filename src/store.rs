@@ -5251,11 +5251,10 @@ mod tests {
         // empty — the caller has to decide what a link into it means.
         let unchunked = file(&store, "unchunked.md");
         assert!(
-            store
+            !store
                 .chunk_seqs_for_files(&[unchunked])
                 .unwrap()
-                .get(&unchunked)
-                .is_none()
+                .contains_key(&unchunked)
         );
     }
 
@@ -5488,7 +5487,9 @@ mod tests {
             path: "habitat/swamp".into(),
             display: "habitat/swamp".into(),
         };
-        store.reconcile_file_tags(one, &[swamp.clone()]).unwrap();
+        store
+            .reconcile_file_tags(one, std::slice::from_ref(&swamp))
+            .unwrap();
         store.reconcile_file_tags(two, &[swamp]).unwrap();
 
         store.reconcile_file_tags(one, &[]).unwrap();

@@ -621,8 +621,10 @@ mod tests {
         record(&store, &fps()).unwrap();
 
         // 0 is the control arm, and it is a different index from the default.
-        let mut config = Config::default();
-        config.chunk_min_chars = 0;
+        let config = Config {
+            chunk_min_chars: 0,
+            ..Config::default()
+        };
         let changed = Fingerprints::compute(&config, "embed-model-abc", Some("rerank-model-xyz"));
 
         let comparison = compare(&store, &changed).unwrap();
@@ -638,8 +640,10 @@ mod tests {
         record(&store, &fps()).unwrap();
 
         // `true` ships, so the control arm `false` is a different index.
-        let mut config = Config::default();
-        config.promote_bold_headings = false;
+        let config = Config {
+            promote_bold_headings: false,
+            ..Config::default()
+        };
         let changed = Fingerprints::compute(&config, "embed-model-abc", Some("rerank-model-xyz"));
 
         let comparison = compare(&store, &changed).unwrap();
@@ -660,8 +664,10 @@ mod tests {
         ]
         .into_iter()
         .map(|root| {
-            let mut config = Config::default();
-            config.breadcrumb_root = root;
+            let config = Config {
+                breadcrumb_root: root,
+                ..Config::default()
+            };
             Fingerprints::compute(&config, "embed-model-abc", None).chunker
         })
         .collect();
