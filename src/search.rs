@@ -2585,6 +2585,7 @@ mod tests {
             !out.results.is_empty(),
             "the fixture query answered nothing"
         );
+        let mut saw_the_long_chunk = false;
         for r in &out.results {
             let scored = store
                 .get_chunk_texts(&[(r.file_id, r.chunk_seq)])
@@ -2597,7 +2598,26 @@ mod tests {
                 r.file_path
             );
             assert!(!r.text.is_empty());
+            // The substring check above is necessary but not sufficient: the
+            // 200-character `snippet` is always a substring of the full
+            // chunk too, so it alone cannot tell "the whole chunk" apart from
+            // "a regression back to the snippet". "Wyrmsbane invocation"
+            // sits past that 200-character mark, so a result whose emitted
+            // text still carries it proves the window is the chunk the model
+            // scored and not the truncated preview.
+            if scored.contains("Wyrmsbane invocation") {
+                saw_the_long_chunk = true;
+                assert!(
+                    r.text.contains("Wyrmsbane invocation"),
+                    "emitted text for {} regressed to the 200-character snippet",
+                    r.file_path
+                );
+            }
         }
+        assert!(
+            saw_the_long_chunk,
+            "the fixture's past-boundary chunk never reached the results"
+        );
     }
 
     /// #35: a result reports which lanes support it, plus the breadcrumb and
