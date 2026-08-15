@@ -197,6 +197,83 @@ pub fn assemble(results: &[InternalSearchResult], p: AssembleParams) -> SearchEn
     }
 }
 
+fn provenance_label(p: &Provenance) -> String {
+    let mut parts = Vec::new();
+    if p.semantic {
+        parts.push("semantic");
+    }
+    if p.keyword {
+        parts.push("keyword");
+    }
+    if p.graph {
+        parts.push("linked");
+    }
+    if parts.is_empty() {
+        "none".to_string()
+    } else {
+        parts.join("+")
+    }
+}
+
+/// Fill each row's `score` from the matching result's confidence — `--scores`
+/// only (#35). Degraded rows have no probability, so `score` stays `None`.
+pub fn apply_scores(env: &mut SearchEnvelope, results: &[InternalSearchResult]) {
+    let by_id: std::collections::HashMap<String, f64> = results
+        .iter()
+        .map(|r| (result_id(r), r.confidence))
+        .collect();
+    if env.degraded {
+        return;
+    }
+    for b in &mut env.blocks {
+        b.score = by_id.get(&b.id).copied();
+    }
+    for s in &mut env.overflow {
+        s.score = by_id.get(&s.id).copied();
+    }
+}
+
+/// The convenience text rendering of the envelope (design §9.3).
+pub fn render_text(env: &SearchEnvelope, scores: bool) -> String {
+    if matches!(env.status, SearchStatus::NoResults) {
+        return format!("{}\n", crate::ranking::NO_RELEVANT_CONTENT);
+    }
+    let mut out = String::new();
+    if env.degraded {
+        out.push_str("(degraded ordering: no cross-encoder available)\n\n");
+    }
+    for b in &env.blocks {
+        let pct = match (scores, b.score) {
+            (true, Some(s)) => format!(" [{s:.0}%]"),
+            _ => String::new(),
+        };
+        out.push_str(&format!(
+            "--- [{}]{pct} {} (matched: {})\n",
+            b.id,
+            b.heading_path,
+            provenance_label(&b.provenance)
+        ));
+        if b.truncated {
+            out.push_str("(truncated)\n");
+        }
+        out.push_str(&b.text);
+        out.push_str("\n\n");
+    }
+    for s in &env.overflow {
+        let pct = match (scores, s.score) {
+            (true, Some(v)) => format!(" [{v:.0}%]"),
+            _ => String::new(),
+        };
+        out.push_str(&format!(
+            "Not included (lower relevance): [{}]{pct} {} (matched: {})\n",
+            s.id,
+            s.heading_path,
+            provenance_label(&s.provenance)
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod assemble_tests {
     use super::*;
@@ -342,5 +419,54 @@ mod tests {
         assert_eq!(est_tokens_fallback(&"x".repeat(40)), 13);
         assert_eq!(est_tokens_fallback(""), 0);
         assert_eq!(est_tokens_fallback("x"), 1);
+    }
+}
+
+#[cfg(test)]
+mod render_tests {
+    use super::*;
+
+    #[test]
+    fn text_render_marks_provenance_and_omits_score_by_default() {
+        let env = SearchEnvelope {
+            status: SearchStatus::Ok,
+            degraded: false,
+            warnings: vec![],
+            blocks: vec![Block {
+                id: "abc#0".into(),
+                path: "n.md".into(),
+                heading_path: "n.md > H".into(),
+                provenance: Provenance {
+                    keyword: true,
+                    semantic: true,
+                    graph: false,
+                    linked_from: vec![],
+                },
+                text: "body".into(),
+                untrusted_content: true,
+                truncated: false,
+                score: None,
+            }],
+            overflow: vec![],
+        };
+        let out = render_text(&env, false);
+        assert!(out.contains("[abc#0]"));
+        assert!(out.contains("semantic+keyword"));
+        assert!(!out.contains('%'));
+    }
+
+    #[test]
+    fn no_results_text_is_the_literal_message() {
+        let env = SearchEnvelope {
+            status: SearchStatus::NoResults,
+            degraded: false,
+            warnings: vec![],
+            blocks: vec![],
+            overflow: vec![],
+        };
+        assert_eq!(
+            render_text(&env, false).trim(),
+            crate::ranking::NO_RELEVANT_CONTENT
+        );
     }
 }
