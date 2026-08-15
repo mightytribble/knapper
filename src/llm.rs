@@ -13,6 +13,11 @@ use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::{LlamaBackendDeviceType, list_llama_ggml_backend_devices};
 
+/// Input wall used when a model does not report a training context length.
+/// A conservative floor: every embedder in use reports at least this
+/// (issue #75).
+pub const FALLBACK_MAX_CONTEXT: usize = 1024;
+
 static BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
 /// Mutex used only during the first initialization of `BACKEND`.
 static BACKEND_INIT: Mutex<()> = Mutex::new(());
@@ -426,6 +431,12 @@ pub trait EmbedModel: Send {
     /// Dimensionality of vectors produced by this model.
     fn dim(&self) -> usize;
 
+    /// The model's real-token input wall, read from the GGUF at load
+    /// (`n_ctx_train`). A chunk longer than this is silently truncated by the
+    /// embedder, so it is the ceiling `split_oversized_chunks` enforces
+    /// (issue #75).
+    fn max_context(&self) -> usize;
+
     /// Everything about this model that decides what a stored vector *means*:
     /// the artifact's bytes, its width, its tokenizer, the prompt template it is
     /// fed through, and what happens to the vector afterwards.
@@ -459,6 +470,10 @@ impl EmbedModel for Box<dyn EmbedModel + Send> {
 
     fn dim(&self) -> usize {
         (**self).dim()
+    }
+
+    fn max_context(&self) -> usize {
+        (**self).max_context()
     }
 
     fn fingerprint(&self) -> String {
@@ -583,6 +598,10 @@ impl EmbedModel for MockLlm {
 
     fn dim(&self) -> usize {
         self.dim
+    }
+
+    fn max_context(&self) -> usize {
+        2048
     }
 
     fn fingerprint(&self) -> String {
@@ -1045,6 +1064,7 @@ pub struct LlamaEmbed {
     model: LlamaModel,
     tokenizer: FlexTokenizer,
     dim: usize,
+    max_context: usize,
     prompt_format: PromptFormat,
     /// Which query template to write (issue #10). Held apart from
     /// `prompt_format` because the document half is a fingerprint component and
@@ -1112,12 +1132,23 @@ impl LlamaEmbed {
             bail!("model {uri_str} reports an embedding dimension of 0");
         }
 
+        let max_context = usize::try_from(model.n_ctx_train())
+            .ok()
+            .filter(|&n| n > 0)
+            .unwrap_or_else(|| {
+                tracing::warn!(
+                    "model {uri_str} reports no training context length; using {FALLBACK_MAX_CONTEXT}"
+                );
+                FALLBACK_MAX_CONTEXT
+            });
+
         let n_threads = resolve_n_threads(config);
         let device = device_identity();
         tracing::info!(
-            "loaded LlamaEmbed from {}, dim={}, n_threads={}, device={}",
+            "loaded LlamaEmbed from {}, dim={}, max_context={}, n_threads={}, device={}",
             uri_str,
             dim,
+            max_context,
             n_threads,
             device
         );
@@ -1134,6 +1165,7 @@ impl LlamaEmbed {
             model,
             tokenizer,
             dim,
+            max_context,
             prompt_format,
             query_template: config.embedding_prompt.query,
             n_threads,
@@ -1298,6 +1330,10 @@ impl EmbedModel for LlamaEmbed {
 
     fn dim(&self) -> usize {
         self.dim
+    }
+
+    fn max_context(&self) -> usize {
+        self.max_context
     }
 
     fn fingerprint(&self) -> String {
@@ -1666,6 +1702,12 @@ mod tests {
             (norm - 1.0).abs() < 0.01,
             "mock vectors should be L2-normalized"
         );
+    }
+
+    #[test]
+    fn mock_reports_a_max_context() {
+        let m = MockLlm::new(8);
+        assert_eq!(m.max_context(), 2048);
     }
 
     #[test]

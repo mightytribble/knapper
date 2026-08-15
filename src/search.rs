@@ -1912,6 +1912,9 @@ mod tests {
         fn dim(&self) -> usize {
             self.inner.dim()
         }
+        fn max_context(&self) -> usize {
+            self.inner.max_context()
+        }
         fn fingerprint(&self) -> String {
             // Disambiguated: `MockLlm` implements both model traits, and each
             // declares a `fingerprint`.

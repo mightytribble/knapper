@@ -1072,6 +1072,9 @@ mod tests {
         fn dim(&self) -> usize {
             384
         }
+        fn max_context(&self) -> usize {
+            2048
+        }
         fn fingerprint(&self) -> String {
             "dummy-embed".to_string()
         }

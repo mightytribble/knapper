@@ -1921,6 +1921,9 @@ mod tests {
         fn dim(&self) -> usize {
             self.inner.dim()
         }
+        fn max_context(&self) -> usize {
+            self.inner.max_context()
+        }
         fn fingerprint(&self) -> String {
             self.inner.fingerprint()
         }
