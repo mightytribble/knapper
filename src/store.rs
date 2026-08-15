@@ -722,16 +722,6 @@ impl Store {
             );",
         )?;
 
-        // Link skiplist table (reserved for future use)
-        self.conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS link_skiplist (
-                id INTEGER PRIMARY KEY,
-                pattern TEXT NOT NULL,
-                reason TEXT,
-                created_at TEXT NOT NULL
-            );",
-        )?;
-
         // CLI events table (observability/analytics)
         self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS cli_events (
@@ -1540,37 +1530,6 @@ impl Store {
     }
 
     // ── Graph helpers ────────────────────────────────────────────
-
-    /// Get neighbor file IDs within N hops via wikilinks, in either direction
-    /// (outgoing links and backlinks). Uses Rust-side BFS, not recursive SQL CTE.
-    pub fn get_neighbors(&self, file_id: i64, depth: usize) -> Result<Vec<(i64, usize)>> {
-        use std::collections::VecDeque;
-        let mut visited = HashSet::new();
-        visited.insert(file_id);
-        let mut queue = VecDeque::new();
-        let mut results = Vec::new();
-        queue.push_back((file_id, 0usize));
-        while let Some((current, current_depth)) = queue.pop_front() {
-            if current_depth >= depth {
-                continue;
-            }
-            // Treat wikilinks as undirected for neighbor discovery: follow
-            // links out of `current` and backlinks into it. Edges are stored
-            // directionally (one per [[link]]), but a knowledge-graph neighbor
-            // is related in either direction, so search and context expansion
-            // should surface backlinks too.
-            let outgoing = self.get_outgoing(current, Some("wikilink"))?;
-            let incoming = self.get_incoming(current, Some("wikilink"))?;
-            for (neighbor_id, _) in outgoing.into_iter().chain(incoming) {
-                if visited.insert(neighbor_id) {
-                    let hop = current_depth + 1;
-                    results.push((neighbor_id, hop));
-                    queue.push_back((neighbor_id, hop));
-                }
-            }
-        }
-        Ok(results)
-    }
 
     /// Every wikilink edge touching any of `file_ids`, oriented near-end-first.
     ///
@@ -3551,101 +3510,6 @@ mod tests {
 
         let inc = store.get_incoming(b, Some("mention")).unwrap();
         assert!(inc.is_empty());
-    }
-
-    // ── Graph helper tests ─────────────────────────────────────
-
-    #[test]
-    fn test_get_neighbors_depth_1() {
-        let store = Store::open_memory().unwrap();
-        let f1 = store
-            .insert_file("n/f1.md", "h1", 100, &generate_docid("n/f1.md"), None, None)
-            .unwrap();
-        let f2 = store
-            .insert_file("n/f2.md", "h2", 100, &generate_docid("n/f2.md"), None, None)
-            .unwrap();
-        let f3 = store
-            .insert_file("n/f3.md", "h3", 100, &generate_docid("n/f3.md"), None, None)
-            .unwrap();
-
-        store
-            .insert_edge(f1, DOC_LEVEL, f2, DOC_LEVEL, "wikilink")
-            .unwrap();
-        store
-            .insert_edge(f1, DOC_LEVEL, f3, DOC_LEVEL, "wikilink")
-            .unwrap();
-
-        let neighbors = store.get_neighbors(f1, 1).unwrap();
-        assert_eq!(neighbors.len(), 2);
-
-        let ids: Vec<i64> = neighbors.iter().map(|(id, _)| *id).collect();
-        assert!(ids.contains(&f2));
-        assert!(ids.contains(&f3));
-
-        // All at depth 1.
-        for (_, d) in &neighbors {
-            assert_eq!(*d, 1);
-        }
-    }
-
-    #[test]
-    fn test_get_neighbors_depth_2() {
-        let store = Store::open_memory().unwrap();
-        let f1 = store
-            .insert_file("n/f1.md", "h1", 100, &generate_docid("n/f1.md"), None, None)
-            .unwrap();
-        let f2 = store
-            .insert_file("n/f2.md", "h2", 100, &generate_docid("n/f2.md"), None, None)
-            .unwrap();
-        let f3 = store
-            .insert_file("n/f3.md", "h3", 100, &generate_docid("n/f3.md"), None, None)
-            .unwrap();
-        let f4 = store
-            .insert_file("n/f4.md", "h4", 100, &generate_docid("n/f4.md"), None, None)
-            .unwrap();
-
-        // f1 -> f2 -> f3 -> f4
-        store
-            .insert_edge(f1, DOC_LEVEL, f2, DOC_LEVEL, "wikilink")
-            .unwrap();
-        store
-            .insert_edge(f2, DOC_LEVEL, f3, DOC_LEVEL, "wikilink")
-            .unwrap();
-        store
-            .insert_edge(f3, DOC_LEVEL, f4, DOC_LEVEL, "wikilink")
-            .unwrap();
-
-        let neighbors = store.get_neighbors(f1, 2).unwrap();
-        assert_eq!(neighbors.len(), 2);
-
-        // f2 at depth 1, f3 at depth 2, f4 NOT included.
-        let map: std::collections::HashMap<i64, usize> = neighbors.into_iter().collect();
-        assert_eq!(map[&f2], 1);
-        assert_eq!(map[&f3], 2);
-        assert!(!map.contains_key(&f4));
-    }
-
-    #[test]
-    fn test_get_neighbors_includes_backlinks() {
-        let store = Store::open_memory().unwrap();
-        let f1 = store
-            .insert_file("n/f1.md", "h1", 100, &generate_docid("n/f1.md"), None, None)
-            .unwrap();
-        let f2 = store
-            .insert_file("n/f2.md", "h2", 100, &generate_docid("n/f2.md"), None, None)
-            .unwrap();
-
-        // f2 links to f1; f1 has no outgoing links of its own.
-        store
-            .insert_edge(f2, DOC_LEVEL, f1, DOC_LEVEL, "wikilink")
-            .unwrap();
-
-        // Neighbor discovery is undirected: f1's neighbors include its
-        // backlink f2 even though f1 has no outgoing edge.
-        let neighbors = store.get_neighbors(f1, 1).unwrap();
-        let ids: Vec<i64> = neighbors.iter().map(|(id, _)| *id).collect();
-        assert_eq!(ids, vec![f2]);
-        assert_eq!(neighbors[0].1, 1);
     }
 
     #[test]
