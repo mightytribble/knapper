@@ -41,6 +41,16 @@ pub struct FusedResult {
     pub docid: Option<String>,
     pub lane_contributions: Vec<LaneContribution>,
     pub confidence: f64, // 0-100% normalized score
+    /// The window the sorted stage's cross-encoder scored (#35). `None` under
+    /// the legacy stage, which scores no window.
+    pub emit_text: Option<String>,
+    /// The reranker's own token count of `emit_text`.
+    pub emit_token_count: Option<usize>,
+    /// Whether `[rerank] max_document_chars` cut the window below its section.
+    pub emit_truncated: bool,
+    /// The graph lane's reserve introduced this candidate (sorted stage). The
+    /// legacy stage carries the same fact in `lane_contributions` instead.
+    pub graph_provenance: bool,
 }
 
 /// Per-lane contribution details for --explain output.
@@ -130,6 +140,10 @@ pub fn rrf_fuse(lanes: &[(&str, &[RankedResult], f64)], k: usize) -> Vec<FusedRe
             docid: a.docid,
             lane_contributions: a.lane_contributions,
             confidence: 0.0,
+            emit_text: None,
+            emit_token_count: None,
+            emit_truncated: false,
+            graph_provenance: false,
         })
         .collect();
 
@@ -324,6 +338,10 @@ mod tests {
                     detail: None,
                 },
             ],
+            emit_text: None,
+            emit_token_count: None,
+            emit_truncated: false,
+            graph_provenance: false,
         };
 
         let output = format_explain(&result);

@@ -8,6 +8,7 @@ use crate::config::{GroupBy, RankingMode};
 use crate::fusion::{self, FusedResult, RankedResult};
 use crate::graph;
 use crate::llm::{self, EmbedModel, RerankModel};
+use crate::packaging::est_tokens_fallback;
 use crate::ranking;
 use crate::store::{EdgeStats, Store, StoreStats};
 
@@ -35,6 +36,16 @@ pub struct InternalSearchResult {
     pub heading: Option<String>,
     pub snippet: String,
     pub docid: Option<String>,
+    /// The scored window (#35): the whole chunk at the shipped default.
+    pub text: String,
+    /// The stored breadcrumb, `Note Title > H1 > H2 > H3`, path-rooted (#46).
+    pub heading_path: String,
+    /// Tokens in `text`: the reranker's own count, or `ceil(chars / 3.33)`.
+    pub token_count: usize,
+    /// Whether `[rerank] max_document_chars` cut `text` below its section.
+    pub truncated: bool,
+    /// Which lanes account for this result, in place of a numeric score (#35).
+    pub provenance: crate::packaging::Provenance,
 }
 
 impl SearchResult {
@@ -564,17 +575,11 @@ pub fn search_with_intelligence(
         let results: Vec<InternalSearchResult> = final_fused
             .iter()
             .take(top_n)
-            .map(|f| InternalSearchResult {
-                file_path: f.file_path.clone(),
-                file_id: f.file_id,
-                chunk_seq: f.chunk_seq,
+            .map(|f| {
                 // The cross-encoder's own number, not a fused one. This is the
                 // absolute score layer 2 thresholds on for abstention.
-                score: model_score(f).unwrap_or(f.rrf_score),
-                confidence: f.confidence,
-                heading: f.heading.clone(),
-                snippet: f.snippet.clone(),
-                docid: f.docid.clone(),
+                let score = model_score(f).unwrap_or(f.rrf_score);
+                build_result(config.store, f, config.rerank, score)
             })
             .collect();
 
@@ -729,16 +734,7 @@ pub fn search_with_intelligence(
     let results: Vec<InternalSearchResult> = final_fused
         .iter()
         .take(top_n)
-        .map(|f| InternalSearchResult {
-            file_path: f.file_path.clone(),
-            file_id: f.file_id,
-            chunk_seq: f.chunk_seq,
-            score: f.rrf_score,
-            confidence: f.confidence,
-            heading: f.heading.clone(),
-            snippet: f.snippet.clone(),
-            docid: f.docid.clone(),
-        })
+        .map(|f| build_result(config.store, f, config.rerank, f.rrf_score))
         .collect();
 
     Ok(SearchOutput {
@@ -767,6 +763,66 @@ fn model_score(result: &FusedResult) -> Option<f64> {
         .iter()
         .find(|l| l.lane_name == "rerank")
         .map(|l| l.raw_score)
+}
+
+/// Build the contract row for one fused result (#35).
+///
+/// The window is the one the sorted stage threaded onto the candidate, when it
+/// threaded one. The legacy and degraded paths score no window, so the capped
+/// chunk text is re-derived here instead and its count is the `3.33`
+/// estimate — that is what those two paths are documented to emit.
+/// `heading_path` is metadata, not part of the window invariant, so it is read
+/// from the store here rather than carried on `FusedResult`.
+///
+/// `score` is supplied by the caller rather than derived here, because the two
+/// ranking stages read it differently: the sorted stage reports the
+/// cross-encoder's own probability, the legacy stage the fused RRF score it
+/// has always been the byte-for-byte control for.
+fn build_result(
+    store: &Store,
+    f: &FusedResult,
+    rerank: crate::config::RerankConfig,
+    score: f64,
+) -> InternalSearchResult {
+    let row = store
+        .get_chunk_by_seq(f.file_id, f.chunk_seq)
+        .ok()
+        .flatten();
+    let heading_path = row
+        .as_ref()
+        .map(|c| c.heading_path.clone())
+        .unwrap_or_default();
+    let (text, token_count, truncated) = match &f.emit_text {
+        Some(body) => (
+            body.clone(),
+            f.emit_token_count
+                .unwrap_or_else(|| est_tokens_fallback(body)),
+            f.emit_truncated,
+        ),
+        None => {
+            let raw = row.map(|c| c.text).unwrap_or_default();
+            let raw_chars = raw.chars().count();
+            let body = truncate_chars(raw, rerank.max_document_chars);
+            let truncated = rerank.max_document_chars > 0 && body.chars().count() < raw_chars;
+            let count = est_tokens_fallback(&body);
+            (body, count, truncated)
+        }
+    };
+    InternalSearchResult {
+        file_path: f.file_path.clone(),
+        file_id: f.file_id,
+        chunk_seq: f.chunk_seq,
+        score,
+        confidence: f.confidence,
+        heading: f.heading.clone(),
+        snippet: f.snippet.clone(),
+        docid: f.docid.clone(),
+        text,
+        heading_path,
+        token_count,
+        truncated,
+        provenance: crate::packaging::Provenance::derive(&f.lane_contributions, f.graph_provenance),
+    }
 }
 
 /// The ranking stage of issue #30: the graph reaches the cross-encoder by
@@ -2490,6 +2546,77 @@ mod tests {
                 .any(|d| d.contains("Wyrmsbane invocation")),
             "prepending the title must not replace the chunk"
         );
+    }
+
+    /// A sorted-stage search with a live reranker and the answer floor off, so
+    /// `MockLlm`'s hash-based scores cannot empty the result the way a floor
+    /// fit for a real cross-encoder would (see `sorted_config`).
+    fn search_with_reranker(
+        query: &str,
+        store: &Store,
+        embedder: &mut llm::MockLlm,
+    ) -> SearchOutput {
+        let mut reranker = llm::MockLlm::new(8);
+        let mut config = SearchConfig {
+            fts: crate::config::FtsConfig::default(),
+            scope: crate::tags::Scope::default(),
+            reranker: Some(&mut reranker),
+            store,
+            rerank_candidates: 30,
+            lane_weights: crate::config::LaneWeights::default(),
+            rerank: crate::config::RerankConfig::default(),
+            max_chunks_per_file: 3,
+            group_by: GroupBy::Chunk,
+            ranking: sorted_config(crate::config::RankingConfig::default()),
+        };
+        search_with_intelligence(query, 20, embedder, &mut config).unwrap()
+    }
+
+    /// #35's window invariant: the text a result emits has to be a substring
+    /// of the chunk the cross-encoder actually scored, not a re-truncated copy
+    /// derived independently of it. `vault_with_text_past_the_snippet_boundary`
+    /// answers "warding" past the 200-character snippet, which is what makes
+    /// the invariant worth checking rather than trivially true.
+    #[test]
+    fn every_emitted_window_is_a_substring_of_what_was_scored() {
+        let (_tmp, store, mut embedder) = vault_with_text_past_the_snippet_boundary();
+        let out = search_with_reranker("warding", &store, &mut embedder);
+        assert!(
+            !out.results.is_empty(),
+            "the fixture query answered nothing"
+        );
+        for r in &out.results {
+            let scored = store
+                .get_chunk_texts(&[(r.file_id, r.chunk_seq)])
+                .unwrap()
+                .remove(0)
+                .expect("chunk text");
+            assert!(
+                scored.contains(&r.text),
+                "emitted text for {} is not a substring of the scored chunk",
+                r.file_path
+            );
+            assert!(!r.text.is_empty());
+        }
+    }
+
+    /// #35: a result reports which lanes support it, plus the breadcrumb and
+    /// the token count, in place of a bare number.
+    #[test]
+    fn results_carry_content_provenance_not_a_bare_score() {
+        let (_tmp, store, mut embedder) = vault_with_text_past_the_snippet_boundary();
+        let out = search_with_reranker("warding", &store, &mut embedder);
+        assert!(
+            !out.results.is_empty(),
+            "the fixture query answered nothing"
+        );
+        let top = &out.results[0];
+        assert!(
+            top.provenance.keyword || top.provenance.semantic || top.provenance.graph,
+            "a result with no supporting lane at all is not a real answer"
+        );
+        assert!(!top.heading_path.is_empty());
+        assert!(top.token_count > 0);
     }
 
     /// Issue #25. The cross-encoder's cost is very nearly linear in the text it

@@ -34,6 +34,14 @@ impl Provenance {
     }
 }
 
+/// `ceil(chars / 3.33)`, the documented estimate for a result with no scored
+/// window to read a reranker's own count from (#35). Matches
+/// `RerankModel::count_tokens`'s default; the two are kept separate because
+/// `llm.rs` must not depend on `packaging`.
+pub fn est_tokens_fallback(text: &str) -> usize {
+    (text.chars().count() * 100).div_ceil(333)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -73,5 +81,13 @@ mod tests {
     fn a_legacy_graph_lane_sets_graph_from_its_contribution() {
         let p = Provenance::derive(&[lane("graph")], false);
         assert!(p.graph);
+    }
+
+    /// Pins the rounding: `ceil`, not `floor`, and 3.33 chars per token, not 3.
+    #[test]
+    fn the_fallback_estimate_rounds_up_at_3_33_chars_per_token() {
+        assert_eq!(est_tokens_fallback(&"x".repeat(40)), 13);
+        assert_eq!(est_tokens_fallback(""), 0);
+        assert_eq!(est_tokens_fallback("x"), 1);
     }
 }

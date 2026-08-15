@@ -375,6 +375,7 @@ pub fn into_fused(pool: Vec<Candidate>) -> Vec<FusedResult> {
                     detail: Some(provenance(&c.admitted_by, c.graph_rank)),
                 });
             }
+            let graph_provenance = matches!(c.admitted_by, Source::Graph) || c.graph_rank.is_some();
             FusedResult {
                 file_path: c.file_path,
                 file_id: c.file_id,
@@ -385,6 +386,10 @@ pub fn into_fused(pool: Vec<Candidate>) -> Vec<FusedResult> {
                 docid: c.docid,
                 lane_contributions,
                 confidence: c.rerank_score.map(|s| s * 100.0).unwrap_or(0.0),
+                emit_text: c.emit_text,
+                emit_token_count: c.emit_token_count,
+                emit_truncated: c.emit_truncated,
+                graph_provenance,
             }
         })
         .collect()
@@ -486,6 +491,10 @@ mod tests {
             docid: None,
             lane_contributions: Vec::new(),
             confidence: 0.0,
+            emit_text: None,
+            emit_token_count: None,
+            emit_truncated: false,
+            graph_provenance: false,
         }
     }
 

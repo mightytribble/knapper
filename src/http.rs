@@ -1844,6 +1844,16 @@ mod tests {
             heading: Some("Level 4 Silence".to_string()),
             snippet: "a snippet".to_string(),
             docid: Some("a1b2c3".to_string()),
+            text: "a snippet, past its 200-character cut".to_string(),
+            heading_path: "Warding > Level 4 Silence".to_string(),
+            token_count: 8,
+            truncated: false,
+            provenance: crate::packaging::Provenance {
+                keyword: true,
+                semantic: true,
+                graph: false,
+                linked_from: Vec::new(),
+            },
         }
     }
 
