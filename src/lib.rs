@@ -19,6 +19,7 @@ pub mod migrate;
 pub mod obsidian;
 pub mod onboarding;
 pub mod openapi;
+pub mod packaging;
 pub mod params;
 pub mod placement;
 pub mod prefix;
