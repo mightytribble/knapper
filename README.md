@@ -642,6 +642,11 @@ intelligence = true
 # rerank = 1.0
 # temporal = 0.0
 
+# Adjacent sections of one document are returned as a single block. Default
+# on; set to false for per-section results.
+[ranking]
+# coalesce_adjacent = true
+
 # Prepend document identity to each chunk before embedding. Off by default —
 # it helped conceptual queries and hurt exact-name lookup on the test vault.
 # Needs `engraph index --rebuild` to take effect either way.

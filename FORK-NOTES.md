@@ -68,6 +68,7 @@ The divergence is significant and likely to get worse.
 | `topic` / `who` / `project` removed | the three composite bundles are gone from all three surfaces, and `build_people_edges` with them — the indexer writes no mention edges, and `LINK_RESOLVER_VERSION = 2` clears the stale rows out of an existing store on its next index run. Composites return as vault-defined commands (#71) once #35 defines what a bundle may emit | this fork, issue #73 |
 | `.github/workflows/ci.yml` | manual dispatch only — upstream runs it on push and PR | this fork, Actions minutes |
 | model-wall chunk cap | a single paragraph or table is embedded whole up to the model's `n_ctx_train`, not torn at 512; the target stays 512 and packing is unchanged | this fork, issue #75 |
+| `src/coalesce.rs` | adjacent chunks of one document coalesce into one block after ranking, query-time. Ships on — see #39 | this fork, issue #39 |
 
 Cherry-picked rather than merged: PR #41 branched before upstream's #40 graph fix, so merging the
 branch wholesale would have silently reverted `src/graph.rs`.
@@ -566,6 +567,13 @@ has never executed on this box.
   because `resolve_tag`'s `Extension` variant echoes the proposed tag back rather than naming the tag
   it extends. A `none` term is not checked, and `tags_under` validates no prefix at all: an empty
   subtree is a true answer for a caller exploring.
+- **Adjacent sections of one document coalesce into one result block** (this fork, issue #39).
+  `coalesce_adjacent` runs after the ranking stage, over a contiguous `chunks.seq` run within one
+  file, so it depends on neither the cross-encoder nor the embedder. The block takes its strongest
+  member's score, so abstention is unchanged. It is query-time: it writes nothing, reaches no
+  fingerprint, and re-indexes nothing — toggling it is a config edit with no vault read. It ships
+  on; `coalesce_adjacent = false` is the control and reproduces the per-section output byte for
+  byte.
 
 ## Open work
 
