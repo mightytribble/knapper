@@ -91,7 +91,7 @@ Single vault only. Re-indexing a different vault path triggers a confirmation pr
 
 ## Testing
 
-- Unit tests in each module (`cargo test --lib`) — 897 tests, no network required. `MockLlm` stands in for the embedder and the cross-encoder, so the write, index and search paths all run with no model download. There is no `tests/` directory: a test that reaches the shipped code through the same public API the module tests use belongs beside them, and the two `#[ignore]`d files that used to live there asserted against a copy of the v0.6 pipeline
+- Unit tests in each module (`cargo test --lib`) — 922 tests, no network required. `MockLlm` stands in for the embedder and the cross-encoder, so the write, index and search paths all run with no model download. There is no `tests/` directory: a test that reaches the shipped code through the same public API the module tests use belongs beside them, and the two `#[ignore]`d files that used to live there asserted against a copy of the v0.6 pipeline
 - End to end, against a real binary: `eval/smoke-tags.sh <scratch-home>` drives the CLI, the MCP stdio handshake and the HTTP endpoint against a store seeded with no model. It uses `target/release/engraph` without building it, so build first or a stale binary answers
 - Build requires CMake (for llama.cpp C++ compilation)
 

@@ -101,7 +101,7 @@ export LIBCLANG_PATH="$HOME/.engraph-buildenv/lib/python3.12/site-packages/clang
 export BINDGEN_EXTRA_CLANG_ARGS="-I/usr/lib/gcc/x86_64-linux-gnu/13/include -I/usr/include -I/usr/include/x86_64-linux-gnu"
 
 cargo build --release        # ~10 min cold, ~20s incremental
-cargo test --lib             # 852 pass
+cargo test --lib             # 922 pass
 ```
 
 Each env var exists for a specific failure. Omit one and you get:
@@ -227,8 +227,10 @@ has never executed on this box.
   `.engraph-i43-min120` and fully re-indexed. `-off` is #44's control and reproduces
   `.engraph-i43-min120` row for row, over one SHA-256 of every
   `(path, seq, heading, heading_path, text)`.
-  **`.engraph-i44-on` is the current baseline** — the shipped defaults, the arm
-  `eval/ground-truth.json` is stamped against, and what a new arm should be copied from.
+  **`.engraph-i75-modelwall` is the current baseline** since #75 — the shipped defaults under the
+  model-wall chunk regime (`CHUNKER_VERSION = 4`) on the `c44618d` checkout, the arm
+  `eval/ground-truth.json` is stamped against (#63), and what a new arm should be copied from.
+  `.engraph-i44-on` is its pre-#75 source, and the current binary refuses it on the chunker fingerprint.
   `.engraph-i43-min120` is a record of the previous default, `.engraph-i43-min0` is #43's control,
   and `.engraph-i46-path` is the same configuration as `-min0` under its old name — the last two
   name `chunk_min_chars = 0` in their own `config.toml`, because the default no longer gives it.
@@ -266,10 +268,12 @@ has never executed on this box.
   29% derived rows in the window, and the graph lane in each of them runs over six hub files that have
   no incoming edges. #36's tables use the exclusion. The other tables need a re-run before they can be
   compared with them.
-  The corpus the store indexes is not frozen. Every measurement from #26 to #29 was taken on a 247-file / 1598-chunk store; the
-  pinned vault at `63f33e6` is 266 / 1863 / 1988 edges, because `standalone/mcp-isekai` tracks the
-  live `cc-isekai` repo and it grew in between. Rank tables from either side of that are not
-  comparable. Earlier stores lived in session scratchpads and expired with the sessions.
+  The corpus the store indexes is not frozen. Every measurement from #26 to #29 was taken on a
+  247-file / 1598-chunk store; the current pin is `c44618d` (tag `eval-corpus-v2`) at 240 files /
+  1498 chunks under the shipped `.engraph-i75-modelwall` arm, re-verified by #63, because
+  `standalone/mcp-isekai` tracks the live `cc-isekai` repo and it grew in between. Rank tables from
+  different corpus versions are not comparable. Earlier stores lived in session scratchpads and
+  expired with the sessions.
 - **`[ranking] retrieval_width` is part of the measurement, not a display setting** (#49). Both
   content lanes retrieve this many rows, so a probe table taken at 15 and one taken at 60 are
   different experiments — probe 2's tracked answer is absent at 15 and rank 1 at 60.
@@ -318,7 +322,7 @@ has never executed on this box.
   every vector to its first 256 of 768 — silently, with no config key and no relationship to the
   model loaded. **Every measurement in `eval/` recorded before this was taken at a third of the
   model's dimensionality.**
-- **`CHUNKER_VERSION` is 2, so every store built by an earlier binary re-indexes once on its next
+- **`CHUNKER_VERSION` is 4, so every store built by an earlier binary re-indexes once on its next
   open.** The version is the chunker's *algorithm* input to `chunker_fingerprint`, hand-bumped
   because there is no runtime view of what a function does, and #44's carry rule changed the rules
   while every hashed number stayed the same. It applies to every arm home, whatever its settings, and
