@@ -222,9 +222,11 @@ pub struct Create {
     /// Note content. The CLI reads stdin when this is omitted.
     #[arg(long)]
     pub content: Option<String>,
-    /// Filename, without `.md`.
+    /// Filename for the note. A bare name gets `.md` appended; a name that
+    /// already ends in `.md` is kept. It becomes the note's breadcrumb root,
+    /// so name the file the way it should read as provenance (#47).
     #[arg(long)]
-    pub filename: Option<String>,
+    pub filename: String,
     /// A hint at the note's kind, used for placement.
     #[arg(long)]
     pub type_hint: Option<String>,

@@ -2168,7 +2168,7 @@ mod tests {
         let written = crate::writer::create_note(
             crate::writer::CreateNoteInput {
                 content: content.to_string(),
-                filename: Some("archdragon".into()),
+                filename: "archdragon".into(),
                 type_hint: None,
                 tags: vec![],
                 folder: Some("lore".into()),

@@ -21,7 +21,7 @@ use crate::store::Store;
 #[derive(Debug, Clone)]
 pub struct CreateNoteInput {
     pub content: String,
-    pub filename: Option<String>,
+    pub filename: String,
     pub type_hint: Option<String>,
     pub tags: Vec<String>,
     pub folder: Option<String>,
@@ -121,49 +121,17 @@ pub fn generate_filename(title: &str) -> String {
         .collect()
 }
 
-/// Extract a title from content: first `# heading` or first non-empty line, truncated to 50 chars.
-pub fn extract_title(content: &str) -> String {
-    // If content has frontmatter, check for a title field and skip FM for heading search
-    let (fm, body) = split_frontmatter(content);
-    if !fm.is_empty() {
-        // Check for title: field in frontmatter
-        let (scalars, _, _) = parse_frontmatter_fields(&fm);
-        if let Some(title) = scalars.get("title") {
-            let title = title.trim();
-            if !title.is_empty() {
-                if title.len() > 50 {
-                    return title[..50].to_string();
-                }
-                return title.to_string();
-            }
-        }
-    }
-
-    // Search body (or full content if no FM) for heading or first non-empty line
-    let search_content = if fm.is_empty() {
-        content
+/// A caller-supplied filename, sanitized and given a `.md` extension. A bare
+/// name gets `.md` appended; a name that already ends in `.md` is kept. The
+/// caller names the file — engraph does not guess one from content, because
+/// since #46 the filename is the breadcrumb root of every chunk (#47).
+pub fn normalize_filename(name: &str) -> String {
+    let cleaned = generate_filename(name);
+    if cleaned.ends_with(".md") {
+        cleaned
     } else {
-        body.as_str()
-    };
-    for line in search_content.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if let Some(heading) = trimmed.strip_prefix("# ") {
-            let heading = heading.trim();
-            if heading.len() > 50 {
-                return heading[..50].to_string();
-            }
-            return heading.to_string();
-        }
-        // First non-empty line
-        if trimmed.len() > 50 {
-            return trimmed[..50].to_string();
-        }
-        return trimmed.to_string();
+        format!("{cleaned}.md")
     }
-    "Untitled".to_string()
 }
 
 /// Optional placement suggestion metadata for inbox notes.
@@ -572,18 +540,8 @@ pub fn create_note(
     vault_path: &Path,
     profile: Option<&VaultProfile>,
 ) -> Result<WriteResult> {
-    // Step 1: Determine filename
-    let title = if let Some(ref name) = input.filename {
-        name.clone()
-    } else {
-        extract_title(&input.content)
-    };
-    let filename = generate_filename(&title);
-    let filename = if filename.ends_with(".md") {
-        filename
-    } else {
-        format!("{}.md", filename)
-    };
+    // Step 1: Sanitize the caller's filename and ensure a `.md` extension.
+    let filename = normalize_filename(&input.filename);
 
     // Step 2: Resolve tags
     let resolved_tags = store.resolve_tags(&input.tags)?;
@@ -680,7 +638,7 @@ pub fn create_note(
     // Check for existing file before doing expensive work
     if final_path.exists() {
         bail!(
-            "file already exists at {}, refusing to overwrite",
+            "file already exists at {}; use update to change an existing note, not create",
             final_path.display()
         );
     }
@@ -1723,21 +1681,18 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_title() {
-        assert_eq!(extract_title("# Hello World\nBody"), "Hello World");
-        assert_eq!(extract_title("Just some text"), "Just some text");
+    fn normalize_filename_accepts_a_bare_or_a_full_name() {
+        assert_eq!(normalize_filename("my-file"), "my-file.md");
+        assert_eq!(normalize_filename("my-file.md"), "my-file.md");
     }
 
     #[test]
-    fn test_extract_title_empty() {
-        assert_eq!(extract_title(""), "Untitled");
-    }
-
-    #[test]
-    fn test_extract_title_truncation() {
-        let long_title = "a".repeat(100);
-        let content = format!("# {}\nBody", long_title);
-        assert_eq!(extract_title(&content).len(), 50);
+    fn normalize_filename_strips_path_separators() {
+        // The character filter is the write path's only defence against a
+        // caller naming a file outside its folder, so pin it (#47 scope note).
+        let out = normalize_filename("../etc/passwd");
+        assert!(!out.contains('/'), "a slash survived: {out}");
+        assert_eq!(out, "..etcpasswd.md");
     }
 
     #[test]
@@ -2291,7 +2246,7 @@ mod tests {
         let result = create_note(
             CreateNoteInput {
                 content: "# Swamp\n\nA #type/undead lives here.\n".to_string(),
-                filename: Some("swamp.md".to_string()),
+                filename: "swamp.md".to_string(),
                 type_hint: None,
                 tags: vec!["habitat/swamp".to_string()],
                 folder: None,
@@ -2311,6 +2266,50 @@ mod tests {
             stored_tags(&store, &result.path),
             vec!["habitat/swamp", "type/undead"],
             "the property and the body are peers"
+        );
+    }
+
+    #[test]
+    fn create_refuses_a_colliding_name_and_points_at_update() {
+        use crate::llm::MockLlm;
+
+        let (_tmp, store, root) = setup_vault();
+        let mut embedder = MockLlm::new(256);
+        let input = || CreateNoteInput {
+            content: "# Note\n\nBody.\n".to_string(),
+            filename: "dup".to_string(),
+            type_hint: None,
+            tags: vec![],
+            folder: Some("notes".to_string()),
+            created_by: "test".to_string(),
+            auto_link: Some(false),
+        };
+        create_note(
+            input(),
+            &store,
+            &mut embedder,
+            EmbedComposition::default(),
+            test_chunk_opts(),
+            &root,
+            None,
+        )
+        .expect("the first create writes the note");
+
+        let err = create_note(
+            input(),
+            &store,
+            &mut embedder,
+            EmbedComposition::default(),
+            test_chunk_opts(),
+            &root,
+            None,
+        )
+        .expect_err("a second note at the same path must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("already exists"), "message was: {msg}");
+        assert!(
+            msg.contains("update"),
+            "the error must point the caller at update: {msg}"
         );
     }
 

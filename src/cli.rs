@@ -328,6 +328,21 @@ mod tests {
         assert!(matches!(cli.command, Command::VaultMap(_)), "{cli:?}");
     }
 
+    /// Since #46 the filename is the breadcrumb root of every chunk, so the
+    /// caller names the file — a name is not guessed from content (#47).
+    #[test]
+    fn create_requires_a_filename() {
+        assert!(
+            Cli::try_parse_from(["engraph", "create", "--content", "hi"]).is_err(),
+            "create without --filename must be refused"
+        );
+        assert!(
+            Cli::try_parse_from(["engraph", "create", "--content", "hi", "--filename", "note"])
+                .is_ok(),
+            "create with --filename parses"
+        );
+    }
+
     /// `--explain` prints text and `--json` asks for none, so asking for both
     /// is a usage error and not a flag silently dropped. The conflict lives on
     /// the shared struct now that the command takes one (#62).

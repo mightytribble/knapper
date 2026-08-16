@@ -179,10 +179,10 @@ fn build_create() -> serde_json::Value {
                 "required": true,
                 "content": { "application/json": { "schema": {
                     "type": "object",
-                    "required": ["content"],
+                    "required": ["content", "filename"],
                     "properties": {
                         "content": { "type": "string", "description": "Note content (markdown)" },
-                        "filename": { "type": "string", "description": "Filename without .md" },
+                        "filename": { "type": "string", "description": "Filename for the note: a bare name, or one ending in .md. Becomes the note's breadcrumb root." },
                         "type_hint": { "type": "string", "description": "Type hint for placement" },
                         "tags": { "type": "array", "items": { "type": "string" }, "description": "Tags to apply" },
                         "folder": { "type": "string", "description": "Explicit folder (skips auto-placement)" },

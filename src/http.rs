@@ -1562,7 +1562,7 @@ mod tests {
                     .uri("/api/create")
                     .header("content-type", "application/json")
                     .header("authorization", "Bearer eg_readkey")
-                    .body(Body::from(r##"{"content":"# Test"}"##))
+                    .body(Body::from(r##"{"content":"# Test","filename":"test"}"##))
                     .unwrap(),
             )
             .await
