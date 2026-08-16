@@ -1346,8 +1346,8 @@ mod tests {
         // (#62). The server here is started on `file`, so a call that names
         // `chunk` proves the override rather than the default.
         let (_tmp, mut server) = indexed_server(crate::config::GroupBy::File);
-        // This test asserts per-section output, which is below coalescing;
-        // coalescing has its own tests (#39).
+        // This test asserts per-section output. That output is below
+        // coalescing. Coalescing has its own tests (#39).
         server.ranking.coalesce_adjacent = false;
 
         let by_default = server

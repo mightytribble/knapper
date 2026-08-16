@@ -1918,8 +1918,8 @@ mod tests {
         // `chunk` proves the override rather than the default.
         let (_tmp, mut state) = indexed_state();
         state.group_by = crate::config::GroupBy::File;
-        // This test asserts per-section output, which is below coalescing;
-        // coalescing has its own tests (#39).
+        // This test asserts per-section output. That output is below
+        // coalescing. Coalescing has its own tests (#39).
         state.ranking.coalesce_adjacent = false;
 
         let (status, body) =

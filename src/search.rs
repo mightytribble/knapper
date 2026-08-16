@@ -739,10 +739,11 @@ fn model_score(result: &FusedResult) -> Option<f64> {
         .map(|l| l.raw_score)
 }
 
-/// Build the search output, applying the adjacent-chunk merge once when the
-/// key is on (#39). Both ranking stages converge here, so the pass runs with
-/// the cross-encoder present or absent. `fused` is left per-chunk: it is the
-/// `--explain` record of the fusion step, not the presented result.
+/// Build the search output. Apply the adjacent-chunk merge once, when the
+/// key is on (#39). Both ranking stages converge here. So the pass runs
+/// whether the cross-encoder is present or absent. `fused` stays per-chunk.
+/// It is the `--explain` record of the fusion step. It is not the presented
+/// result.
 fn finalize_search_output(
     results: Vec<InternalSearchResult>,
     fused: Vec<FusedResult>,
@@ -1812,8 +1813,8 @@ mod tests {
             max_chunks_per_file: crate::config::default_max_chunks_per_file(),
             group_by,
             fts: crate::config::FtsConfig::default(),
-            // These helpers test the ranking pipeline, which is below
-            // coalescing; coalescing has its own tests (#39).
+            // These helpers test the ranking pipeline. The ranking pipeline
+            // is below coalescing. Coalescing has its own tests (#39).
             ranking: crate::config::RankingConfig {
                 coalesce_adjacent: false,
                 ..crate::config::RankingConfig::default()
@@ -1945,6 +1946,122 @@ mod tests {
         assert_eq!(
             on, off,
             "coalescing keeps the anchor's score, so the top score is unchanged"
+        );
+    }
+
+    #[test]
+    fn group_by_file_makes_coalescing_a_no_op() {
+        // `group_by = "file"` collapses each file to one section before
+        // coalescing runs. So coalescing finds nothing adjacent to merge.
+        // The result must be the same with coalescing on or off (design
+        // doc, "Composition and control").
+        let (_tmp, store, mut embedder) = indexed_vault();
+
+        let run = |coalesce_adjacent, embedder: &mut llm::MockLlm| {
+            let mut config = SearchConfig {
+                fts: crate::config::FtsConfig::default(),
+                scope: crate::tags::Scope::default(),
+                reranker: None,
+                store: &store,
+                rerank_candidates: 30,
+                lane_weights: crate::config::LaneWeights::default(),
+                rerank: crate::config::RerankConfig::default(),
+                max_chunks_per_file: crate::config::default_max_chunks_per_file(),
+                group_by: GroupBy::File,
+                ranking: crate::config::RankingConfig {
+                    coalesce_adjacent,
+                    ..crate::config::RankingConfig::default()
+                },
+            };
+            search_with_intelligence("warding", 10, embedder, &mut config)
+                .unwrap()
+                .results
+        };
+
+        let with_coalescing = run(true, &mut embedder);
+        let without_coalescing = run(false, &mut embedder);
+
+        let abjuration_with: Vec<&InternalSearchResult> = with_coalescing
+            .iter()
+            .filter(|r| r.file_path == "rules/abjuration-spells.md")
+            .collect();
+        let abjuration_without: Vec<&InternalSearchResult> = without_coalescing
+            .iter()
+            .filter(|r| r.file_path == "rules/abjuration-spells.md")
+            .collect();
+
+        assert_eq!(
+            abjuration_with.len(),
+            1,
+            "group_by = file caps one file to one row: {with_coalescing:#?}"
+        );
+        assert_eq!(
+            abjuration_without.len(),
+            1,
+            "group_by = file caps one file to one row: {without_coalescing:#?}"
+        );
+        assert_eq!(
+            abjuration_with[0].text, abjuration_without[0].text,
+            "group_by = file already collapsed the file to one section, \
+             so coalescing must change nothing"
+        );
+    }
+
+    #[test]
+    fn per_note_cap_bounds_a_coalesced_block_span() {
+        // `per_note_cap` limits how many sections of one file reach the
+        // result, above coalescing. So it also limits how many sections a
+        // coalesced block can span (design doc, "Composition and control").
+        let (_tmp, store, mut embedder) = indexed_vault();
+
+        let abjuration_text = |per_note_cap, embedder: &mut llm::MockLlm| {
+            let mut reranker = llm::MockLlm::new(8);
+            let mut config = SearchConfig {
+                fts: crate::config::FtsConfig::default(),
+                scope: crate::tags::Scope::default(),
+                reranker: Some(&mut reranker),
+                store: &store,
+                rerank_candidates: 30,
+                lane_weights: crate::config::LaneWeights::default(),
+                rerank: crate::config::RerankConfig::default(),
+                max_chunks_per_file: 3,
+                group_by: GroupBy::Chunk,
+                ranking: sorted_config(crate::config::RankingConfig {
+                    coalesce_adjacent: true,
+                    per_note_cap,
+                    ..crate::config::RankingConfig::default()
+                }),
+            };
+            let out = search_with_intelligence("warding", 20, embedder, &mut config).unwrap();
+            out.results
+                .into_iter()
+                .find(|r| r.file_path == "rules/abjuration-spells.md")
+                .map(|r| r.text)
+                .unwrap_or_default()
+        };
+
+        let markers = ["Counterspell", "Dispel Magic", "Dimensional Anchor"];
+
+        // Control: unbounded, the block spans all three sections.
+        let unbounded = abjuration_text(0, &mut embedder);
+        let unbounded_count = markers.iter().filter(|m| unbounded.contains(**m)).count();
+        assert_eq!(
+            unbounded_count, 3,
+            "per_note_cap: 0 must let all three sections merge, got: {unbounded}"
+        );
+
+        // `per_note_cap: 2` bounds the sections available to merge to two, so
+        // the block must span strictly fewer sections than the control.
+        let bounded = abjuration_text(2, &mut embedder);
+        let bounded_count = markers.iter().filter(|m| bounded.contains(**m)).count();
+        assert!(
+            bounded_count < unbounded_count,
+            "per_note_cap: 2 must bound the block to fewer sections than the \
+             unbounded case, got {bounded_count} markers: {bounded}"
+        );
+        assert!(
+            bounded_count <= 2,
+            "per_note_cap: 2 must not let more than 2 sections merge, got: {bounded}"
         );
     }
 
@@ -2854,8 +2971,8 @@ mod tests {
                 .count()
         };
 
-        // This test exercises the ranking pipeline, which is below
-        // coalescing; coalescing has its own tests (#39).
+        // This test exercises the ranking pipeline. The ranking pipeline is
+        // below coalescing. Coalescing has its own tests (#39).
         let legacy = count_for(
             crate::config::RankingConfig {
                 mode: crate::config::RankingMode::Legacy,
@@ -2968,8 +3085,9 @@ mod tests {
                 rerank: crate::config::RerankConfig::default(),
                 max_chunks_per_file: 3,
                 group_by: GroupBy::Chunk,
-                // This test exercises the ranking pipeline, which is below
-                // coalescing; coalescing has its own tests (#39).
+                // This test exercises the ranking pipeline. The ranking
+                // pipeline is below coalescing. Coalescing has its own
+                // tests (#39).
                 ranking: sorted_config(crate::config::RankingConfig {
                     shortlist_cap: 6,
                     per_note_cap,
@@ -3104,8 +3222,9 @@ mod tests {
             rerank: crate::config::RerankConfig::default(),
             max_chunks_per_file: 3,
             group_by: GroupBy::Chunk,
-            // This test exercises the ranking pipeline, which is below
-            // coalescing; coalescing has its own tests (#39).
+            // This test exercises the ranking pipeline. The ranking
+            // pipeline is below coalescing. Coalescing has its own
+            // tests (#39).
             ranking: sorted_config(crate::config::RankingConfig {
                 shortlist_cap: 6,
                 coalesce_adjacent: false,
