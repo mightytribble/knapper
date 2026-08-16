@@ -1,5 +1,6 @@
 pub mod chunker;
 pub mod cli;
+pub mod coalesce;
 pub mod config;
 pub mod context;
 pub mod docid;
