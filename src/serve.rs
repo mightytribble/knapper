@@ -1345,7 +1345,10 @@ mod tests {
         // `group_by` is per call, with the process setting as the default
         // (#62). The server here is started on `file`, so a call that names
         // `chunk` proves the override rather than the default.
-        let (_tmp, server) = indexed_server(crate::config::GroupBy::File);
+        let (_tmp, mut server) = indexed_server(crate::config::GroupBy::File);
+        // This test asserts per-section output, which is below coalescing;
+        // coalescing has its own tests (#39).
+        server.ranking.coalesce_adjacent = false;
 
         let by_default = server
             .search(super::Parameters(search_params(None, false)))

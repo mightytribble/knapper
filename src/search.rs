@@ -555,13 +555,14 @@ pub fn search_with_intelligence(
             })
             .collect();
 
-        return Ok(SearchOutput {
+        return Ok(finalize_search_output(
             results,
-            fused: final_fused,
+            final_fused,
             degraded,
-            retrieval: trace,
-            fts_columns: config.fts.columns(),
-        });
+            trace,
+            config.fts.columns(),
+            config.ranking.coalesce_adjacent,
+        ));
     }
 
     // --- Step 2: RRF Pass 1 (3-lane) ---
@@ -709,13 +710,14 @@ pub fn search_with_intelligence(
         .map(|f| build_result(config.store, f, config.rerank, f.rrf_score))
         .collect();
 
-    Ok(SearchOutput {
+    Ok(finalize_search_output(
         results,
-        fused: final_fused,
-        degraded: false,
-        retrieval: trace,
-        fts_columns: config.fts.columns(),
-    })
+        final_fused,
+        false,
+        trace,
+        config.fts.columns(),
+        config.ranking.coalesce_adjacent,
+    ))
 }
 
 /// A `FusedResult` as the rerank lane needs it.
@@ -735,6 +737,32 @@ fn model_score(result: &FusedResult) -> Option<f64> {
         .iter()
         .find(|l| l.lane_name == "rerank")
         .map(|l| l.raw_score)
+}
+
+/// Build the search output, applying the adjacent-chunk merge once when the
+/// key is on (#39). Both ranking stages converge here, so the pass runs with
+/// the cross-encoder present or absent. `fused` is left per-chunk: it is the
+/// `--explain` record of the fusion step, not the presented result.
+fn finalize_search_output(
+    results: Vec<InternalSearchResult>,
+    fused: Vec<FusedResult>,
+    degraded: bool,
+    trace: RetrievalTrace,
+    fts_columns: Vec<(&'static str, f64)>,
+    coalesce: bool,
+) -> SearchOutput {
+    let results = if coalesce {
+        crate::coalesce::coalesce_adjacent(results)
+    } else {
+        results
+    };
+    SearchOutput {
+        results,
+        fused,
+        degraded,
+        retrieval: trace,
+        fts_columns,
+    }
 }
 
 /// Build the contract row for one fused result (#35).
@@ -1784,7 +1812,12 @@ mod tests {
             max_chunks_per_file: crate::config::default_max_chunks_per_file(),
             group_by,
             fts: crate::config::FtsConfig::default(),
-            ranking: crate::config::RankingConfig::default(),
+            // These helpers test the ranking pipeline, which is below
+            // coalescing; coalescing has its own tests (#39).
+            ranking: crate::config::RankingConfig {
+                coalesce_adjacent: false,
+                ..crate::config::RankingConfig::default()
+            },
             lane_weights: crate::config::LaneWeights::default(),
             scope: crate::tags::Scope::default(),
         };
@@ -1816,6 +1849,103 @@ mod tests {
 
         // Every result names the section it came from.
         assert!(hits.iter().all(|r| r.heading.is_some()));
+    }
+
+    #[test]
+    fn coalescing_runs_with_no_cross_encoder() {
+        // The three adjacent sections of the abjuration file are one block, and the
+        // pass ran with reranker: None — so it does not depend on the model.
+        let (_tmp, store, mut embedder) = indexed_vault();
+        let mut config = SearchConfig {
+            fts: crate::config::FtsConfig::default(),
+            scope: crate::tags::Scope::default(),
+            reranker: None,
+            store: &store,
+            rerank_candidates: 30,
+            lane_weights: crate::config::LaneWeights::default(),
+            rerank: crate::config::RerankConfig::default(),
+            max_chunks_per_file: crate::config::default_max_chunks_per_file(),
+            group_by: GroupBy::Chunk,
+            ranking: crate::config::RankingConfig {
+                coalesce_adjacent: true,
+                ..crate::config::RankingConfig::default()
+            },
+        };
+        let out = search_with_intelligence("warding", 10, &mut embedder, &mut config).unwrap();
+        let abjuration: Vec<&InternalSearchResult> = out
+            .results
+            .iter()
+            .filter(|r| r.file_path == "rules/abjuration-spells.md")
+            .collect();
+        assert_eq!(
+            abjuration.len(),
+            1,
+            "the adjacent sections are one block: {:#?}",
+            out.results
+        );
+        assert!(abjuration[0].text.contains("Counterspell"));
+        assert!(abjuration[0].text.contains("Dispel Magic"));
+        assert!(abjuration[0].text.contains("Dimensional Anchor"));
+    }
+
+    #[test]
+    fn coalescing_off_is_the_per_section_control() {
+        let (_tmp, store, mut embedder) = indexed_vault();
+        let mut config = SearchConfig {
+            fts: crate::config::FtsConfig::default(),
+            scope: crate::tags::Scope::default(),
+            reranker: None,
+            store: &store,
+            rerank_candidates: 30,
+            lane_weights: crate::config::LaneWeights::default(),
+            rerank: crate::config::RerankConfig::default(),
+            max_chunks_per_file: crate::config::default_max_chunks_per_file(),
+            group_by: GroupBy::Chunk,
+            ranking: crate::config::RankingConfig {
+                coalesce_adjacent: false,
+                ..crate::config::RankingConfig::default()
+            },
+        };
+        let out = search_with_intelligence("warding", 10, &mut embedder, &mut config).unwrap();
+        let count = out
+            .results
+            .iter()
+            .filter(|r| r.file_path == "rules/abjuration-spells.md")
+            .count();
+        assert!(count > 1, "with coalescing off each section is its own row");
+    }
+
+    #[test]
+    fn coalescing_preserves_the_top_score_with_a_reranker() {
+        let (_tmp, store, mut embedder) = indexed_vault();
+
+        let top_score = |coalesce: bool, embedder: &mut llm::MockLlm| {
+            let mut reranker = llm::MockLlm::new(8);
+            let mut config = SearchConfig {
+                fts: crate::config::FtsConfig::default(),
+                scope: crate::tags::Scope::default(),
+                reranker: Some(&mut reranker),
+                store: &store,
+                rerank_candidates: 30,
+                lane_weights: crate::config::LaneWeights::default(),
+                rerank: crate::config::RerankConfig::default(),
+                max_chunks_per_file: 3,
+                group_by: GroupBy::Chunk,
+                ranking: sorted_config(crate::config::RankingConfig {
+                    coalesce_adjacent: coalesce,
+                    ..crate::config::RankingConfig::default()
+                }),
+            };
+            let out = search_with_intelligence("warding", 20, embedder, &mut config).unwrap();
+            out.results.first().map(|r| r.score)
+        };
+
+        let on = top_score(true, &mut embedder);
+        let off = top_score(false, &mut embedder);
+        assert_eq!(
+            on, off,
+            "coalescing keeps the anchor's score, so the top score is unchanged"
+        );
     }
 
     /// A vault of one-section files, all carrying the same term, so a lane has
@@ -2724,9 +2854,12 @@ mod tests {
                 .count()
         };
 
+        // This test exercises the ranking pipeline, which is below
+        // coalescing; coalescing has its own tests (#39).
         let legacy = count_for(
             crate::config::RankingConfig {
                 mode: crate::config::RankingMode::Legacy,
+                coalesce_adjacent: false,
                 ..Default::default()
             },
             &mut embedder,
@@ -2736,6 +2869,7 @@ mod tests {
         let sorted = count_for(
             sorted_config(crate::config::RankingConfig {
                 shortlist_cap: 6,
+                coalesce_adjacent: false,
                 ..Default::default()
             }),
             &mut embedder,
@@ -2834,9 +2968,12 @@ mod tests {
                 rerank: crate::config::RerankConfig::default(),
                 max_chunks_per_file: 3,
                 group_by: GroupBy::Chunk,
+                // This test exercises the ranking pipeline, which is below
+                // coalescing; coalescing has its own tests (#39).
                 ranking: sorted_config(crate::config::RankingConfig {
                     shortlist_cap: 6,
                     per_note_cap,
+                    coalesce_adjacent: false,
                     ..Default::default()
                 }),
             };
@@ -2967,8 +3104,11 @@ mod tests {
             rerank: crate::config::RerankConfig::default(),
             max_chunks_per_file: 3,
             group_by: GroupBy::Chunk,
+            // This test exercises the ranking pipeline, which is below
+            // coalescing; coalescing has its own tests (#39).
             ranking: sorted_config(crate::config::RankingConfig {
                 shortlist_cap: 6,
+                coalesce_adjacent: false,
                 ..Default::default()
             }),
         };
