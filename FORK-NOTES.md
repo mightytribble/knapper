@@ -59,6 +59,7 @@ The divergence is significant and likely to get worse.
 | `ranking::retrieval_width` | how deep the content lanes dig is a setting; `top_n` truncates the output and nothing else | this fork, issue #49 |
 | `chunk_min_chars` | a section too short to stand on its own merges into the preceding chunk rather than becoming a row. Ships at 120 — see #43 | this fork, issue #43 |
 | `structure_headings` | a bold-only line opens a section, deeper than any `#` heading and an ancestor of nothing. Ships on — see #44 | this fork, issue #44 |
+| `carry_orphan_headings` | a bodyless heading whose line no descendant breadcrumb or #44 carry keeps — a same-level sibling, a shallower heading, or the end of the file — is folded into a neighbour instead of dropped. Ships on; inert on the pinned corpus — see #54 | this fork, issue #54 |
 | `tags` + `file_tags` | a tag is an attribute of a note, and it joins to the note. Usage and last use are derived, so neither can drift. Upstream keys its vocabulary in `tag_registry`, a flat table with no join to `files` whose `usage_count` counts index events | this fork, issue #60 |
 | `tags::predicate` / `Scope` / `tags_under` | notes filter by tag term (`all`/`any`/`none`) and the vocabulary lists whole or by subtree | this fork, issue #60 |
 | one tag vocabulary on three surfaces | the filter and the vocabulary each carry one name and one parameter set across `engraph list`/`engraph tags`, MCP `list`/`tags` and `GET /api/list`/`GET /api/tags`. A term is a tag path, a trailing `/` names the subtree, `scope` is the alias of `all`, and an unmatched `all`/`any` term is an error naming the nearest tag. Only the container encoding is per-surface: a JSON body reads an array, and a query string reads one comma-separated value, because `serde_urlencoded` reads no sequence | this fork, issue #61 |
@@ -228,10 +229,13 @@ has never executed on this box.
   `.engraph-i43-min120` and fully re-indexed. `-off` is #44's control and reproduces
   `.engraph-i43-min120` row for row, over one SHA-256 of every
   `(path, seq, heading, heading_path, text)`.
-  **`.engraph-i75-modelwall` is the current baseline** since #75 — the shipped defaults under the
-  model-wall chunk regime (`CHUNKER_VERSION = 4`) on the `c44618d` checkout, the arm
-  `eval/ground-truth.json` is stamped against (#63), and what a new arm should be copied from.
-  `.engraph-i44-on` is its pre-#75 source, and the current binary refuses it on the chunker fingerprint.
+  **`.engraph-i75-modelwall` is the baseline `eval/ground-truth.json` is stamped against** (#63) —
+  the shipped defaults on the `c44618d` checkout, a `CHUNKER_VERSION = 4` store built under #75.
+  **`.engraph-i54-on` reproduces its chunk rows exactly under `CHUNKER_VERSION = 5`** (row SHA
+  `3642367f`, 1498 chunks; the orphan-heading carry finds no shape to fire on), and is what a new arm
+  should be copied from now; its `carry_orphan_headings = false` control reproduced the same SHA and is
+  dropped. `.engraph-i44-on` is the pin's pre-#75 source, and the current binary refuses it on the
+  chunker fingerprint.
   `.engraph-i43-min120` is a record of the previous default, `.engraph-i43-min0` is #43's control,
   and `.engraph-i46-path` is the same configuration as `-min0` under its old name — the last two
   name `chunk_min_chars = 0` in their own `config.toml`, because the default no longer gives it.
@@ -323,11 +327,12 @@ has never executed on this box.
   every vector to its first 256 of 768 — silently, with no config key and no relationship to the
   model loaded. **Every measurement in `eval/` recorded before this was taken at a third of the
   model's dimensionality.**
-- **`CHUNKER_VERSION` is 4, so every store built by an earlier binary re-indexes once on its next
+- **`CHUNKER_VERSION` is 5, so every store built by an earlier binary re-indexes once on its next
   open.** The version is the chunker's *algorithm* input to `chunker_fingerprint`, hand-bumped
-  because there is no runtime view of what a function does, and #44's carry rule changed the rules
-  while every hashed number stayed the same. It applies to every arm home, whatever its settings, and
-  it is on top of any key-driven mismatch an arm already has.
+  because there is no runtime view of what a function does: #44's carry rule and #54's orphan-heading
+  carry each changed what the chunker does while every hashed number stayed the same. It applies to
+  every arm home, whatever its settings, and it is on top of any key-driven mismatch an arm already
+  has.
 - **Upgrading past #12 re-indexes the vault on the first `engraph index`.** `run_index_inner` calls
   `store.ensure_embedding_dim`, which rebuilds `chunks_vec` at the model's width and discards every
   chunk indexed at the old one. It is automatic and prints what it is doing, but it is a full

@@ -62,6 +62,17 @@ impl Chunk {
         self.text = format!("{line}\n{}", self.text);
         self.snippet = make_snippet(&self.text);
     }
+
+    /// Put a heading line at the foot of this chunk's text (issue #54).
+    ///
+    /// The backward twin of [`Chunk::prepend_carried`]: a bodyless heading
+    /// whose next heading is shallower, or the end of the file, belongs with
+    /// what preceded it. Its own `heading` and `heading_path` do not change —
+    /// the line labels no chunk, it is only kept in the corpus.
+    fn append_line(&mut self, line: &str) {
+        self.text = format!("{}\n{line}", self.text);
+        self.snippet = make_snippet(&self.text);
+    }
 }
 
 /// Result of parsing a markdown file.
@@ -418,6 +429,15 @@ pub struct ChunkOptions {
     /// Whether a line that is one bold span and nothing else opens a section
     /// (issue #44).
     pub promote_bold: bool,
+    /// Whether a bodyless `#` heading whose line would otherwise be lost is
+    /// carried into a neighbouring chunk instead of dropped (issue #54).
+    ///
+    /// The loss happens when the next heading is not strictly deeper: a
+    /// same-level sibling, a shallower heading, or the end of the file. A
+    /// deeper `#` heading keeps the bodyless one in its breadcrumb, and a
+    /// promoted next line is #44's own carry — neither is governed by this
+    /// flag. `false` reproduces the pre-#54 chunking exactly.
+    pub carry_orphan_headings: bool,
 }
 
 /// Drop a promoted line whose section body is empty.
@@ -517,9 +537,9 @@ pub fn structure_chunk(content: &str, target_tokens: usize, opts: ChunkOptions) 
 
     // Ancestor stack of (level, heading text) for the heading path.
     let mut ancestors: Vec<(u8, String)> = Vec::new();
-    // A heading line skipped for an empty body, waiting for the promoted
-    // section that follows it. See the skip below.
-    let mut carried: Option<String> = None;
+    // Heading lines skipped for an empty body, in file order, waiting to be
+    // prepended to the next emitted section. See the skip below.
+    let mut carried: Vec<String> = Vec::new();
 
     for (i, heading) in headings.iter().enumerate() {
         while ancestors
@@ -535,46 +555,91 @@ pub fn structure_chunk(content: &str, target_tokens: usize, opts: ChunkOptions) 
         let body_start = line_start(heading.line + 1);
         // Next heading of ANY level ends this section: subsections are siblings,
         // not children, for the purpose of chunk content.
-        let body_end = headings
-            .get(i + 1)
-            .map(|next| line_start(next.line))
-            .unwrap_or(content.len());
+        let next = headings.get(i + 1);
+        let body_end = next.map(|n| line_start(n.line)).unwrap_or(content.len());
 
         let heading_line = content[heading_start..body_start].trim_end();
         let body = &content[body_start..body_end.max(body_start)];
 
-        // A heading with no body of its own (immediately followed by a
-        // subheading) would produce a chunk that is nothing but its own title.
-        // Skip it — the text survives in its descendants' heading_path.
+        // A heading with no body of its own would produce a chunk that is
+        // nothing but its own title, so it is not a chunk. Where its line then
+        // goes depends on the next heading:
         //
-        // A promoted line is an ancestor of nothing, so it carries no such
-        // path, and a promoted section under `min_chars` merges into a chunk
-        // that keeps the host's breadcrumb. The skipped heading would then
-        // reach the corpus nowhere. Carry the line into the next section
-        // instead, and only when that section is a promoted one: a heading
-        // with `#` descendants keeps the behaviour above (issue #44).
+        // - a strictly-deeper `#` heading keeps it in a descendant's breadcrumb,
+        //   so nothing need be carried (form A);
+        // - a promoted line is an ancestor of nothing, and a promoted section
+        //   under `min_chars` merges into a chunk that keeps the host's
+        //   breadcrumb, so the skipped heading would reach the corpus nowhere.
+        //   Carry it forward into that section (issue #44). This is not gated by
+        //   `carry_orphan_headings` — it is #44's own carry;
+        // - a same-level sibling, a shallower heading, or the end of the file
+        //   keeps it nowhere, so its line is lost. Carry it — forward into the
+        //   next section for a sibling, backward into the previous chunk for a
+        //   shallower one or the file's end (issue #54).
         if body.trim().is_empty() {
-            if headings.get(i + 1).is_some_and(|next| next.promoted) {
-                carried = Some(heading_line.to_string());
+            let promoted_next = next.is_some_and(|n| n.promoted);
+            let deeper_hash_next = next.is_some_and(|n| !n.promoted && n.level > heading.level);
+            let same_level_next = next.is_some_and(|n| !n.promoted && n.level == heading.level);
+
+            if promoted_next || (opts.carry_orphan_headings && same_level_next) {
+                carried.push(heading_line.to_string());
+            } else if deeper_hash_next {
+                // Ancestor: survives in a descendant's breadcrumb (form A).
+            } else if opts.carry_orphan_headings {
+                // Shallower `#` heading, or end of file: backward.
+                flush_orphans_backward(&mut carried, heading_line, &mut chunks);
             }
             continue;
         }
 
+        let carried_str = (!carried.is_empty()).then(|| carried.join("\n"));
         emit_section(
             body,
             SectionHeading {
                 line: Some(heading_line),
                 path: &path,
-                carried: carried.as_deref(),
+                carried: carried_str.as_deref(),
             },
             target_tokens,
             opts.min_chars,
             &mut chunks,
         );
-        carried = None;
+        carried.clear();
+    }
+
+    // A file that is nothing but headings emits no section, so every heading
+    // line would be lost. Keep them all in one chunk (issue #54). This also
+    // catches a leading run of orphan headings that never found a previous
+    // chunk to fold back into. Gated by the flag: pre-#54 such a file was
+    // empty, and the control must reproduce that.
+    if opts.carry_orphan_headings && chunks.is_empty() && !headings.is_empty() {
+        let text = headings
+            .iter()
+            .map(|h| content[line_start(h.line)..line_start(h.line + 1)].trim_end())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !text.trim().is_empty() {
+            chunks.push(Chunk::from_section(None, &[], &text, false));
+        }
     }
 
     chunks
+}
+
+/// Fold a run of orphaned heading lines onto the foot of the previous chunk.
+///
+/// `line` is the orphan whose next heading is shallower or absent; `carried`
+/// holds any earlier forward-pending orphans that precede it. They travel
+/// together in file order. With no previous chunk to fold into — a leading run
+/// of orphan headings — they stay in `carried`: a later section prepends them,
+/// or `structure_chunk`'s pure-heading net emits them as one chunk (issue #54).
+fn flush_orphans_backward(carried: &mut Vec<String>, line: &str, chunks: &mut [Chunk]) {
+    carried.push(line.to_string());
+    if let Some(host) = chunks.last_mut() {
+        for orphan in carried.drain(..) {
+            host.append_line(&orphan);
+        }
+    }
 }
 
 /// What labels a section when it becomes a chunk.
@@ -1230,12 +1295,24 @@ mod tests {
 
     // ── Structure-first chunking tests ───────────────────────────────────
 
-    /// `ChunkOptions` at a given minimum, with promotion off — the settings
-    /// every test written before #44 was written against.
+    /// `ChunkOptions` at a given minimum, with promotion off and the orphan
+    /// carry off — the settings every test written before #44 was written
+    /// against, and the pre-#54 control.
     fn opts(min_chars: usize) -> ChunkOptions {
         ChunkOptions {
             min_chars,
             promote_bold: false,
+            carry_orphan_headings: false,
+        }
+    }
+
+    /// `ChunkOptions` with the orphan carry on and promotion off — the #54
+    /// on-arm. Promotion is off so a test isolates the carry from #44's own.
+    fn carrying(min_chars: usize) -> ChunkOptions {
+        ChunkOptions {
+            min_chars,
+            promote_bold: false,
+            carry_orphan_headings: true,
         }
     }
 
@@ -1437,6 +1514,148 @@ mod tests {
             chunks[0].heading_path,
             vec!["Parent".to_string(), "Child".to_string()]
         );
+    }
+
+    #[test]
+    fn a_bodyless_heading_above_a_same_level_sibling_keeps_its_line() {
+        // `## Nobody` has no body of its own and its next heading is a
+        // same-level sibling, so no descendant breadcrumb keeps it. With the
+        // carry on, its line rides into the top of the sibling's chunk text —
+        // but not the sibling's breadcrumb (issue #54).
+        let md = format!("## Nobody\n## Body\n{}\n", body(200));
+        let chunks = structure_chunk(&md, 512, carrying(120));
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].heading_path, vec!["Body"]);
+        assert!(
+            chunks[0].text.starts_with("## Nobody\n## Body"),
+            "carried line missing, got: {:?}",
+            chunks[0].text
+        );
+
+        // The control drops the line entirely.
+        let control = structure_chunk(&md, 512, opts(120));
+        assert!(!control[0].text.contains("Nobody"));
+    }
+
+    #[test]
+    fn a_bodyless_heading_above_a_shallower_heading_folds_backward() {
+        // `### Orphan` has no body and its next heading is shallower, so it
+        // closed a nesting under `## Chapter`. Its line folds onto the foot of
+        // the Chapter chunk, and the shallower `## Next` starts clean (#54).
+        let md = format!(
+            "## Chapter\n{}\n\n### Orphan\n## Next\n{}\n",
+            body(200),
+            body(200)
+        );
+        let chunks = structure_chunk(&md, 512, carrying(120));
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].heading_path, vec!["Chapter"]);
+        assert!(
+            chunks[0].text.trim_end().ends_with("### Orphan"),
+            "orphan not folded backward, got: {:?}",
+            chunks[0].text
+        );
+        assert_eq!(chunks[1].heading_path, vec!["Next"]);
+        assert!(!chunks[1].text.contains("Orphan"));
+    }
+
+    #[test]
+    fn a_trailing_bodyless_heading_folds_into_the_previous_chunk() {
+        // A heading at the end of the file has nothing after it, so it folds
+        // backward like a shallower one (#54).
+        let md = format!("## Alpha\n{}\n\n## Trailing\n", body(200));
+        let chunks = structure_chunk(&md, 512, carrying(120));
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].heading_path, vec!["Alpha"]);
+        assert!(chunks[0].text.trim_end().ends_with("## Trailing"));
+
+        // The control drops the trailing line.
+        let control = structure_chunk(&md, 512, opts(120));
+        assert!(!control[0].text.contains("Trailing"));
+    }
+
+    #[test]
+    fn consecutive_bodyless_siblings_all_carry_forward() {
+        // A run of empty same-level headings accumulates and flushes together
+        // into the top of the next section, in file order (#54).
+        let md = format!("## S1\n## S2\n## Real\n{}\n", body(200));
+        let chunks = structure_chunk(&md, 512, carrying(120));
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].heading_path, vec!["Real"]);
+        assert!(chunks[0].text.starts_with("## S1\n## S2\n## Real"));
+    }
+
+    #[test]
+    fn a_leading_orphan_with_no_previous_chunk_rides_the_next_section() {
+        // `### Deep` is the first heading, empty, and its next heading is
+        // shallower. There is no previous chunk to fold back into, so it waits
+        // and is prepended to the following section instead (#54).
+        let md = format!("### Deep\n## Shallow\n{}\n", body(200));
+        let chunks = structure_chunk(&md, 512, carrying(120));
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].heading_path, vec!["Shallow"]);
+        assert!(chunks[0].text.starts_with("### Deep\n## Shallow"));
+    }
+
+    #[test]
+    fn a_file_of_only_headings_becomes_one_chunk() {
+        // Nothing has a body, so no section emits. Every heading line is kept
+        // in one chunk rather than lost (#54).
+        let md = "## A\n## B\n## C\n";
+        let chunks = structure_chunk(md, 512, carrying(120));
+
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].heading.is_none());
+        assert_eq!(chunks[0].text, "## A\n## B\n## C");
+
+        // The control emitted no chunk at all before #54.
+        let control = structure_chunk(md, 512, opts(120));
+        assert!(control.is_empty());
+    }
+
+    #[test]
+    fn the_orphan_carry_and_promotion_compose() {
+        // The shipped defaults run both rules. A same-level empty sibling
+        // carries forward (#54) while a bold-only line still opens its own
+        // section (#44).
+        let shipped = ChunkOptions {
+            min_chars: 120,
+            promote_bold: true,
+            carry_orphan_headings: true,
+        };
+        let md = format!(
+            "## Empty\n## Body\n{}\n\n**Promoted**\n{}\n",
+            body(200),
+            body(200)
+        );
+        let chunks = structure_chunk(&md, 512, shipped);
+
+        assert_eq!(chunks.len(), 2);
+        // #54: the empty sibling rode into the Body chunk's text.
+        assert!(chunks[0].text.starts_with("## Empty\n## Body"));
+        assert_eq!(chunks[0].heading_path, vec!["Body"]);
+        // #44: the bold line still opened its own section.
+        assert_eq!(chunks[1].heading_path, vec!["Body", "Promoted"]);
+    }
+
+    #[test]
+    fn a_bodyless_ancestor_heading_stays_only_in_the_breadcrumb() {
+        // A deeper `#` descendant keeps the ancestor in its breadcrumb, so #54
+        // leaves form A untouched — the line is not carried into the text, at
+        // either setting.
+        let md = format!("# Parent\n## Child\n{}\n", body(200));
+        for options in [carrying(120), opts(120)] {
+            let chunks = structure_chunk(&md, 512, options);
+            assert_eq!(chunks.len(), 1);
+            assert_eq!(chunks[0].heading_path, vec!["Parent", "Child"]);
+            assert!(chunks[0].text.starts_with("## Child"));
+            assert!(!chunks[0].text.contains("# Parent"));
+        }
     }
 
     #[test]
@@ -1649,6 +1868,7 @@ mod tests {
         ChunkOptions {
             min_chars,
             promote_bold: true,
+            carry_orphan_headings: false,
         }
     }
 

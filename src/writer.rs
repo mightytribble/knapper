@@ -2212,6 +2212,7 @@ mod tests {
             ChunkOptions {
                 min_chars: 0,
                 promote_bold: false,
+                carry_orphan_headings: false,
             },
         )
         .unwrap();
@@ -2277,6 +2278,7 @@ mod tests {
         ChunkOptions {
             min_chars: 0,
             promote_bold: false,
+            carry_orphan_headings: false,
         }
     }
 

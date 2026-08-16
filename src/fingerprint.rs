@@ -66,7 +66,15 @@ pub const PARSER_VERSION: u32 = 2;
 /// Version 4 is issue #75: a single over-budget paragraph or table is emitted
 /// whole up to the embed model's input wall, instead of torn at a fixed 512.
 /// The boundaries move where such a block existed.
-pub const CHUNKER_VERSION: u32 = 4;
+///
+/// Version 5 is issue #54: a bodyless heading whose line no descendant
+/// breadcrumb and no #44 carry keeps — a same-level sibling, a shallower
+/// heading, or the end of the file — is carried into a neighbouring chunk
+/// rather than dropped. The text a row holds moves where such a heading
+/// existed. Gated by `carry_orphan_headings`, which the chunker digest also
+/// hashes, so the off arm reproduces version 4 exactly and the version bump is
+/// what re-indexes it once regardless.
+pub const CHUNKER_VERSION: u32 = 5;
 
 /// Bump when what a chunk **row** holds changes, even though the chunk
 /// boundaries do not.
@@ -225,6 +233,10 @@ impl Fingerprints {
                 // which rows exist at all — the same class of change as the
                 // minimum, and the same action.
                 &config.promote_bold_headings.to_string(),
+                // #54: carrying an orphaned heading line changes which chunk a
+                // row's text holds, so it changes the rows — the same class of
+                // change again.
+                &config.carry_orphan_headings.to_string(),
                 &limits::TARGET_TOKENS.to_string(),
                 &limits::OVERLAP_TOKENS.to_string(),
             ]),
@@ -662,6 +674,26 @@ mod tests {
         assert_eq!(comparison.actions(), BTreeSet::from([Action::Reindex]));
     }
 
+    /// Carrying an orphaned heading line changes which chunk a row's text
+    /// holds, so it changes the rows — the same class of change as promotion
+    /// (issue #54).
+    #[test]
+    fn a_changed_orphan_carry_setting_demands_a_reindex() {
+        let store = Store::open_memory().unwrap();
+        record(&store, &fps()).unwrap();
+
+        // `true` ships, so the control arm `false` is a different index.
+        let config = Config {
+            carry_orphan_headings: false,
+            ..Config::default()
+        };
+        let changed = Fingerprints::compute(&config, "embed-model-abc", Some("rerank-model-xyz"));
+
+        let comparison = compare(&store, &changed).unwrap();
+        assert_eq!(comparison.mismatches[0].key, CHUNKER.name);
+        assert_eq!(comparison.actions(), BTreeSet::from([Action::Reindex]));
+    }
+
     /// Each root is a distinct fingerprint, not merely distinct from the
     /// default, so a switch between two non-default arms re-indexes too.
     #[test]
@@ -883,6 +915,7 @@ mod tests {
                 &format!("{:?}", Config::default().breadcrumb_root),
                 &Config::default().chunk_min_chars.to_string(),
                 &Config::default().promote_bold_headings.to_string(),
+                &Config::default().carry_orphan_headings.to_string(),
                 &crate::chunker::limits::TARGET_TOKENS.to_string(),
                 &crate::chunker::limits::OVERLAP_TOKENS.to_string(),
             ]),
@@ -903,6 +936,7 @@ mod tests {
             &format!("{:?}", Config::default().breadcrumb_root),
             &Config::default().chunk_min_chars.to_string(),
             &Config::default().promote_bold_headings.to_string(),
+            &Config::default().carry_orphan_headings.to_string(),
             &crate::chunker::limits::TARGET_TOKENS.to_string(),
             &crate::chunker::limits::OVERLAP_TOKENS.to_string(),
         ]);

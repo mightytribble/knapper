@@ -1112,6 +1112,7 @@ mod tests {
             chunk_opts: crate::chunker::ChunkOptions {
                 min_chars: 0,
                 promote_bold: false,
+                carry_orphan_headings: false,
             },
             output: crate::config::OutputConfig::default(),
         }

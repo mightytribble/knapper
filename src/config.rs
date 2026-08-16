@@ -228,6 +228,22 @@ pub fn default_promote_bold_headings() -> bool {
     true
 }
 
+/// Whether a bodyless heading whose line would otherwise be lost is carried
+/// into a neighbouring chunk (issue #54).
+///
+/// A `#` heading with no body of its own is dropped when the next heading is
+/// not strictly deeper — a same-level sibling, a shallower heading, or the end
+/// of the file — because no descendant breadcrumb keeps it and #44's carry only
+/// covers a promoted next line. The line then leaves the corpus. `true` carries
+/// it: forward into the next section, or backward into the previous chunk when
+/// nothing deeper follows.
+///
+/// `true` ships. `false` is the control and reproduces the pre-#54 chunking
+/// exactly.
+pub fn default_carry_orphan_headings() -> bool {
+    true
+}
+
 /// How the rerank lane presents a candidate to the cross-encoder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -774,6 +790,12 @@ pub struct Config {
     /// it reaches the chunker digest, so a change to it re-indexes the vault.
     #[serde(default = "default_promote_bold_headings")]
     pub promote_bold_headings: bool,
+    /// Carry a bodyless heading's line into a neighbouring chunk rather than
+    /// dropping it when no descendant breadcrumb or #44 carry keeps it (issue
+    /// #54). Like [`Config::chunk_min_chars`] it reaches the chunker digest, so
+    /// a change to it re-indexes the vault.
+    #[serde(default = "default_carry_orphan_headings")]
+    pub carry_orphan_headings: bool,
     #[serde(default)]
     pub identity: IdentityConfig,
     #[serde(default)]
@@ -792,6 +814,7 @@ impl Default for Config {
             breadcrumb_root: BreadcrumbRoot::default(),
             chunk_min_chars: default_chunk_min_chars(),
             promote_bold_headings: default_promote_bold_headings(),
+            carry_orphan_headings: default_carry_orphan_headings(),
             embedding_prefix: PrefixConfig::default(),
             embedding_prompt: EmbeddingPromptConfig::default(),
             exclude: vec![".obsidian/".to_string()],
@@ -853,7 +876,7 @@ impl Config {
         }
     }
 
-    /// The two chunker settings that are config keys, as one value.
+    /// The chunker settings that are config keys, as one value.
     ///
     /// Every path that chunks a file takes this rather than the settings
     /// separately, so no path can carry one and forget the other.
@@ -861,19 +884,21 @@ impl Config {
         crate::chunker::ChunkOptions {
             min_chars: self.chunk_min_chars,
             promote_bold: self.promote_bold_headings,
+            carry_orphan_headings: self.carry_orphan_headings,
         }
     }
 
     /// Put the chunker settings of `opts` back on this config.
     ///
     /// The inverse of [`Config::chunk_options`], and it lives beside it so that
-    /// a third chunker key cannot be added to one and forgotten in the other. A
+    /// a further chunker key cannot be added to one and forgotten in the other. A
     /// long-running session captures `chunk_options()` once at startup, and a
     /// path that has to hand a whole `Config` to the indexer uses this to carry
     /// the session's settings rather than a fresh load's.
     pub fn set_chunk_options(&mut self, opts: crate::chunker::ChunkOptions) {
         self.chunk_min_chars = opts.min_chars;
         self.promote_bold_headings = opts.promote_bold;
+        self.carry_orphan_headings = opts.carry_orphan_headings;
     }
 
     /// Put the embedding composition of `cfg` back on this config.
@@ -1131,6 +1156,19 @@ batch_size = 128
     }
 
     #[test]
+    fn orphan_carry_ships_on_and_false_is_the_control() {
+        // `true` ships. `false` is the control: it reproduces the pre-#54
+        // index, and it reaches `chunk_options` so every chunking path sees it.
+        let bare: Config = toml::from_str("").unwrap();
+        assert!(bare.carry_orphan_headings);
+        assert!(bare.chunk_options().carry_orphan_headings);
+
+        let control: Config = toml::from_str("carry_orphan_headings = false\n").unwrap();
+        assert!(!control.carry_orphan_headings);
+        assert!(!control.chunk_options().carry_orphan_headings);
+    }
+
+    #[test]
     fn output_defaults_are_8192_and_text_on() {
         let c = OutputConfig::default();
         assert_eq!(c.budget_tokens, 8192);
@@ -1152,6 +1190,7 @@ batch_size = 128
         let session = crate::chunker::ChunkOptions {
             min_chars: 0,
             promote_bold: false,
+            carry_orphan_headings: false,
         };
         let mut fresh = Config::default();
         assert_ne!(fresh.chunk_options(), session);
