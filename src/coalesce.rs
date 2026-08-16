@@ -1,17 +1,19 @@
 //! Coalescing adjacent chunks of one document into a single result block (#39).
 //!
-//! A query-time, model-free transform over the ranked result. It runs after
-//! the ranking stage, so it depends on neither the cross-encoder nor the
-//! embedder — only on each result's file, section ordinal, score and text.
+//! This is a query-time transform over the ranked result. It uses no model.
+//! It runs after the ranking stage. It does not depend on the cross-encoder.
+//! It does not depend on the embedder. It reads only each result's file,
+//! section ordinal, score and text.
 
 use crate::packaging::{Provenance, est_tokens_fallback};
 use crate::search::InternalSearchResult;
 
 /// Present each document's abutting sections as one block, in place, over the
-/// ranked result. The block sits at its anchor's (the first member found)
-/// rank, carries the strongest member's score, is headed by its leading
-/// (lowest-`seq`) section, and holds the members' text in document order. It
-/// grows to a contiguous `seq` run and carries no length limit.
+/// ranked result. The block sits at its anchor's rank. The anchor is the
+/// first member found. The block carries the strongest member's score. The
+/// block is headed by its leading section, the one with the lowest `seq`.
+/// The block holds the members' text in document order. The block grows to
+/// a contiguous `seq` run. The block carries no length limit.
 pub fn coalesce_adjacent(results: Vec<InternalSearchResult>) -> Vec<InternalSearchResult> {
     let mut taken = vec![false; results.len()];
     let mut out: Vec<InternalSearchResult> = Vec::with_capacity(results.len());
@@ -55,15 +57,16 @@ pub fn coalesce_adjacent(results: Vec<InternalSearchResult>) -> Vec<InternalSear
     out
 }
 
-/// Fold a group of members (indices into `results`) into one block. Identity
-/// comes from the leading (lowest-`seq`) section, the score from the
-/// strongest member, the text from the members in `seq` order.
+/// Fold a group of members into one block. A member is an index into
+/// `results`. Identity comes from the leading section, the one with the
+/// lowest `seq`. The score comes from the strongest member. The text comes
+/// from the members in `seq` order.
 fn merge_block(results: &[InternalSearchResult], members: &[usize]) -> InternalSearchResult {
     let mut ordered: Vec<&InternalSearchResult> = members.iter().map(|&k| &results[k]).collect();
     ordered.sort_by_key(|m| m.chunk_seq);
     let leading = ordered[0];
 
-    let anchor = ordered
+    let strongest = ordered
         .iter()
         .max_by(|a, b| a.score.total_cmp(&b.score))
         .expect("members is non-empty");
@@ -97,8 +100,8 @@ fn merge_block(results: &[InternalSearchResult], members: &[usize]) -> InternalS
         file_path: leading.file_path.clone(),
         file_id: leading.file_id,
         chunk_seq: leading.chunk_seq,
-        score: anchor.score,
-        confidence: anchor.confidence,
+        score: strongest.score,
+        confidence: strongest.confidence,
         heading: leading.heading.clone(),
         snippet: leading.snippet.clone(),
         docid: leading.docid.clone(),
@@ -143,7 +146,7 @@ mod tests {
         let out = coalesce_adjacent(vec![r(1, 3, 90.0, "A"), r(1, 4, 50.0, "B")]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].chunk_seq, 3, "headed by the leading section");
-        assert_eq!(out[0].score, 90.0, "scored by the anchor");
+        assert_eq!(out[0].score, 90.0, "scored by the strongest member");
         assert_eq!(out[0].text, "A\n\nB", "members in document order");
     }
 
@@ -259,5 +262,26 @@ mod tests {
     #[test]
     fn empty_input_is_empty() {
         assert!(coalesce_adjacent(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn rank_placement_is_independent_of_score_selection() {
+        // File 1's first-encountered row (seq 3, score 50) is not its
+        // strongest member (seq 4, score 80). File 1's block still lands
+        // first, because its first row was encountered first. Its score is
+        // still the max over its members, not the first row's score.
+        let out = coalesce_adjacent(vec![
+            r(1, 3, 50.0, "a1"),
+            r(2, 0, 90.0, "b0"),
+            r(1, 4, 80.0, "a2"),
+        ]);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].file_id, 1, "file 1's row was encountered first");
+        assert_eq!(
+            out[0].score, 80.0,
+            "scored by the strongest member, not the first row"
+        );
+        assert_eq!(out[1].file_id, 2);
+        assert_eq!(out[1].score, 90.0);
     }
 }
