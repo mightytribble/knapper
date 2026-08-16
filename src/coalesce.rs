@@ -8,12 +8,13 @@
 use crate::packaging::{Provenance, est_tokens_fallback};
 use crate::search::InternalSearchResult;
 
-/// Present each document's abutting sections as one block, in place, over the
-/// ranked result. The block sits at its anchor's rank. The anchor is the
-/// first member found. The block carries the strongest member's score. The
-/// block is headed by its leading section, the one with the lowest `seq`.
-/// The block holds the members' text in document order. The block grows to
-/// a contiguous `seq` run. The block carries no length limit.
+/// Present each document's abutting sections as one block. It works in
+/// place. It works over the ranked result. The block sits at its anchor's
+/// rank. The anchor is the first member found. The block carries the
+/// strongest member's score. The block is headed by its leading section,
+/// the one with the lowest `seq`. The block holds the members' text in
+/// document order. The block grows to a contiguous `seq` run. The block
+/// carries no length limit.
 pub fn coalesce_adjacent(results: Vec<InternalSearchResult>) -> Vec<InternalSearchResult> {
     let mut taken = vec![false; results.len()];
     let mut out: Vec<InternalSearchResult> = Vec::with_capacity(results.len());
