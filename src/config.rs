@@ -608,6 +608,11 @@ pub struct RankingConfig {
     /// Probe 4 is the candidate: `archdragon.md` holds ranks 1, 3 and 5, and all
     /// 20 of its results are above the floor.
     pub per_note_cap: usize,
+    /// Present adjacent sections of one document as one result block, after
+    /// ranking (#39). Query-time: it reaches no fingerprint and re-indexes
+    /// nothing. The block takes its strongest section's score, so abstention
+    /// is unchanged. `false` reproduces the per-section output byte for byte.
+    pub coalesce_adjacent: bool,
 }
 
 impl Default for RankingConfig {
@@ -622,6 +627,7 @@ impl Default for RankingConfig {
             tiebreak: Tiebreak::default(),
             answer_floor: default_answer_floor(),
             per_note_cap: 0,
+            coalesce_adjacent: true,
         }
     }
 }
@@ -1376,5 +1382,22 @@ vault_purpose = "notes"
         assert!(config.memory.identity_enabled);
         assert!(config.memory.timeline_enabled);
         assert!(config.memory.mining_enabled);
+    }
+
+    #[test]
+    fn coalesce_adjacent_defaults_on() {
+        assert!(RankingConfig::default().coalesce_adjacent);
+    }
+
+    #[test]
+    fn coalesce_adjacent_reads_false_and_omission_stays_on() {
+        let off: Config = toml::from_str("[ranking]\ncoalesce_adjacent = false\n").unwrap();
+        assert!(!off.ranking.coalesce_adjacent);
+
+        let omitted: Config = toml::from_str("[ranking]\nanswer_floor = 0.0\n").unwrap();
+        assert!(
+            omitted.ranking.coalesce_adjacent,
+            "a [ranking] table that omits the key keeps the default on"
+        );
     }
 }
