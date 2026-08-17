@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased — Address a section by its heading path ([#69](https://github.com/mightytribble/engraph/issues/69))
+## 0.9.0 (2026-08-16) — knapper
+
+The project leaves fork status: engraph, forked at v1.7.2, becomes knapper. The binary, the repository (mightytribble/knapper), the data directory (`~/.knapper/`) and the store file (`knapper.db`, with a read fallback to an existing `engraph.db`) carry the new name. The MIT license and the full git history stay; see `NOTICE`. Versions restart at 0.9.x; 1.0.0 marks the v1 milestone: functional Metal and Docker build pipelines.
+
+### Address a section by its heading path ([#69](https://github.com/mightytribble/engraph/issues/69))
 
 `--section` names a section by its heading text or by its full heading path, and a promoted bold line is one of the sections it reaches. `list --detailed` enumerates the same set, so what the outline prints is what `read` and `update` can name.
 
@@ -16,7 +20,7 @@
 - **`markdown.rs` owns what a heading is** and `chunker.rs` owns which headings start a chunk. The chunker's set is unchanged, so no fingerprint moves and no store re-indexes.
 - **Test count: 893 → 918.**
 
-## Unreleased — List the vault's files ([#68](https://github.com/mightytribble/engraph/issues/68))
+### List the vault's files ([#68](https://github.com/mightytribble/engraph/issues/68))
 
 `engraph list` is the call an agent makes to see a vault it cannot read: every note the scope admits, in path order, one bare path per line, and each note's heading outline under `--detailed`.
 
@@ -35,7 +39,7 @@
 - **The CLI's plain `list` output is one bare path per line** and nothing else — no docid, tags, edge count, or trailing total — so it pipes and `wc -l` is the total. The path is relative to the vault root, the form `read`, `update` and `move` take, so a listed path pastes into the next call. `--json` still answers the full `NoteListItem` array.
 - **Test count: 877 → 893.**
 
-## Unreleased — One name per capability ([#62](https://github.com/mightytribble/engraph/issues/62))
+### One name per capability ([#62](https://github.com/mightytribble/engraph/issues/62))
 
 Every capability now has one name and one parameter set on the CLI, the MCP server and the HTTP API. The name is one word in `kebab-case`, and each surface spells it its own way: the CLI command as written, the MCP tool with `-` as `_`, and the HTTP route under `/api/` and the name. One transform gets from any spelling to any other.
 
@@ -75,6 +79,10 @@ Every capability now has one name and one parameter set on the CLI, the MCP serv
 - **A read-only server refuses `index` and `init {mode: apply}`** on both servers, as it already refused the write calls.
 - **MCP tools: 26 → 20. HTTP routes: 29 → 23** (27 under `/api` → 21, beside the `/api/health-check` liveness probe and the two discovery routes). **CLI top-level commands: 13 → 24** — twenty capabilities plus `configure`, `models`, `clear` and `serve`, which configure the process and not the vault.
 - **Test count: 785 → 851.**
+
+---
+
+Entries below this line describe the upstream engraph lineage (https://github.com/devwhodevs/engraph).
 
 ## v1.6.1 — Patch Release (2026-04-21)
 
