@@ -1,8 +1,11 @@
 name: Release
 
 on:
-  push:
-    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.9.0)"
+        required: true
 
 jobs:
   build:
@@ -11,14 +14,16 @@ jobs:
       matrix:
         include:
           - os: macos-14
-            archive: engraph-macos-arm64.tar.gz
+            archive: knapper-macos-arm64.tar.gz
           - os: ubuntu-latest
-            archive: engraph-linux-x86_64.tar.gz
+            archive: knapper-linux-x86_64.tar.gz
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
       - name: Install CMake (Ubuntu)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y cmake
@@ -27,7 +32,7 @@ jobs:
       - name: Archive binary
         run: |
           cd target/release
-          tar czf ../../${{ matrix.archive }} engraph
+          tar czf ../../${{ matrix.archive }} knapper
           cd ../..
       - uses: softprops/action-gh-release@v2
         with:
@@ -37,14 +42,14 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - name: Get tag version
-        id: tag
-        run: echo "version=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
 
       - name: Compute source tarball SHA256
         id: sha
         run: |
-          url="https://github.com/devwhodevs/engraph/archive/refs/tags/${{ steps.tag.outputs.version }}.tar.gz"
+          url="https://github.com/mightytribble/knapper/archive/refs/tags/${{ inputs.tag }}.tar.gz"
           sha=$(curl -sL "$url" | sha256sum | cut -d' ' -f1)
           echo "sha256=$sha" >> "$GITHUB_OUTPUT"
 
@@ -52,14 +57,14 @@ jobs:
         env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
-          git clone https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/devwhodevs/homebrew-tap.git
+          git clone https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/mightytribble/homebrew-tap.git
           cd homebrew-tap
 
-          cat > Formula/engraph.rb << 'FORMULA'
-          class Engraph < Formula
-            desc "Local semantic search for Obsidian vaults"
-            homepage "https://github.com/devwhodevs/engraph"
-            url "https://github.com/devwhodevs/engraph/archive/refs/tags/TAG.tar.gz"
+          cat > Formula/knapper.rb << 'FORMULA'
+          class Knapper < Formula
+            desc "Local hybrid search and MCP retrieval for Obsidian-format vaults"
+            homepage "https://github.com/mightytribble/knapper"
+            url "https://github.com/mightytribble/knapper/archive/refs/tags/TAG.tar.gz"
             sha256 "SHA256"
             license "MIT"
 
@@ -71,19 +76,19 @@ jobs:
             end
 
             test do
-              assert_match "engraph", shell_output("#{bin}/engraph --help")
+              assert_match "knapper", shell_output("#{bin}/knapper --help")
             end
           end
           FORMULA
 
-          sed -i "s|TAG|${{ steps.tag.outputs.version }}|g" Formula/engraph.rb
-          sed -i "s|SHA256|${{ steps.sha.outputs.sha256 }}|g" Formula/engraph.rb
+          sed -i "s|TAG|${{ inputs.tag }}|g" Formula/knapper.rb
+          sed -i "s|SHA256|${{ steps.sha.outputs.sha256 }}|g" Formula/knapper.rb
 
           # Remove leading whitespace from heredoc
-          sed -i 's/^          //' Formula/engraph.rb
+          sed -i 's/^          //' Formula/knapper.rb
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Formula/engraph.rb
-          git commit -m "Update engraph to ${{ steps.tag.outputs.version }}"
+          git add Formula/knapper.rb
+          git commit -m "Update knapper to ${{ inputs.tag }}"
           git push
