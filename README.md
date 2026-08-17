@@ -23,7 +23,18 @@ Plain vector search treats your notes as isolated documents. But knowledge isn't
 
 ## The Split from Engraph
 
-I originally investigated Engraph because it seemed to meet my needs - proper hybrid search + wikilinks search across an Obsidian vault, provided via MCP. Unfortunately the actual search implementation wasn't what I wanted, and many aspects of the API seemed to be the result of organic growth and aspirational design rather than tested, implemented methods. It also at the time seemed abandoned by the developer - 3 months stale and with several critical bugfix PRs outstanding. A private fork was the obvious place to start, but after working on it for a week or so it became obvious that I was ripping out more of the original code to fit it into what I wanted and fix existing bugs. I can see that trend continuing, so it made sense to drop the pretence that this was a fork, acknowledge with gratitude the bones upon which `knapper` is built, and move on.  
+I originally investigated Engraph because it seemed to meet my needs - proper hybrid search + wikilinks search across an Obsidian vault, provided via MCP. Unfortunately the actual search implementation wasn't what I wanted, and many aspects of the API seemed to be the result of organic growth and aspirational design rather than tested, implemented methods. It also at the time seemed abandoned by the developer - 3 months stale and with several critical bugfix PRs outstanding. A private fork was the obvious place to start, but after working on it for a week or so it became obvious that I was ripping out more of the original code to fit it into what I wanted and fix existing bugs. I can see that trend continuing, so it made sense to drop the pretence that this was a fork, acknowledge with gratitude the bones upon which `knapper` is built, and move on.
+
+Main Changes from Engraph:
+
+- The search lanes now correctly include the `graph` lane, with a 1-hop personal page rank implementation.
+- Searches can be filtered by tag and directory either by inclusion, exclusion, or a combination thereof, using a common vocabulary.
+- The chunker has been completely re-worked and optimized for markdown ingest (chunking by section, handling empty sections, etc).
+- The three endpoints (`knapper CLI`, `MCP` and `http`) have all been normalized to a single command and parameter surface.
+- `knapper` can now correctly list, read, and edit content in markdown using resolvable breadcrumbs. 
+- breadcrumbs now correctly contribute to search results.
+- CUDA builds are now possible, utilizing local GPU resources to vastly improve embedding and cross-encoding times (approx x30 speedup).
+- Dead and aspirational code has been removed, pending new implementations.
 
 ## What problem it solves
 
