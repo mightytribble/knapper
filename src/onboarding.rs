@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use console::style;
 use serde_json::json;
 
-use crate::config::Config;
+use crate::config::{Config, db_path};
 use crate::identity::{L1Summary, extract_l1_facts};
 use crate::indexer::{IndexResult, IndexSettings, run_index};
 use crate::profile::{
@@ -384,7 +384,7 @@ pub fn run_interactive(
         }
 
         // ── L1 Extraction ──
-        let db_path = data_dir.join("engraph.db");
+        let db_path = db_path(data_dir);
         if db_path.exists() {
             let store = Store::open(&db_path)?;
             if let Ok(Some(vault_profile)) = Config::load_vault_profile() {
@@ -463,7 +463,7 @@ pub fn run_detect_json(vault_path: &Path) -> Result<serde_json::Value> {
 
     // Check for existing index
     let data_dir = Config::data_dir()?;
-    let db_path = data_dir.join("engraph.db");
+    let db_path = db_path(&data_dir);
 
     let (existing_index, active_projects, key_people) = if db_path.exists() {
         let store = Store::open(&db_path)?;
@@ -595,7 +595,7 @@ pub fn run_apply_json(
 
     // ── L1 Extraction ──
     let l1_summary = if !flags.identity_only {
-        let db_path = data_dir.join("engraph.db");
+        let db_path = db_path(data_dir);
         if db_path.exists() {
             let store = Store::open(&db_path)?;
             if let Some(ref vp) = vault_profile {

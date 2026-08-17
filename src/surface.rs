@@ -382,7 +382,7 @@ mod tests {
 
     #[test]
     fn the_mcp_server_registers_what_the_table_names() {
-        let actual: BTreeSet<String> = crate::serve::EngraphServer::tool_router()
+        let actual: BTreeSet<String> = crate::serve::KnapperServer::tool_router()
             .list_all()
             .into_iter()
             .map(|t| t.name.to_string())
@@ -449,7 +449,7 @@ mod tests {
         let cmd = crate::cli::Cli::command();
         let mut checked = 0;
 
-        for tool in crate::serve::EngraphServer::tool_router().list_all() {
+        for tool in crate::serve::KnapperServer::tool_router().list_all() {
             let name = tool.name.to_string();
             let capability = CAPABILITIES
                 .iter()
@@ -524,7 +524,7 @@ mod tests {
     #[test]
     fn every_exempt_argument_exists_and_says_why() {
         let cmd = crate::cli::Cli::command();
-        let tools = crate::serve::EngraphServer::tool_router().list_all();
+        let tools = crate::serve::KnapperServer::tool_router().list_all();
 
         for capability in CAPABILITIES {
             let subcommand = cmd
@@ -602,7 +602,7 @@ mod tests {
             "the CLI still declares --folder"
         );
 
-        let tool = crate::serve::EngraphServer::tool_router()
+        let tool = crate::serve::KnapperServer::tool_router()
             .list_all()
             .into_iter()
             .find(|t| t.name == "list")

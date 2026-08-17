@@ -18,7 +18,7 @@ use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "engraph",
+    name = "knapper",
     version,
     about = "Local semantic search for Obsidian vaults"
 )]

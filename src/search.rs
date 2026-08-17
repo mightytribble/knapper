@@ -4,7 +4,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde_json::json;
 
-use crate::config::{GroupBy, RankingMode};
+use crate::config::{GroupBy, RankingMode, db_path};
 use crate::fusion::{self, FusedResult, RankedResult};
 use crate::graph;
 use crate::llm::{self, EmbedModel, RerankModel};
@@ -1248,7 +1248,7 @@ pub fn run_search(
     let mut embedder =
         crate::llm::LlamaEmbed::new(&models_dir, config).context("loading embedder")?;
 
-    let db_path = data_dir.join("engraph.db");
+    let db_path = db_path(data_dir);
     let store = Store::open(&db_path).context("opening store")?;
     store.verify_embedding_dim(embedder.dim())?;
 
@@ -1373,7 +1373,7 @@ fn collect_status(store: &Store, data_dir: &Path) -> Result<StatusInputs> {
     let date_count = store.count_files_with_dates().unwrap_or(0);
 
     // Compute index size on disk (sqlite db file).
-    let index_size = std::fs::metadata(data_dir.join("engraph.db"))
+    let index_size = std::fs::metadata(db_path(data_dir))
         .map(|m| m.len())
         .unwrap_or(0);
 
@@ -1395,7 +1395,7 @@ fn collect_status(store: &Store, data_dir: &Path) -> Result<StatusInputs> {
 /// Run the status command and print index information. The CLI holds no
 /// store, so this opens one.
 pub fn run_status(json: bool, data_dir: &Path) -> Result<()> {
-    let store = Store::open(&data_dir.join("engraph.db")).context("opening store")?;
+    let store = Store::open(&db_path(data_dir)).context("opening store")?;
     let s = collect_status(&store, data_dir)?;
     let output = format_status(
         &s.stats,

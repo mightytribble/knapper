@@ -11,7 +11,7 @@ pub struct CorrectionInfo {
     pub actual_folder: String,
 }
 
-const ENGRAPH_AGENTS: &[&str] = &["claude-code", "cli", "mcp-server"];
+const KNAPPER_AGENTS: &[&str] = &["claude-code", "cli", "mcp-server"];
 
 #[derive(Debug, Clone)]
 pub struct PlacementResult {
@@ -335,7 +335,7 @@ pub fn detect_correction_from_frontmatter(
 
     // Guard: created_by must exist and match a known engraph agent
     let agent = created_by?;
-    if !ENGRAPH_AGENTS.contains(&agent.as_str()) {
+    if !KNAPPER_AGENTS.contains(&agent.as_str()) {
         return None;
     }
 

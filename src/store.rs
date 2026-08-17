@@ -4633,7 +4633,7 @@ mod tests {
     #[test]
     fn reopening_a_database_recovers_its_width_without_guessing() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("engraph.db");
+        let path = dir.path().join("test.db");
         {
             let store = Store::open(&path).unwrap();
             store.ensure_embedding_dim(768).unwrap();
@@ -5158,7 +5158,7 @@ mod tests {
         // The migration rebuilds the table to widen the unique key, which is the
         // one operation that could silently lose the whole graph.
         let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("engraph.db");
+        let path = dir.path().join("test.db");
         let (a, b) = {
             let store = Store::open(&path).unwrap();
             let a = file(&store, "a.md");

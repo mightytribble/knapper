@@ -710,7 +710,7 @@ pub fn default_answer_floor() -> f64 {
     0.30
 }
 
-/// Application configuration, loaded from `~/.engraph/config.toml` with CLI overrides.
+/// Application configuration, loaded from `~/.knapper/config.toml` with CLI overrides.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -836,14 +836,29 @@ impl Default for Config {
     }
 }
 
+/// The store's file name before the rename.
+const LEGACY_DB_NAME: &str = "engraph.db";
+
+/// The store file inside `dir`: `knapper.db`. A directory holding only a
+/// [`LEGACY_DB_NAME`] written before the rename keeps it, so no store
+/// migrates.
+pub fn db_path(dir: &Path) -> PathBuf {
+    let new = dir.join("knapper.db");
+    if new.exists() {
+        return new;
+    }
+    let legacy = dir.join(LEGACY_DB_NAME);
+    if legacy.exists() { legacy } else { new }
+}
+
 impl Config {
-    /// Canonical data directory: `~/.engraph/`.
+    /// Canonical data directory: `~/.knapper/`.
     pub fn data_dir() -> Result<PathBuf> {
         let home = dirs::home_dir().context("could not determine home directory")?;
-        Ok(home.join(".engraph"))
+        Ok(home.join(".knapper"))
     }
 
-    /// Load config from `~/.engraph/config.toml`, falling back to defaults.
+    /// Load config from `~/.knapper/config.toml`, falling back to defaults.
     pub fn load() -> Result<Self> {
         let config_path = Self::data_dir()?.join("config.toml");
 
@@ -923,7 +938,7 @@ impl Config {
         }
     }
 
-    /// Load vault profile from `~/.engraph/vault.toml`, if it exists.
+    /// Load vault profile from `~/.knapper/vault.toml`, if it exists.
     pub fn load_vault_profile() -> Result<Option<crate::profile::VaultProfile>> {
         let dir = Self::data_dir()?;
         crate::profile::load_vault_toml(&dir)
@@ -951,7 +966,7 @@ impl Config {
         Ok(config)
     }
 
-    /// Save to the default config path (`~/.engraph/config.toml`).
+    /// Save to the default config path (`~/.knapper/config.toml`).
     pub fn save(&self) -> Result<()> {
         let path = Self::data_dir()?.join("config.toml");
         std::fs::create_dir_all(path.parent().unwrap())?;
@@ -998,9 +1013,22 @@ mod tests {
     }
 
     #[test]
-    fn data_dir_ends_with_engraph() {
+    fn data_dir_ends_with_knapper() {
         let dir = Config::data_dir().unwrap();
-        assert!(dir.ends_with(".engraph"));
+        assert!(dir.ends_with(".knapper"));
+    }
+
+    #[test]
+    fn db_path_prefers_the_new_name_and_falls_back_to_a_legacy_store() {
+        let dir = tempfile::tempdir().unwrap();
+        // A fresh directory gets the new name.
+        assert!(db_path(dir.path()).ends_with("knapper.db"));
+        // A directory holding only a pre-rename store keeps it.
+        std::fs::write(dir.path().join(LEGACY_DB_NAME), b"x").unwrap();
+        assert!(db_path(dir.path()).ends_with(LEGACY_DB_NAME));
+        // The new name wins when both exist.
+        std::fs::write(dir.path().join("knapper.db"), b"x").unwrap();
+        assert!(db_path(dir.path()).ends_with("knapper.db"));
     }
 
     #[test]
@@ -1252,7 +1280,7 @@ batch_size = 128
 
     #[test]
     fn load_from_nonexistent_file_returns_defaults() {
-        // Config::load() reads from ~/.engraph/config.toml.
+        // Config::load() reads from ~/.knapper/config.toml.
         // If it doesn't exist, defaults are fine. We test the parsing path
         // separately above. This just ensures load() doesn't panic.
         let cfg = Config::load().unwrap();

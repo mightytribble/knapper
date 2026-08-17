@@ -41,9 +41,9 @@ fn prompt_intelligence(data_dir: &std::path::Path) -> Result<bool> {
     Ok(enable)
 }
 
-/// Check whether an index has been built by looking for engraph.db in data_dir.
+/// Check whether an index has been built by looking for the store file in data_dir.
 fn index_exists(data_dir: &std::path::Path) -> bool {
-    data_dir.join("engraph.db").exists()
+    config::db_path(data_dir).exists()
 }
 
 /// Remove a file, ignoring NotFound errors.
@@ -75,7 +75,7 @@ fn open_vault(data_dir: &Path) -> Result<(store::Store, PathBuf, Option<VaultPro
         eprintln!("No index found. Run 'engraph index <path>' first.");
         std::process::exit(1);
     }
-    let store = store::Store::open(&data_dir.join("engraph.db"))?;
+    let store = store::Store::open(&config::db_path(data_dir))?;
     let vault_path = store.get_meta("vault_path")?.ok_or_else(|| {
         anyhow::anyhow!("No vault path in index. Run 'engraph index <path>' first.")
     })?;
@@ -169,7 +169,7 @@ async fn main() -> Result<()> {
             std::fs::create_dir_all(&data_dir)?;
 
             // Check for vault mismatch: if store has a different vault path, warn.
-            let db_path = data_dir.join("engraph.db");
+            let db_path = config::db_path(&data_dir);
             if db_path.exists() && !rebuild {
                 let store = store::Store::open(&db_path)?;
                 if let Some(stored_vault) = store.get_meta("vault_path")? {
@@ -402,15 +402,15 @@ async fn main() -> Result<()> {
 
         Command::Clear { all } => {
             if all {
-                // Delete entire ~/.engraph/ directory.
+                // Delete entire ~/.knapper/ directory.
                 if remove_dir_if_exists(&data_dir)? {
                     println!("Removed {}", data_dir.display());
                 } else {
                     println!("Nothing to clear (data directory does not exist).");
                 }
             } else {
-                // Delete only index files: engraph.db.
-                let db_path = data_dir.join("engraph.db");
+                // Delete only index files.
+                let db_path = config::db_path(&data_dir);
                 if remove_if_exists(&db_path)? {
                     println!("Removed {}", db_path.display());
                 } else {
@@ -501,7 +501,7 @@ async fn main() -> Result<()> {
 
         Command::Identity(args) => {
             let json = cli.json;
-            let db_path = data_dir.join("engraph.db");
+            let db_path = config::db_path(&data_dir);
             if !db_path.exists() {
                 anyhow::bail!("No index found. Run `engraph init` first.");
             }
@@ -977,7 +977,7 @@ async fn main() -> Result<()> {
                 eprintln!("No index found. Run 'engraph index <path>' first.");
                 std::process::exit(1);
             }
-            let db_path = data_dir.join("engraph.db");
+            let db_path = config::db_path(&data_dir);
             let store = store::Store::open(&db_path)?;
             let vault_path_str = store
                 .get_meta("vault_path")?
@@ -1045,7 +1045,7 @@ async fn main() -> Result<()> {
             // reading it means loading the GGUF (issue #12). Report what the
             // index was actually built at instead — the number that matters
             // operationally — and say so plainly.
-            let indexed_dim = store::Store::open(&data_dir.join("engraph.db"))
+            let indexed_dim = store::Store::open(&config::db_path(&data_dir))
                 .ok()
                 .and_then(|s| s.vec_table_dim().ok().flatten());
             match action {

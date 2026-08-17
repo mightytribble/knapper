@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use tracing::info;
 
 use crate::chunker::{chunk_markdown, split_oversized_chunks};
-use crate::config::Config;
+use crate::config::{Config, db_path};
 use crate::docid::generate_docid;
 use crate::exclude::ExcludeMatcher;
 use crate::graph::{Wikilink, extract_wikilinks};
@@ -628,7 +628,7 @@ pub fn run_index(
     let data_dir = Config::data_dir()?;
     std::fs::create_dir_all(&data_dir)?;
 
-    let db_path = data_dir.join("engraph.db");
+    let db_path = db_path(&data_dir);
     let store = Store::open(&db_path)?;
 
     let models_dir = data_dir.join("models");

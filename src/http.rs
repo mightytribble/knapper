@@ -235,14 +235,14 @@ pub fn authorize(
     Ok(())
 }
 
-/// Generate a new API key with `eg_` prefix + 32 hex chars.
+/// Generate a new API key with `kn_` prefix + 32 hex chars.
 pub fn generate_api_key() -> String {
     use rand::Rng;
     let mut rng = rand::rng();
     let hex: String = (0..32)
         .map(|_| format!("{:x}", rng.random_range(0..16u8)))
         .collect();
-    format!("eg_{hex}")
+    format!("kn_{hex}")
 }
 
 // ---------------------------------------------------------------------------
@@ -1038,12 +1038,12 @@ mod tests {
             cors_origins: vec![],
             api_keys: vec![
                 ApiKeyConfig {
-                    key: "eg_readkey".into(),
+                    key: "kn_readkey".into(),
                     name: "reader".into(),
                     permissions: "read".into(),
                 },
                 ApiKeyConfig {
-                    key: "eg_writekey".into(),
+                    key: "kn_writekey".into(),
                     name: "writer".into(),
                     permissions: "write".into(),
                 },
@@ -1119,7 +1119,7 @@ mod tests {
     #[test]
     fn test_validate_api_key_valid() {
         let config = test_http_config();
-        let result = validate_api_key("eg_readkey", &config);
+        let result = validate_api_key("kn_readkey", &config);
         assert!(result.is_some());
         assert_eq!(result.unwrap().permissions, "read");
     }
@@ -1127,14 +1127,14 @@ mod tests {
     #[test]
     fn test_validate_api_key_invalid() {
         let config = test_http_config();
-        assert!(validate_api_key("eg_badkey", &config).is_none());
+        assert!(validate_api_key("kn_badkey", &config).is_none());
     }
 
     #[test]
     fn test_generate_api_key_format() {
         let key = generate_api_key();
-        assert!(key.starts_with("eg_"));
-        assert_eq!(key.len(), 35); // "eg_" + 32 hex chars
+        assert!(key.starts_with("kn_"));
+        assert_eq!(key.len(), 35); // "kn_" + 32 hex chars
     }
 
     #[test]
@@ -1185,7 +1185,7 @@ mod tests {
             .oneshot(
                 axum::http::Request::builder()
                     .uri("/api/vault-map")
-                    .header("authorization", "Bearer eg_badkey")
+                    .header("authorization", "Bearer kn_badkey")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1202,7 +1202,7 @@ mod tests {
             .oneshot(
                 axum::http::Request::builder()
                     .uri("/api/vault-map")
-                    .header("authorization", "Bearer eg_readkey")
+                    .header("authorization", "Bearer kn_readkey")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1219,7 +1219,7 @@ mod tests {
             .oneshot(
                 axum::http::Request::builder()
                     .uri("/api/health")
-                    .header("authorization", "Bearer eg_readkey")
+                    .header("authorization", "Bearer kn_readkey")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1274,7 +1274,7 @@ mod tests {
                     .method("POST")
                     .uri("/api/index")
                     .header("content-type", "application/json")
-                    .header("authorization", "Bearer eg_readkey")
+                    .header("authorization", "Bearer kn_readkey")
                     .body(Body::from(r#"{}"#))
                     .unwrap(),
             )
@@ -1313,7 +1313,7 @@ mod tests {
                     .method("POST")
                     .uri("/api/search")
                     .header("content-type", "application/json")
-                    .header("authorization", "Bearer eg_readkey")
+                    .header("authorization", "Bearer kn_readkey")
                     .body(Body::from(r#"{"query":"warding","all":["type/undead"]}"#))
                     .unwrap(),
             )
@@ -1334,7 +1334,7 @@ mod tests {
                     .method("POST")
                     .uri("/api/search")
                     .header("content-type", "application/json")
-                    .header("authorization", "Bearer eg_readkey")
+                    .header("authorization", "Bearer kn_readkey")
                     .body(Body::from(r#"{"query":"warding","all":["/Nowhere/"]}"#))
                     .unwrap(),
             )
@@ -1359,7 +1359,7 @@ mod tests {
                     .method("POST")
                     .uri("/api/search")
                     .header("content-type", "application/json")
-                    .header("authorization", "Bearer eg_readkey")
+                    .header("authorization", "Bearer kn_readkey")
                     .body(Body::from(r#"{"query":"warding","all":null}"#))
                     .unwrap(),
             )
@@ -1376,7 +1376,7 @@ mod tests {
             .oneshot(
                 axum::http::Request::builder()
                     .uri("/api/list")
-                    .header("authorization", "Bearer eg_readkey")
+                    .header("authorization", "Bearer kn_readkey")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1427,7 +1427,7 @@ mod tests {
             .oneshot(
                 axum::http::Request::builder()
                     .uri(uri)
-                    .header("authorization", "Bearer eg_readkey")
+                    .header("authorization", "Bearer kn_readkey")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1559,7 +1559,7 @@ mod tests {
                     .method("POST")
                     .uri("/api/create")
                     .header("content-type", "application/json")
-                    .header("authorization", "Bearer eg_readkey")
+                    .header("authorization", "Bearer kn_readkey")
                     .body(Body::from(r##"{"content":"# Test","filename":"test"}"##))
                     .unwrap(),
             )
@@ -1578,7 +1578,7 @@ mod tests {
                     .method("POST")
                     .uri("/api/update")
                     .header("content-type", "application/json")
-                    .header("authorization", "Bearer eg_writekey")
+                    .header("authorization", "Bearer kn_writekey")
                     .body(Body::from(
                         r#"{"file":"nonexistent","edits":[{"section":"Test","mode":"append","content":"new"}]}"#,
                     ))
@@ -1637,7 +1637,7 @@ mod tests {
             .oneshot(
                 axum::http::Request::builder()
                     .uri("/api/vault-map")
-                    .header("authorization", "Bearer eg_readkey")
+                    .header("authorization", "Bearer kn_readkey")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1649,7 +1649,7 @@ mod tests {
             .oneshot(
                 axum::http::Request::builder()
                     .uri("/api/vault-map")
-                    .header("authorization", "Bearer eg_readkey")
+                    .header("authorization", "Bearer kn_readkey")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1708,7 +1708,7 @@ mod tests {
                     .method("POST")
                     .uri(path)
                     .header("content-type", "application/json")
-                    .header("authorization", "Bearer eg_writekey")
+                    .header("authorization", "Bearer kn_writekey")
                     .body(Body::from(body.to_string()))
                     .unwrap(),
             )
@@ -2115,7 +2115,7 @@ mod tests {
             .oneshot(
                 axum::http::Request::builder()
                     .uri("/api/identity?refresh=true")
-                    .header("authorization", "Bearer eg_writekey")
+                    .header("authorization", "Bearer kn_writekey")
                     .body(Body::empty())
                     .unwrap(),
             )
