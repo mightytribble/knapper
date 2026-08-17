@@ -18,7 +18,7 @@ export LIBCLANG_PATH="$HOME/.knapper-buildenv/lib/python3.12/site-packages/clang
 export BINDGEN_EXTRA_CLANG_ARGS="-I/usr/lib/gcc/x86_64-linux-gnu/13/include -I/usr/include -I/usr/include/x86_64-linux-gnu"
 
 cargo build --release        # ~10 min cold, ~20s incremental
-cargo test --lib             # 922 pass
+cargo test --lib             # 955 pass
 ```
 
 Each env var exists for a specific failure. Omit one and you get:
@@ -77,22 +77,23 @@ relinks the same path and a rebuild each way costs the llama.cpp compile.
 
 ## There is no `tests/` directory
 
-This fork deleted `tests/integration.rs`, `tests/write_pipeline.rs` and `tests/fixtures/`. They had
-not compiled since upstream v1.0.0 — `unresolved import engraph::embedder`, `engraph::hnsw`, and a
-`walk_vault` arity mismatch — so `cargo test` (full) and `cargo clippy --all-targets` both failed on
-pristine upstream, and every test in them was `#[ignore]` behind a GGUF download. `integration.rs`
-also reimplemented the index and search pipeline in its own helpers, so repairing it would have
-asserted against a copy of the shipped code rather than against the code. The one behaviour with no
-twin in the lib suite, the mtime conflict, moved to `writer::tests` and runs on `MockLlm`.
+There is no `tests/integration.rs`, `tests/write_pipeline.rs` or `tests/fixtures/`. None of the three
+compiled past v1.0.0 — `unresolved import engraph::embedder`, `engraph::hnsw`, and a `walk_vault`
+arity mismatch are what `cargo test` (full) and `cargo clippy --all-targets` reported against them —
+and every test they held was `#[ignore]`d behind a GGUF download. `integration.rs` also reimplemented
+the index and search pipeline in its own helpers, so a repaired copy would assert against a second
+copy of the shipped code rather than against the code itself. The one behaviour with no twin in the
+lib suite — the mtime conflict — lives in `writer::tests` and runs on `MockLlm`.
 
-**A rebase onto upstream brings all three paths back.** Delete them again. Upstream PR #47 repairs
-them instead, if that is ever the better answer.
+**Merging in engraph's history can bring all three paths back.** Delete them again. Upstream
+engraph's PR #47 repairs them instead, if that is ever the better answer.
 
-## CI is manual-only in this fork
+## CI is manual-only
 
-`.github/workflows/ci.yml` triggers on `workflow_dispatch` and nothing else — upstream runs it on
-every push and PR to `main`. The hosted run duplicated checks that take seconds here and billed
-Actions minutes for it, two jobs per push, with the macOS leg charged at 10× the minute rate.
+`.github/workflows/ci.yml` triggers on `workflow_dispatch` and nothing else — no push, no PR. The
+three commands below all complete in seconds on this box, so running them again on a hosted runner
+on every push would duplicate that work and spend Actions minutes for it: two jobs per push, with
+the macOS leg billed at 10× the minute rate.
 
 **So the gate is local, and it is not optional.** Before every commit:
 

@@ -8,13 +8,13 @@ The project leaves fork status: engraph, forked at v1.7.2, becomes knapper. The 
 
 `--section` names a section by its heading text or by its full heading path, and a promoted bold line is one of the sections it reaches. `list --detailed` enumerates the same set, so what the outline prints is what `read` and `update` can name.
 
-### Added
+#### Added
 
 - **`--section` takes a heading path.** `read` and `update` accept a heading's own text, as before, or its full path from its own root joined with ` > `: `--section "About the Empire > Current Events > History"` reaches the second `History` of a note that holds two. A partial path resolves nothing, so a wrong guess is an error and never an edit to another section. Two same-named siblings under one parent share a path, and the first in document order is the one that resolves.
 - **A promoted bold heading is addressable** ([#53](https://github.com/mightytribble/engraph/issues/53)). `--section "Spells"`, `--section "**Spells**"` and `--section "Stat Block > Spells"` all reach a `**Spells**` section, which is 107 of the 1559 chunks in the pinned corpus and was reachable by no name at all. The section ends where the chunker ends it: at the next promoted line, or the next `#` heading of any depth. An ATX heading keeps precedence over a promoted one of the same name under the same parent. The fallback runs whatever `promote_bold_headings` says, because what a caller may name is a property of the file and not of what the indexer chunks.
 - **An empty section is addressable**, promoted or ATX, because addressing one is how a caller fills it.
 
-### Changed
+#### Changed
 
 - **`list --detailed` lists promoted headings** beside the ATX ones, and lists a bodyless promoted heading too, so every entry of an outline is a section `read` and `update` can name. `Heading.level` is now absent for a promoted line rather than carrying a depth it does not have; on the CLI such a line prints in its bold form, `**Spells**`.
 - **`markdown.rs` owns what a heading is** and `chunker.rs` owns which headings start a chunk. The chunker's set is unchanged, so no fingerprint moves and no store re-indexes.
@@ -24,15 +24,15 @@ The project leaves fork status: engraph, forked at v1.7.2, becomes knapper. The 
 
 `engraph list` is the call an agent makes to see a vault it cannot read: every note the scope admits, in path order, one bare path per line, and each note's heading outline under `--detailed`.
 
-### Removed
+#### Removed
 
 - **`list --folder`**, and the `folder` parameter on the MCP `list` tool and `GET /api/list`. A directory filter is a scope term: `--scope /lore/` — a leading `/` reads a term as a directory path, a trailing `/` its subtree — which is a case-sensitive range anchored at the path boundary, where `--folder lore` was a `LIKE 'lore%'` that folded case, read `_` as a wildcard and matched `lorekeeper.md`. `store::list_files` keeps its `folder` argument for `project`'s sibling gather, which is not a caller-typed filter.
 
-### Added
+#### Added
 
 - **`list --detailed`** answers each note's ATX heading outline beneath its path. The outline is read from the file, because the index cannot hold it: a short section merges into the chunk before it, an empty heading emits no chunk, and a promoted bold line sits in `chunks.heading` beside real headings. `NoteListItem` gains `headings: Option<Vec<Heading>>` — level, text, and a 1-based line — absent unless `detailed` is set, so an undetailed listing serialises as it did before. On the CLI the headings print as their own `#` markers under the path; over MCP and HTTP they are structured. `detailed=true` is required on the HTTP query string, because `serde_urlencoded` reads no bare flag. A note whose file is missing on disk lists with an empty outline and no error.
 
-### Changed
+#### Changed
 
 - **`list` answers in path order** (`ORDER BY f.path`, SQLite `BINARY` collation, so `Lore/` sorts before `lore/`), where it answered most-recently-indexed first. A folder's notes now arrive together and a subtree scope reads as one block. `project`'s sibling gather takes the same ordering: the first 50 of the folder in path order.
 - **`list`'s limit is unbounded by default.** It was capped at 20. An absent `--limit` now emits no `LIMIT` clause, so a bare `engraph list` answers every note the scope admits, and a caller that wants less names a scope or a `--limit`; `--limit 0` answers none. The default is the same on every surface, so no one surface silently caps the whole vault.
@@ -45,7 +45,7 @@ Every capability now has one name and one parameter set on the CLI, the MCP serv
 
 **The renames land with no aliases and with no deprecation window.** Nothing outside this repository named an MCP tool or a CLI command, so no old name is kept working. Everything under "Removed" below is a hard break: an agent or a script that calls an old name gets an error, not a warning. This section is the whole list.
 
-### Removed
+#### Removed
 
 - **CLI command groups.** `engraph context <leaf>` and `engraph write <leaf>` are gone; every leaf is a top-level command. `context read` → `read`, `context list` → `list`, `context tags` → `tags`, `context vault-map` → `vault-map`, `context who` → `who`, `context project` → `project`, `context topic` → `topic`, `write create` → `create`, `write archive` → `archive`, `write delete` → `delete`.
 - **`engraph graph`**, both leaves. `graph show` ran the same four queries `read` runs, so `read` answers it and now carries a docid beside each link. `graph stats` is folded into `status`.
@@ -58,7 +58,7 @@ Every capability now has one name and one parameter set on the CLI, the MCP serv
 - **`total_files`** from the `status` JSON. `files` already reports it.
 - **The disk fallback for `migrate` `mode: apply`** on the two servers. `apply` now requires the `preview` the caller's own `mode: preview` returned; it no longer falls back to `~/.engraph/migration-preview.json`. The CLI's two-step flow, which saves and reads that file itself, is unchanged.
 
-### Added
+#### Added
 
 - **`update`**, one capability for every change to an existing note. It takes a list of edits and applies them in order in one write: one mtime conflict check, one file write, one re-index. Each edit names a `section`, a `property`, or neither (the note's body), and carries a `mode` of `replace`, `prepend`, `append` or `remove`. `content` is a string, or a list of strings for a list-valued property. The grammar reaches something no call it replaced could: two sections and a tag change in one atomic write.
 - **`read --section`** narrows the content to one ATX heading's body and adds `heading`, `line_start` and `line_end`. The heading match folds case, and `byte_count` measures the section. The note's tags and links are reported either way, because a section's are its file's.
@@ -68,7 +68,7 @@ Every capability now has one name and one parameter set on the CLI, the MCP serv
 - **`docs/surfaces.md`**, generated from `src/surface.rs` and checked by a test, listing what every capability is called on each surface.
 - **Parity tests.** Five tests compare the capability table with what `Cli::command()`, `EngraphServer::tool_router()` and `http::routes()` register, including each tool's schema against its clap arguments. A capability added to one surface and forgotten on another fails the build.
 
-### Changed
+#### Changed
 
 - **`search`'s default `top_n` is the configured one** on both servers. It was a hardcoded 10; it is now `top_n` from `config.toml`, whose default is **5** — the same number the CLI has always used. A caller that relied on ten results per query must now ask for `top_n: 10`.
 - **`search` over HTTP returns an envelope**, `{"results": [...], "message": ...}`, replacing the bare array. `explain` joins it when the call asked for it. HTTP was the one surface with nowhere to put the answer-floor signal.
