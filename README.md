@@ -4,19 +4,20 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
+Knapper is under active development and should still be considered experimental.
+
 ## Why knapper?
 
-Plain vector search treats your notes as isolated documents. But knowledge isn't flat — your notes link to each other, share tags, reference the same people and projects. knapper understands these connections.
+Plain vector search treats your notes as isolated documents. But knowledge isn't flat — your notes link to each other, share tags, reference the same people and projects. knapper understands these connections and makes them visible to your agents.
 
-- **5-lane hybrid search** — semantic embeddings + BM25 full-text + graph expansion + cross-encoder reranking + temporal scoring, fused via [Reciprocal Rank Fusion](https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf). Lane weights are configurable. Time-aware queries like "what happened last week" or "March 2026 notes" activate the temporal lane automatically.
-- **MCP server for AI agents** — `knapper serve` exposes 20 tools (search, read, list, tags, vault_map, who, project, topic, create, update, delete, move, archive, index, reindex_file, status, health, identity, init, migrate) that Claude, Cursor, or any MCP client can call directly.
-- **HTTP REST API** — `knapper serve --http` adds an axum-based HTTP server alongside MCP with 21 REST endpoints, API key authentication, rate limiting, and CORS. Web-based agents and scripts can query your vault with simple `curl` calls.
+- **5-lane hybrid search** — semantic embeddings + BM25 full-text + graph expansion + cross-encoder reranking + temporal scoring. The content lanes fuse via [Reciprocal Rank Fusion](https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf), graph and temporal candidates join the shortlist by reserved quota, and the cross-encoder sorts it. Lane weights are configurable. Time-aware queries like "what happened last week" or "March 2026 notes" activate the temporal lane automatically.
+- **MCP server for AI agents** — `knapper serve` exposes 17 tools (search, read, list, tags, vault_map, create, update, delete, move, archive, index, reindex_file, status, health, identity, init, migrate) that Claude, Cursor, or any MCP client can call directly.
+- **HTTP REST API** — `knapper serve --http` adds an axum-based HTTP server alongside MCP with 18 REST endpoints, API key authentication, rate limiting, and CORS. Web-based agents and scripts can query your vault with simple `curl` calls.
 - **Section-level editing** — AI agents can read, replace, prepend, or append to a section by heading, to the note's body, or to a frontmatter property — every change is one `update` call carrying a list of edits.
 - **Vault health diagnostics** — detect orphan notes, broken wikilinks, stale content, and tag hygiene issues. Available as MCP tool and CLI command.
-- **Obsidian CLI integration** — auto-detects running Obsidian and delegates compatible operations. Circuit breaker (Closed/Degraded/Open) ensures graceful fallback.
 - **Real-time sync** — file watcher keeps the index fresh as you edit in Obsidian. No manual re-indexing needed.
 - **Smart write pipeline** — AI agents can create, edit, rewrite, and delete notes with automatic tag resolution, wikilink discovery, and folder placement based on semantic similarity.
-- **Fully local** — [llama.cpp](https://github.com/ggml-org/llama.cpp) inference with GGUF models (~300MB mandatory, ~650MB optional for the cross-encoder). Metal GPU-accelerated on macOS (88 files indexed in 70s). No API keys, no cloud.
+- **Fully local** — [llama.cpp](https://github.com/ggml-org/llama.cpp) inference with GGUF models (~300MB mandatory, ~650MB optional for the cross-encoder). Metal GPU-accelerated on macOS (88 files indexed in 70s), CUDA build available for local GPU. No API keys, no cloud.
 
 ## What problem it solves
 
@@ -31,25 +32,25 @@ Your vault (markdown files)
         │
         ▼
 ┌─────────────────────────────────────────────┐
-│              knapper index                   │
+│                knapper index                │
 │                                             │
 │  Walk → Chunk → Embed (llama.cpp) → Store   │
 │                                             │
 │  SQLite: files, chunks, FTS5, vectors,      │
-│          edges, centroids, tags, LLM cache  │
+│          edges, centroids, tags, audit log  │
 └─────────────────────────────────────────────┘
         │
         ▼
 ┌─────────────────────────────────────────────┐
-│              knapper serve                   │
+│                knapper serve                │
 │                                             │
 │  MCP Server (stdio) + File Watcher          │
 │  + HTTP REST API (--http, optional)         │
 │                                             │
-│  Search: 3-lane retrieval → Reranker        │
-│          → Two-pass RRF fusion              │
+│  Search: retrieval → RRF fuses lanes        │
+│          → cross-encoder sorts shortlist    │
 │                                             │
-│  20 MCP tools + 21 REST endpoints           │
+│  17 MCP tools + 18 REST endpoints           │
 └─────────────────────────────────────────────┘
         │
         ▼
@@ -57,7 +58,7 @@ Your vault (markdown files)
 ```
 
 1. **Index** — walks your vault, chunks markdown by headings, embeds with a local GGUF model via llama.cpp (Metal GPU on macOS), stores everything in SQLite with FTS5 + sqlite-vec + a wikilink graph
-2. **Search** — runs the query through up to five lanes (semantic KNN, BM25 keyword, graph expansion, cross-encoder reranking, temporal scoring), fused via RRF at configurable per-lane weights
+2. **Search** — runs the query through up to five lanes (semantic KNN, BM25 keyword, graph expansion, cross-encoder reranking, temporal scoring): the content lanes fuse via RRF at configurable per-lane weights, then the cross-encoder sorts the shortlist
 3. **Serve** — starts an MCP server that AI agents connect to, with a file watcher that re-indexes changes in real time
 
 ## Quick start
@@ -190,26 +191,6 @@ knapper search "how does authentication work" --explain
 
 The reranker scored each result for relevance as the 4th RRF lane.
 
-**Rich context for AI agents:**
-
-```bash
-knapper topic "authentication" --budget 8000
-```
-
-Returns a context bundle to paste into a prompt or serve over MCP: the five notes that best match the query, each read whole, and then the notes one wikilink hop from the top three. The budget is characters, so 8000 of them are about 2000 tokens, and a note that overruns it is cut and marked. A bundle holds whole notes, so the query runs at one result per note, and no cross-encoder scores it: `knapper search` is the sharper ranking. Tag terms hold both steps to the notes they admit, and a term starting with `/` is a directory path from the vault root instead, a trailing `/` its subtree:
-
-```bash
-knapper topic "warding" --all type/undead --budget 8000
-```
-
-**Person context:**
-
-```bash
-knapper who "Sarah Chen"
-```
-
-Returns Sarah's note, the notes that mention her, and her wikilinks in both directions. The name resolves as a docid, a path or a basename, and then by keyword search, which prefers a hit under the People folder. The mention list comes from that folder: knapper writes a mention edge when a note's text holds a person note's filename or one of its frontmatter aliases. A vault whose `vault.toml` names no People folder has no mention edges, and `who` answers with the note and its links alone.
-
 **Vault structure overview:**
 
 ```bash
@@ -231,7 +212,7 @@ locations/aurelian-empire.md
 ## Current Events
 ```
 
-One bare path per line, in path order, so a folder's notes arrive together and `wc -l` is the total. A bare `knapper list` answers every indexed note; `--scope`, `--all`, `--any` and `--none` narrow it by tag or by directory, and `--limit` keeps the first n. `--detailed` reads each listed note and prints its headings, which is how an agent finds the section to read or write before it calls `read` or `update`.
+One bare path per line, in path order, so a folder's notes arrive together and `wc -l` is the total. A bare `knapper list` returns every indexed note; `--scope`, `--all`, `--any` and `--none` narrow it by tag or by directory, and `--limit` keeps the first n. `--detailed` reads each listed note and prints its headings, which is how an agent finds the section to read or write before it calls `read` or `update`.
 
 **Create a note via the write pipeline:**
 
@@ -284,7 +265,7 @@ Returns orphan notes (no links in or out), broken wikilinks, stale notes, and ta
 
 `knapper serve --http` adds a full REST API alongside the MCP server, exposing the same capabilities over HTTP for web agents, scripts, and integrations.
 
-**21 endpoints:**
+**18 endpoints:**
 
 Every capability is one route, and the route is the CLI command's name under `/api/`. `docs/surfaces.md` is the generated table of all three surfaces.
 
@@ -296,9 +277,6 @@ Every capability is one route, and the route is the CLI command's name under `/a
 | GET | `/api/list` | read | List notes by tag or directory terms — a leading `/` reads a term as a directory path (`scope`/`all`, `any`, `none`), creator, limit, and `detailed=true` for each note's heading outline |
 | GET | `/api/tags` | read | The tag vocabulary, whole or under one term (`under`) |
 | GET | `/api/vault-map` | read | Vault structure overview (folders, tags, recent files) |
-| GET | `/api/who` | read | Person context bundle (`name`) |
-| GET | `/api/project` | read | Project context bundle (`name`) |
-| POST | `/api/topic` | read | Topic context bundle: whole notes and their one-hop neighbours, within a character budget |
 | GET | `/api/status` | read | Index status and statistics |
 | GET | `/api/health` | read | Vault health diagnostics |
 | POST | `/api/create` | write | Create a new note |
@@ -496,9 +474,8 @@ You are a knowledge assistant connected to the user's Obsidian vault via knapper
 WORKFLOW:
 1. Use searchVault to find relevant notes before answering questions
 2. Use readNote for full content, and its section parameter for one heading
-3. Use getWho for people context, getProject for project context
-4. Use getVaultMap to orient yourself in the vault structure
-5. Only create or edit notes when explicitly asked
+3. Use getVaultMap to orient yourself in the vault structure
+4. Only create or edit notes when explicitly asked
 
 SEARCH TIPS:
 - Temporal queries ("last week", "yesterday") activate time-aware search automatically
@@ -539,7 +516,7 @@ STYLE:
 
 **Developer second brain** — Index architecture docs, decision records, meeting notes, and code snippets. Search by concept across all of them.
 
-**Research and writing** — Find connections between notes that you didn't explicitly link. The graph lane surfaces related content through shared wikilinks and mentions.
+**Research and writing** — Find connections between notes that you didn't explicitly link. The graph lane surfaces related content through shared wikilinks.
 
 **Team knowledge graphs** — Index a shared docs vault. AI agents can answer "who knows about X?" and "what decisions were made about Y?" by traversing the note graph.
 
@@ -547,10 +524,10 @@ STYLE:
 
 | | knapper | Basic RAG (vector-only) | Obsidian search |
 |---|---|---|---|
-| Search method | 5-lane RRF (semantic + BM25 + graph + reranker + temporal) | Vector similarity only | Keyword only |
+| Search method | 5-lane hybrid (semantic + BM25 + graph + reranker + temporal): content lanes RRF-fused, cross-encoder sorts | Vector similarity only | Keyword only |
 | Query understanding | Cross-encoder reads each candidate jointly with the query | None | None |
 | Understands note links | Yes (wikilink graph traversal) | No | Limited (backlinks panel) |
-| AI agent access | MCP server (20 tools) + HTTP REST API (21 endpoints) | Custom API needed | No |
+| AI agent access | MCP server (17 tools) + HTTP REST API (18 endpoints) | Custom API needed | No |
 | Write capability | Create/edit/rewrite/delete with smart filing | No | Manual |
 | Vault health | Orphans, broken links, stale notes, tag hygiene | No | Limited |
 | Real-time sync | File watcher, 2s debounce | Manual re-index | N/A |
@@ -561,44 +538,28 @@ knapper is not a replacement for Obsidian — it's the intelligence layer that s
 
 ## Current capabilities
 
-- 5-lane hybrid search (semantic + FTS5 + graph + cross-encoder reranker + temporal) with two-pass RRF fusion
+- 5-lane hybrid search (semantic + FTS5 + graph + cross-encoder reranker + temporal): content lanes RRF-fused, graph and temporal routed into the shortlist by reserved quota, cross-encoder sorts it (legacy mode fuses all five by weighted RRF)
 - Temporal search: natural language date queries ("last week", "March 2026", "recent"), date extraction from frontmatter and filenames, smooth decay scoring
 - Confidence % display: search results show normalized 0-100% confidence instead of raw RRF scores
 - llama.cpp inference via Rust bindings (GGUF models, Metal GPU on macOS, CUDA on Linux)
 - Intelligence opt-in: the cross-encoder lane is off unless enabled
-- MCP server with 20 tools (8 read, 5 write, 5 index and diagnostic, 1 setup, 1 migrate) via stdio
-- HTTP REST API with 21 endpoints, API key auth (`kn_` prefix), rate limiting, CORS — enabled via `knapper serve --http`
+- MCP server with 17 tools (5 read, 5 write, 5 index and diagnostic, 1 setup, 1 migrate) via stdio
+- HTTP REST API with 18 endpoints, API key auth (`kn_` prefix), rate limiting, CORS — enabled via `knapper serve --http`
 - User identity with L0/L1 tiered context for AI agent session starts
 - Section-level reading and editing: target specific headings with replace/prepend/append modes
 - Full note rewriting with automatic frontmatter preservation
 - Frontmatter property edits: replace, append to or remove a property, scalar or list-valued
 - Soft delete (archive) and hard delete (permanent) with audit logging
 - Vault health diagnostics: orphan notes, broken wikilinks, stale content, tag hygiene
-- Obsidian CLI integration with circuit breaker (Closed/Degraded/Open) for resilient delegation
 - Real-time file watching with 2s debounce, startup reconciliation, and watcher coordination to prevent double re-indexing
 - Write pipeline: tag resolution, fuzzy link discovery, semantic folder placement
-- Context engine: a topic bundle of whole notes within a character budget, plus person and project bundles
-- Vault graph: bidirectional wikilink + mention edges with multi-hop expansion
+- Vault graph: directional wikilink edges, traversed both ways (outgoing links + backlinks); single-hop personalized-PageRank expansion over the chunk graph
 - Placement correction learning from user file moves
 - Enhanced file resolution with fuzzy Levenshtein matching fallback
 - Content-based folder role detection (people, daily, archive) by content patterns
 - PARA migration: AI-assisted vault restructuring into Projects/Areas/Resources/Archive with preview, apply, and undo workflow
 - Configurable model overrides for multilingual support
-- 846 unit tests, CI on macOS + Ubuntu
-
-## Roadmap
-
-- [x] ~~LLM reranker — optional local model for result quality~~ (v1.0)
-- [x] ~~MCP edit/rewrite tools — full note editing for AI agents~~ (v1.1)
-- [x] ~~Vault health monitor — orphan notes, broken links, stale content, tag hygiene~~ (v1.1)
-- [x] ~~Obsidian CLI integration — auto-detect and delegate with circuit breaker~~ (v1.1)
-- [x] ~~Temporal search — find notes by time period, date-aware queries~~ (v1.2)
-- [x] ~~HTTP/REST API — complement MCP with a standard web API~~ (v1.3)
-- [x] ~~PARA migration — AI-assisted vault restructuring with preview/apply/undo~~ (v1.4)
-- [x] ~~ChatGPT Actions — OpenAPI 3.1.0 spec + plugin manifest + `--setup-chatgpt` helper~~ (v1.5)
-- [x] ~~Identity — user context at session start, enhanced onboarding~~ (v1.6)
-- [ ] Timeline — temporal knowledge graph with point-in-time queries (v1.7)
-- [ ] Mining — automatic fact extraction from vault notes (v1.8)
+- 955 unit tests, CI on macOS + Ubuntu
 
 ## Configuration
 
@@ -650,11 +611,6 @@ enabled = false
 # embed = "hf:Qwen/Qwen3-Embedding-0.6B-GGUF/qwen3-embedding-0.6b-q8_0.gguf"
 # rerank = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf"
 
-# Obsidian CLI integration (auto-detected during init)
-[obsidian]
-# enabled = true
-# cli_path = "/usr/local/bin/obsidian"
-
 # Registered AI agents
 [agents]
 # names = ["claude-code", "cursor"]
@@ -673,7 +629,7 @@ All data stored in `~/.knapper/` — single SQLite database (~10MB typical), GGU
 ## Development
 
 ```bash
-cargo test --lib          # 852 unit tests, no network (requires CMake for llama.cpp)
+cargo test --lib          # 955 unit tests, no network (requires CMake for llama.cpp)
 cargo clippy -- -D warnings
 cargo fmt --check
 ```
