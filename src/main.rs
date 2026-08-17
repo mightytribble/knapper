@@ -126,9 +126,9 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Set up tracing. Default: suppress all logs (ort is very noisy).
-    // --verbose enables debug for engraph, info for everything else.
+    // --verbose enables debug for knapper, info for everything else.
     let filter = if cli.verbose {
-        "engraph=debug,info"
+        "knapper=debug,info"
     } else {
         "error"
     };
