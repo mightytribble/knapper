@@ -1,11 +1,11 @@
-# Engraph HTTP REST API
+# Knapper HTTP REST API
 
 Enable alongside MCP for web agents, scripts, and integrations:
 
 ```bash
-engraph serve --http              # Default port 3000
-engraph serve --http --port 8080 --host 0.0.0.0
-engraph serve --http --no-auth    # Local dev only (127.0.0.1)
+knapper serve --http              # Default port 3000
+knapper serve --http --port 8080 --host 0.0.0.0
+knapper serve --http --no-auth    # Local dev only (127.0.0.1)
 ```
 
 ## Key Endpoints
@@ -31,11 +31,11 @@ Every capability is one route, named after the CLI command it answers. The whole
 ```bash
 # One section of a document
 curl "http://localhost:3000/api/read?file=Meeting%20Notes&section=Action%20Items" \
-  -H "Authorization: Bearer eg_abc123..."
+  -H "Authorization: Bearer kn_abc123..."
 
 # Append to a section, and add a tag, in one write
 curl -X POST http://localhost:3000/api/update \
-  -H "Authorization: Bearer eg_abc123..." -H "Content-Type: application/json" \
+  -H "Authorization: Bearer kn_abc123..." -H "Content-Type: application/json" \
   -d '{"file": "Meeting Notes", "edits": [
         {"section": "Action Items", "mode": "append", "content": "- [ ] Follow up"},
         {"property": "tags", "mode": "append", "content": "actionable"}
@@ -47,14 +47,14 @@ curl -X POST http://localhost:3000/api/update \
 All HTTP requests require an API key via the `Authorization` header:
 
 ```bash
-curl -H "Authorization: Bearer eg_abc123..." http://localhost:3000/api/search \
+curl -H "Authorization: Bearer kn_abc123..." http://localhost:3000/api/search \
   -H "Content-Type: application/json" -d '{"query": "architecture", "top_n": 5}'
 ```
 
 Generate keys:
 
 ```bash
-engraph configure --add-api-key       # Interactive
-engraph configure --list-api-keys     # List existing
-engraph configure --revoke-api-key <name>  # Revoke a key by name
+knapper configure --add-api-key       # Interactive
+knapper configure --list-api-keys     # List existing
+knapper configure --revoke-api-key <name>  # Revoke a key by name
 ```

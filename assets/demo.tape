@@ -21,7 +21,7 @@ Sleep 1.5s
 Ctrl+U
 Sleep 200ms
 
-Type "engraph index /tmp/engraph-demo-vault"
+Type "knapper index /tmp/knapper-demo-vault"
 Enter
 Sleep 3s
 
@@ -35,7 +35,7 @@ Sleep 1.5s
 Ctrl+U
 Sleep 200ms
 
-Type "engraph search 'how does authentication work' --explain"
+Type "knapper search 'how does authentication work' --explain"
 Enter
 Sleep 5s
 
@@ -49,7 +49,7 @@ Sleep 1.5s
 Ctrl+U
 Sleep 200ms
 
-Type "engraph who 'Sarah Chen'"
+Type "knapper who 'Sarah Chen'"
 Enter
 Sleep 4s
 
@@ -63,7 +63,7 @@ Sleep 1.5s
 Ctrl+U
 Sleep 200ms
 
-Type "engraph status"
+Type "knapper status"
 Enter
 Sleep 3s
 

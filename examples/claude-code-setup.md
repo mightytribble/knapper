@@ -1,14 +1,14 @@
-# Using engraph with Claude Code
+# Using knapper with Claude Code
 
-Connect engraph to Claude Code so it can search, read, and write to your Obsidian vault.
+Connect knapper to Claude Code so it can search, read, and write to your Obsidian vault.
 
 ## Setup
 
 ### 1. Install and index
 
 ```bash
-brew install devwhodevs/tap/engraph
-engraph index ~/path/to/vault
+brew install mightytribble/tap/knapper
+knapper index ~/path/to/vault
 ```
 
 ### 2. Add to Claude Code settings
@@ -18,8 +18,8 @@ Add to `~/.claude/settings.json`:
 ```json
 {
   "mcpServers": {
-    "engraph": {
-      "command": "engraph",
+    "knapper": {
+      "command": "knapper",
       "args": ["serve"]
     }
   }
@@ -55,7 +55,7 @@ command it answers, with `-` written as `_`.
 
 **Index and diagnostic tools:**
 - `index` — index the configured vault
-- `reindex_file` — re-index one file after an edit made outside engraph
+- `reindex_file` — re-index one file after an edit made outside knapper
 - `status` — index status and statistics
 - `health` — vault health diagnostics
 - `identity` — user identity (L0) and current context (L1)
@@ -71,11 +71,11 @@ Claude will call `search("authentication")` and get results from semantic, keywo
 Claude will call `project("API")` to get the project bundle — related notes, team members, active tasks.
 
 **"Create a meeting note for today's standup"**
-Claude will call `create` with content, tags, and type hint. engraph resolves tags against your registry, discovers wikilinks in the content, and places the note in the best folder.
+Claude will call `create` with content, tags, and type hint. knapper resolves tags against your registry, discovers wikilinks in the content, and places the note in the best folder.
 
 ## Real-time sync
 
-The MCP server includes a file watcher. When you edit notes in Obsidian, engraph re-indexes them automatically (2-second debounce). No need to manually re-run `engraph index`.
+The MCP server includes a file watcher. When you edit notes in Obsidian, knapper re-indexes them automatically (2-second debounce). No need to manually re-run `knapper index`.
 
 ## Tips
 

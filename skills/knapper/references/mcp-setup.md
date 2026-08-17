@@ -1,10 +1,10 @@
-# Engraph MCP Server Setup
+# Knapper MCP Server Setup
 
 ## Install
 
 ```bash
-brew install devwhodevs/tap/engraph
-engraph index /path/to/documents
+brew install mightytribble/tap/knapper
+knapper index /path/to/documents
 ```
 
 ## Configure MCP Client
@@ -14,7 +14,7 @@ engraph index /path/to/documents
 ```json
 {
   "mcpServers": {
-    "engraph": { "command": "engraph", "args": ["serve"] }
+    "knapper": { "command": "knapper", "args": ["serve"] }
   }
 }
 ```
@@ -24,7 +24,7 @@ engraph index /path/to/documents
 ```json
 {
   "mcpServers": {
-    "engraph": { "command": "engraph", "args": ["serve"] }
+    "knapper": { "command": "knapper", "args": ["serve"] }
   }
 }
 ```
@@ -32,5 +32,5 @@ engraph index /path/to/documents
 ## HTTP Mode
 
 ```bash
-engraph serve --http              # Port 3000
+knapper serve --http              # Port 3000
 ```

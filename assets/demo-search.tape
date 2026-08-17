@@ -11,7 +11,7 @@ Type "# Index an Obsidian vault"
 Enter
 Sleep 500ms
 
-Type "engraph index ~/vault"
+Type "knapper index ~/vault"
 Enter
 Sleep 3s
 
@@ -23,7 +23,7 @@ Type "# Search across notes — 3-lane hybrid (semantic + keyword + graph)"
 Enter
 Sleep 500ms
 
-Type "engraph search 'how does authentication work' --explain"
+Type "knapper search 'how does authentication work' --explain"
 Enter
 Sleep 4s
 
@@ -35,7 +35,7 @@ Type "# Get rich context for an AI agent"
 Enter
 Sleep 500ms
 
-Type "engraph who 'Steve Barbera'"
+Type "knapper who 'Steve Barbera'"
 Enter
 Sleep 3s
 

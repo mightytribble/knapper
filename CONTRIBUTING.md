@@ -1,12 +1,12 @@
-# Contributing to engraph
+# Contributing to knapper
 
-Thanks for your interest in contributing to engraph.
+Thanks for your interest in contributing to knapper.
 
 ## Getting started
 
 ```bash
 git clone https://github.com/devwhodevs/engraph
-cd engraph
+cd knapper
 cargo test --lib    # 225 tests, no network required
 ```
 

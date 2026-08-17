@@ -1,28 +1,16 @@
-<p align="center">
-  <img src="assets/logo.png" alt="engraph logo" width="180">
-</p>
+# knapper
 
-<h1 align="center">engraph — Vault Intelligence for AI Agents</h1>
+**Local hybrid search and MCP retrieval for Obsidian-format vaults.** knapper indexes a markdown vault into section-level chunks and serves them to AI agents — Claude Code over [MCP](https://modelcontextprotocol.io), any tool over a REST API. Semantic embeddings, full-text search, wikilink graph traversal, and cross-encoder reranking run in one local binary. No API keys, no cloud.
 
-<p align="center"><strong>Turn your Obsidian vault into a knowledge API.</strong> 5-lane hybrid search, MCP server, HTTP REST API, ChatGPT Actions — all local, all offline.</p>
-
-[![CI](https://github.com/devwhodevs/engraph/actions/workflows/ci.yml/badge.svg)](https://github.com/devwhodevs/engraph/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![GitHub release](https://img.shields.io/github/v/release/devwhodevs/engraph)](https://github.com/devwhodevs/engraph/releases)
 
-engraph turns your markdown vault into a searchable knowledge graph that any AI agent can query — Claude Code via [MCP](https://modelcontextprotocol.io), ChatGPT via [Actions](https://platform.openai.com/docs/actions), or any tool via REST API. It combines semantic embeddings, full-text search, wikilink graph traversal, temporal awareness, and LLM-powered reranking into a single local binary. Same model stack as [qmd](https://github.com/tobi/qmd). No API keys, no cloud — everything runs on your machine.
+## Why knapper?
 
-<p align="center">
-  <img src="assets/demo.gif" alt="engraph demo: 4-lane hybrid search with LLM intelligence, person context bundles, Metal GPU" width="800">
-</p>
-
-## Why engraph?
-
-Plain vector search treats your notes as isolated documents. But knowledge isn't flat — your notes link to each other, share tags, reference the same people and projects. engraph understands these connections.
+Plain vector search treats your notes as isolated documents. But knowledge isn't flat — your notes link to each other, share tags, reference the same people and projects. knapper understands these connections.
 
 - **5-lane hybrid search** — semantic embeddings + BM25 full-text + graph expansion + cross-encoder reranking + temporal scoring, fused via [Reciprocal Rank Fusion](https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf). Lane weights are configurable. Time-aware queries like "what happened last week" or "March 2026 notes" activate the temporal lane automatically.
-- **MCP server for AI agents** — `engraph serve` exposes 20 tools (search, read, list, tags, vault_map, who, project, topic, create, update, delete, move, archive, index, reindex_file, status, health, identity, init, migrate) that Claude, Cursor, or any MCP client can call directly.
-- **HTTP REST API** — `engraph serve --http` adds an axum-based HTTP server alongside MCP with 21 REST endpoints, API key authentication, rate limiting, and CORS. Web-based agents and scripts can query your vault with simple `curl` calls.
+- **MCP server for AI agents** — `knapper serve` exposes 20 tools (search, read, list, tags, vault_map, who, project, topic, create, update, delete, move, archive, index, reindex_file, status, health, identity, init, migrate) that Claude, Cursor, or any MCP client can call directly.
+- **HTTP REST API** — `knapper serve --http` adds an axum-based HTTP server alongside MCP with 21 REST endpoints, API key authentication, rate limiting, and CORS. Web-based agents and scripts can query your vault with simple `curl` calls.
 - **Section-level editing** — AI agents can read, replace, prepend, or append to a section by heading, to the note's body, or to a frontmatter property — every change is one `update` call carrying a list of edits.
 - **Vault health diagnostics** — detect orphan notes, broken wikilinks, stale content, and tag hygiene issues. Available as MCP tool and CLI command.
 - **Obsidian CLI integration** — auto-detects running Obsidian and delegates compatible operations. Circuit breaker (Closed/Degraded/Open) ensures graceful fallback.
@@ -34,7 +22,7 @@ Plain vector search treats your notes as isolated documents. But knowledge isn't
 
 You have hundreds of markdown notes. You want your AI coding assistant to understand what you've written — not just search keywords, but follow the connections between notes, understand context, and write new notes that fit your vault's structure.
 
-Existing options are either cloud-dependent (Notion AI, Mem), limited to keyword search (Obsidian's built-in), or require you to copy-paste context manually. engraph gives AI agents direct, structured access to your entire vault through a standard protocol.
+Existing options are either cloud-dependent (Notion AI, Mem), limited to keyword search (Obsidian's built-in), or require you to copy-paste context manually. knapper gives AI agents direct, structured access to your entire vault through a standard protocol.
 
 ## How it works
 
@@ -43,7 +31,7 @@ Your vault (markdown files)
         │
         ▼
 ┌─────────────────────────────────────────────┐
-│              engraph index                   │
+│              knapper index                   │
 │                                             │
 │  Walk → Chunk → Embed (llama.cpp) → Store   │
 │                                             │
@@ -53,7 +41,7 @@ Your vault (markdown files)
         │
         ▼
 ┌─────────────────────────────────────────────┐
-│              engraph serve                   │
+│              knapper serve                   │
 │                                             │
 │  MCP Server (stdio) + File Watcher          │
 │  + HTTP REST API (--http, optional)         │
@@ -78,19 +66,19 @@ Your vault (markdown files)
 
 ```bash
 # Homebrew (macOS)
-brew install devwhodevs/tap/engraph
+brew install mightytribble/tap/knapper
 
 # Pre-built binaries (macOS arm64, Linux x86_64)
-# → https://github.com/devwhodevs/engraph/releases
+# → https://github.com/mightytribble/knapper/releases
 
 # From source (requires CMake for llama.cpp)
-cargo install --git https://github.com/devwhodevs/engraph
+cargo install --git https://github.com/mightytribble/knapper
 ```
 
 **Index your vault:**
 
 ```bash
-engraph index ~/path/to/vault
+knapper index ~/path/to/vault
 # Downloads embedding model on first run (~300MB)
 # Incremental — only re-embeds changed files on subsequent runs
 ```
@@ -98,7 +86,7 @@ engraph index ~/path/to/vault
 **Search:**
 
 ```bash
-engraph search "how does the auth system work"
+knapper search "how does the auth system work"
 ```
 
 ```
@@ -117,8 +105,8 @@ Note how result #3 was found via **graph expansion** — Sarah's note doesn't me
 **Claude Code** — Install the plugin (recommended):
 
 ```bash
-claude plugin marketplace add devwhodevs/engraph
-claude plugin install engraph@engraph
+claude plugin marketplace add mightytribble/knapper
+claude plugin install knapper@knapper
 ```
 
 **Connect to Claude Code:**
@@ -128,8 +116,8 @@ Or configure MCP manually in `~/.claude/settings.json`:
 ```bash
 {
   "mcpServers": {
-    "engraph": {
-      "command": "engraph",
+    "knapper": {
+      "command": "knapper",
       "args": ["serve"]
     }
   }
@@ -138,42 +126,42 @@ Or configure MCP manually in `~/.claude/settings.json`:
 
 Now Claude can search your vault, read notes, build context bundles, and create new notes — all through structured tool calls.
 
-**AI Agent Skills** — Install the Engraph skills using the skills CLI (recommended):
+**AI Agent Skills** — Install the Knapper skills using the skills CLI (recommended):
 
 ```bash
-npx skills add devwhodevs/engraph
+npx skills add mightytribble/knapper
 ```
 
 **Enable HTTP REST API:**
 
 ```bash
 # Start MCP + HTTP server on port 3000
-engraph serve --http
+knapper serve --http
 
 # Custom port and host
-engraph serve --http --port 8080 --host 0.0.0.0
+knapper serve --http --port 8080 --host 0.0.0.0
 
 # Local development without API keys (127.0.0.1 only)
-engraph serve --http --no-auth
+knapper serve --http --no-auth
 ```
 
 **API key management:**
 
 ```bash
 # Add a new API key (read or write permission)
-engraph configure --add-api-key
+knapper configure --add-api-key
 
 # List existing keys
-engraph configure --list-api-keys
+knapper configure --list-api-keys
 
 # Revoke a key
-engraph configure --revoke-api-key eg_abc123...
+knapper configure --revoke-api-key kn_abc123...
 ```
 
 **Enable intelligence (optional, ~650MB download):**
 
 ```bash
-engraph configure --enable-intelligence
+knapper configure --enable-intelligence
 # Downloads Qwen3-Reranker (cross-encoder)
 # Adds the reranker lane to search
 ```
@@ -183,7 +171,7 @@ engraph configure --enable-intelligence
 **Search with the cross-encoder lane:**
 
 ```bash
-engraph search "how does authentication work" --explain
+knapper search "how does authentication work" --explain
 ```
 ```
  1. [97%] 01-Projects/API-Design.md > # API Design  #e3e350
@@ -205,27 +193,27 @@ The reranker scored each result for relevance as the 4th RRF lane.
 **Rich context for AI agents:**
 
 ```bash
-engraph topic "authentication" --budget 8000
+knapper topic "authentication" --budget 8000
 ```
 
-Returns a context bundle to paste into a prompt or serve over MCP: the five notes that best match the query, each read whole, and then the notes one wikilink hop from the top three. The budget is characters, so 8000 of them are about 2000 tokens, and a note that overruns it is cut and marked. A bundle holds whole notes, so the query runs at one result per note, and no cross-encoder scores it: `engraph search` is the sharper ranking. Tag terms hold both steps to the notes they admit, and a term starting with `/` is a directory path from the vault root instead, a trailing `/` its subtree:
+Returns a context bundle to paste into a prompt or serve over MCP: the five notes that best match the query, each read whole, and then the notes one wikilink hop from the top three. The budget is characters, so 8000 of them are about 2000 tokens, and a note that overruns it is cut and marked. A bundle holds whole notes, so the query runs at one result per note, and no cross-encoder scores it: `knapper search` is the sharper ranking. Tag terms hold both steps to the notes they admit, and a term starting with `/` is a directory path from the vault root instead, a trailing `/` its subtree:
 
 ```bash
-engraph topic "warding" --all type/undead --budget 8000
+knapper topic "warding" --all type/undead --budget 8000
 ```
 
 **Person context:**
 
 ```bash
-engraph who "Sarah Chen"
+knapper who "Sarah Chen"
 ```
 
-Returns Sarah's note, the notes that mention her, and her wikilinks in both directions. The name resolves as a docid, a path or a basename, and then by keyword search, which prefers a hit under the People folder. The mention list comes from that folder: engraph writes a mention edge when a note's text holds a person note's filename or one of its frontmatter aliases. A vault whose `vault.toml` names no People folder has no mention edges, and `who` answers with the note and its links alone.
+Returns Sarah's note, the notes that mention her, and her wikilinks in both directions. The name resolves as a docid, a path or a basename, and then by keyword search, which prefers a hit under the People folder. The mention list comes from that folder: knapper writes a mention edge when a note's text holds a person note's filename or one of its frontmatter aliases. A vault whose `vault.toml` names no People folder has no mention edges, and `who` answers with the note and its links alone.
 
 **Vault structure overview:**
 
 ```bash
-engraph vault-map
+knapper vault-map
 ```
 
 Returns folder counts, top tags, recent files — gives an AI agent orientation before it starts searching.
@@ -233,7 +221,7 @@ Returns folder counts, top tags, recent files — gives an AI agent orientation 
 **See what the vault holds:**
 
 ```bash
-engraph list --scope /locations/ --detailed
+knapper list --scope /locations/ --detailed
 ```
 ```
 locations/aurelian-empire.md
@@ -243,20 +231,20 @@ locations/aurelian-empire.md
 ## Current Events
 ```
 
-One bare path per line, in path order, so a folder's notes arrive together and `wc -l` is the total. A bare `engraph list` answers every indexed note; `--scope`, `--all`, `--any` and `--none` narrow it by tag or by directory, and `--limit` keeps the first n. `--detailed` reads each listed note and prints its headings, which is how an agent finds the section to read or write before it calls `read` or `update`.
+One bare path per line, in path order, so a folder's notes arrive together and `wc -l` is the total. A bare `knapper list` answers every indexed note; `--scope`, `--all`, `--any` and `--none` narrow it by tag or by directory, and `--limit` keeps the first n. `--detailed` reads each listed note and prints its headings, which is how an agent finds the section to read or write before it calls `read` or `update`.
 
 **Create a note via the write pipeline:**
 
 ```bash
-engraph create --content "# Meeting Notes\n\nDiscussed auth timeline with Sarah." --tags meeting,auth
+knapper create --content "# Meeting Notes\n\nDiscussed auth timeline with Sarah." --tags meeting,auth
 ```
 
-engraph resolves tags against the registry (fuzzy matching), discovers potential wikilinks (`[[Sarah Chen]]`), suggests the best folder based on semantic similarity to existing notes, and writes atomically.
+knapper resolves tags against the registry (fuzzy matching), discovers potential wikilinks (`[[Sarah Chen]]`), suggests the best folder based on semantic similarity to existing notes, and writes atomically.
 
 **Edit a specific section:**
 
 ```bash
-engraph update "Meeting Notes" --section "Action Items" --mode append --content="- [ ] Follow up with Sarah"
+knapper update "Meeting Notes" --section "Action Items" --mode append --content="- [ ] Follow up with Sarah"
 ```
 
 Targets the "Action Items" section by heading, appends content without touching the rest of the note. Write `--content=` with an equals sign when the value starts with a `-`: the shell passes the text through untouched, and clap reads a leading `-` as a flag.
@@ -264,7 +252,7 @@ Targets the "Action Items" section by heading, appends content without touching 
 **Rewrite a note (preserves frontmatter):**
 
 ```bash
-engraph update "Meeting Notes" --mode replace --content "# Meeting Notes\n\nRevised content here."
+knapper update "Meeting Notes" --mode replace --content "# Meeting Notes\n\nRevised content here."
 ```
 
 Replaces the entire body while keeping existing frontmatter (tags, dates, metadata) intact.
@@ -272,7 +260,7 @@ Replaces the entire body while keeping existing frontmatter (tags, dates, metada
 **Edit frontmatter:**
 
 ```bash
-engraph update "Meeting Notes" --property tags --mode append --content "actionable"
+knapper update "Meeting Notes" --property tags --mode append --content "actionable"
 ```
 
 A property takes `--mode replace`, `append` or `remove`; a body or a section takes `replace`, `prepend` or `append`. Repeat `--content` to write a list-valued property such as tags or aliases.
@@ -280,21 +268,21 @@ A property takes `--mode replace`, `append` or `remove`; a body or a section tak
 **Delete a note:**
 
 ```bash
-engraph delete "Old Draft" --mode soft   # moves to archive
-engraph delete "Old Draft" --mode hard   # permanent removal
+knapper delete "Old Draft" --mode soft   # moves to archive
+knapper delete "Old Draft" --mode hard   # permanent removal
 ```
 
 **Check vault health:**
 
 ```bash
-engraph health
+knapper health
 ```
 
 Returns orphan notes (no links in or out), broken wikilinks, stale notes, and tag hygiene issues.
 
 ## HTTP REST API
 
-`engraph serve --http` adds a full REST API alongside the MCP server, exposing the same capabilities over HTTP for web agents, scripts, and integrations.
+`knapper serve --http` adds a full REST API alongside the MCP server, exposing the same capabilities over HTTP for web agents, scripts, and integrations.
 
 **21 endpoints:**
 
@@ -329,7 +317,7 @@ Every capability is one route, and the route is the CLI command's name under `/a
 All requests require an API key via the `Authorization` header:
 
 ```bash
-curl -H "Authorization: Bearer eg_abc123..." http://localhost:3000/api/vault-map
+curl -H "Authorization: Bearer kn_abc123..." http://localhost:3000/api/vault-map
 ```
 
 Keys have either `read` or `write` permission. Write keys can access all endpoints; read keys are restricted to read-only endpoints. Use `--no-auth` for local development without keys (127.0.0.1 only).
@@ -339,26 +327,26 @@ Keys have either `read` or `write` permission. Write keys can access all endpoin
 ```bash
 # Search
 curl -X POST http://localhost:3000/api/search \
-  -H "Authorization: Bearer eg_..." \
+  -H "Authorization: Bearer kn_..." \
   -H "Content-Type: application/json" \
   -d '{"query": "authentication architecture", "top_n": 5}'
 
 # Search, scoped to a tag or directory filter (scope/all, any, none; a
 # leading / reads a term as a directory path from the vault root)
 curl -X POST http://localhost:3000/api/search \
-  -H "Authorization: Bearer eg_..." \
+  -H "Authorization: Bearer kn_..." \
   -H "Content-Type: application/json" \
   -d '{"query": "authentication architecture", "top_n": 5, "scope": ["project/auth", "/01-Projects/"], "all": ["type/decision"], "any": ["status/reviewed", "status/draft"], "none": ["status/archived"]}'
 
 # Read a note, or one of its sections
 curl "http://localhost:3000/api/read?file=01-Projects/API-Design.md" \
-  -H "Authorization: Bearer eg_..."
+  -H "Authorization: Bearer kn_..."
 curl "http://localhost:3000/api/read?file=01-Projects/API-Design.md&section=Endpoints" \
-  -H "Authorization: Bearer eg_..."
+  -H "Authorization: Bearer kn_..."
 
 # Create a note
 curl -X POST http://localhost:3000/api/create \
-  -H "Authorization: Bearer eg_..." \
+  -H "Authorization: Bearer kn_..." \
   -H "Content-Type: application/json" \
   -d '{"content": "# Meeting Notes\n\nDiscussed auth timeline.", "tags": ["meeting", "auth"]}'
 ```
@@ -375,29 +363,29 @@ cors_origins = ["http://localhost:3000", "https://myapp.example.com"]
 rate_limit = 60
 
 [[http.api_keys]]
-key = "eg_..."
+key = "kn_..."
 permission = "write"
 ```
 
 ## PARA Migration
 
-`engraph migrate` restructures your vault into the [PARA method](https://fortelabs.com/blog/para/) (Projects, Areas, Resources, Archive) using heuristic classification. The workflow is non-destructive: preview first, review the plan, then apply.
+`knapper migrate` restructures your vault into the [PARA method](https://fortelabs.com/blog/para/) (Projects, Areas, Resources, Archive) using heuristic classification. The workflow is non-destructive: preview first, review the plan, then apply.
 
 **Workflow:**
 
 ```bash
 # 1. Preview — classify notes and generate a migration plan
-engraph migrate --mode preview
-# Outputs: markdown summary + JSON plan saved to ~/.engraph/
+knapper migrate --mode preview
+# Outputs: markdown summary + JSON plan saved to ~/.knapper/
 
 # 2. Review the plan (edit if needed)
-cat ~/.engraph/migration_preview.md
+cat ~/.knapper/migration_preview.md
 
 # 3. Apply — move files according to the plan
-engraph migrate --mode apply
+knapper migrate --mode apply
 
 # 4. Undo — reverse the last migration if something looks wrong
-engraph migrate --mode undo
+knapper migrate --mode undo
 ```
 
 **Classification signals:**
@@ -411,27 +399,27 @@ engraph migrate --mode undo
 
 Notes that don't match any signal with sufficient confidence stay in place. Daily notes (`YYYY-MM-DD.md`) and templates are always skipped.
 
-**MCP tool:** `migrate`, with the same `mode` — available in `engraph serve` for AI-assisted migration.
+**MCP tool:** `migrate`, with the same `mode` — available in `knapper serve` for AI-assisted migration.
 
-**HTTP endpoint:** `POST /api/migrate`, with the same `mode` — available via `engraph serve --http`. On both servers `mode: apply` takes the `preview` that `mode: preview` returned; only the CLI reads the copy saved on disk.
+**HTTP endpoint:** `POST /api/migrate`, with the same `mode` — available via `knapper serve --http`. On both servers `mode: apply` takes the `preview` that `mode: preview` returned; only the CLI reads the copy saved on disk.
 
 ## ChatGPT Actions
 
-Connect your Obsidian vault to ChatGPT as a custom GPT Action. ChatGPT can search, read, create, and edit your notes through engraph's REST API.
+Connect your Obsidian vault to ChatGPT as a custom GPT Action. ChatGPT can search, read, create, and edit your notes through knapper's REST API.
 
 ### Prerequisites
 
-- engraph installed and indexed (`engraph index ~/your-vault`)
+- knapper installed and indexed (`knapper index ~/your-vault`)
 - A tunnel tool: [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/get-started/create-local-tunnel/) (recommended) or [ngrok](https://ngrok.com)
 
-### Step 1: Configure engraph
+### Step 1: Configure knapper
 
 ```bash
 # Interactive setup — enables HTTP, creates API key, sets CORS
-engraph configure --setup-chatgpt
+knapper configure --setup-chatgpt
 ```
 
-Or configure manually in `~/.engraph/config.toml`:
+Or configure manually in `~/.knapper/config.toml`:
 
 ```toml
 [http]
@@ -442,7 +430,7 @@ rate_limit = 60
 cors_origins = ["https://chat.openai.com", "https://chatgpt.com"]
 
 [[http.api_keys]]
-key = "eg_your_key_here"    # generate with: engraph configure --add-api-key --key-name chatgpt --key-permissions write
+key = "kn_your_key_here"    # generate with: knapper configure --add-api-key --key-name chatgpt --key-permissions write
 name = "chatgpt"
 permissions = "write"        # "read" for search-only, "write" to also create/edit notes
 
@@ -452,11 +440,11 @@ description = "Search and manage my Obsidian vault"
 public_url = "https://your-tunnel-url.trycloudflare.com"   # set after starting tunnel
 ```
 
-### Step 2: Start engraph + tunnel
+### Step 2: Start knapper + tunnel
 
-**Terminal 1 — engraph HTTP server:**
+**Terminal 1 — knapper HTTP server:**
 ```bash
-engraph serve --http
+knapper serve --http
 ```
 
 **Terminal 2 — Cloudflare tunnel:**
@@ -473,14 +461,14 @@ ngrok http 3000
 
 ### Step 3: Update config with tunnel URL
 
-Edit `~/.engraph/config.toml` and set `public_url` to your tunnel URL:
+Edit `~/.knapper/config.toml` and set `public_url` to your tunnel URL:
 
 ```toml
 [http.plugin]
 public_url = "https://abc-xyz.trycloudflare.com"
 ```
 
-Then restart engraph (`Ctrl+C` and re-run `engraph serve --http`). This ensures the OpenAPI spec points to the correct public URL.
+Then restart knapper (`Ctrl+C` and re-run `knapper serve --http`). This ensures the OpenAPI spec points to the correct public URL.
 
 ### Step 4: Verify endpoints
 
@@ -490,7 +478,7 @@ curl https://your-tunnel-url/openapi.json
 curl https://your-tunnel-url/.well-known/ai-plugin.json
 
 # Search with auth
-curl -X POST -H "Authorization: Bearer eg_your_key" \
+curl -X POST -H "Authorization: Bearer kn_your_key" \
   -H "Content-Type: application/json" \
   -d '{"query": "test search"}' \
   https://your-tunnel-url/api/search
@@ -503,7 +491,7 @@ curl -X POST -H "Authorization: Bearer eg_your_key" \
 3. Add these **Instructions**:
 
 ```
-You are a knowledge assistant connected to the user's Obsidian vault via engraph.
+You are a knowledge assistant connected to the user's Obsidian vault via knapper.
 
 WORKFLOW:
 1. Use searchVault to find relevant notes before answering questions
@@ -528,7 +516,7 @@ STYLE:
 5. Enter: `https://your-tunnel-url/openapi.json`
 6. Click the **gear icon** next to Authentication
 7. Select **API Key**, Auth Type: **Bearer**
-8. Paste your API key (the `eg_...` key from Step 1)
+8. Paste your API key (the `kn_...` key from Step 1)
 9. **Save** and test
 
 ### Conversation starters
@@ -543,7 +531,7 @@ STYLE:
 - **Tunnel URLs are temporary** (Cloudflare quick tunnels change on restart). For persistent URLs, set up a [named Cloudflare tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/get-started/create-local-tunnel/) or use ngrok with a reserved domain.
 - **Read-only mode**: set `permissions = "read"` on the API key if you don't want ChatGPT to create or modify notes.
 - **Rate limiting**: default is 60 requests/minute per key. Adjust `rate_limit` in config if needed.
-- **engraph must be running** on your machine for ChatGPT to access it. If you close the terminal, the connection drops.
+- **knapper must be running** on your machine for ChatGPT to access it. If you close the terminal, the connection drops.
 
 ## Use cases
 
@@ -557,7 +545,7 @@ STYLE:
 
 ## How it compares
 
-| | engraph | Basic RAG (vector-only) | Obsidian search |
+| | knapper | Basic RAG (vector-only) | Obsidian search |
 |---|---|---|---|
 | Search method | 5-lane RRF (semantic + BM25 + graph + reranker + temporal) | Vector similarity only | Keyword only |
 | Query understanding | Cross-encoder reads each candidate jointly with the query | None | None |
@@ -569,7 +557,7 @@ STYLE:
 | Runs locally | Yes, llama.cpp + Metal GPU | Depends | Yes |
 | Setup | One binary, one command | Framework + code | Built-in |
 
-engraph is not a replacement for Obsidian — it's the intelligence layer that sits between your vault and your AI tools.
+knapper is not a replacement for Obsidian — it's the intelligence layer that sits between your vault and your AI tools.
 
 ## Current capabilities
 
@@ -579,7 +567,7 @@ engraph is not a replacement for Obsidian — it's the intelligence layer that s
 - llama.cpp inference via Rust bindings (GGUF models, Metal GPU on macOS, CUDA on Linux)
 - Intelligence opt-in: the cross-encoder lane is off unless enabled
 - MCP server with 20 tools (8 read, 5 write, 5 index and diagnostic, 1 setup, 1 migrate) via stdio
-- HTTP REST API with 21 endpoints, API key auth (`eg_` prefix), rate limiting, CORS — enabled via `engraph serve --http`
+- HTTP REST API with 21 endpoints, API key auth (`kn_` prefix), rate limiting, CORS — enabled via `knapper serve --http`
 - User identity with L0/L1 tiered context for AI agent session starts
 - Section-level reading and editing: target specific headings with replace/prepend/append modes
 - Full note rewriting with automatic frontmatter preservation
@@ -614,7 +602,7 @@ engraph is not a replacement for Obsidian — it's the intelligence layer that s
 
 ## Configuration
 
-Optional config at `~/.engraph/config.toml`:
+Optional config at `~/.knapper/config.toml`:
 
 ```toml
 vault_path = "~/Documents/MyVault"
@@ -649,7 +637,7 @@ intelligence = true
 
 # Prepend document identity to each chunk before embedding. Off by default —
 # it helped conceptual queries and hurt exact-name lookup on the test vault.
-# Needs `engraph index --rebuild` to take effect either way.
+# Needs `knapper index --rebuild` to take effect either way.
 [embedding_prefix]
 enabled = false
 # path = true      # "Archdragon — lore/bestiary/archdragon.md"
@@ -680,7 +668,7 @@ The keyword lane indexes each chunk's **full text**. `chunks.snippet` — the le
 
 `exclude` takes `.gitignore`-style globs, matched against paths relative to the vault root. A pattern with no `/` matches at any depth (`*-index.md` catches `lore/lore-index.md`); a trailing `/` means a directory and everything under it; an embedded `/` anchors the pattern to the vault root (`drafts/**`). Excluding a path that is already indexed removes it from the store — chunks, vectors, FTS entries and graph edges — on the next index run.
 
-All data stored in `~/.engraph/` — single SQLite database (~10MB typical), GGUF models, and vault profile.
+All data stored in `~/.knapper/` — single SQLite database (~10MB typical), GGUF models, and vault profile.
 
 ## Development
 
@@ -695,6 +683,10 @@ cargo fmt --check
 Contributions welcome. Please open an issue first to discuss what you'd like to change.
 
 The codebase is 35 Rust modules behind a lib crate. `CLAUDE.md` in the repo root has detailed architecture documentation for AI-assisted development.
+
+## Attribution
+
+knapper began as a fork of [engraph](https://github.com/devwhodevs/engraph) (MIT) at v1.7.2. See `NOTICE`. The full git history carries the original commits and their authorship.
 
 ## License
 
