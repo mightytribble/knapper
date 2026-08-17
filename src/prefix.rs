@@ -93,7 +93,7 @@ impl PrefixConfig {
 pub struct DocContext {
     /// Frontmatter `name` if present, else the filename stem.
     ///
-    /// Not the breadcrumb root since #46 — `name` is a convention engraph reads
+    /// Not the breadcrumb root since #46 — `name` is a convention knapper reads
     /// and never writes, and it is not Obsidian's. See [`BreadcrumbRoot`].
     pub name: String,
     /// The filename without its extension or folders. Not identifying: 14 stems

@@ -34,7 +34,7 @@ fn prompt_intelligence(data_dir: &std::path::Path) -> Result<bool> {
         println!("Done.");
     } else {
         println!(
-            "Intelligence disabled. You can enable later with: engraph configure --enable-intelligence"
+            "Intelligence disabled. You can enable later with: knapper configure --enable-intelligence"
         );
     }
 
@@ -72,12 +72,12 @@ fn remove_dir_if_exists(path: &std::path::Path) -> Result<bool> {
 /// from each spelling it out (#62).
 fn open_vault(data_dir: &Path) -> Result<(store::Store, PathBuf, Option<VaultProfile>)> {
     if !index_exists(data_dir) {
-        eprintln!("No index found. Run 'engraph index <path>' first.");
+        eprintln!("No index found. Run 'knapper index <path>' first.");
         std::process::exit(1);
     }
     let store = store::Store::open(&config::db_path(data_dir))?;
     let vault_path = store.get_meta("vault_path")?.ok_or_else(|| {
-        anyhow::anyhow!("No vault path in index. Run 'engraph index <path>' first.")
+        anyhow::anyhow!("No vault path in index. Run 'knapper index <path>' first.")
     })?;
     let profile = config::Config::load_vault_profile().ok().flatten();
     Ok((store, PathBuf::from(&vault_path), profile))
@@ -221,7 +221,7 @@ async fn main() -> Result<()> {
             let scope = knapper::tags::Scope::parse(&all_terms, &args.any, &args.none)?;
 
             if !index_exists(&data_dir) {
-                eprintln!("No index found. Run 'engraph index <path>' first.");
+                eprintln!("No index found. Run 'knapper index <path>' first.");
                 std::process::exit(1);
             }
 
@@ -243,7 +243,7 @@ async fn main() -> Result<()> {
 
         Command::Status(_) => {
             if !index_exists(&data_dir) {
-                eprintln!("No index found. Run 'engraph index <path>' first.");
+                eprintln!("No index found. Run 'knapper index <path>' first.");
                 std::process::exit(1);
             }
 
@@ -503,7 +503,7 @@ async fn main() -> Result<()> {
             let json = cli.json;
             let db_path = config::db_path(&data_dir);
             if !db_path.exists() {
-                anyhow::bail!("No index found. Run `engraph init` first.");
+                anyhow::bail!("No index found. Run `knapper init` first.");
             }
             let store = knapper::store::Store::open(&db_path)?;
             if args.refresh {
@@ -514,7 +514,7 @@ async fn main() -> Result<()> {
                         eprintln!("L1 facts refreshed.");
                     }
                     None => {
-                        anyhow::bail!("No vault profile found. Run `engraph init` first.");
+                        anyhow::bail!("No vault profile found. Run `knapper init` first.");
                     }
                 }
             }
@@ -585,7 +585,7 @@ async fn main() -> Result<()> {
                     "embed" => {
                         cfg.models.embed = Some(uri.clone());
                         println!("Embedding model set to: {uri}");
-                        println!("Warning: Next 'engraph index' will re-embed your entire vault.");
+                        println!("Warning: Next 'knapper index' will re-embed your entire vault.");
                     }
                     "rerank" => {
                         cfg.models.rerank = Some(uri.clone());
@@ -611,8 +611,8 @@ async fn main() -> Result<()> {
                         cfg.agents.claude_code = true;
                         println!(
                             "Registered Claude Code. Add to ~/.claude/settings.json:\n  \
-                             \"engraph\": {{\n    \
-                             \"command\": \"engraph\",\n    \
+                             \"knapper\": {{\n    \
+                             \"command\": \"knapper\",\n    \
                              \"args\": [\"serve\"]\n  \
                              }}"
                         );
@@ -621,8 +621,8 @@ async fn main() -> Result<()> {
                         cfg.agents.cursor = true;
                         println!(
                             "Registered Cursor. Add to ~/.cursor/mcp.json:\n  \
-                             \"engraph\": {{\n    \
-                             \"command\": \"engraph\",\n    \
+                             \"knapper\": {{\n    \
+                             \"command\": \"knapper\",\n    \
                              \"args\": [\"serve\"]\n  \
                              }}"
                         );
@@ -631,8 +631,8 @@ async fn main() -> Result<()> {
                         cfg.agents.windsurf = true;
                         println!(
                             "Registered Windsurf. Add to ~/.codeium/windsurf/mcp_config.json:\n  \
-                             \"engraph\": {{\n    \
-                             \"command\": \"engraph\",\n    \
+                             \"knapper\": {{\n    \
+                             \"command\": \"knapper\",\n    \
                              \"args\": [\"serve\"]\n  \
                              }}"
                         );
@@ -688,7 +688,7 @@ async fn main() -> Result<()> {
             }
 
             if setup_chatgpt {
-                println!("Setting up engraph for ChatGPT Actions...\n");
+                println!("Setting up knapper for ChatGPT Actions...\n");
 
                 if !cfg.http.enabled {
                     cfg.http.enabled = true;
@@ -730,7 +730,7 @@ async fn main() -> Result<()> {
 
                 cfg.save()?;
                 println!("\nSetup complete. Next steps:");
-                println!("1. engraph serve --http");
+                println!("1. knapper serve --http");
                 println!(
                     "2. Expose via tunnel: cloudflared tunnel --url http://localhost:{}",
                     cfg.http.port
@@ -762,7 +762,7 @@ async fn main() -> Result<()> {
             read_only,
         } => {
             if !index_exists(&data_dir) {
-                eprintln!("No index found. Run 'engraph index <path>' first.");
+                eprintln!("No index found. Run 'knapper index <path>' first.");
                 std::process::exit(1);
             }
             let http_opts = if http {
@@ -974,7 +974,7 @@ async fn main() -> Result<()> {
             let mode = args.mode;
             let data_dir = Config::data_dir()?;
             if !index_exists(&data_dir) {
-                eprintln!("No index found. Run 'engraph index <path>' first.");
+                eprintln!("No index found. Run 'knapper index <path>' first.");
                 std::process::exit(1);
             }
             let db_path = config::db_path(&data_dir);
@@ -1003,7 +1003,7 @@ async fn main() -> Result<()> {
                     println!("  {}", data_dir.join("migration-preview.md").display());
                     println!("  {}", data_dir.join("migration-preview.json").display());
                     println!();
-                    println!("Review the preview, then run: engraph migrate --mode apply");
+                    println!("Review the preview, then run: knapper migrate --mode apply");
                 }
                 "apply" => {
                     let preview = knapper::migrate::load_preview(&data_dir)?;
@@ -1065,7 +1065,7 @@ async fn main() -> Result<()> {
                         println!("Description: Default embedding model (GGUF)");
                     } else {
                         eprintln!("Unknown model: {name}");
-                        eprintln!("Run 'engraph models list' to see available models.");
+                        eprintln!("Run 'knapper models list' to see available models.");
                         std::process::exit(1);
                     }
                 }

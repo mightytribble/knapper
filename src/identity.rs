@@ -162,7 +162,7 @@ pub fn format_identity_block(config: &Config, store: &Store) -> Result<String> {
 
     if facts.is_empty() {
         out.push_str("\n## Current State (L1)\n");
-        out.push_str("[no data — run engraph index]\n");
+        out.push_str("[no data — run knapper index]\n");
         return Ok(out);
     }
 

@@ -233,7 +233,7 @@ pub enum QueryTemplate {
 ///
 /// The model card documents eight of them. `search result` is the one a
 /// retrieval engine asks for: the others describe classification, clustering
-/// and similarity, which engraph never wants.
+/// and similarity, which knapper never wants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmbedTask {
     /// No task field at all — the legacy `search_query:` prefix.
@@ -966,7 +966,7 @@ const FALLBACK_N_THREADS: i32 = 4;
 /// Counts distinct `thread_siblings` masks in sysfs — one entry per physical
 /// core, with an SMT pair sharing a mask. This is llama.cpp's own rule, from
 /// `common/common.cpp::cpu_get_num_physical_cores`, which is what its CLI feeds
-/// to `n_threads`; only the *library* default is the flat 4 that engraph used to
+/// to `n_threads`; only the *library* default is the flat 4 that knapper used to
 /// inherit.
 ///
 /// Linux only, deliberately. Everywhere else the caller falls back to
@@ -1031,7 +1031,7 @@ fn physical_cores() -> Option<usize> {
 ///
 /// Both context knobs get this value. `n_threads` governs single-token
 /// autoregressive decode and `n_threads_batch` governs multi-token forward
-/// passes, and engraph is all of the latter: nothing generates. The reranker
+/// passes, and knapper is all of the latter: nothing generates. The reranker
 /// decodes a whole ~155-token pair and reads the final logits, and the embedder
 /// encodes a chunk.
 pub fn resolve_n_threads(config: &crate::config::Config) -> i32 {

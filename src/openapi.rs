@@ -33,7 +33,7 @@ pub fn build_openapi_spec(server_url: &str) -> serde_json::Value {
     serde_json::json!({
         "openapi": "3.1.0",
         "info": {
-            "title": "engraph",
+            "title": "knapper",
             "version": "1.6.0",
             "description": "AI-powered semantic search and management API for Obsidian vaults."
         },
@@ -200,7 +200,7 @@ fn build_update() -> serde_json::Value {
         "post": {
             "operationId": "updateNote",
             "summary": "Change an existing note. Applies a list of edits in order, in one write.",
-            "description": "Each edit names its target: `section` for one heading, `property` for one frontmatter key, and neither for the note's body. An edit naming both is an error. `content` is a string, or a list of strings for a list-valued property such as tags or aliases; a body edit and a section edit take a string. A body edit always keeps the note's frontmatter, so change the frontmatter with `property` edits in the same list. Three things differ from the append/edit/rewrite/edit-frontmatter/update-metadata calls this replaces. A note changed outside engraph and not yet re-indexed fails with an mtime conflict. Replacing a note's frontmatter wholesale has no spelling here: rewrite's `preserve_frontmatter: false` is gone rather than renamed, and the new frontmatter is written with `property` edits instead. A whole-note tag or alias replacement no longer stamps a `modified_by` property on the note.",
+            "description": "Each edit names its target: `section` for one heading, `property` for one frontmatter key, and neither for the note's body. An edit naming both is an error. `content` is a string, or a list of strings for a list-valued property such as tags or aliases; a body edit and a section edit take a string. A body edit always keeps the note's frontmatter, so change the frontmatter with `property` edits in the same list. Three things differ from the append/edit/rewrite/edit-frontmatter/update-metadata calls this replaces. A note changed outside knapper and not yet re-indexed fails with an mtime conflict. Replacing a note's frontmatter wholesale has no spelling here: rewrite's `preserve_frontmatter: false` is gone rather than renamed, and the new frontmatter is written with `property` edits instead. A whole-note tag or alias replacement no longer stamps a `modified_by` property on the note.",
             "requestBody": {
                 "required": true,
                 "content": { "application/json": { "schema": {
@@ -417,8 +417,8 @@ fn build_migrate() -> serde_json::Value {
 pub fn build_plugin_manifest(config: &HttpConfig, server_url: &str) -> serde_json::Value {
     serde_json::json!({
         "schema_version": "v1",
-        "name_for_human": config.plugin.name.as_deref().unwrap_or("engraph"),
-        "name_for_model": "engraph",
+        "name_for_human": config.plugin.name.as_deref().unwrap_or("knapper"),
+        "name_for_model": "knapper",
         "description_for_human": config.plugin.description.as_deref()
             .unwrap_or("Search and manage your Obsidian vault with AI-powered hybrid search."),
         "description_for_model": "Access an Obsidian knowledge vault. Use search to find notes by content or time. read for full content. who/project for context bundles. Write tools create, edit, and organize notes.",
@@ -473,7 +473,7 @@ mod tests {
         let config = crate::config::HttpConfig::default();
         let manifest = build_plugin_manifest(&config, "https://vault.example.com");
         assert_eq!(manifest["schema_version"], "v1");
-        assert_eq!(manifest["name_for_model"], "engraph");
+        assert_eq!(manifest["name_for_model"], "knapper");
         assert!(
             manifest["api"]["url"]
                 .as_str()

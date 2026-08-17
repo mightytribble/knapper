@@ -21,7 +21,7 @@ pub struct ModelConfig {
     /// 8-core/16-thread box, 8 threads runs a query in 8.4 s and 16 runs it in
     /// 15 s, worse than the 4 this replaced. llama.cpp's library default is the
     /// constant `GGML_DEFAULT_N_THREADS = 4` regardless of hardware, carrying
-    /// its own `// TODO: better default`, and engraph used to inherit it —
+    /// its own `// TODO: better default`, and knapper used to inherit it —
     /// so every model call ran on four threads of whatever box it was on
     /// (issue #20).
     ///
@@ -171,7 +171,7 @@ pub enum GroupBy {
     #[default]
     Chunk,
     /// One result per document, represented by its best-scoring section. This is
-    /// what engraph returned before sections were addressable.
+    /// what knapper returned before sections were addressable.
     File,
 }
 
@@ -331,7 +331,7 @@ pub enum BreadcrumbRoot {
     Path,
     /// Frontmatter `name`, else the filename stem. What shipped before #46.
     ///
-    /// **`name` is not engraph's key and not Obsidian's.** Obsidian gives
+    /// **`name` is not knapper's key and not Obsidian's.** Obsidian gives
     /// meaning to `aliases`, `tags` and `cssclasses`; a note's title is its
     /// filename. `name:` is a cc-isekai convention that this engine reads and
     /// never writes, and it is a natural property key for a note *about* a
@@ -458,7 +458,7 @@ impl FtsConfig {
 #[serde(rename_all = "lowercase")]
 pub enum RankingMode {
     /// Five lanes fused by weighted RRF, the cross-encoder among them as a
-    /// voter. What engraph did before #30.
+    /// voter. What knapper did before #30.
     ///
     /// Kept as the control the change is measured against: a switch that
     /// reproduces prior output byte-for-byte is what proves nothing incidental
@@ -725,13 +725,13 @@ pub struct Config {
     pub group_by: GroupBy,
     /// What document identity is prepended to a chunk's text before embedding.
     /// Affects the vector only — storage, snippets and FTS see the raw chunk.
-    /// Changing this needs `engraph index --rebuild`; the incremental path
+    /// Changing this needs `knapper index --rebuild`; the incremental path
     /// compares content hashes and will not notice.
     #[serde(default)]
     pub embedding_prefix: PrefixConfig,
     /// Which prompt template each half of an asymmetric embedding model is fed
     /// through (issue #10). `document` is a fingerprint component, so changing
-    /// it re-indexes on the next `engraph index`; `query` costs nothing.
+    /// it re-indexes on the next `knapper index`; `query` costs nothing.
     #[serde(default)]
     pub embedding_prompt: EmbeddingPromptConfig,
     /// Glob patterns to exclude from indexing.
@@ -839,7 +839,7 @@ impl Default for Config {
 /// The store's file name before the rename.
 const LEGACY_DB_NAME: &str = "engraph.db";
 
-/// The store file inside `dir`: `knapper.db`. A directory holding only a
+/// The store file inside `dir`: `knapper.db`. A directory holding only an
 /// [`LEGACY_DB_NAME`] written before the rename keeps it, so no store
 /// migrates.
 pub fn db_path(dir: &Path) -> PathBuf {

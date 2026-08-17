@@ -123,7 +123,7 @@ pub fn generate_filename(title: &str) -> String {
 
 /// A caller-supplied filename, sanitized and given a `.md` extension. A bare
 /// name gets `.md` appended; a name that already ends in `.md` is kept. The
-/// caller names the file — engraph does not guess one from content, because
+/// caller names the file — knapper does not guess one from content, because
 /// since #46 the filename is the breadcrumb root of every chunk (#47).
 pub fn normalize_filename(name: &str) -> String {
     let cleaned = generate_filename(name);
@@ -1082,7 +1082,7 @@ pub fn update_note(store: &Store, vault_path: &Path, input: &UpdateInput) -> Res
     let disk_mtime = file_mtime(&full_path)?;
     if disk_mtime != file_record.mtime {
         bail!(
-            "mtime conflict: file {} was modified outside engraph (disk={}, indexed={})",
+            "mtime conflict: file {} was modified outside knapper (disk={}, indexed={})",
             file_record.path,
             disk_mtime,
             file_record.mtime
@@ -1698,7 +1698,7 @@ mod tests {
     #[test]
     fn test_build_frontmatter() {
         let fm = build_frontmatter(
-            &["work".to_string(), "engraph".to_string()],
+            &["work".to_string(), "knapper".to_string()],
             Some("claude-code"),
             None,
             None,
@@ -2023,7 +2023,7 @@ mod tests {
     fn test_merge_tags_deduplicated() {
         let user_fm = "---\ntags:\n  - project\n  - work\n  - rust\n---\n";
         let (user_scalars, user_tags, user_aliases) = parse_frontmatter_fields(user_fm);
-        let auto_tags = vec!["project".to_string(), "engraph".to_string()];
+        let auto_tags = vec!["project".to_string(), "knapper".to_string()];
 
         let merged = build_merged_frontmatter(
             &auto_tags,
@@ -2034,11 +2034,11 @@ mod tests {
             &user_aliases,
         );
 
-        // "project" should appear once, "engraph" from auto, "work" and "rust" from user
+        // "project" should appear once, "knapper" from auto, "work" and "rust" from user
         let tag_lines: Vec<&str> = merged.lines().filter(|l| l.starts_with("  - ")).collect();
         assert_eq!(tag_lines.len(), 4);
         assert!(merged.contains("  - project\n"));
-        assert!(merged.contains("  - engraph\n"));
+        assert!(merged.contains("  - knapper\n"));
         assert!(merged.contains("  - work\n"));
         assert!(merged.contains("  - rust\n"));
 
@@ -2547,11 +2547,11 @@ mod tests {
     /// whole seconds, so an outside write in the same second as the index
     /// passes the check and the test would assert nothing.
     #[test]
-    fn an_update_of_a_note_edited_outside_engraph_is_a_conflict() {
+    fn an_update_of_a_note_edited_outside_knapper_is_a_conflict() {
         let (_tmp, store, vault) = indexed_note("# Note\n\nIndexed body\n");
         let indexed_mtime = store.get_file("note.md").unwrap().unwrap().mtime;
 
-        let outside = "# Note\n\nWritten outside engraph\n";
+        let outside = "# Note\n\nWritten outside knapper\n";
         std::fs::write(vault.join("note.md"), outside).unwrap();
         std::fs::File::options()
             .write(true)
@@ -2573,7 +2573,7 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(vault.join("note.md")).unwrap(),
             outside,
-            "the update wrote over an edit made outside engraph"
+            "the update wrote over an edit made outside knapper"
         );
     }
 

@@ -945,7 +945,7 @@ async fn handle_identity(
     let store = state.store.lock().await;
     if p.refresh {
         let profile = state.profile.as_ref().as_ref().ok_or_else(|| {
-            ApiError::bad_request("No vault profile found. Run `engraph init` first.")
+            ApiError::bad_request("No vault profile found. Run `knapper init` first.")
         })?;
         crate::identity::extract_l1_facts(&store, profile)
             .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
@@ -2053,7 +2053,7 @@ mod tests {
     }
 
     /// A server's `apply` acts on the plan its caller sends and no other. The
-    /// copy `engraph migrate --mode preview` saves belongs to the CLI's own
+    /// copy `knapper migrate --mode preview` saves belongs to the CLI's own
     /// two-step flow, and an `apply` that fell back to it would move files
     /// against a plan this caller never saw (#62).
     #[tokio::test]

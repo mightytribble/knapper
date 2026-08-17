@@ -1132,7 +1132,7 @@ mod tests {
         for display in [
             "domaine",
             "scentbird",
-            "engraph",
+            "knapper",
             "work",
             "work/domaine",
             "Type/Undead",

@@ -806,7 +806,7 @@ fn emit_section(
 /// (issue #31): a store built at one set of these values holds different chunks
 /// — and therefore different vectors and different FTS rows — than the same
 /// vault indexed at another, and nothing else in the database records which set
-/// was used. Changing one here is enough to make the next `engraph index`
+/// was used. Changing one here is enough to make the next `knapper index`
 /// rebuild; there is no second place to remember to edit.
 pub mod limits {
     /// The packing budget `structure_chunk` aims for.

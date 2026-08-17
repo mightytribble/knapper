@@ -1,6 +1,6 @@
 //! What built the index, so the store can tell when that changed (issue #31).
 //!
-//! engraph fingerprinted exactly one thing: embedding *dimension*. Everything
+//! knapper fingerprinted exactly one thing: embedding *dimension*. Everything
 //! else that decides what is in the store — chunk boundaries, the embedding
 //! prompt template, the tokenizer, the FTS schema, the link resolver, the model
 //! artifact itself — could change while the store reported itself healthy, and
@@ -124,7 +124,7 @@ pub const EMBEDDING_NORMALIZATION_VERSION: u32 = 1;
 pub enum Action {
     /// Re-read, rechunk and re-embed every file.
     ///
-    /// §4 distinguishes reparse from rechunk from re-embed. engraph does not:
+    /// §4 distinguishes reparse from rechunk from re-embed. knapper does not:
     /// `index_file` parses, chunks and embeds as one unit, and re-embedding is
     /// where essentially all of the cost is — rechunking on top of it is free.
     /// Splitting them would buy nothing and add three code paths.
@@ -398,7 +398,7 @@ pub fn verify(store: &Store, computed: &Fingerprints) -> Result<()> {
     if comparison.blocks_reads() {
         anyhow::bail!(
             "the index was built by different code or configuration than is \
-             running now: {}. Run 'engraph index' to bring it up to date.",
+             running now: {}. Run 'knapper index' to bring it up to date.",
             comparison.summary()
         );
     }

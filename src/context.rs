@@ -157,7 +157,7 @@ pub fn context_read(
             (c, b, fm)
         }
         Err(_) => {
-            let msg = "[File not found on disk. Re-run 'engraph index' to update.]".to_string();
+            let msg = "[File not found on disk. Re-run 'knapper index' to update.]".to_string();
             (String::new(), msg, String::new())
         }
     };

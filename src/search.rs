@@ -693,7 +693,7 @@ pub fn search_with_intelligence(
     };
 
     // Bound each document's share of the result set. `GroupBy::File` is the same
-    // operation with a cap of one, which is what engraph did before chunks were
+    // operation with a cap of one, which is what knapper did before chunks were
     // addressable at all.
     let final_fused = fusion::cap_per_file(
         final_fused,

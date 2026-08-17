@@ -176,7 +176,7 @@ pub fn rrf_fuse(lanes: &[(&str, &[RankedResult], f64)], k: usize) -> Vec<FusedRe
 ///
 /// Chunk-level fusion is what lets one document contribute several sections; this
 /// is the guard rail that stops a long document from contributing all of them.
-/// `cap_per_file(results, 1)` is exactly the file-level grouping engraph did
+/// `cap_per_file(results, 1)` is exactly the file-level grouping knapper did
 /// before chunks were addressable, which is how `group_by = "file"` is served.
 ///
 /// Expects `results` sorted best-first, as [`rrf_fuse`] returns them. A cap of 0

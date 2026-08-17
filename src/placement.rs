@@ -308,10 +308,10 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
     }
 }
 
-/// Detect whether a note was placed by engraph and then moved by the user to a different folder.
+/// Detect whether a note was placed by knapper and then moved by the user to a different folder.
 ///
 /// Returns `Some(CorrectionInfo)` if the frontmatter contains `suggested_folder` and `created_by`
-/// matching a known engraph agent, and the actual folder differs from the suggested one.
+/// matching a known knapper agent, and the actual folder differs from the suggested one.
 /// Returns `None` if there's no correction (confirmed placement, missing fields, or external tool).
 pub fn detect_correction_from_frontmatter(
     content: &str,
@@ -333,7 +333,7 @@ pub fn detect_correction_from_frontmatter(
         }
     }
 
-    // Guard: created_by must exist and match a known engraph agent
+    // Guard: created_by must exist and match a known knapper agent
     let agent = created_by?;
     if !KNAPPER_AGENTS.contains(&agent.as_str()) {
         return None;

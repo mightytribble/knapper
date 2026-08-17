@@ -323,7 +323,7 @@ pub fn render_table() -> String {
     );
     for c in CAPABILITIES {
         let cli = match c.cli {
-            Presence::On => format!("`engraph {}`", c.name),
+            Presence::On => format!("`knapper {}`", c.name),
             Presence::Exempt(r) => format!("— ({r})"),
         };
         let mcp = match c.mcp {
@@ -339,7 +339,7 @@ pub fn render_table() -> String {
     }
     out.push_str("\n## CLI only\n\n| command | reason |\n|---|---|\n");
     for (name, reason) in CLI_ONLY {
-        out.push_str(&format!("| `engraph {name}` | {reason} |\n"));
+        out.push_str(&format!("| `knapper {name}` | {reason} |\n"));
     }
     out.push_str("\n## Transport routes\n\n| route | reason |\n|---|---|\n");
     for (path, reason) in HTTP_TRANSPORT_ROUTES {

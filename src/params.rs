@@ -366,7 +366,7 @@ impl Update {
         self.edits.iter().map(Edit::to_writer_edit).collect()
     }
 
-    /// The request `engraph update`'s one-edit form names.
+    /// The request `knapper update`'s one-edit form names.
     ///
     /// MCP and HTTP send this struct as JSON, where a string and an array are
     /// two different things a caller writes. A command line has no such
@@ -402,7 +402,7 @@ impl Update {
         }
     }
 
-    /// The request an `engraph update` names, whichever of its two forms the
+    /// The request an `knapper update` names, whichever of its two forms the
     /// caller used.
     ///
     /// `--edits` is the whole grammar; the flags beside it are the one-edit

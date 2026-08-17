@@ -59,9 +59,9 @@ fn print_divider(title: &str) {
     println!();
 }
 
-/// Print the engraph banner box.
+/// Print the knapper banner box.
 fn print_banner() {
-    let tag = format!("engraph v{}", VERSION);
+    let tag = format!("knapper v{}", VERSION);
     let sub = "vault intelligence for AI agents";
     let inner_width = tag.len().max(sub.len()) + 4;
 
@@ -235,9 +235,9 @@ fn print_next_steps(config_path: &Path) {
     check(&format!("Identity saved to {}", config_path.display()));
     println!();
     println!("  Try these:");
-    println!("    {}", style("engraph search \"...\"").cyan());
-    println!("    {}", style("engraph identity").cyan());
-    println!("    {}", style("engraph serve").cyan());
+    println!("    {}", style("knapper search \"...\"").cyan());
+    println!("    {}", style("knapper identity").cyan());
+    println!("    {}", style("knapper serve").cyan());
     println!();
 }
 
@@ -362,7 +362,7 @@ pub fn run_interactive(
                 if !confirm {
                     println!(
                         "\n  {}",
-                        style("Skipped indexing. Run `engraph index` when ready.").dim()
+                        style("Skipped indexing. Run `knapper index` when ready.").dim()
                     );
                     let config_path = Config::data_dir()?.join("config.toml");
                     print_next_steps(&config_path);
@@ -670,9 +670,9 @@ pub fn run_apply_json(
         "l1": l1_info,
         "steps_completed": steps_completed,
         "next_steps": [
-            "engraph search \"...\"",
-            "engraph identity",
-            "engraph serve",
+            "knapper search \"...\"",
+            "knapper identity",
+            "knapper serve",
         ],
     }))
 }

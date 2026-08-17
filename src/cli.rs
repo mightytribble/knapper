@@ -110,7 +110,7 @@ pub enum Command {
     /// Archive a note, or restore one the archive holds.
     Archive(crate::params::Archive),
 
-    /// Re-index one file after an edit made outside engraph.
+    /// Re-index one file after an edit made outside knapper.
     ReindexFile(crate::params::ReindexFile),
 
     /// Show index status and statistics.
@@ -155,7 +155,7 @@ pub enum Command {
     /// Print identity block (L0 + L1 context for AI agents).
     Identity(crate::params::Identity),
 
-    /// Configure engraph settings.
+    /// Configure knapper settings.
     Configure {
         /// Enable intelligence features.
         #[arg(long, conflicts_with = "disable_intelligence")]
@@ -269,17 +269,17 @@ mod tests {
     fn migrate_takes_the_mode_the_servers_take() {
         // PARA is the only strategy, so `migrate` is a leaf that takes the
         // same three words every surface takes (#62).
-        let cli = Cli::try_parse_from(["engraph", "migrate", "--mode", "apply"]).unwrap();
+        let cli = Cli::try_parse_from(["knapper", "migrate", "--mode", "apply"]).unwrap();
         match cli.command {
             Command::Migrate(args) => assert_eq!(args.mode, "apply"),
             other => panic!("got {other:?}"),
         }
         assert!(
-            Cli::try_parse_from(["engraph", "migrate", "para", "--apply"]).is_err(),
+            Cli::try_parse_from(["knapper", "migrate", "para", "--apply"]).is_err(),
             "the PARA leaf is gone"
         );
         assert!(
-            Cli::try_parse_from(["engraph", "migrate"]).is_err(),
+            Cli::try_parse_from(["knapper", "migrate"]).is_err(),
             "the mode is required"
         );
     }
@@ -288,12 +288,12 @@ mod tests {
     fn init_takes_a_mode_and_runs_the_prompts_without_one() {
         // `init` is one capability: `--mode` on every surface, and the
         // interactive flow when the CLI is given none (#62).
-        let cli = Cli::try_parse_from(["engraph", "init", "--mode", "detect"]).unwrap();
+        let cli = Cli::try_parse_from(["knapper", "init", "--mode", "detect"]).unwrap();
         match cli.command {
             Command::Init { args, .. } => assert_eq!(args.mode.as_deref(), Some("detect")),
             other => panic!("got {other:?}"),
         }
-        let cli = Cli::try_parse_from(["engraph", "init"]).unwrap();
+        let cli = Cli::try_parse_from(["knapper", "init"]).unwrap();
         match cli.command {
             Command::Init { args, .. } => assert_eq!(args.mode, None),
             other => panic!("got {other:?}"),
@@ -304,8 +304,8 @@ mod tests {
     #[test]
     fn the_capabilities_are_top_level_commands() {
         for group in [
-            ["engraph", "context", "read"],
-            ["engraph", "write", "create"],
+            ["knapper", "context", "read"],
+            ["knapper", "write", "create"],
         ] {
             assert!(
                 Cli::try_parse_from(group).is_err(),
@@ -313,7 +313,7 @@ mod tests {
             );
         }
 
-        let cli = Cli::try_parse_from(["engraph", "read", "note.md", "--section", "Spells"])
+        let cli = Cli::try_parse_from(["knapper", "read", "note.md", "--section", "Spells"])
             .expect("read is a command");
         match cli.command {
             Command::Read(args) => {
@@ -324,7 +324,7 @@ mod tests {
         }
 
         let cli =
-            Cli::try_parse_from(["engraph", "vault-map"]).expect("vault-map is one command name");
+            Cli::try_parse_from(["knapper", "vault-map"]).expect("vault-map is one command name");
         assert!(matches!(cli.command, Command::VaultMap(_)), "{cli:?}");
     }
 
@@ -333,11 +333,11 @@ mod tests {
     #[test]
     fn create_requires_a_filename() {
         assert!(
-            Cli::try_parse_from(["engraph", "create", "--content", "hi"]).is_err(),
+            Cli::try_parse_from(["knapper", "create", "--content", "hi"]).is_err(),
             "create without --filename must be refused"
         );
         assert!(
-            Cli::try_parse_from(["engraph", "create", "--content", "hi", "--filename", "note"])
+            Cli::try_parse_from(["knapper", "create", "--content", "hi", "--filename", "note"])
                 .is_ok(),
             "create with --filename parses"
         );
@@ -348,9 +348,9 @@ mod tests {
     /// the shared struct now that the command takes one (#62).
     #[test]
     fn search_refuses_explain_and_json_together() {
-        assert!(Cli::try_parse_from(["engraph", "search", "q", "--explain"]).is_ok());
-        assert!(Cli::try_parse_from(["engraph", "search", "q", "--json"]).is_ok());
-        let err = Cli::try_parse_from(["engraph", "search", "q", "--explain", "--json"])
+        assert!(Cli::try_parse_from(["knapper", "search", "q", "--explain"]).is_ok());
+        assert!(Cli::try_parse_from(["knapper", "search", "q", "--json"]).is_ok());
+        let err = Cli::try_parse_from(["knapper", "search", "q", "--explain", "--json"])
             .expect_err("the two together are a usage error");
         assert!(
             err.to_string().contains("--explain") && err.to_string().contains("--json"),
@@ -361,7 +361,7 @@ mod tests {
     /// `move` is a Rust keyword, so the variant carries the command name.
     #[test]
     fn move_is_spelled_the_way_the_table_spells_it() {
-        let cli = Cli::try_parse_from(["engraph", "move", "note.md", "--new-folder", "02-Areas"])
+        let cli = Cli::try_parse_from(["knapper", "move", "note.md", "--new-folder", "02-Areas"])
             .expect("move is a command");
         match cli.command {
             Command::Move(args) => {
@@ -377,7 +377,7 @@ mod tests {
     #[test]
     fn update_takes_one_edit_as_flags_or_a_list_as_json() {
         let cli = Cli::try_parse_from([
-            "engraph",
+            "knapper",
             "update",
             "note.md",
             "--property",
@@ -407,7 +407,7 @@ mod tests {
         // One `--content` is one value, commas and all. Splitting it would
         // make ordinary prose unwritable through the flag form (#62).
         let cli = Cli::try_parse_from([
-            "engraph",
+            "knapper",
             "update",
             "note.md",
             "--section",
@@ -423,7 +423,7 @@ mod tests {
             other => panic!("got {other:?}"),
         }
 
-        let cli = Cli::try_parse_from(["engraph", "update", "note.md", "--edits", "[]"])
+        let cli = Cli::try_parse_from(["knapper", "update", "note.md", "--edits", "[]"])
             .expect("the list form parses");
         match cli.command {
             Command::Update { edits, .. } => assert_eq!(edits.as_deref(), Some("[]")),
@@ -432,7 +432,7 @@ mod tests {
 
         assert!(
             Cli::try_parse_from([
-                "engraph",
+                "knapper",
                 "update",
                 "note.md",
                 "--edits",

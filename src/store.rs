@@ -2133,7 +2133,7 @@ impl Store {
         {
             bail!(
                 "index was built with {dim}-dimensional embeddings but the model \
-                 produces {model_dim}. Run 'engraph index' to rebuild it."
+                 produces {model_dim}. Run 'knapper index' to rebuild it."
             );
         }
         Ok(())
@@ -2642,7 +2642,7 @@ impl Store {
 
     /// The axes this vault holds, and how many notes each covers (#60).
     ///
-    /// engraph names no axis. This reports what the vault wrote: the first
+    /// knapper names no axis. This reports what the vault wrote: the first
     /// segment of every path, counting each note once however many tags of that
     /// axis it carries.
     pub fn tag_axes(&self) -> Result<Vec<(String, usize)>> {
@@ -4620,7 +4620,7 @@ mod tests {
         let err = store.verify_embedding_dim(768).unwrap_err().to_string();
         assert!(err.contains("256"), "{err}");
         assert!(err.contains("768"), "{err}");
-        assert!(err.contains("engraph index"), "{err}");
+        assert!(err.contains("knapper index"), "{err}");
     }
 
     #[test]

@@ -333,7 +333,7 @@ impl KnapperServer {
              `mode` is `replace`, `append`, `prepend` or `remove`. `remove` is for a property alone. \
              `content` is a string, or a list of strings to set a list-valued property such as tags or aliases. A body edit and a section edit take a string. \
              A body edit always keeps the note's frontmatter: content that starts with its own `---` block gives the note two of them. Change the frontmatter with `property` edits in the same list. \
-             Three things differ from the calls this replaces. A note changed outside engraph and not yet re-indexed fails with an mtime conflict. \
+             Three things differ from the calls this replaces. A note changed outside knapper and not yet re-indexed fails with an mtime conflict. \
              Replacing a note's frontmatter wholesale has no spelling here — `rewrite`'s `preserve_frontmatter: false` is gone, not renamed, and write the new frontmatter with `property` edits instead. \
              A whole-note tag or alias replacement no longer stamps a `modified_by` property on the note."
     )]
@@ -566,7 +566,7 @@ impl KnapperServer {
 
     #[tool(
         name = "reindex_file",
-        description = "Re-index a single file after external edits. Reads the file from disk, re-embeds its chunks, and updates the search index. Use when a file was modified outside engraph and you need the index to reflect current content."
+        description = "Re-index a single file after external edits. Reads the file from disk, re-embeds its chunks, and updates the search index. Use when a file was modified outside knapper and you need the index to reflect current content."
     )]
     async fn reindex_file(
         &self,
@@ -606,7 +606,7 @@ impl KnapperServer {
 
     #[tool(
         name = "index",
-        description = "Index the server's vault: walk it, diff it against the store, and re-embed what changed. `rebuild: true` discards the index and builds it again. Use after a batch of writes made outside engraph; a single file is cheaper through reindex_file. \
+        description = "Index the server's vault: walk it, diff it against the store, and re-embed what changed. `rebuild: true` discards the index and builds it again. Use after a batch of writes made outside knapper; a single file is cheaper through reindex_file. \
              The call runs to completion once it starts. It holds the store and the embedder while it runs, so every other tool waits on it, and a graceful shutdown will not interrupt it. On a large vault a rebuild takes minutes."
     )]
     async fn index(
@@ -690,7 +690,7 @@ impl KnapperServer {
             let profile = self.profile.as_ref().as_ref().ok_or_else(|| {
                 McpError::new(
                     rmcp::model::ErrorCode::INVALID_REQUEST,
-                    "No vault profile found. Run `engraph init` first.",
+                    "No vault profile found. Run `knapper init` first.",
                     None::<serde_json::Value>,
                 )
             })?;
@@ -827,7 +827,7 @@ pub async fn run_serve(
     store.verify_embedding_dim(embedder.dim())?;
 
     let vault_path_str = store.get_meta("vault_path")?.ok_or_else(|| {
-        anyhow::anyhow!("No vault path in index. Run 'engraph index <path>' first.")
+        anyhow::anyhow!("No vault path in index. Run 'knapper index <path>' first.")
     })?;
     let vault_path = PathBuf::from(&vault_path_str);
 
@@ -995,7 +995,7 @@ pub async fn run_serve(
         });
     }
 
-    eprintln!("engraph MCP server starting...");
+    eprintln!("knapper MCP server starting...");
 
     let transport = rmcp::transport::io::stdio();
     match server.serve(transport).await {
@@ -1279,7 +1279,7 @@ mod tests {
     }
 
     /// A server's `apply` acts on the plan its caller sends and no other. The
-    /// copy `engraph migrate --mode preview` saves belongs to the CLI's own
+    /// copy `knapper migrate --mode preview` saves belongs to the CLI's own
     /// two-step flow, and an `apply` that fell back to it would move files
     /// against a plan this caller never saw (#62).
     #[tokio::test]
