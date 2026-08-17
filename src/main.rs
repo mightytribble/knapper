@@ -1,9 +1,9 @@
-use engraph::cli::{Cli, Command, ModelsAction};
-use engraph::config;
-use engraph::indexer;
-use engraph::profile::VaultProfile;
-use engraph::search;
-use engraph::store;
+use knapper::cli::{Cli, Command, ModelsAction};
+use knapper::config;
+use knapper::indexer;
+use knapper::profile::VaultProfile;
+use knapper::search;
+use knapper::store;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -27,10 +27,10 @@ fn prompt_intelligence(data_dir: &std::path::Path) -> Result<bool> {
 
     if enable {
         let models_dir = data_dir.join("models");
-        let defaults = engraph::llm::ModelDefaults::default();
+        let defaults = knapper::llm::ModelDefaults::default();
         println!("Downloading the cross-encoder (~650MB)...");
-        let rerank_uri = engraph::llm::HfModelUri::parse(&defaults.rerank_uri)?;
-        engraph::llm::ensure_model(&rerank_uri, &models_dir)?;
+        let rerank_uri = knapper::llm::HfModelUri::parse(&defaults.rerank_uri)?;
+        knapper::llm::ensure_model(&rerank_uri, &models_dir)?;
         println!("Done.");
     } else {
         println!(
@@ -93,15 +93,15 @@ fn open_indexing_embedder(
     cfg: &Config,
     data_dir: &Path,
     store: &store::Store,
-) -> Result<engraph::llm::LlamaEmbed> {
+) -> Result<knapper::llm::LlamaEmbed> {
     let models_dir = data_dir.join("models");
-    let embedder = engraph::llm::LlamaEmbed::new(&models_dir, cfg)?;
-    store.verify_embedding_dim(engraph::llm::EmbedModel::dim(&embedder))?;
-    engraph::fingerprint::verify(
+    let embedder = knapper::llm::LlamaEmbed::new(&models_dir, cfg)?;
+    store.verify_embedding_dim(knapper::llm::EmbedModel::dim(&embedder))?;
+    knapper::fingerprint::verify(
         store,
-        &engraph::fingerprint::Fingerprints::compute(
+        &knapper::fingerprint::Fingerprints::compute(
             cfg,
-            &engraph::llm::EmbedModel::fingerprint(&embedder),
+            &knapper::llm::EmbedModel::fingerprint(&embedder),
             None,
         ),
     )?;
@@ -217,8 +217,8 @@ async fn main() -> Result<()> {
         Command::Search(args) => {
             cfg.merge_top_n(args.top_n);
             let group_by = args.group_by.unwrap_or(cfg.group_by);
-            let all_terms = engraph::tags::merge_scope_alias(args.scope, args.all);
-            let scope = engraph::tags::Scope::parse(&all_terms, &args.any, &args.none)?;
+            let all_terms = knapper::tags::merge_scope_alias(args.scope, args.all);
+            let scope = knapper::tags::Scope::parse(&all_terms, &args.any, &args.none)?;
 
             if !index_exists(&data_dir) {
                 eprintln!("No index found. Run 'engraph index <path>' first.");
@@ -252,13 +252,13 @@ async fn main() -> Result<()> {
 
         Command::Read(args) => {
             let (store, vault_path, profile) = open_vault(&data_dir)?;
-            let params = engraph::context::ContextParams {
+            let params = knapper::context::ContextParams {
                 store: &store,
                 vault_path: &vault_path,
                 profile: profile.as_ref(),
             };
             let note =
-                engraph::context::context_read(&params, &args.file, args.section.as_deref())?;
+                knapper::context::context_read(&params, &args.file, args.section.as_deref())?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&note)?);
             } else {
@@ -280,14 +280,14 @@ async fn main() -> Result<()> {
 
         Command::List(args) => {
             let (store, vault_path, profile) = open_vault(&data_dir)?;
-            let params = engraph::context::ContextParams {
+            let params = knapper::context::ContextParams {
                 store: &store,
                 vault_path: &vault_path,
                 profile: profile.as_ref(),
             };
-            let all_terms = engraph::tags::merge_scope_alias(args.scope, args.all);
-            let filter = engraph::tags::Scope::parse(&all_terms, &args.any, &args.none)?;
-            let items = engraph::context::context_list(
+            let all_terms = knapper::tags::merge_scope_alias(args.scope, args.all);
+            let filter = knapper::tags::Scope::parse(&all_terms, &args.any, &args.none)?;
+            let items = knapper::context::context_list(
                 &params,
                 &filter,
                 args.created_by.as_deref(),
@@ -327,7 +327,7 @@ async fn main() -> Result<()> {
 
         Command::Tags(args) => {
             let (store, _vault_path, _profile) = open_vault(&data_dir)?;
-            let prefix = args.under.as_deref().and_then(engraph::tags::parse_term);
+            let prefix = args.under.as_deref().and_then(knapper::tags::parse_term);
             let rows = store.tags_under(prefix.as_ref())?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&rows)?);
@@ -340,12 +340,12 @@ async fn main() -> Result<()> {
 
         Command::VaultMap(_) => {
             let (store, vault_path, profile) = open_vault(&data_dir)?;
-            let params = engraph::context::ContextParams {
+            let params = knapper::context::ContextParams {
                 store: &store,
                 vault_path: &vault_path,
                 profile: profile.as_ref(),
             };
-            let map = engraph::context::vault_map(&params)?;
+            let map = knapper::context::vault_map(&params)?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&map)?);
             } else {
@@ -372,7 +372,7 @@ async fn main() -> Result<()> {
 
         Command::Health(_) => {
             let (store, _vault_path, profile) = open_vault(&data_dir)?;
-            let health_config = engraph::health::HealthConfig {
+            let health_config = knapper::health::HealthConfig {
                 daily_folder: profile
                     .as_ref()
                     .and_then(|p| p.structure.folders.daily.clone()),
@@ -380,7 +380,7 @@ async fn main() -> Result<()> {
                     .as_ref()
                     .and_then(|p| p.structure.folders.inbox.clone()),
             };
-            let report = engraph::health::generate_health_report(&store, &health_config)?;
+            let report = knapper::health::generate_health_report(&store, &health_config)?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
@@ -428,7 +428,7 @@ async fn main() -> Result<()> {
             json,
             quiet,
         } => {
-            let engraph::params::Init {
+            let knapper::params::Init {
                 mode,
                 name,
                 role,
@@ -463,21 +463,21 @@ async fn main() -> Result<()> {
             let vault_path = vault_path.canonicalize().unwrap_or(vault_path);
 
             if detect {
-                let result = engraph::onboarding::run_detect_json(&vault_path)?;
+                let result = knapper::onboarding::run_detect_json(&vault_path)?;
                 println!("{}", serde_json::to_string_pretty(&result)?);
                 return Ok(());
             }
 
             if json {
-                let flags = engraph::onboarding::ApplyFlags {
+                let flags = knapper::onboarding::ApplyFlags {
                     name,
                     role,
                     purpose,
                     identity_only: identity,
                     reindex_only: reindex,
                 };
-                let settings = engraph::indexer::IndexSettings::from_config(&cfg);
-                let result = engraph::onboarding::run_apply_json(
+                let settings = knapper::indexer::IndexSettings::from_config(&cfg);
+                let result = knapper::onboarding::run_apply_json(
                     &vault_path,
                     &mut cfg,
                     settings,
@@ -488,7 +488,7 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
 
-            let flags = engraph::onboarding::InteractiveFlags {
+            let flags = knapper::onboarding::InteractiveFlags {
                 name,
                 role,
                 purpose,
@@ -496,7 +496,7 @@ async fn main() -> Result<()> {
                 reindex_only: reindex,
                 quiet,
             };
-            engraph::onboarding::run_interactive(&vault_path, &mut cfg, &data_dir, flags)?;
+            knapper::onboarding::run_interactive(&vault_path, &mut cfg, &data_dir, flags)?;
         }
 
         Command::Identity(args) => {
@@ -505,12 +505,12 @@ async fn main() -> Result<()> {
             if !db_path.exists() {
                 anyhow::bail!("No index found. Run `engraph init` first.");
             }
-            let store = engraph::store::Store::open(&db_path)?;
+            let store = knapper::store::Store::open(&db_path)?;
             if args.refresh {
-                let profile = engraph::config::Config::load_vault_profile()?;
+                let profile = knapper::config::Config::load_vault_profile()?;
                 match profile {
                     Some(ref p) => {
-                        engraph::identity::extract_l1_facts(&store, p)?;
+                        knapper::identity::extract_l1_facts(&store, p)?;
                         eprintln!("L1 facts refreshed.");
                     }
                     None => {
@@ -538,7 +538,7 @@ async fn main() -> Result<()> {
                 });
                 println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
-                let block = engraph::identity::format_identity_block(&cfg, &store)?;
+                let block = knapper::identity::format_identity_block(&cfg, &store)?;
                 println!("{}", block);
             }
         }
@@ -563,12 +563,12 @@ async fn main() -> Result<()> {
                 cfg.intelligence = Some(true);
                 println!("Intelligence enabled. Models will be downloaded on first search.");
                 let models_dir = data_dir.join("models");
-                let defaults = engraph::llm::ModelDefaults::default();
+                let defaults = knapper::llm::ModelDefaults::default();
                 println!("Downloading the cross-encoder (~650MB)...");
-                let rerank_uri = engraph::llm::HfModelUri::parse(
+                let rerank_uri = knapper::llm::HfModelUri::parse(
                     cfg.models.rerank.as_deref().unwrap_or(&defaults.rerank_uri),
                 )?;
-                engraph::llm::ensure_model(&rerank_uri, &models_dir)?;
+                knapper::llm::ensure_model(&rerank_uri, &models_dir)?;
                 println!("Done.");
             } else if disable_intelligence {
                 cfg.intelligence = Some(false);
@@ -580,7 +580,7 @@ async fn main() -> Result<()> {
             {
                 let model_type = &parts[0];
                 let uri = &parts[1];
-                engraph::llm::HfModelUri::parse(uri)?;
+                knapper::llm::HfModelUri::parse(uri)?;
                 match model_type.as_str() {
                     "embed" => {
                         cfg.models.embed = Some(uri.clone());
@@ -651,8 +651,8 @@ async fn main() -> Result<()> {
                 if perms != "read" && perms != "write" {
                     anyhow::bail!("Permissions must be 'read' or 'write', got: {perms}");
                 }
-                let key = engraph::http::generate_api_key();
-                cfg.http.api_keys.push(engraph::config::ApiKeyConfig {
+                let key = knapper::http::generate_api_key();
+                cfg.http.api_keys.push(knapper::config::ApiKeyConfig {
                     key: key.clone(),
                     name: name.clone(),
                     permissions: perms.clone(),
@@ -698,8 +698,8 @@ async fn main() -> Result<()> {
                 }
 
                 if cfg.http.api_keys.is_empty() {
-                    let key = engraph::http::generate_api_key();
-                    cfg.http.api_keys.push(engraph::config::ApiKeyConfig {
+                    let key = knapper::http::generate_api_key();
+                    cfg.http.api_keys.push(knapper::config::ApiKeyConfig {
                         key: key.clone(),
                         name: "chatgpt".into(),
                         permissions: "read".into(),
@@ -767,7 +767,7 @@ async fn main() -> Result<()> {
             }
             let http_opts = if http {
                 let cfg = Config::load()?;
-                Some(engraph::serve::HttpServeOpts {
+                Some(knapper::serve::HttpServeOpts {
                     port: port.unwrap_or(cfg.http.port),
                     host: host.unwrap_or(cfg.http.host.clone()),
                     no_auth,
@@ -775,7 +775,7 @@ async fn main() -> Result<()> {
             } else {
                 None
             };
-            engraph::serve::run_serve(&data_dir, http_opts, read_only).await?;
+            knapper::serve::run_serve(&data_dir, http_opts, read_only).await?;
         }
 
         Command::Create(args) => {
@@ -784,7 +784,7 @@ async fn main() -> Result<()> {
             // The CLI is the one surface with a stdin, so an omitted content
             // is read from it here and is an error on the other two.
             let content = content_or_stdin(args.content)?;
-            let input = engraph::writer::CreateNoteInput {
+            let input = knapper::writer::CreateNoteInput {
                 content,
                 filename: args.filename,
                 type_hint: args.type_hint,
@@ -793,11 +793,11 @@ async fn main() -> Result<()> {
                 created_by: "cli".into(),
                 auto_link: args.auto_link,
             };
-            let result = engraph::writer::create_note(
+            let result = knapper::writer::create_note(
                 input,
                 &store,
                 &mut embedder,
-                engraph::prefix::EmbedComposition::from_config(&cfg),
+                knapper::prefix::EmbedComposition::from_config(&cfg),
                 cfg.chunk_options(),
                 &vault_path,
                 profile.as_ref(),
@@ -833,7 +833,7 @@ async fn main() -> Result<()> {
             let mut embedder = open_indexing_embedder(&cfg, &data_dir, &store)?;
             // The whole list is read before anything is written, so a request
             // that names an impossible target writes nothing (#62).
-            let request = engraph::params::Update::from_cli(
+            let request = knapper::params::Update::from_cli(
                 file,
                 section,
                 property,
@@ -843,11 +843,11 @@ async fn main() -> Result<()> {
                 || content_or_stdin(None),
             )?;
             let edits = request.to_writer_edits()?;
-            let input = engraph::writer::UpdateInput {
+            let input = knapper::writer::UpdateInput {
                 file: request.file,
                 edits,
             };
-            let result = engraph::writer::update_note(&store, &vault_path, &input)?;
+            let result = knapper::writer::update_note(&store, &vault_path, &input)?;
             // `update_note` stores the new content hash and writes no chunks,
             // so nothing else will re-derive them: `diff_vault` sees a hash
             // that already matches disk. Re-index here or the note stays
@@ -856,12 +856,12 @@ async fn main() -> Result<()> {
             //
             // A failure here happens after the write, so the message says what
             // did happen rather than reading as "nothing did".
-            engraph::indexer::reindex_written_file(
+            knapper::indexer::reindex_written_file(
                 &result.path,
                 &store,
                 &mut embedder,
                 &vault_path,
-                engraph::indexer::IndexSettings::from_config(&cfg),
+                knapper::indexer::IndexSettings::from_config(&cfg),
             )
             .with_context(|| {
                 format!(
@@ -881,7 +881,7 @@ async fn main() -> Result<()> {
             // A move changes a path and no content, so it re-indexes nothing
             // and needs no model.
             let result =
-                engraph::writer::move_note(&args.file, &args.new_folder, &store, &vault_path)?;
+                knapper::writer::move_note(&args.file, &args.new_folder, &store, &vault_path)?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
@@ -896,16 +896,16 @@ async fn main() -> Result<()> {
             // Only the restore indexes anything, so only it loads a model.
             let result = if args.undo {
                 let mut embedder = open_indexing_embedder(&cfg, &data_dir, &store)?;
-                engraph::writer::unarchive_note(
+                knapper::writer::unarchive_note(
                     &args.file,
                     &store,
                     &mut embedder,
-                    engraph::prefix::EmbedComposition::from_config(&cfg),
+                    knapper::prefix::EmbedComposition::from_config(&cfg),
                     cfg.chunk_options(),
                     &vault_path,
                 )?
             } else {
-                engraph::writer::archive_note(&args.file, &store, &vault_path, profile.as_ref())?
+                knapper::writer::archive_note(&args.file, &store, &vault_path, profile.as_ref())?
             };
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&result)?);
@@ -918,12 +918,12 @@ async fn main() -> Result<()> {
 
         Command::Delete(args) => {
             let (store, vault_path, profile) = open_vault(&data_dir)?;
-            let delete_mode = engraph::writer::DeleteMode::from(args.mode);
+            let delete_mode = knapper::writer::DeleteMode::from(args.mode);
             let archive_folder = profile
                 .as_ref()
                 .and_then(|p| p.structure.folders.archive.as_deref())
                 .unwrap_or("04-Archive");
-            engraph::writer::delete_note(
+            knapper::writer::delete_note(
                 &store,
                 &vault_path,
                 &args.file,
@@ -946,12 +946,12 @@ async fn main() -> Result<()> {
         Command::ReindexFile(args) => {
             let (store, vault_path, _profile) = open_vault(&data_dir)?;
             let mut embedder = open_indexing_embedder(&cfg, &data_dir, &store)?;
-            let result = engraph::indexer::reindex_written_file(
+            let result = knapper::indexer::reindex_written_file(
                 &args.file,
                 &store,
                 &mut embedder,
                 &vault_path,
-                engraph::indexer::IndexSettings::from_config(&cfg),
+                knapper::indexer::IndexSettings::from_config(&cfg),
             )?;
             let output = serde_json::json!({
                 "file": args.file,
@@ -991,8 +991,8 @@ async fn main() -> Result<()> {
                 "preview" => {
                     println!("Scanning vault for PARA classification...");
                     let preview =
-                        engraph::migrate::generate_preview(&store, &vault_path, profile.as_ref())?;
-                    engraph::migrate::save_preview(&preview, &data_dir)?;
+                        knapper::migrate::generate_preview(&store, &vault_path, profile.as_ref())?;
+                    knapper::migrate::save_preview(&preview, &data_dir)?;
                     println!();
                     println!("Preview generated:");
                     println!("  Files to move: {}", preview.files.len());
@@ -1006,8 +1006,8 @@ async fn main() -> Result<()> {
                     println!("Review the preview, then run: engraph migrate --mode apply");
                 }
                 "apply" => {
-                    let preview = engraph::migrate::load_preview(&data_dir)?;
-                    let result = engraph::migrate::apply_preview(&preview, &store, &vault_path)?;
+                    let preview = knapper::migrate::load_preview(&data_dir)?;
+                    let result = knapper::migrate::apply_preview(&preview, &store, &vault_path)?;
                     println!(
                         "Migration {} applied: {} files moved",
                         result.migration_id, result.moved
@@ -1020,7 +1020,7 @@ async fn main() -> Result<()> {
                     }
                 }
                 "undo" => {
-                    let result = engraph::migrate::undo_last(&store, &vault_path)?;
+                    let result = knapper::migrate::undo_last(&store, &vault_path)?;
                     println!(
                         "Migration {} undone: {} files restored",
                         result.migration_id, result.restored
@@ -1040,7 +1040,7 @@ async fn main() -> Result<()> {
         }
 
         Command::Models { action } => {
-            let defaults = engraph::llm::ModelDefaults::default();
+            let defaults = knapper::llm::ModelDefaults::default();
             // Dimensionality belongs to the model, not to a table here, and
             // reading it means loading the GGUF (issue #12). Report what the
             // index was actually built at instead — the number that matters

@@ -493,7 +493,7 @@ pub fn search_with_intelligence(
     )
     .unwrap_or_default();
     // The lane's cost was the second-largest stage in the query before #29 and
-    // nothing reported it; `RUST_LOG=engraph::search=debug` is how the sweep
+    // nothing reported it; `RUST_LOG=knapper::search=debug` is how the sweep
     // reads it back, as it does for the reranker's assembled size.
     tracing::debug!(
         seeds = combined_seeds.len(),

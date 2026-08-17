@@ -1,11 +1,11 @@
 [package]
-name = "engraph"
-version = "1.7.2"
+name = "knapper"
+version = "0.9.0"
 edition = "2024"
-description = "Local knowledge graph for AI agents. Hybrid search + MCP server for Obsidian vaults."
+description = "Local hybrid search and MCP retrieval for Obsidian-format vaults"
 license = "MIT"
-repository = "https://github.com/devwhodevs/engraph"
-homepage = "https://github.com/devwhodevs/engraph"
+repository = "https://github.com/mightytribble/knapper"
+homepage = "https://github.com/mightytribble/knapper"
 readme = "README.md"
 keywords = ["obsidian", "semantic-search", "mcp", "rag", "knowledge-graph"]
 categories = ["command-line-utilities", "database", "text-processing"]

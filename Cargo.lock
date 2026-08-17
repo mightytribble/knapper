@@ -707,51 +707,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "engraph"
-version = "1.7.2"
-dependencies = [
- "anyhow",
- "axum",
- "clap",
- "console 0.16.3",
- "dialoguer",
- "dirs",
- "encoding_rs",
- "globset",
- "ignore",
- "indicatif",
- "llama-cpp-2",
- "notify",
- "notify-debouncer-full",
- "rand",
- "rayon",
- "regex",
- "rmcp",
- "rusqlite",
- "serde",
- "serde_json",
- "serde_urlencoded",
- "serde_yaml",
- "sha2",
- "shimmytok",
- "sqlite-vec",
- "strsim",
- "tempfile",
- "time",
- "tokenizers",
- "tokio",
- "tokio-util",
- "toml",
- "tower",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "ureq",
- "uuid",
- "zerocopy 0.7.35",
-]
-
-[[package]]
 name = "enumflags2"
 version = "0.7.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1437,6 +1392,51 @@ checksum = "b49715b7073f385ba4bc528e5747d02e66cb39c6146efb66b781f131f0fb399c"
 dependencies = [
  "once_cell",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "knapper"
+version = "0.9.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "console 0.16.3",
+ "dialoguer",
+ "dirs",
+ "encoding_rs",
+ "globset",
+ "ignore",
+ "indicatif",
+ "llama-cpp-2",
+ "notify",
+ "notify-debouncer-full",
+ "rand",
+ "rayon",
+ "regex",
+ "rmcp",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "serde_yaml",
+ "sha2",
+ "shimmytok",
+ "sqlite-vec",
+ "strsim",
+ "tempfile",
+ "time",
+ "tokenizers",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "ureq",
+ "uuid",
+ "zerocopy 0.7.35",
 ]
 
 [[package]]
