@@ -1,0 +1,9 @@
+target/
+target-cuda/
+.git/
+.worktrees/
+.superpowers/
+docs/superpowers/
+*.swp
+*.swo
+.DS_Store
