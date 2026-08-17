@@ -9,8 +9,8 @@
     {
       "name": "knapper",
       "source": "./",
-      "description": "Turn your Markdown vault into a searchable knowledge graph that any AI agent can query.",
-      "version": "1.0.0",
+      "description": "Local hybrid search and MCP retrieval for Obsidian-format vaults",
+      "version": "0.9.0",
       "author": {
         "name": "mightytribble",
         "url": "https://github.com/mightytribble",

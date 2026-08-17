@@ -106,4 +106,4 @@ macOS or a clean Ubuntu toolchain — anything touching llama.cpp bindings, `#[c
 build script. `resolve_n_threads` is the current example: its Linux path reads sysfs and its fallback
 has never executed on this box.
 
-`release.yml` is untouched. It fires only on `v*` tags, so it cannot go off by accident.
+`release.yml` runs on manual dispatch only (`gh workflow run release.yml -f tag=v0.9.x`). It does not fire on tag pushes, so it cannot go off by accident.

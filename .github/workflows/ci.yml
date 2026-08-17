@@ -1,6 +1,6 @@
 name: CI
 
-# Manual only. This is a private fork worked on from one machine, and the
+# Manual only. This is a private repository worked on from one machine, and the
 # checks below all run locally in seconds — the hosted run bought nothing and
 # billed for it, twice per push, with the macOS leg charged at 10x the minute
 # rate. See BUILDING.md ("CI is manual-only") for the local equivalent.

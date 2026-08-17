@@ -4,14 +4,14 @@
 
 The project leaves fork status: engraph, forked at v1.7.2, becomes knapper. The binary, the repository (mightytribble/knapper), the data directory (`~/.knapper/`) and the store file (`knapper.db`, with a read fallback to an existing `engraph.db`) carry the new name. The MIT license and the full git history stay; see `NOTICE`. Versions restart at 0.9.x; 1.0.0 marks the v1 milestone: functional Metal and Docker build pipelines.
 
-### Address a section by its heading path ([#69](https://github.com/mightytribble/engraph/issues/69))
+### Address a section by its heading path ([#69](https://github.com/mightytribble/knapper/issues/69))
 
 `--section` names a section by its heading text or by its full heading path, and a promoted bold line is one of the sections it reaches. `list --detailed` enumerates the same set, so what the outline prints is what `read` and `update` can name.
 
 #### Added
 
 - **`--section` takes a heading path.** `read` and `update` accept a heading's own text, as before, or its full path from its own root joined with ` > `: `--section "About the Empire > Current Events > History"` reaches the second `History` of a note that holds two. A partial path resolves nothing, so a wrong guess is an error and never an edit to another section. Two same-named siblings under one parent share a path, and the first in document order is the one that resolves.
-- **A promoted bold heading is addressable** ([#53](https://github.com/mightytribble/engraph/issues/53)). `--section "Spells"`, `--section "**Spells**"` and `--section "Stat Block > Spells"` all reach a `**Spells**` section, which is 107 of the 1559 chunks in the pinned corpus and was reachable by no name at all. The section ends where the chunker ends it: at the next promoted line, or the next `#` heading of any depth. An ATX heading keeps precedence over a promoted one of the same name under the same parent. The fallback runs whatever `promote_bold_headings` says, because what a caller may name is a property of the file and not of what the indexer chunks.
+- **A promoted bold heading is addressable** ([#53](https://github.com/mightytribble/knapper/issues/53)). `--section "Spells"`, `--section "**Spells**"` and `--section "Stat Block > Spells"` all reach a `**Spells**` section, which is 107 of the 1559 chunks in the pinned corpus and was reachable by no name at all. The section ends where the chunker ends it: at the next promoted line, or the next `#` heading of any depth. An ATX heading keeps precedence over a promoted one of the same name under the same parent. The fallback runs whatever `promote_bold_headings` says, because what a caller may name is a property of the file and not of what the indexer chunks.
 - **An empty section is addressable**, promoted or ATX, because addressing one is how a caller fills it.
 
 #### Changed
@@ -20,9 +20,9 @@ The project leaves fork status: engraph, forked at v1.7.2, becomes knapper. The 
 - **`markdown.rs` owns what a heading is** and `chunker.rs` owns which headings start a chunk. The chunker's set is unchanged, so no fingerprint moves and no store re-indexes.
 - **Test count: 893 → 918.**
 
-### List the vault's files ([#68](https://github.com/mightytribble/engraph/issues/68))
+### List the vault's files ([#68](https://github.com/mightytribble/knapper/issues/68))
 
-`engraph list` is the call an agent makes to see a vault it cannot read: every note the scope admits, in path order, one bare path per line, and each note's heading outline under `--detailed`.
+`knapper list` is the call an agent makes to see a vault it cannot read: every note the scope admits, in path order, one bare path per line, and each note's heading outline under `--detailed`.
 
 #### Removed
 
@@ -35,11 +35,11 @@ The project leaves fork status: engraph, forked at v1.7.2, becomes knapper. The 
 #### Changed
 
 - **`list` answers in path order** (`ORDER BY f.path`, SQLite `BINARY` collation, so `Lore/` sorts before `lore/`), where it answered most-recently-indexed first. A folder's notes now arrive together and a subtree scope reads as one block. `project`'s sibling gather takes the same ordering: the first 50 of the folder in path order.
-- **`list`'s limit is unbounded by default.** It was capped at 20. An absent `--limit` now emits no `LIMIT` clause, so a bare `engraph list` answers every note the scope admits, and a caller that wants less names a scope or a `--limit`; `--limit 0` answers none. The default is the same on every surface, so no one surface silently caps the whole vault.
+- **`list`'s limit is unbounded by default.** It was capped at 20. An absent `--limit` now emits no `LIMIT` clause, so a bare `knapper list` answers every note the scope admits, and a caller that wants less names a scope or a `--limit`; `--limit 0` answers none. The default is the same on every surface, so no one surface silently caps the whole vault.
 - **The CLI's plain `list` output is one bare path per line** and nothing else — no docid, tags, edge count, or trailing total — so it pipes and `wc -l` is the total. The path is relative to the vault root, the form `read`, `update` and `move` take, so a listed path pastes into the next call. `--json` still answers the full `NoteListItem` array.
 - **Test count: 877 → 893.**
 
-### One name per capability ([#62](https://github.com/mightytribble/engraph/issues/62))
+### One name per capability ([#62](https://github.com/mightytribble/knapper/issues/62))
 
 Every capability now has one name and one parameter set on the CLI, the MCP server and the HTTP API. The name is one word in `kebab-case`, and each surface spells it its own way: the CLI command as written, the MCP tool with `-` as `_`, and the HTTP route under `/api/` and the name. One transform gets from any spelling to any other.
 
@@ -47,16 +47,16 @@ Every capability now has one name and one parameter set on the CLI, the MCP serv
 
 #### Removed
 
-- **CLI command groups.** `engraph context <leaf>` and `engraph write <leaf>` are gone; every leaf is a top-level command. `context read` → `read`, `context list` → `list`, `context tags` → `tags`, `context vault-map` → `vault-map`, `context who` → `who`, `context project` → `project`, `context topic` → `topic`, `write create` → `create`, `write archive` → `archive`, `write delete` → `delete`.
-- **`engraph graph`**, both leaves. `graph show` ran the same four queries `read` runs, so `read` answers it and now carries a docid beside each link. `graph stats` is folded into `status`.
-- **`engraph migrate para`.** PARA is the only strategy, so the leaf is gone: `engraph migrate --mode preview|apply|undo`.
+- **CLI command groups.** `knapper context <leaf>` and `knapper write <leaf>` are gone; every leaf is a top-level command. `context read` → `read`, `context list` → `list`, `context tags` → `tags`, `context vault-map` → `vault-map`, `context who` → `who`, `context project` → `project`, `context topic` → `topic`, `write create` → `create`, `write archive` → `archive`, `write delete` → `delete`.
+- **`knapper graph`**, both leaves. `graph show` ran the same four queries `read` runs, so `read` answers it and now carries a docid beside each link. `graph stats` is folded into `status`.
+- **`knapper migrate para`.** PARA is the only strategy, so the leaf is gone: `knapper migrate --mode preview|apply|undo`.
 - **12 MCP tools** (26 → 20, with six added below): `read_section` is a `section` parameter of `read`; `append`, `edit`, `rewrite`, `edit_frontmatter` and `update_metadata` are one `update` tool; `unarchive` is `archive {undo: true}`; `setup` is `init {mode}`; `migrate_preview`, `migrate_apply` and `migrate_undo` are `migrate {mode}`; `context` is renamed `topic`. `move_note` is renamed `move`.
 - **12 HTTP routes** (29 → 23, 27 under `/api` → 21, with five added below): `POST /api/read-section`, `/api/append`, `/api/edit`, `/api/rewrite`, `/api/edit-frontmatter`, `/api/update-metadata`, `/api/unarchive`, `/api/setup`, `/api/context`, and `POST /api/migrate/preview`, `/apply` and `/undo`.
 - **Path parameters.** `GET /api/read/{*file}`, `/api/who/{name}` and `/api/project/{name}` are `?file=`, `?name=` and `?name=` query parameters, because the shared parameter struct carries its arguments the way it names them.
 - **`rewrite`'s `preserve_frontmatter: false`** has no spelling in `update`. A body edit always keeps the note's frontmatter; change the frontmatter with `property` edits in the same list.
 - **`update_metadata`'s `modified_by` stamp.** A whole-note tag or alias replacement no longer writes a `modified_by` property into the note.
 - **`total_files`** from the `status` JSON. `files` already reports it.
-- **The disk fallback for `migrate` `mode: apply`** on the two servers. `apply` now requires the `preview` the caller's own `mode: preview` returned; it no longer falls back to `~/.engraph/migration-preview.json`. The CLI's two-step flow, which saves and reads that file itself, is unchanged.
+- **The disk fallback for `migrate` `mode: apply`** on the two servers. `apply` now requires the `preview` the caller's own `mode: preview` returned; it no longer falls back to `~/.knapper/migration-preview.json`. The CLI's two-step flow, which saves and reads that file itself, is unchanged.
 
 #### Added
 
@@ -66,15 +66,15 @@ Every capability now has one name and one parameter set on the CLI, the MCP serv
 - **`explain` and `group_by` are per call on every surface**, so one query answers the same way whoever asks it.
 - **`GET /api/identity?refresh=` and MCP `identity {refresh}`** re-extract the L1 facts, which was a CLI-only flag. It rewrites the `identity_facts` rows, so it takes the write permission and a read-only server refuses it.
 - **`docs/surfaces.md`**, generated from `src/surface.rs` and checked by a test, listing what every capability is called on each surface.
-- **Parity tests.** Five tests compare the capability table with what `Cli::command()`, `EngraphServer::tool_router()` and `http::routes()` register, including each tool's schema against its clap arguments. A capability added to one surface and forgotten on another fails the build.
+- **Parity tests.** Five tests compare the capability table with what `Cli::command()`, `KnapperServer::tool_router()` and `http::routes()` register, including each tool's schema against its clap arguments. A capability added to one surface and forgotten on another fails the build.
 
 #### Changed
 
 - **`search`'s default `top_n` is the configured one** on both servers. It was a hardcoded 10; it is now `top_n` from `config.toml`, whose default is **5** — the same number the CLI has always used. A caller that relied on ten results per query must now ask for `top_n: 10`.
 - **`search` over HTTP returns an envelope**, `{"results": [...], "message": ...}`, replacing the bare array. `explain` joins it when the call asked for it. HTTP was the one surface with nowhere to put the answer-floor signal.
-- **`update`'s `--mode` defaults to `replace`.** The calls it absorbed were stricter — `write rewrite --content` and `write edit --content` were required, and `write edit`'s mode defaulted to `append`. `engraph update <file>` with no `--content` and no `--edits` still reads stdin, and an empty read is now refused for a body or section `replace` rather than blanking the note. `--content ""` is the deliberate spelling for that.
+- **`update`'s `--mode` defaults to `replace`.** The calls it absorbed were stricter — `write rewrite --content` and `write edit --content` were required, and `write edit`'s mode defaulted to `append`. `knapper update <file>` with no `--content` and no `--edits` still reads stdin, and an empty read is now refused for a body or section `replace` rather than blanking the note. `--content ""` is the deliberate spelling for that.
 - **A body edit adds no blank line of its own.** `split_frontmatter` rejoins the body carrying the break after the closing `---`, and the reassembly supplies its own, so successive appends and successive property edits used to push the body one line down per call. Both reassembly paths now normalise it.
-- **`update` checks the mtime.** A note changed outside engraph and not yet re-indexed fails with an mtime conflict, which `edit`, `rewrite` and `edit_frontmatter` did not do.
+- **`update` checks the mtime.** A note changed outside knapper and not yet re-indexed fails with an mtime conflict, which `edit`, `rewrite` and `edit_frontmatter` did not do.
 - **`delete`'s `mode` is an enum** on all three surfaces. It read `"hard" => hard, _ => soft`, so `mode: "hardd"` archived the note silently; an unknown word is now refused where the request is read.
 - **A read-only server refuses `index` and `init {mode: apply}`** on both servers, as it already refused the write calls.
 - **MCP tools: 26 → 20. HTTP routes: 29 → 23** (27 under `/api` → 21, beside the `/api/health-check` liveness probe and the two discovery routes). **CLI top-level commands: 13 → 24** — twenty capabilities plus `configure`, `models`, `clear` and `serve`, which configure the process and not the vault.
