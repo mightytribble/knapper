@@ -402,7 +402,7 @@ impl Update {
         }
     }
 
-    /// The request an `knapper update` names, whichever of its two forms the
+    /// The request a `knapper update` names, whichever of its two forms the
     /// caller used.
     ///
     /// `--edits` is the whole grammar; the flags beside it are the one-edit
