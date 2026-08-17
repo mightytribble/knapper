@@ -31,6 +31,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub verbose: bool,
 
+    /// Data directory, overriding `KNAPPER_HOME` and the `~/.knapper` default.
+    #[arg(long, global = true, value_name = "DIR")]
+    pub data_dir: Option<std::path::PathBuf>,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -263,6 +267,20 @@ mod tests {
     #[test]
     fn every_command_passes_claps_own_asserts() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn data_dir_flag_is_global_and_optional() {
+        use std::path::PathBuf;
+        // Absent by default.
+        let cli = Cli::try_parse_from(["knapper", "status"]).unwrap();
+        assert_eq!(cli.data_dir, None);
+        // Accepted before the subcommand.
+        let cli = Cli::try_parse_from(["knapper", "--data-dir", "/tmp/kn", "status"]).unwrap();
+        assert_eq!(cli.data_dir, Some(PathBuf::from("/tmp/kn")));
+        // Global, so it is also accepted after the subcommand.
+        let cli = Cli::try_parse_from(["knapper", "status", "--data-dir", "/tmp/kn"]).unwrap();
+        assert_eq!(cli.data_dir, Some(PathBuf::from("/tmp/kn")));
     }
 
     #[test]

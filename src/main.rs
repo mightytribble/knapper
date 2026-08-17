@@ -125,6 +125,12 @@ fn content_or_stdin(content: Option<String>) -> Result<String> {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // A `--data-dir` flag sets the override before any `data_dir()` read, so
+    // config, store, and models all resolve under it (issue #77).
+    if let Some(dir) = &cli.data_dir {
+        config::set_data_dir_override(dir.clone());
+    }
+
     // Set up tracing. Default: suppress all logs (ort is very noisy).
     // --verbose enables debug for knapper, info for everything else.
     let filter = if cli.verbose {

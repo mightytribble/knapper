@@ -66,7 +66,7 @@ Single binary with 35 modules behind a lib crate:
 
 ## Data directory
 
-`~/.knapper/` — hardcoded via `Config::data_dir()`. Contains the store (SQLite with FTS5 + sqlite-vec + edges), `models/` (GGUF models + tokenizers), `vault.toml` (vault profile), `config.toml` (user config with intelligence toggle + model overrides). `config::db_path()` resolves the store file: `knapper.db` for a fresh directory, with a read fallback to a legacy `engraph.db` left by a store from before the rename.
+`~/.knapper/` by default, resolved by `Config::data_dir()` through `config::resolve_data_dir`: the `--data-dir` override (a `OnceLock` set once in `main` before any read) wins, then `KNAPPER_HOME` (used verbatim, empty reads as unset), then `~/.knapper`. Everything derives from it, so one override moves them together (#77). Contains the store (SQLite with FTS5 + sqlite-vec + edges), `models/` (GGUF models + tokenizers), `vault.toml` (vault profile), `config.toml` (user config with intelligence toggle + model overrides). `config::db_path()` resolves the store file: `knapper.db` for a fresh directory, with a read fallback to a legacy `engraph.db` left by a store from before the rename.
 
 Single vault only. Re-indexing a different vault path triggers a confirmation prompt.
 

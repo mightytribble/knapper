@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use crate::llm::EmbeddingPromptConfig;
 use crate::prefix::PrefixConfig;
@@ -851,11 +853,50 @@ pub fn db_path(dir: &Path) -> PathBuf {
     if legacy.exists() { legacy } else { new }
 }
 
+/// Override for the data directory, set once by `--data-dir` before any read.
+static DATA_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Set the data-directory override from the top-level `--data-dir` flag.
+///
+/// First value wins; call once, before any [`Config::data_dir`] read. It sits
+/// ahead of `KNAPPER_HOME` in resolution, so a flag beats the environment.
+pub fn set_data_dir_override(dir: PathBuf) {
+    let _ = DATA_DIR_OVERRIDE.set(dir);
+}
+
+/// Resolve the data directory from its three inputs, in order: the `--data-dir`
+/// override, then `KNAPPER_HOME`, then `~/.knapper`.
+///
+/// The override and the environment value are used verbatim (not joined with
+/// `.knapper`); an empty `KNAPPER_HOME` reads as unset. `home` is consulted only
+/// when both are absent, so a container that sets `KNAPPER_HOME` needs no home
+/// directory.
+fn resolve_data_dir(
+    override_dir: Option<PathBuf>,
+    env_home: Option<OsString>,
+    home: Option<PathBuf>,
+) -> Result<PathBuf> {
+    if let Some(dir) = override_dir {
+        return Ok(dir);
+    }
+    if let Some(env) = env_home
+        && !env.is_empty()
+    {
+        return Ok(PathBuf::from(env));
+    }
+    let home = home.context("could not determine home directory")?;
+    Ok(home.join(".knapper"))
+}
+
 impl Config {
-    /// Canonical data directory: `~/.knapper/`.
+    /// Canonical data directory: `~/.knapper/`, or an override from `--data-dir`
+    /// or `KNAPPER_HOME`.
     pub fn data_dir() -> Result<PathBuf> {
-        let home = dirs::home_dir().context("could not determine home directory")?;
-        Ok(home.join(".knapper"))
+        resolve_data_dir(
+            DATA_DIR_OVERRIDE.get().cloned(),
+            std::env::var_os("KNAPPER_HOME"),
+            dirs::home_dir(),
+        )
     }
 
     /// Load config from `~/.knapper/config.toml`, falling back to defaults.
@@ -1016,6 +1057,57 @@ mod tests {
     fn data_dir_ends_with_knapper() {
         let dir = Config::data_dir().unwrap();
         assert!(dir.ends_with(".knapper"));
+    }
+
+    #[test]
+    fn resolve_prefers_override_over_env_and_home() {
+        let got = resolve_data_dir(
+            Some(PathBuf::from("/flag/dir")),
+            Some(OsString::from("/env/dir")),
+            Some(PathBuf::from("/home/user")),
+        )
+        .unwrap();
+        assert_eq!(got, PathBuf::from("/flag/dir"));
+    }
+
+    #[test]
+    fn resolve_uses_env_verbatim_not_joined() {
+        let got = resolve_data_dir(
+            None,
+            Some(OsString::from("/data")),
+            Some(PathBuf::from("/home/user")),
+        )
+        .unwrap();
+        assert_eq!(got, PathBuf::from("/data"));
+    }
+
+    #[test]
+    fn resolve_empty_env_falls_back_to_default() {
+        let got = resolve_data_dir(
+            None,
+            Some(OsString::from("")),
+            Some(PathBuf::from("/home/user")),
+        )
+        .unwrap();
+        assert_eq!(got, PathBuf::from("/home/user/.knapper"));
+    }
+
+    #[test]
+    fn resolve_defaults_to_home_dot_knapper() {
+        let got = resolve_data_dir(None, None, Some(PathBuf::from("/home/user"))).unwrap();
+        assert_eq!(got, PathBuf::from("/home/user/.knapper"));
+    }
+
+    #[test]
+    fn resolve_env_needs_no_home() {
+        // A container sets KNAPPER_HOME and has no home directory.
+        let got = resolve_data_dir(None, Some(OsString::from("/data")), None).unwrap();
+        assert_eq!(got, PathBuf::from("/data"));
+    }
+
+    #[test]
+    fn resolve_errors_when_default_and_no_home() {
+        assert!(resolve_data_dir(None, None, None).is_err());
     }
 
     #[test]

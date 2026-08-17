@@ -565,7 +565,7 @@ knapper is not a replacement for Obsidian — it's the intelligence layer that s
 - Content-based folder role detection (people, daily, archive) by content patterns
 - PARA migration: AI-assisted vault restructuring into Projects/Areas/Resources/Archive with preview, apply, and undo workflow
 - Configurable model overrides for multilingual support
-- 955 unit tests, CI on macOS + Ubuntu
+- 962 unit tests, CI on macOS + Ubuntu
 
 ## Configuration
 
@@ -630,12 +630,12 @@ The keyword lane indexes each chunk's **full text**. `chunks.snippet` — the le
 
 `exclude` takes `.gitignore`-style globs, matched against paths relative to the vault root. A pattern with no `/` matches at any depth (`*-index.md` catches `lore/lore-index.md`); a trailing `/` means a directory and everything under it; an embedded `/` anchors the pattern to the vault root (`drafts/**`). Excluding a path that is already indexed removes it from the store — chunks, vectors, FTS entries and graph edges — on the next index run.
 
-All data stored in `~/.knapper/` — single SQLite database (~10MB typical), GGUF models, and vault profile.
+All data stored in `~/.knapper/` — single SQLite database (~10MB typical), GGUF models, and vault profile. Set `KNAPPER_HOME` (used verbatim) or pass `--data-dir` to move that directory; `--data-dir` wins over the environment, which wins over the default.
 
 ## Development
 
 ```bash
-cargo test --lib          # 955 unit tests, no network (requires CMake for llama.cpp)
+cargo test --lib          # 962 unit tests, no network (requires CMake for llama.cpp)
 cargo clippy -- -D warnings
 cargo fmt --check
 ```
