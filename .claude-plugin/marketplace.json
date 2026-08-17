@@ -1,8 +1,9 @@
 {
   "name": "knapper",
   "owner": {
-    "name": "devwhodevs",
-    "email": "devwhodevs@gmail.com"
+    "name": "mightytribble",
+    "url": "https://github.com/mightytribble",
+    "email": "mightytribble@gmail.com"
   },
   "plugins": [
     {
@@ -11,8 +12,9 @@
       "description": "Turn your Markdown vault into a searchable knowledge graph that any AI agent can query.",
       "version": "1.0.0",
       "author": {
-        "name": "devwhodevs",
-        "email": "devwhodevs@gmail.com"
+        "name": "mightytribble",
+        "url": "https://github.com/mightytribble",
+        "email": "mightytribble@gmail.com"
       },
       "repository": "https://github.com/mightytribble/knapper",
       "license": "MIT",
