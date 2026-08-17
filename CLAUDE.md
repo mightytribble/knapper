@@ -1,6 +1,6 @@
 # knapper
 
-Local knowledge graph + intelligence layer for Obsidian vaults. Rust CLI + MCP server. llama.cpp inference with Metal GPU. MIT licensed.
+Local hybrid search and MCP retrieval for Obsidian-format vaults. Rust CLI + MCP server. llama.cpp inference with Metal GPU. MIT licensed.
 
 ## Architecture
 

@@ -5,7 +5,7 @@ Thanks for your interest in contributing to knapper.
 ## Getting started
 
 ```bash
-git clone https://github.com/devwhodevs/engraph
+git clone https://github.com/mightytribble/knapper.git
 cd knapper
 cargo test --lib    # 225 tests, no network required
 ```

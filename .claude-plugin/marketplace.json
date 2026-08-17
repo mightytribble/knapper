@@ -1,12 +1,12 @@
 {
-  "name": "engraph",
+  "name": "knapper",
   "owner": {
     "name": "devwhodevs",
     "email": "devwhodevs@gmail.com"
   },
   "plugins": [
     {
-      "name": "engraph",
+      "name": "knapper",
       "source": "./",
       "description": "Turn your Markdown vault into a searchable knowledge graph that any AI agent can query.",
       "version": "1.0.0",
@@ -14,19 +14,19 @@
         "name": "devwhodevs",
         "email": "devwhodevs@gmail.com"
       },
-      "repository": "https://github.com/devwhodevs/engraph",
+      "repository": "https://github.com/mightytribble/knapper",
       "license": "MIT",
       "keywords": [
         "markdown",
         "search",
-        "engraph",
+        "knapper",
         "graph search",
         "knowledge graph"
       ],
       "skills": ["./skills/"],
       "mcpServers": {
-        "engraph": {
-          "command": "engraph",
+        "knapper": {
+          "command": "knapper",
           "args": ["serve"]
         }
       }
