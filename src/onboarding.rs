@@ -6,7 +6,7 @@ use serde_json::json;
 
 use crate::config::Config;
 use crate::identity::{L1Summary, extract_l1_facts};
-use crate::indexer::{IndexResult, run_index};
+use crate::indexer::{IndexResult, IndexSettings, run_index};
 use crate::profile::{
     self, FolderMap, StructureDetection, StructureMethod, VaultProfile, VaultStats, VaultType,
 };
@@ -371,7 +371,12 @@ pub fn run_interactive(
             }
         }
 
-        let result = run_index(vault_path, config, false)?;
+        let result = run_index(
+            vault_path,
+            config,
+            IndexSettings::from_config(config),
+            false,
+        )?;
 
         if !quiet {
             println!();
@@ -540,6 +545,7 @@ pub fn run_detect_json(vault_path: &Path) -> Result<serde_json::Value> {
 pub fn run_apply_json(
     vault_path: &Path,
     config: &mut Config,
+    settings: IndexSettings,
     data_dir: &Path,
     flags: ApplyFlags,
 ) -> Result<serde_json::Value> {
@@ -580,7 +586,7 @@ pub fn run_apply_json(
 
     // ── Indexing ──
     let index_result = if !flags.identity_only {
-        let result = run_index(&vault_path, config, false)?;
+        let result = run_index(&vault_path, config, settings, false)?;
         steps_completed.push("index_built".into());
         Some(result)
     } else {

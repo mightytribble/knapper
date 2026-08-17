@@ -52,9 +52,15 @@ pub fn start_watcher(
         {
             let store_lock = store_clone.lock().await;
             let mut embedder_lock = embedder_clone.lock().await;
+            // The startup config is the session's own, captured once and never
+            // reloaded, so reading the index-time settings off it here yields
+            // the same values `engraph serve` captured — not a fresh load that
+            // could drift (#72).
+            let settings = crate::indexer::IndexSettings::from_config(&config_clone);
             if let Err(e) = crate::indexer::run_index_shared(
                 &vault_clone,
                 &config_clone,
+                settings,
                 &store_lock,
                 &mut *embedder_lock,
                 false,
@@ -611,9 +617,13 @@ pub async fn run_consumer(
                     tracing::info!("performing full rescan");
                     let store_guard = store.lock().await;
                     let mut embedder_guard = embedder.lock().await;
+                    // Off the session's own startup config, not a fresh load —
+                    // the same settings `engraph serve` captured (#72).
+                    let settings = crate::indexer::IndexSettings::from_config(&config);
                     match indexer::run_index_shared(
                         &vault_path,
                         &config,
+                        settings,
                         &store_guard,
                         &mut *embedder_guard,
                         false,

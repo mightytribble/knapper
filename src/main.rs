@@ -197,7 +197,12 @@ async fn main() -> Result<()> {
                 cfg.save()?;
             }
 
-            let result = indexer::run_index(&vault_path, &cfg, rebuild)?;
+            let result = indexer::run_index(
+                &vault_path,
+                &cfg,
+                indexer::IndexSettings::from_config(&cfg),
+                rebuild,
+            )?;
 
             println!(
                 "Indexed {} new, {} updated, {} deleted files ({} chunks) in {:.1}s",
@@ -471,8 +476,14 @@ async fn main() -> Result<()> {
                     identity_only: identity,
                     reindex_only: reindex,
                 };
-                let result =
-                    engraph::onboarding::run_apply_json(&vault_path, &mut cfg, &data_dir, flags)?;
+                let settings = engraph::indexer::IndexSettings::from_config(&cfg);
+                let result = engraph::onboarding::run_apply_json(
+                    &vault_path,
+                    &mut cfg,
+                    settings,
+                    &data_dir,
+                    flags,
+                )?;
                 println!("{}", serde_json::to_string_pretty(&result)?);
                 return Ok(());
             }
@@ -850,8 +861,7 @@ async fn main() -> Result<()> {
                 &store,
                 &mut embedder,
                 &vault_path,
-                engraph::prefix::EmbedComposition::from_config(&cfg),
-                cfg.chunk_options(),
+                engraph::indexer::IndexSettings::from_config(&cfg),
             )
             .with_context(|| {
                 format!(
@@ -941,8 +951,7 @@ async fn main() -> Result<()> {
                 &store,
                 &mut embedder,
                 &vault_path,
-                engraph::prefix::EmbedComposition::from_config(&cfg),
-                cfg.chunk_options(),
+                engraph::indexer::IndexSettings::from_config(&cfg),
             )?;
             let output = serde_json::json!({
                 "file": args.file,

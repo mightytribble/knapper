@@ -33,6 +33,38 @@ pub struct IndexFileResult {
     pub docid: String,
 }
 
+/// The index-time settings a store is built at: how a chunk is cut, and the
+/// vector it is embedded as. Both must be the same for every row in one store —
+/// a row cut or embedded at settings the rest of the store was not built at is
+/// a row nothing downstream can tell apart, because both are fingerprint
+/// components and a full index records whatever it ran at (issue #72).
+///
+/// It bundles [`ChunkOptions`] and [`EmbedComposition`] — each already one value
+/// so a caller cannot thread half of it — into one value for the same reason,
+/// one level up: every indexing entry point takes this, so a caller cannot pass
+/// the chunking and forget the embedding. [`IndexSettings::from_config`] is the
+/// one place both are read out of a `Config`; a session that has captured them
+/// carries this value instead, so a fresh `Config::load` cannot be a second
+/// source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexSettings {
+    pub chunk: crate::chunker::ChunkOptions,
+    pub embed: crate::prefix::EmbedComposition,
+}
+
+impl IndexSettings {
+    /// Read both settings off a `Config`. For a caller whose config is the
+    /// session — the CLI, a test — this is the whole of it; a long-running
+    /// server captures the result once and carries it, so a later handler's
+    /// fresh load cannot drift the store's chunking or vector space.
+    pub fn from_config(config: &Config) -> Self {
+        Self {
+            chunk: config.chunk_options(),
+            embed: crate::prefix::EmbedComposition::from_config(config),
+        }
+    }
+}
+
 /// Walk a vault directory and collect all `.md` file paths.
 ///
 /// When `respect_gitignore` is true, the `ignore` crate honors `.gitignore` /
@@ -340,15 +372,14 @@ pub fn backfill_edges_from_chunks(store: &Store) -> Result<usize> {
 /// `[embedding_prompt] document_title` and `breadcrumb_root` together for that
 /// reason: a caller that threads one and forgets the others writes vectors into
 /// a space the store does not share, which is what `prefix::EmbedComposition`
-/// exists to prevent. It takes both beside each other, the way `create_note`
-/// and `unarchive_note` do.
+/// exists to prevent. It takes both as one [`IndexSettings`], so a caller
+/// cannot thread the chunking and forget the embedding.
 pub fn reindex_written_file(
     rel_path: &str,
     store: &Store,
     embedder: &mut impl EmbedModel,
     vault_path: &Path,
-    embed: crate::prefix::EmbedComposition,
-    chunk_opts: crate::chunker::ChunkOptions,
+    settings: IndexSettings,
 ) -> Result<IndexFileResult> {
     let full_path = vault_path.join(rel_path);
     let content = std::fs::read_to_string(&full_path)
@@ -360,8 +391,8 @@ pub fn reindex_written_file(
     };
 
     let mut config = Config::load().unwrap_or_default();
-    config.set_chunk_options(chunk_opts);
-    config.set_embed_composition(embed);
+    config.set_chunk_options(settings.chunk);
+    config.set_embed_composition(settings.embed);
 
     let result = index_file(
         rel_path,
@@ -588,7 +619,12 @@ pub fn rename_file(old_rel: &str, new_rel: &str, store: &Store) -> Result<()> {
 ///
 /// Walks the vault, diffs against the store, processes new/changed/deleted files,
 /// embeds chunks in parallel, and writes everything to the store.
-pub fn run_index(vault_path: &Path, config: &Config, rebuild: bool) -> Result<IndexResult> {
+pub fn run_index(
+    vault_path: &Path,
+    config: &Config,
+    settings: IndexSettings,
+    rebuild: bool,
+) -> Result<IndexResult> {
     let data_dir = Config::data_dir()?;
     std::fs::create_dir_all(&data_dir)?;
 
@@ -602,6 +638,7 @@ pub fn run_index(vault_path: &Path, config: &Config, rebuild: bool) -> Result<In
     run_index_inner(
         vault_path,
         config,
+        settings,
         &store,
         &mut embedder,
         rebuild,
@@ -616,23 +653,38 @@ pub fn run_index(vault_path: &Path, config: &Config, rebuild: bool) -> Result<In
 pub fn run_index_shared(
     vault_path: &Path,
     config: &Config,
+    settings: IndexSettings,
     store: &Store,
     embedder: &mut impl EmbedModel,
     rebuild: bool,
     profile: Option<&VaultProfile>,
 ) -> Result<IndexResult> {
-    run_index_inner(vault_path, config, store, embedder, rebuild, profile)
+    run_index_inner(
+        vault_path, config, settings, store, embedder, rebuild, profile,
+    )
 }
 
 /// Shared implementation for [`run_index`] and [`run_index_shared`].
 fn run_index_inner(
     vault_path: &Path,
     config: &Config,
+    settings: IndexSettings,
     store: &Store,
     embedder: &mut impl EmbedModel,
     rebuild: bool,
     profile: Option<&VaultProfile>,
 ) -> Result<IndexResult> {
+    // The single application point for the index-time settings (#72). Everything
+    // below — the fingerprint that decides a rebuild, and `index_file`'s chunk
+    // and embed — reads them back off this reconciled config, the way
+    // `reindex_written_file` already does for one file. A caller reaches this
+    // function only through a signature that asks for `settings`, so a bare
+    // `Config` cannot be a second source of either.
+    let mut config = config.clone();
+    config.set_chunk_options(settings.chunk);
+    config.set_embed_composition(settings.embed);
+    let config = &config;
+
     let start = Instant::now();
 
     // Size vector storage to the model before anything is written. On a width
@@ -918,6 +970,33 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    #[test]
+    fn index_settings_from_config_reads_both_sides() {
+        // The one place both index-time settings are read off a `Config` reads
+        // both, not one (#72). A config whose chunking and whose embedding
+        // composition are each moved off the defaults must round-trip through
+        // `IndexSettings::from_config` whole.
+        let mut config = Config::default();
+        config.chunk_min_chars = 0;
+        config.promote_bold_headings = false;
+        config.carry_orphan_headings = false;
+        config.breadcrumb_root = crate::config::BreadcrumbRoot::Name;
+        config.embedding_prompt.document_title = crate::llm::DocumentTitle::Breadcrumb;
+
+        let settings = IndexSettings::from_config(&config);
+        assert_eq!(settings.chunk, config.chunk_options());
+        assert_eq!(
+            settings.embed,
+            crate::prefix::EmbedComposition::from_config(&config)
+        );
+        // Both sides actually moved, so neither assertion passes by defaulting.
+        assert_ne!(settings.chunk, Config::default().chunk_options());
+        assert_ne!(
+            settings.embed,
+            crate::prefix::EmbedComposition::from_config(&Config::default())
+        );
+    }
+
     /// Helper: create a file with given content inside a temp directory.
     fn write_file(dir: &Path, rel_path: &str, content: &str) {
         let full = dir.join(rel_path);
@@ -1001,7 +1080,16 @@ mod tests {
         let store = Store::open_memory().unwrap();
         let mut embedder = MockLlm::new(256);
         let config = Config::default();
-        run_index_shared(root, &config, &store, &mut embedder, false, None).unwrap();
+        run_index_shared(
+            root,
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
 
         let input = crate::writer::UpdateInput {
             file: "note.md".into(),
@@ -1027,8 +1115,7 @@ mod tests {
             &store,
             &mut embedder,
             root,
-            crate::prefix::EmbedComposition::from_config(&config),
-            config.chunk_options(),
+            IndexSettings::from_config(&config),
         )
         .unwrap();
 
@@ -1070,7 +1157,16 @@ mod tests {
         let mut embedder = MockLlm::new(256);
         let mut config = Config::default();
 
-        let result = run_index_shared(root, &config, &store, &mut embedder, false, None).unwrap();
+        let result = run_index_shared(
+            root,
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
         assert_eq!(result.new_files, 2);
 
         let indexed = store
@@ -1104,7 +1200,16 @@ mod tests {
 
         // Exclude it and re-index.
         config.exclude.push("*-index.md".to_string());
-        let result = run_index_shared(root, &config, &store, &mut embedder, false, None).unwrap();
+        let result = run_index_shared(
+            root,
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(result.deleted_files, 1);
         assert!(store.get_file("lore/lore-index.md").unwrap().is_none());
@@ -1138,7 +1243,16 @@ mod tests {
         let mut embedder = MockLlm::new(256);
         let mut config = Config::default();
 
-        run_index_shared(root, &config, &store, &mut embedder, false, None).unwrap();
+        run_index_shared(
+            root,
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
         let sources: Vec<String> = store
             .get_unresolved_links()
             .unwrap()
@@ -1148,7 +1262,16 @@ mod tests {
         assert_eq!(sources.len(), 2, "got {sources:?}");
 
         config.exclude.push("*-index.md".to_string());
-        run_index_shared(root, &config, &store, &mut embedder, false, None).unwrap();
+        run_index_shared(
+            root,
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
 
         let sources: Vec<String> = store
             .get_unresolved_links()
@@ -1226,7 +1349,16 @@ mod tests {
         let mut embedder = MockLlm::new(256);
         let config = Config::default();
 
-        run_index_shared(root, &config, &store, &mut embedder, false, None).unwrap();
+        run_index_shared(
+            root,
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
         let hub_id = store.get_file("hub.md").unwrap().unwrap().id;
         assert_eq!(
             store.get_incoming(hub_id, Some("wikilink")).unwrap().len(),
@@ -1241,7 +1373,16 @@ mod tests {
             "hub.md",
             "# Hub\nStill no links out, one word changed.",
         );
-        run_index_shared(root, &config, &store, &mut embedder, false, None).unwrap();
+        run_index_shared(
+            root,
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
 
         let hub = store.get_file("hub.md").unwrap().unwrap();
         assert_eq!(
@@ -1260,7 +1401,16 @@ mod tests {
 
         // The real acceptance criterion: incremental and from-scratch agree.
         let fresh = Store::open_memory().unwrap();
-        run_index_shared(root, &config, &fresh, &mut embedder, false, None).unwrap();
+        run_index_shared(
+            root,
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &fresh,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
         assert_eq!(edge_snapshot(&store), edge_snapshot(&fresh));
     }
 
@@ -1281,18 +1431,45 @@ mod tests {
         let mut embedder = MockLlm::new(256);
         let config = Config::default();
 
-        run_index_shared(root, &config, &store, &mut embedder, false, None).unwrap();
+        run_index_shared(
+            root,
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
         let a_id = store.get_file("a.md").unwrap().unwrap().id;
         assert_eq!(store.get_outgoing(a_id, Some("wikilink")).unwrap().len(), 2);
 
         write_file(root, "a.md", "# A\nSee [[c]]. The hub link is gone.");
-        run_index_shared(root, &config, &store, &mut embedder, false, None).unwrap();
+        run_index_shared(
+            root,
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
 
         let out = store.get_outgoing(a_id, Some("wikilink")).unwrap();
         assert_eq!(out.len(), 1, "the removed wikilink should be gone: {out:?}");
 
         let fresh = Store::open_memory().unwrap();
-        run_index_shared(root, &config, &fresh, &mut embedder, false, None).unwrap();
+        run_index_shared(
+            root,
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &fresh,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
         assert_eq!(edge_snapshot(&store), edge_snapshot(&fresh));
     }
 
@@ -1320,7 +1497,16 @@ mod tests {
         let store = Store::open_memory().unwrap();
         let mut embedder = RecordingEmbed::new(256);
         let config = Config::default();
-        run_index_shared(root, &config, &store, &mut embedder, false, None).unwrap();
+        run_index_shared(
+            root,
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
         embedder.seen.clear();
         (tmp, store, embedder, config)
     }
@@ -1366,8 +1552,16 @@ mod tests {
         let before = chunk_snapshot(&store);
 
         store.conn().execute("DELETE FROM chunks_fts", []).unwrap();
-        let result =
-            run_index_shared(tmp.path(), &config, &store, &mut embedder, false, None).unwrap();
+        let result = run_index_shared(
+            tmp.path(),
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(result.new_files, 0);
         assert_eq!(result.updated_files, 0);
@@ -1416,8 +1610,16 @@ mod tests {
             .set_meta(crate::fingerprint::CHUNKER.name, "built-by-other-constants")
             .unwrap();
 
-        let result =
-            run_index_shared(tmp.path(), &config, &store, &mut embedder, false, None).unwrap();
+        let result = run_index_shared(
+            tmp.path(),
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(
             result.new_files, 3,
@@ -1447,8 +1649,16 @@ mod tests {
             .set_meta(crate::fingerprint::FTS.name, "built-by-another-schema")
             .unwrap();
 
-        let result =
-            run_index_shared(tmp.path(), &config, &store, &mut embedder, false, None).unwrap();
+        let result = run_index_shared(
+            tmp.path(),
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(
             fts_row_count(&store),
@@ -1478,8 +1688,16 @@ mod tests {
             .set_meta(crate::fingerprint::LINK.name, "built-by-another-resolver")
             .unwrap();
 
-        let result =
-            run_index_shared(tmp.path(), &config, &store, &mut embedder, false, None).unwrap();
+        let result = run_index_shared(
+            tmp.path(),
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(edge_snapshot(&store), expected, "every edge should be back");
         assert_eq!(result.new_files, 0);
@@ -1500,8 +1718,16 @@ mod tests {
             .set_meta(crate::fingerprint::RERANKER.name, "some-other-reranker")
             .unwrap();
 
-        let result =
-            run_index_shared(tmp.path(), &config, &store, &mut embedder, false, None).unwrap();
+        let result = run_index_shared(
+            tmp.path(),
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(result.new_files, 0);
         assert_eq!(result.updated_files, 0);
@@ -1537,8 +1763,16 @@ mod tests {
                 .unwrap();
         }
 
-        let result =
-            run_index_shared(tmp.path(), &config, &store, &mut embedder, false, None).unwrap();
+        let result = run_index_shared(
+            tmp.path(),
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(result.new_files, 0);
         assert_eq!(result.updated_files, 0);
@@ -1561,7 +1795,16 @@ mod tests {
         assert!(!chunk_snapshot(&store).is_empty());
 
         let mut wider = RecordingEmbed::new(512);
-        run_index_shared(tmp.path(), &config, &store, &mut wider, false, None).unwrap();
+        run_index_shared(
+            tmp.path(),
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut wider,
+            false,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(store.vec_table_dim().unwrap(), Some(512));
         assert!(
@@ -1962,7 +2205,16 @@ mod tests {
 
         let store = Store::open_memory().unwrap();
         let mut embedder = RecordingEmbed::new(256);
-        run_index_shared(tmp.path(), config, &store, &mut embedder, false, None).unwrap();
+        run_index_shared(
+            tmp.path(),
+            config,
+            crate::indexer::IndexSettings::from_config(config),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
         (store, embedder)
     }
 
@@ -2038,6 +2290,7 @@ mod tests {
         run_index_shared(
             tmp.path(),
             &Config::default(),
+            crate::indexer::IndexSettings::from_config(&Config::default()),
             &store,
             &mut embedder,
             false,
@@ -2277,6 +2530,7 @@ mod tests {
         run_index_shared(
             tmp.path(),
             &Config::default(),
+            crate::indexer::IndexSettings::from_config(&Config::default()),
             &store,
             &mut embedder,
             false,
@@ -2307,6 +2561,7 @@ mod tests {
         run_index_shared(
             tmp.path(),
             &Config::default(),
+            crate::indexer::IndexSettings::from_config(&Config::default()),
             &store,
             &mut embedder,
             false,
@@ -2377,7 +2632,16 @@ mod tests {
             }
             let store = Store::open_memory().unwrap();
             let mut embedder = crate::llm::MockLlm::new(256);
-            run_index_shared(tmp.path(), &config, &store, &mut embedder, false, None).unwrap();
+            run_index_shared(
+                tmp.path(),
+                &config,
+                crate::indexer::IndexSettings::from_config(&config),
+                &store,
+                &mut embedder,
+                false,
+                None,
+            )
+            .unwrap();
             store
                 .fts_search_any("casting", 10, &config.fts.weights(), None)
                 .unwrap()
@@ -2420,8 +2684,16 @@ mod tests {
             fts: crate::config::FtsConfig::CONTROL,
             ..Config::default()
         };
-        let result =
-            run_index_shared(tmp.path(), &control, &store, &mut embedder, false, None).unwrap();
+        let result = run_index_shared(
+            tmp.path(),
+            &control,
+            crate::indexer::IndexSettings::from_config(&control),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(result.new_files, 0);
         assert_eq!(result.updated_files, 0);
@@ -2451,7 +2723,16 @@ mod tests {
         }
         let store = Store::open_memory().unwrap();
         let mut embedder = MockLlm::new(256);
-        run_index_shared(root, &Config::default(), &store, &mut embedder, false, None).unwrap();
+        run_index_shared(
+            root,
+            &Config::default(),
+            crate::indexer::IndexSettings::from_config(&Config::default()),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
         store
     }
 
@@ -2731,6 +3012,7 @@ mod tests {
         let result = run_index_shared(
             tmp.path(),
             &Config::default(),
+            crate::indexer::IndexSettings::from_config(&Config::default()),
             &store,
             &mut embedder,
             false,
@@ -2763,7 +3045,16 @@ mod tests {
 
     fn index_once(dir: &std::path::Path, store: &Store) {
         let mut embedder = crate::llm::MockLlm::new(256);
-        run_index_shared(dir, &Config::default(), store, &mut embedder, false, None).unwrap();
+        run_index_shared(
+            dir,
+            &Config::default(),
+            crate::indexer::IndexSettings::from_config(&Config::default()),
+            store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
     }
 
     #[test]

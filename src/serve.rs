@@ -56,14 +56,11 @@ pub struct EngraphServer {
     /// positional over the columns the store's index is declared with, so this
     /// has to be the config the store was built from (issue #37).
     fts: crate::config::FtsConfig,
-    /// Embedding-prefix settings, for the same reason: notes written by MCP
-    /// tools share a vector space with the indexed vault.
-    embed: crate::prefix::EmbedComposition,
-    /// The chunker settings, one step earlier than `embed` for the same reason: a
-    /// note written by an MCP tool has to be cut into the rows a re-index of it
-    /// would produce (issue #43), and the same now holds for where a section
-    /// starts (issue #44).
-    chunk_opts: crate::chunker::ChunkOptions,
+    /// The index-time settings — how a note written by an MCP tool is chunked,
+    /// and the vector it is embedded as — captured once at startup so every
+    /// write tool and every full index this server runs shares one chunking and
+    /// one vector space with the indexed vault (issues #43, #44, #72).
+    index_settings: crate::indexer::IndexSettings,
     /// Output-packaging settings from `config.toml` (#35): the default token
     /// budget and whether the text rendering rides beside the structured
     /// content.
@@ -320,8 +317,8 @@ impl EngraphServer {
             input,
             &store,
             &mut *embedder,
-            self.embed,
-            self.chunk_opts,
+            self.index_settings.embed,
+            self.index_settings.chunk,
             &self.vault_path,
             self.profile.as_ref().as_ref(),
         )
@@ -380,8 +377,7 @@ impl EngraphServer {
             &store,
             &mut *embedder,
             &self.vault_path,
-            self.embed,
-            self.chunk_opts,
+            self.index_settings,
         )
         .with_context(|| {
             format!(
@@ -440,8 +436,8 @@ impl EngraphServer {
                 &params.0.file,
                 &store,
                 &mut *embedder,
-                self.embed,
-                self.chunk_opts,
+                self.index_settings.embed,
+                self.index_settings.chunk,
                 &self.vault_path,
             )
             .map_err(|e| mcp_err(&e))?
@@ -589,8 +585,7 @@ impl EngraphServer {
             &store,
             &mut *embedder,
             &self.vault_path,
-            self.embed,
-            self.chunk_opts,
+            self.index_settings,
         )
         .map_err(|e| match e.downcast_ref::<std::io::Error>() {
             Some(_) => McpError::new(
@@ -630,19 +625,19 @@ impl EngraphServer {
         let store = self.store.lock().await;
         let mut embedder = self.embedder.lock().await;
         let mut config = crate::config::Config::load().unwrap_or_default();
-        // The chunker settings and the embedding composition come from the
-        // session, for the reason `reindex_file` gives: one store holds one
-        // chunking and one embedding space (#55, #72).
-        config.set_chunk_options(self.chunk_opts);
-        config.set_embed_composition(self.embed);
         if params.0.no_gitignore {
             config.respect_gitignore = false;
         }
+        // The index-time settings come from the session, not this load: the
+        // signature asks for them, so a fresh `Config::load` cannot be a second
+        // source of the store's chunking or vector space (#55, #72). This load
+        // supplies only the other index fields, such as `respect_gitignore`.
         // A server is bound to the vault it was started on, so there is no
         // path parameter here — that argument is the CLI's alone (#62).
         let result = crate::indexer::run_index_shared(
             &self.vault_path,
             &config,
+            self.index_settings,
             &store,
             &mut *embedder,
             params.0.rebuild,
@@ -730,17 +725,14 @@ impl EngraphServer {
                     return Err(read_only_err());
                 }
                 let mut config = crate::config::Config::load().unwrap_or_default();
-                // The chunker settings and the embedding composition come from
-                // the session, not from this load. `apply` indexes the whole
-                // vault, and every later write tool and `reindex_file` chunk and
-                // embed at the captured `chunk_opts` and `embed`. A fresh load
-                // that fell back to the defaults, or drifted from disk, would
-                // build the index at settings the rest of the session does not
-                // use, and nothing downstream can tell the two sets of rows
-                // apart. Carrying the captured values is what `ChunkOptions` and
-                // `EmbedComposition` exist to give (#55, #72).
-                config.set_chunk_options(self.chunk_opts);
-                config.set_embed_composition(self.embed);
+                // `apply` indexes the whole vault. The index-time settings come
+                // from the session, not this load: `run_apply_json` asks for
+                // them, so a fresh load that fell back to the defaults, or
+                // drifted from disk, cannot build the index at a chunking or a
+                // vector space the rest of the session does not use — the
+                // divergence nothing downstream can tell apart (#55, #72). This
+                // load supplies only the identity and profile fields `apply`
+                // writes.
                 let data_dir = crate::config::Config::data_dir().map_err(|e| mcp_err(&e))?;
                 let flags = crate::onboarding::ApplyFlags {
                     name: params.0.name,
@@ -752,6 +744,7 @@ impl EngraphServer {
                 let result = crate::onboarding::run_apply_json(
                     &self.vault_path,
                     &mut config,
+                    self.index_settings,
                     &data_dir,
                     flags,
                 )
@@ -917,8 +910,10 @@ pub async fn run_serve(
     let ranking = config.ranking;
     let lane_weights = config.lane_weights;
     let fts = config.fts;
-    let embed = crate::prefix::EmbedComposition::from_config(&config);
-    let chunk_opts = config.chunk_options();
+    // The index-time settings read once, off this startup config, so the write
+    // tools, the full index and the watcher all share one chunking and one
+    // vector space with the vault (#72).
+    let index_settings = crate::indexer::IndexSettings::from_config(&config);
     let output = config.output.clone();
 
     let (watcher_handle, watcher_shutdown) = crate::watcher::start_watcher(
@@ -951,8 +946,7 @@ pub async fn run_serve(
         ranking,
         lane_weights,
         fts,
-        embed,
-        chunk_opts,
+        index_settings,
         output: output.clone(),
     };
 
@@ -980,8 +974,7 @@ pub async fn run_serve(
             ranking,
             lane_weights,
             fts,
-            embed,
-            chunk_opts,
+            index_settings,
             output,
         };
         let router = crate::http::build_router(api_state);
@@ -1110,6 +1103,7 @@ mod tests {
         crate::indexer::run_index_shared(
             root,
             &crate::config::Config::default(),
+            crate::indexer::IndexSettings::from_config(&crate::config::Config::default()),
             &store,
             &mut embedder,
             false,
@@ -1135,11 +1129,13 @@ mod tests {
             ranking: crate::config::RankingConfig::default(),
             lane_weights: crate::config::LaneWeights::default(),
             fts: crate::config::FtsConfig::default(),
-            embed: crate::prefix::EmbedComposition::default(),
-            chunk_opts: crate::chunker::ChunkOptions {
-                min_chars: 0,
-                promote_bold: false,
-                carry_orphan_headings: false,
+            index_settings: crate::indexer::IndexSettings {
+                chunk: crate::chunker::ChunkOptions {
+                    min_chars: 0,
+                    promote_bold: false,
+                    carry_orphan_headings: false,
+                },
+                embed: crate::prefix::EmbedComposition::default(),
             },
             output: crate::config::OutputConfig::default(),
         };
@@ -1427,6 +1423,7 @@ mod tests {
         crate::indexer::run_index_shared(
             root,
             &crate::config::Config::default(),
+            crate::indexer::IndexSettings::from_config(&crate::config::Config::default()),
             &store,
             &mut embedder,
             false,
@@ -1452,11 +1449,13 @@ mod tests {
             ranking: crate::config::RankingConfig::default(),
             lane_weights: crate::config::LaneWeights::default(),
             fts: crate::config::FtsConfig::default(),
-            embed: crate::prefix::EmbedComposition::default(),
-            chunk_opts: crate::chunker::ChunkOptions {
-                min_chars: 0,
-                promote_bold: false,
-                carry_orphan_headings: false,
+            index_settings: crate::indexer::IndexSettings {
+                chunk: crate::chunker::ChunkOptions {
+                    min_chars: 0,
+                    promote_bold: false,
+                    carry_orphan_headings: false,
+                },
+                embed: crate::prefix::EmbedComposition::default(),
             },
             output: crate::config::OutputConfig::default(),
         };

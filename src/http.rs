@@ -54,14 +54,11 @@ pub struct ApiState {
     pub lane_weights: crate::config::LaneWeights,
     /// Keyword-lane settings from `config.toml` (issue #37).
     pub fts: crate::config::FtsConfig,
-    /// Embedding-prefix settings from `config.toml`. Notes written over HTTP
-    /// must be embedded the way `engraph index` embedded the rest of the vault.
-    pub embed: crate::prefix::EmbedComposition,
-    /// The chunker settings, one step earlier than `embed` for the same reason: a
-    /// note written over HTTP has to be cut into the rows a re-index of it
-    /// would produce (issue #43), and the same now holds for where a section
-    /// starts (issue #44).
-    pub chunk_opts: crate::chunker::ChunkOptions,
+    /// The index-time settings — how a note written over HTTP is chunked, and
+    /// the vector it is embedded as — captured once at startup so every write
+    /// endpoint and every full index this server runs shares one chunking and
+    /// one vector space with the indexed vault (issues #43, #44, #72).
+    pub index_settings: crate::indexer::IndexSettings,
     /// Output-packaging settings from `config.toml` (#35): the default token
     /// budget a request's `budget_tokens` overrides.
     pub output: crate::config::OutputConfig,
@@ -635,8 +632,8 @@ async fn handle_create(
         input,
         &store,
         &mut *embedder,
-        state.embed,
-        state.chunk_opts,
+        state.index_settings.embed,
+        state.index_settings.chunk,
         &state.vault_path,
         state.profile.as_ref().as_ref(),
     )
@@ -686,8 +683,7 @@ async fn handle_update(
         &store,
         &mut *embedder,
         &state.vault_path,
-        state.embed,
-        state.chunk_opts,
+        state.index_settings,
     )
     .with_context(|| {
         format!(
@@ -741,8 +737,8 @@ async fn handle_archive(
             &body.file,
             &store,
             &mut *embedder,
-            state.embed,
-            state.chunk_opts,
+            state.index_settings.embed,
+            state.index_settings.chunk,
             &state.vault_path,
         )
         .map_err(|e| ApiError::internal(&format!("{e:#}")))?
@@ -864,17 +860,17 @@ async fn handle_index(
     let store = state.store.lock().await;
     let mut embedder = state.embedder.lock().await;
     let mut config = crate::config::Config::load().unwrap_or_default();
-    // The chunker settings and the embedding composition come from the
-    // session, for the reason `handle_reindex_file` gives: one store holds one
-    // chunking and one embedding space (#55, #72).
-    config.set_chunk_options(state.chunk_opts);
-    config.set_embed_composition(state.embed);
     if body.no_gitignore {
         config.respect_gitignore = false;
     }
+    // The index-time settings come from the session, not this load: the
+    // signature asks for them, so a fresh `Config::load` cannot be a second
+    // source of the store's chunking or vector space (#55, #72). This load
+    // supplies only the other index fields, such as `respect_gitignore`.
     let result = crate::indexer::run_index_shared(
         &state.vault_path,
         &config,
+        state.index_settings,
         &store,
         &mut *embedder,
         body.rebuild,
@@ -908,8 +904,7 @@ async fn handle_reindex_file(
         &store,
         &mut *embedder,
         &state.vault_path,
-        state.embed,
-        state.chunk_opts,
+        state.index_settings,
     )
     .map_err(|e| match e.downcast_ref::<std::io::Error>() {
         Some(_) => ApiError::bad_request(&format!("Cannot read file {}: {e:#}", body.file)),
@@ -983,17 +978,13 @@ async fn handle_init(
                 ));
             }
             let mut config = crate::config::Config::load().unwrap_or_default();
-            // The chunker settings and the embedding composition come from the
-            // session, not from this load. `apply` indexes the whole vault, and
-            // every later write tool and `reindex_file` chunk and embed at the
-            // captured `chunk_opts` and `embed`. A fresh load that fell back to
-            // the defaults, or drifted from disk, would build the index at
-            // settings the rest of the session does not use, and nothing
-            // downstream can tell the two sets of rows apart. Carrying the
-            // captured values is what `ChunkOptions` and `EmbedComposition`
-            // exist to give (#55, #72).
-            config.set_chunk_options(state.chunk_opts);
-            config.set_embed_composition(state.embed);
+            // `apply` indexes the whole vault. The index-time settings come from
+            // the session, not this load: `run_apply_json` asks for them, so a
+            // fresh load that fell back to the defaults, or drifted from disk,
+            // cannot build the index at a chunking or a vector space the rest of
+            // the session does not use — the divergence nothing downstream can
+            // tell apart (#55, #72). This load supplies only the identity and
+            // profile fields `apply` writes.
             let data_dir = crate::config::Config::data_dir()
                 .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
             let flags = crate::onboarding::ApplyFlags {
@@ -1003,9 +994,14 @@ async fn handle_init(
                 identity_only: false,
                 reindex_only: false,
             };
-            let result =
-                crate::onboarding::run_apply_json(&state.vault_path, &mut config, &data_dir, flags)
-                    .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+            let result = crate::onboarding::run_apply_json(
+                &state.vault_path,
+                &mut config,
+                state.index_settings,
+                &data_dir,
+                flags,
+            )
+            .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
             Ok(Json(result))
         }
         Some(other) => Err(ApiError::bad_request(&format!(
@@ -1108,11 +1104,13 @@ mod tests {
             ranking: crate::config::RankingConfig::default(),
             lane_weights: crate::config::LaneWeights::default(),
             fts: crate::config::FtsConfig::default(),
-            embed: crate::prefix::EmbedComposition::default(),
-            chunk_opts: crate::chunker::ChunkOptions {
-                min_chars: 0,
-                promote_bold: false,
-                carry_orphan_headings: false,
+            index_settings: crate::indexer::IndexSettings {
+                chunk: crate::chunker::ChunkOptions {
+                    min_chars: 0,
+                    promote_bold: false,
+                    carry_orphan_headings: false,
+                },
+                embed: crate::prefix::EmbedComposition::default(),
             },
             output: crate::config::OutputConfig::default(),
         }
@@ -1884,6 +1882,7 @@ mod tests {
         crate::indexer::run_index_shared(
             root,
             &crate::config::Config::default(),
+            crate::indexer::IndexSettings::from_config(&crate::config::Config::default()),
             &store,
             &mut embedder,
             false,
@@ -2153,6 +2152,7 @@ mod tests {
         crate::indexer::run_index_shared(
             root,
             &crate::config::Config::default(),
+            crate::indexer::IndexSettings::from_config(&crate::config::Config::default()),
             &store,
             &mut embedder,
             false,

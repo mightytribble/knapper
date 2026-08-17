@@ -1199,6 +1199,30 @@ batch_size = 128
     }
 
     #[test]
+    fn the_embedding_composition_travels_back_onto_a_config_whole() {
+        // The twin of `the_chunker_settings_travel_back_onto_a_config_whole`
+        // for the embedding side: a session captures the composition once and
+        // puts it back on a freshly loaded config, so a load that failed cannot
+        // re-embed one file at the defaults and into a space the store does not
+        // share. All three keys travel as one value (#2, #36, #46, #72).
+        let session = crate::prefix::EmbedComposition {
+            prefix: crate::prefix::PrefixConfig::default(),
+            title: crate::llm::DocumentTitle::Breadcrumb,
+            root: BreadcrumbRoot::Name,
+        };
+        let mut fresh = Config::default();
+        assert_ne!(
+            crate::prefix::EmbedComposition::from_config(&fresh),
+            session
+        );
+        fresh.set_embed_composition(session);
+        assert_eq!(
+            crate::prefix::EmbedComposition::from_config(&fresh),
+            session
+        );
+    }
+
+    #[test]
     fn parse_partial_config_uses_defaults() {
         let toml_str = r#"top_n = 20"#;
         let cfg: Config = toml::from_str(toml_str).unwrap();

@@ -1792,8 +1792,16 @@ mod tests {
         let store = Store::open_memory().unwrap();
         let mut embedder = crate::llm::MockLlm::new(256);
         let config = crate::config::Config::default();
-        crate::indexer::run_index_shared(root, &config, &store, &mut embedder, false, None)
-            .unwrap();
+        crate::indexer::run_index_shared(
+            root,
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
         (tmp, store, embedder)
     }
 
@@ -2082,8 +2090,16 @@ mod tests {
         let store = Store::open_memory().unwrap();
         let mut embedder = llm::MockLlm::new(256);
         let config = crate::config::Config::default();
-        crate::indexer::run_index_shared(root, &config, &store, &mut embedder, false, None)
-            .unwrap();
+        crate::indexer::run_index_shared(
+            root,
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
         (tmp, store, embedder)
     }
 
@@ -2136,8 +2152,16 @@ mod tests {
         let store = Store::open_memory().unwrap();
         let mut embedder = llm::MockLlm::new(256);
         let config = crate::config::Config::default();
-        crate::indexer::run_index_shared(root, &config, &store, &mut embedder, false, None)
-            .unwrap();
+        crate::indexer::run_index_shared(
+            root,
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
         (tmp, store, embedder)
     }
 
@@ -2325,8 +2349,16 @@ mod tests {
         let store = Store::open_memory().unwrap();
         let mut embedder = llm::MockLlm::new(256);
         let config = crate::config::Config::default();
-        crate::indexer::run_index_shared(root, &config, &store, &mut embedder, false, None)
-            .unwrap();
+        crate::indexer::run_index_shared(
+            root,
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
         (tmp, store, embedder)
     }
 
@@ -2399,8 +2431,16 @@ mod tests {
         let store = Store::open_memory().unwrap();
         let mut embedder = llm::MockLlm::new(256);
         let config = crate::config::Config::default();
-        crate::indexer::run_index_shared(root, &config, &store, &mut embedder, false, None)
-            .unwrap();
+        crate::indexer::run_index_shared(
+            root,
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
         (tmp, store, embedder)
     }
 
@@ -2548,8 +2588,16 @@ mod tests {
         let store = Store::open_memory().unwrap();
         let mut embedder = llm::MockLlm::new(256);
         let config = crate::config::Config::default();
-        crate::indexer::run_index_shared(root, &config, &store, &mut embedder, false, None)
-            .unwrap();
+        crate::indexer::run_index_shared(
+            root,
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
         (tmp, store, embedder)
     }
 
@@ -2921,8 +2969,16 @@ mod tests {
         let store = Store::open_memory().unwrap();
         let mut embedder = llm::MockLlm::new(256);
         let config = crate::config::Config::default();
-        crate::indexer::run_index_shared(root, &config, &store, &mut embedder, false, None)
-            .unwrap();
+        crate::indexer::run_index_shared(
+            root,
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
         (tmp, store, embedder)
     }
 

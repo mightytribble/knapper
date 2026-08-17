@@ -1917,8 +1917,16 @@ mod tests {
 
         let mut embedder = MockLlm::new(256);
         let config = crate::config::Config::default();
-        crate::indexer::run_index_shared(&root, &config, &store, &mut embedder, false, None)
-            .unwrap();
+        crate::indexer::run_index_shared(
+            &root,
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
 
         let before = store.get_file("inbox/hub.md").unwrap().unwrap();
         assert_eq!(store.get_chunks_by_file(before.id).unwrap().len(), 1);
@@ -2384,8 +2392,16 @@ mod tests {
         std::fs::write(vault.join("Projects/n.md"), "# N\n\nbody\n").unwrap();
         let mut embedder = MockLlm::new(256);
         let config = crate::config::Config::default();
-        crate::indexer::run_index_shared(&vault, &config, &store, &mut embedder, false, None)
-            .unwrap();
+        crate::indexer::run_index_shared(
+            &vault,
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
 
         archive_note("Projects/n.md", &store, &vault, None).unwrap();
         assert!(!vault.join("Projects/n.md").exists());
@@ -2413,8 +2429,16 @@ mod tests {
         std::fs::write(vault.join("note.md"), body).unwrap();
         let mut embedder = MockLlm::new(256);
         let config = crate::config::Config::default();
-        crate::indexer::run_index_shared(&vault, &config, &store, &mut embedder, false, None)
-            .unwrap();
+        crate::indexer::run_index_shared(
+            &vault,
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
         (tmp, store, vault)
     }
 
@@ -2691,8 +2715,10 @@ mod tests {
             &store,
             &mut embedder,
             &vault,
-            EmbedComposition::default(),
-            test_chunk_opts(),
+            crate::indexer::IndexSettings {
+                chunk: test_chunk_opts(),
+                embed: EmbedComposition::default(),
+            },
         )
         .unwrap();
 
@@ -2718,8 +2744,16 @@ mod tests {
         .unwrap();
         let mut embedder = MockLlm::new(256);
         let config = crate::config::Config::default();
-        crate::indexer::run_index_shared(&vault, &config, &store, &mut embedder, false, None)
-            .unwrap();
+        crate::indexer::run_index_shared(
+            &vault,
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
 
         let before = std::fs::metadata(vault.join("note.md")).unwrap().len();
 
@@ -2880,8 +2914,16 @@ mod tests {
         .unwrap();
         let mut embedder = MockLlm::new(256);
         let config = crate::config::Config::default();
-        crate::indexer::run_index_shared(&vault, &config, &store, &mut embedder, false, None)
-            .unwrap();
+        crate::indexer::run_index_shared(
+            &vault,
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
 
         let input = UpdateInput {
             file: "note.md".into(),
