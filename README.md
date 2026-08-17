@@ -2,6 +2,8 @@
 
 **Local hybrid search and MCP retrieval for Obsidian-format vaults.** knapper indexes a markdown vault into section-level chunks and serves them to AI agents — Claude Code over [MCP](https://modelcontextprotocol.io), any tool over a REST API. Semantic embeddings, full-text search, wikilink graph traversal, and cross-encoder reranking run in one local binary. No API keys, no cloud.
 
+**knapper** will work with any hierachy of markdown files, but it's targeted at Obsidian vaults and leverages Obsidian frontmatter conventions for tagging and other fields. 
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 Knapper is under active development and should still be considered experimental.
@@ -18,6 +20,10 @@ Plain vector search treats your notes as isolated documents. But knowledge isn't
 - **Real-time sync** — file watcher keeps the index fresh as you edit in Obsidian. No manual re-indexing needed.
 - **Smart write pipeline** — AI agents can create, edit, rewrite, and delete notes with automatic tag resolution, wikilink discovery, and folder placement based on semantic similarity.
 - **Fully local** — [llama.cpp](https://github.com/ggml-org/llama.cpp) inference with GGUF models (~300MB mandatory, ~650MB optional for the cross-encoder). Metal GPU-accelerated on macOS (88 files indexed in 70s), CUDA build available for local GPU. No API keys, no cloud.
+
+## The Split from Engraph
+
+I originally investigated Engraph because it seemed to meet my needs - proper hybrid search + wikilinks search across an Obsidian vault, provided via MCP. Unfortunately the actual search implementation wasn't what I wanted, and many aspects of the API seemed to be the result of organic growth and aspirational design rather than tested, implemented methods. It also at the time seemed abandoned by the developer - 3 months stale and with several critical bugfix PRs outstanding. A private fork was the obvious place to start, but after working on it for a week or so it became obvious that I was ripping out more of the original code to fit it into what I wanted and fix existing bugs. I can see that trend continuing, so it made sense to drop the pretence that this was a fork, acknowledge with gratitude the bones upon which `knapper` is built, and move on.  
 
 ## What problem it solves
 
