@@ -39,6 +39,7 @@ rmcp = { version = "1.5", features = ["transport-io"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time", "net"] }
 notify = "7.0"
 notify-debouncer-full = "0.4"
+libc = "0.2"
 llama-cpp-2 = "0.1"
 encoding_rs = "0.8"
 shimmytok = "0.7"

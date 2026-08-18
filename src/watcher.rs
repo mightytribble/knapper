@@ -3,13 +3,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use notify::RecursiveMode;
-use notify_debouncer_full::{DebouncedEvent, new_debouncer};
+use notify::{PollWatcher, RecursiveMode, Watcher};
+use notify_debouncer_full::{
+    DebounceEventResult, DebouncedEvent, Debouncer, FileIdCache, RecommendedCache, new_debouncer,
+    new_debouncer_opt,
+};
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
-use crate::config::Config;
+use crate::config::{Config, WatcherBackend};
 use crate::exclude::ExcludeMatcher;
 use crate::indexer;
 use crate::llm::EmbedModel;
@@ -17,6 +20,85 @@ use crate::placement;
 use crate::profile::VaultProfile;
 use crate::serve::RecentWrites;
 use crate::store::Store;
+
+/// The concrete watcher backend after config, env, and filesystem are resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResolvedWatcher {
+    Native,
+    Poll,
+}
+
+/// The backend the operator asked for: the `KNAPPER_WATCHER_BACKEND` override
+/// if it named one, else the config value.
+fn requested_backend(
+    config_backend: WatcherBackend,
+    env: Option<WatcherBackend>,
+) -> WatcherBackend {
+    env.unwrap_or(config_backend)
+}
+
+/// Resolve the concrete backend. `fs_needs_poll` is consulted only for `Auto`;
+/// `None` there — detection did not run or could not tell — resolves to native,
+/// the safe default on a local disk.
+fn resolve_watcher(requested: WatcherBackend, fs_needs_poll: Option<bool>) -> ResolvedWatcher {
+    match requested {
+        WatcherBackend::Native => ResolvedWatcher::Native,
+        WatcherBackend::Poll => ResolvedWatcher::Poll,
+        WatcherBackend::Auto => match fs_needs_poll {
+            Some(true) => ResolvedWatcher::Poll,
+            _ => ResolvedWatcher::Native,
+        },
+    }
+}
+
+/// Linux `statfs` `f_type` magics for filesystems whose change notifications
+/// inotify cannot deliver, so a warm watcher on them must poll (issue #83).
+/// Values from `linux/magic.h`.
+fn fs_magic_needs_poll(magic: i64) -> bool {
+    const OVERLAYFS_SUPER_MAGIC: i64 = 0x794c_7630;
+    const FUSE_SUPER_MAGIC: i64 = 0x6573_5546;
+    const V9FS_MAGIC: i64 = 0x0102_1997; // 9p — Docker Desktop / WSL2 mounts
+    const NFS_SUPER_MAGIC: i64 = 0x6969;
+    const SMB_SUPER_MAGIC: i64 = 0x517b;
+    const CIFS_MAGIC_NUMBER: i64 = 0xff53_4d42; // cifs / smb2 / smb3
+    matches!(
+        magic,
+        OVERLAYFS_SUPER_MAGIC
+            | FUSE_SUPER_MAGIC
+            | V9FS_MAGIC
+            | NFS_SUPER_MAGIC
+            | SMB_SUPER_MAGIC
+            | CIFS_MAGIC_NUMBER
+    )
+}
+
+/// Whether the filesystem under `path` needs the poll backend. `None` when
+/// detection did not run (non-Linux) or `statfs` failed — [`resolve_watcher`]
+/// reads that as native, the safe default on a local disk.
+#[cfg(target_os = "linux")]
+fn fs_needs_poll(path: &Path) -> Option<bool> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut buf = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `statfs` writes a full `struct statfs` into `buf` when it returns
+    // 0; `f_type` is read only on that path, after `assume_init`.
+    let rc = unsafe { libc::statfs(c_path.as_ptr(), buf.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
+    let buf = unsafe { buf.assume_init() };
+    // `f_type` is `__fsword_t`, whose width is platform-dependent — i64 here,
+    // i32 on 32-bit targets — so the widening cast is needed for portability
+    // even where this target makes it a no-op.
+    #[allow(clippy::unnecessary_cast)]
+    let magic = buf.f_type as i64;
+    Some(fs_magic_needs_poll(magic))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn fs_needs_poll(_path: &Path) -> Option<bool> {
+    None
+}
 
 /// Start the file watcher and consumer. Returns a thread handle for the producer
 /// and a shutdown sender. On startup, runs a reconciliation index to catch any
@@ -39,7 +121,14 @@ pub fn start_watcher(
     let matcher = ExcludeMatcher::new(&exclude)?;
 
     // Start producer (begins buffering events immediately)
-    let producer_handle = start_producer(vault_path.as_ref().clone(), matcher, tx, shutdown_rx);
+    let producer_handle = start_producer(
+        vault_path.as_ref().clone(),
+        matcher,
+        tx,
+        shutdown_rx,
+        config.watcher.backend,
+        Duration::from_secs(config.watcher.poll_interval_secs),
+    );
 
     // Spawn consumer task
     let store_clone = store.clone();
@@ -105,52 +194,102 @@ pub fn start_producer(
     vault_path: PathBuf,
     exclude: ExcludeMatcher,
     tx: mpsc::Sender<Vec<WatchEvent>>,
-    mut shutdown_rx: oneshot::Receiver<()>,
+    shutdown_rx: oneshot::Receiver<()>,
+    backend: WatcherBackend,
+    poll_interval: Duration,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         // Create std channel for debouncer events
         let (debouncer_tx, debouncer_rx) = std::sync::mpsc::channel();
 
-        let mut debouncer = match new_debouncer(Duration::from_secs(2), None, debouncer_tx) {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::error!("Failed to create file watcher: {}", e);
-                return;
-            }
-        };
+        // Resolve which backend runs: the env override wins over config, and
+        // `Auto` probes the filesystem under the vault (issue #83).
+        let requested = requested_backend(
+            backend,
+            std::env::var("KNAPPER_WATCHER_BACKEND")
+                .ok()
+                .and_then(|v| WatcherBackend::from_env_value(&v)),
+        );
+        let resolved = resolve_watcher(
+            requested,
+            if requested == WatcherBackend::Auto {
+                fs_needs_poll(&vault_path)
+            } else {
+                None
+            },
+        );
+        tracing::info!(backend = ?resolved, "warm-sync watcher backend selected");
 
-        if let Err(e) = debouncer.watch(&vault_path, RecursiveMode::Recursive) {
-            tracing::error!("Failed to watch {:?}: {}", vault_path, e);
-            return;
-        }
-
-        tracing::info!("File watcher started for {:?}", vault_path);
-
-        loop {
-            // Check shutdown (non-blocking)
-            if shutdown_rx.try_recv().is_ok() {
-                tracing::info!("Watcher shutting down");
-                break;
-            }
-
-            match debouncer_rx.recv_timeout(Duration::from_millis(500)) {
-                Ok(Ok(events)) => {
-                    let watch_events = process_debounced_events(&events, &vault_path, &exclude);
-                    if !watch_events.is_empty() && tx.blocking_send(watch_events).is_err() {
-                        tracing::info!("Consumer gone, watcher exiting");
-                        break;
-                    }
+        match resolved {
+            ResolvedWatcher::Native => {
+                match new_debouncer(Duration::from_secs(2), None, debouncer_tx) {
+                    Ok(d) => drive_producer(d, vault_path, exclude, tx, shutdown_rx, debouncer_rx),
+                    Err(e) => tracing::error!("Failed to create file watcher: {}", e),
                 }
-                Ok(Err(errors)) => {
-                    for e in errors {
-                        tracing::warn!("Watcher error: {:?}", e);
-                    }
+            }
+            ResolvedWatcher::Poll => {
+                let cfg = notify::Config::default().with_poll_interval(poll_interval);
+                match new_debouncer_opt::<_, PollWatcher, RecommendedCache>(
+                    Duration::from_secs(2),
+                    None,
+                    debouncer_tx,
+                    RecommendedCache::new(),
+                    cfg,
+                ) {
+                    Ok(d) => drive_producer(d, vault_path, exclude, tx, shutdown_rx, debouncer_rx),
+                    Err(e) => tracing::error!("Failed to create poll watcher: {}", e),
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
     })
+}
+
+/// Watch the vault and forward debounced batches until shutdown. Generic over
+/// the watcher backend so the native and poll paths share one loop; the only
+/// thing that differs is the `Debouncer` handed in, which stays alive — and so
+/// keeps watching — for as long as this runs.
+fn drive_producer<T, C>(
+    mut debouncer: Debouncer<T, C>,
+    vault_path: PathBuf,
+    exclude: ExcludeMatcher,
+    tx: mpsc::Sender<Vec<WatchEvent>>,
+    mut shutdown_rx: oneshot::Receiver<()>,
+    debouncer_rx: std::sync::mpsc::Receiver<DebounceEventResult>,
+) where
+    T: Watcher,
+    C: FileIdCache + Send + 'static,
+{
+    if let Err(e) = debouncer.watch(&vault_path, RecursiveMode::Recursive) {
+        tracing::error!("Failed to watch {:?}: {}", vault_path, e);
+        return;
+    }
+
+    tracing::info!("File watcher started for {:?}", vault_path);
+
+    loop {
+        // Check shutdown (non-blocking)
+        if shutdown_rx.try_recv().is_ok() {
+            tracing::info!("Watcher shutting down");
+            break;
+        }
+
+        match debouncer_rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(Ok(events)) => {
+                let watch_events = process_debounced_events(&events, &vault_path, &exclude);
+                if !watch_events.is_empty() && tx.blocking_send(watch_events).is_err() {
+                    tracing::info!("Consumer gone, watcher exiting");
+                    break;
+                }
+            }
+            Ok(Err(errors)) => {
+                for e in errors {
+                    tracing::warn!("Watcher error: {:?}", e);
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
 }
 
 /// Convert `DebouncedEvent`s to `WatchEvent`s, filtering to `.md` files.
@@ -688,4 +827,76 @@ pub async fn run_consumer(
     }
 
     tracing::info!("Watcher consumer shutting down (channel closed)");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ResolvedWatcher, fs_magic_needs_poll, requested_backend, resolve_watcher};
+    use crate::config::WatcherBackend;
+
+    #[test]
+    fn the_env_override_wins_over_config() {
+        assert_eq!(
+            requested_backend(WatcherBackend::Auto, Some(WatcherBackend::Poll)),
+            WatcherBackend::Poll
+        );
+        assert_eq!(
+            requested_backend(WatcherBackend::Poll, None),
+            WatcherBackend::Poll
+        );
+    }
+
+    #[test]
+    fn resolve_honours_explicit_backends_and_ignores_the_filesystem() {
+        assert_eq!(
+            resolve_watcher(WatcherBackend::Native, Some(true)),
+            ResolvedWatcher::Native
+        );
+        assert_eq!(
+            resolve_watcher(WatcherBackend::Poll, Some(false)),
+            ResolvedWatcher::Poll
+        );
+    }
+
+    #[test]
+    fn auto_polls_only_when_the_filesystem_needs_it() {
+        assert_eq!(
+            resolve_watcher(WatcherBackend::Auto, Some(true)),
+            ResolvedWatcher::Poll
+        );
+        assert_eq!(
+            resolve_watcher(WatcherBackend::Auto, Some(false)),
+            ResolvedWatcher::Native
+        );
+        assert_eq!(
+            resolve_watcher(WatcherBackend::Auto, None),
+            ResolvedWatcher::Native
+        );
+    }
+
+    #[test]
+    fn bind_mount_filesystems_want_polling() {
+        // overlay, fuse, 9p, nfs, smbfs, cifs
+        for magic in [
+            0x794c7630_i64,
+            0x65735546,
+            0x0102_1997,
+            0x6969,
+            0x517b,
+            0xff53_4d42,
+        ] {
+            assert!(fs_magic_needs_poll(magic), "magic {magic:#x} should poll");
+        }
+    }
+
+    #[test]
+    fn local_filesystems_use_native_notifications() {
+        // ext4, btrfs, xfs, tmpfs
+        for magic in [0xEF53_i64, 0x9123_683E, 0x5846_5342, 0x0102_1994] {
+            assert!(
+                !fs_magic_needs_poll(magic),
+                "magic {magic:#x} should not poll"
+            );
+        }
+    }
 }

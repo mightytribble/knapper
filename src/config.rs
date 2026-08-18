@@ -792,6 +792,60 @@ pub struct Config {
     pub memory: MemoryConfig,
     #[serde(default)]
     pub output: OutputConfig,
+    #[serde(default)]
+    pub watcher: WatcherConfig,
+}
+
+/// Which filesystem-watch backend `knapper serve` uses to keep the index warm
+/// (issue #83).
+///
+/// `Auto` uses native OS notifications — inotify on Linux, FSEvents on macOS —
+/// unless the vault sits on a filesystem those cannot service: a Docker bind
+/// mount, an overlay, 9p, fuse, or a network share. On such a filesystem the
+/// native watcher registers without error and then delivers nothing, so
+/// external edits go unseen until an explicit `index`. There `Auto` falls back
+/// to interval polling. `Native` and `Poll` force one backend regardless.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WatcherBackend {
+    #[default]
+    Auto,
+    Native,
+    Poll,
+}
+
+impl WatcherBackend {
+    /// Parse the `KNAPPER_WATCHER_BACKEND` override — the container's way to
+    /// select a backend with no config file. Unset or unrecognised reads as
+    /// `None`, so the config value stands.
+    pub fn from_env_value(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "native" => Some(Self::Native),
+            "poll" => Some(Self::Poll),
+            _ => None,
+        }
+    }
+}
+
+/// `[watcher]` — the warm-sync file watcher (issue #83).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WatcherConfig {
+    /// Which backend to run. See [`WatcherBackend`].
+    pub backend: WatcherBackend,
+    /// How often the poll backend restats the vault, in seconds. Ignored by the
+    /// native backend.
+    pub poll_interval_secs: u64,
+}
+
+impl Default for WatcherConfig {
+    fn default() -> Self {
+        Self {
+            backend: WatcherBackend::default(),
+            poll_interval_secs: 10,
+        }
+    }
 }
 
 impl Default for Config {
@@ -821,6 +875,7 @@ impl Default for Config {
             identity: IdentityConfig::default(),
             memory: MemoryConfig::default(),
             output: OutputConfig::default(),
+            watcher: WatcherConfig::default(),
         }
     }
 }
@@ -1442,6 +1497,46 @@ rerank = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.ggu
         let toml = r#"intelligence = true"#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.intelligence, Some(true));
+    }
+
+    #[test]
+    fn watcher_backend_parses_the_env_override() {
+        assert_eq!(
+            WatcherBackend::from_env_value("poll"),
+            Some(WatcherBackend::Poll)
+        );
+        assert_eq!(
+            WatcherBackend::from_env_value("NATIVE"),
+            Some(WatcherBackend::Native)
+        );
+        assert_eq!(
+            WatcherBackend::from_env_value("  Auto  "),
+            Some(WatcherBackend::Auto)
+        );
+        assert_eq!(WatcherBackend::from_env_value("nonsense"), None);
+        assert_eq!(WatcherBackend::from_env_value(""), None);
+    }
+
+    #[test]
+    fn watcher_config_defaults_to_auto_with_a_ten_second_poll() {
+        let w = WatcherConfig::default();
+        assert_eq!(w.backend, WatcherBackend::Auto);
+        assert_eq!(w.poll_interval_secs, 10);
+    }
+
+    #[test]
+    fn a_config_without_a_watcher_section_defaults_it() {
+        let cfg: Config = toml::from_str("intelligence = true").unwrap();
+        assert_eq!(cfg.watcher.backend, WatcherBackend::Auto);
+        assert_eq!(cfg.watcher.poll_interval_secs, 10);
+    }
+
+    #[test]
+    fn a_watcher_section_deserializes() {
+        let cfg: Config =
+            toml::from_str("[watcher]\nbackend = \"poll\"\npoll_interval_secs = 3\n").unwrap();
+        assert_eq!(cfg.watcher.backend, WatcherBackend::Poll);
+        assert_eq!(cfg.watcher.poll_interval_secs, 3);
     }
 
     #[test]
