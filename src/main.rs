@@ -576,8 +576,6 @@ async fn main() -> Result<()> {
             enable_intelligence,
             disable_intelligence,
             model,
-            enable_obsidian_cli,
-            disable_obsidian_cli,
             register,
             add_api_key,
             key_name,
@@ -624,14 +622,6 @@ async fn main() -> Result<()> {
                         anyhow::bail!("Unknown model type: {other}. Use: embed or rerank.");
                     }
                 }
-            }
-
-            if enable_obsidian_cli {
-                cfg.obsidian.enabled = true;
-                println!("Obsidian CLI integration enabled.");
-            } else if disable_obsidian_cli {
-                cfg.obsidian.enabled = false;
-                println!("Obsidian CLI integration disabled.");
             }
 
             if let Some(agent) = register {

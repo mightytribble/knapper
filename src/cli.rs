@@ -174,14 +174,6 @@ pub enum Command {
         #[arg(long, num_args = 2, value_names = &["TYPE", "URI"])]
         model: Option<Vec<String>>,
 
-        /// Enable Obsidian CLI integration.
-        #[arg(long, conflicts_with = "disable_obsidian_cli")]
-        enable_obsidian_cli: bool,
-
-        /// Disable Obsidian CLI integration.
-        #[arg(long, conflicts_with = "enable_obsidian_cli")]
-        disable_obsidian_cli: bool,
-
         /// Register with an AI agent: "claude-code", "cursor", or "windsurf".
         #[arg(long)]
         register: Option<String>,

@@ -17,7 +17,6 @@ pub mod links;
 pub mod llm;
 pub mod markdown;
 pub mod migrate;
-pub mod obsidian;
 pub mod onboarding;
 pub mod openapi;
 pub mod packaging;

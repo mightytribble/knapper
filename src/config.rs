@@ -34,15 +34,6 @@ pub struct ModelConfig {
     pub n_threads: Option<usize>,
 }
 
-/// Obsidian integration configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ObsidianConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    pub vault_name: Option<String>,
-    pub cli_path: Option<PathBuf>,
-}
-
 /// Agent integration configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AgentsConfig {
@@ -747,9 +738,6 @@ pub struct Config {
     pub intelligence: Option<bool>,
     /// Model override URIs.
     pub models: ModelConfig,
-    /// Obsidian integration settings.
-    #[serde(default)]
-    pub obsidian: ObsidianConfig,
     /// Agent integration settings.
     #[serde(default)]
     pub agents: AgentsConfig,
@@ -828,7 +816,6 @@ impl Default for Config {
             ranking: RankingConfig::default(),
             lane_weights: LaneWeights::default(),
             fts: FtsConfig::default(),
-            obsidian: ObsidianConfig::default(),
             agents: AgentsConfig::default(),
             http: HttpConfig::default(),
             identity: IdentityConfig::default(),
@@ -1455,21 +1442,6 @@ rerank = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.ggu
         let toml = r#"intelligence = true"#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.intelligence, Some(true));
-        // New fields default to None/false
-        assert!(!config.obsidian.enabled);
-    }
-
-    #[test]
-    fn test_config_with_obsidian() {
-        let toml = r#"
-intelligence = true
-[obsidian]
-enabled = true
-vault_name = "Personal"
-"#;
-        let config: Config = toml::from_str(toml).unwrap();
-        assert!(config.obsidian.enabled);
-        assert_eq!(config.obsidian.vault_name.as_deref(), Some("Personal"));
     }
 
     #[test]
