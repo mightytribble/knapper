@@ -627,6 +627,10 @@ enabled = false
 [models]
 # embed = "hf:Qwen/Qwen3-Embedding-0.6B-GGUF/qwen3-embedding-0.6b-q8_0.gguf"
 # rerank = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf"
+# Larger 4B cross-encoder (third-party GGUF): more accurate, slower, larger
+# download. It runs at query time, so a switch needs no re-index.
+# rerank = "hf:gscoppino/Qwen3-Reranker-4B-GGUF-llama_cpp/Qwen3-Reranker-4B-Q4_K_M.gguf"  # ~2.5 GB
+# rerank = "hf:gscoppino/Qwen3-Reranker-4B-GGUF-llama_cpp/Qwen3-Reranker-4B.Q8_0.gguf"    # ~4.3 GB
 
 # Registered AI agents
 [agents]
