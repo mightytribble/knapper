@@ -13,18 +13,43 @@ pub struct ContextParams<'a> {
     pub profile: Option<&'a VaultProfile>,
 }
 
+/// A note's content: the requested text and where it sits, and nothing more.
+/// The default read (#80). Metadata — frontmatter, links, size — is a
+/// separate read, so a caller pays for the note's prose alone.
 #[derive(Debug, Serialize)]
 pub struct NoteContent {
     pub path: String,
     pub docid: Option<String>,
+    /// The requested text: the whole note's body with the frontmatter
+    /// stripped, or one section's markdown with its heading line included
+    /// (#80, #81).
     pub content: String,
-    pub tags: Vec<String>,
+    /// The section's span, only when a section was asked for (#80).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub section: Option<SectionSpan>,
+}
+
+/// A note's metadata: everything about the note that is not its prose — its
+/// frontmatter, its links, and its size. The `--metadata` read (#80). It is
+/// always the whole note's, so it takes no section.
+#[derive(Debug, Serialize)]
+pub struct NoteMetadata {
+    pub path: String,
+    pub docid: Option<String>,
     pub frontmatter: String,
-    pub body: String,
     pub outgoing_links: Vec<LinkRef>,
     pub incoming_links: Vec<LinkRef>,
     pub byte_count: usize,
-    pub section: Option<SectionSpan>,
+}
+
+/// What a read returns: a note's content, or its metadata. The two are
+/// separate reads, so a caller receives exactly one (#80). Serialized
+/// untagged, so the JSON is the inner object with no wrapper.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum ReadResult {
+    Content(NoteContent),
+    Metadata(NoteMetadata),
 }
 
 /// A link's other end. The docid is here because `graph show` printed it
@@ -37,7 +62,10 @@ pub struct LinkRef {
 }
 
 /// Where a section sits in its file. `read` reports it when a section was
-/// asked for, and nothing when the whole note was (#62).
+/// asked for, and nothing when the whole note was (#62). `line_start` and
+/// `line_end` are 1-based and inclusive, and they bracket the returned
+/// content: `line_start` is the heading's own line, because a section read
+/// carries its heading (#81), and `line_end` is the section's last line.
 #[derive(Debug, Serialize)]
 pub struct SectionSpan {
     pub heading: String,
@@ -138,81 +166,101 @@ fn split_frontmatter(content: &str) -> (String, String) {
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Read a single note with full content, metadata, and graph edges. A
-/// section narrows `content` to one heading's body and reports its span;
-/// the file-level fields — tags and links — are the file's either way,
-/// because a section's tags and backlinks are its file's (#62).
+/// The links off one file, as `LinkRef` rows. One reader for both directions,
+/// so the two cannot drift.
+fn link_refs<T>(store: &Store, edges: &[(i64, T)]) -> Vec<LinkRef> {
+    edges
+        .iter()
+        .filter_map(|(fid, _)| store.get_file_by_id(*fid).ok().flatten())
+        .map(|f| LinkRef {
+            path: f.path,
+            docid: f.docid,
+        })
+        .collect()
+}
+
+/// Read a note. Two modes (#80): the default returns the note's content —
+/// the whole note's body, frontmatter stripped, or one section's markdown —
+/// and `metadata` returns the note's frontmatter, links, and size instead.
+/// The two modes are exclusive, and `metadata` describes the whole note, so
+/// it cannot be combined with a section.
 pub fn context_read(
     params: &ContextParams,
     file_or_docid: &str,
     section: Option<&str>,
-) -> Result<NoteContent> {
+    metadata: bool,
+) -> Result<ReadResult> {
+    if metadata && section.is_some() {
+        anyhow::bail!(
+            "--section and --metadata cannot be combined: metadata describes the whole note"
+        );
+    }
+
     let record = resolve_file(params, file_or_docid)?
         .ok_or_else(|| anyhow::anyhow!("File not found: {}", file_or_docid))?;
 
     let full_path = params.vault_path.join(&record.path);
-    let (content, body, frontmatter) = match std::fs::read_to_string(&full_path) {
-        Ok(c) => {
-            let (fm, b) = split_frontmatter(&c);
-            (c, b, fm)
-        }
-        Err(_) => {
-            let msg = "[File not found on disk. Re-run 'knapper index' to update.]".to_string();
-            (String::new(), msg, String::new())
-        }
+    let disk = std::fs::read_to_string(&full_path).ok();
+
+    if metadata {
+        let (frontmatter, byte_count) = match &disk {
+            Some(c) => (split_frontmatter(c).0, c.len()),
+            // A row whose file is gone on disk still has its links and its
+            // docid; the frontmatter and the size are the file's, so they are
+            // empty rather than invented.
+            None => (String::new(), 0),
+        };
+        return Ok(ReadResult::Metadata(NoteMetadata {
+            path: record.path,
+            docid: record.docid,
+            frontmatter,
+            outgoing_links: link_refs(
+                params.store,
+                &params.store.get_outgoing(record.id, Some("wikilink"))?,
+            ),
+            incoming_links: link_refs(
+                params.store,
+                &params.store.get_incoming(record.id, Some("wikilink"))?,
+            ),
+            byte_count,
+        }));
+    }
+
+    // Content mode. A file the store holds and the disk does not answers the
+    // re-index note in place of content, the way it always has (#62).
+    let Some(content_str) = disk else {
+        return Ok(ReadResult::Content(NoteContent {
+            path: record.path,
+            docid: record.docid,
+            content: "[File not found on disk. Re-run 'knapper index' to update.]".to_string(),
+            section: None,
+        }));
     };
 
-    // A section read narrows the content and nothing else: a section's tags
-    // and backlinks are its file's, so those fields are the same either way
-    // (#62). `find_section` resolves a section by its heading text or its full
-    // heading path, and a promoted bold line is one it reaches (#53, #69).
-    let (content, body, span) = match section {
-        None => (content, body, None),
+    // The whole note's body with the frontmatter stripped, or one section's
+    // markdown with its heading line included (#80, #81). `find_section`
+    // resolves a section by its heading text or its full heading path, and a
+    // promoted bold line is one it reaches (#53, #69).
+    let (content, span) = match section {
+        None => (split_frontmatter(&content_str).1, None),
         Some(heading) => {
-            let found = crate::markdown::find_section(&content, heading)
+            let found = crate::markdown::find_section(&content_str, heading)
                 .ok_or_else(|| anyhow::anyhow!("Section not found: {heading}"))?;
             let span = SectionSpan {
                 heading: found.heading.text.clone(),
-                line_start: found.body_start,
+                line_start: found.heading.line + 1,
                 line_end: found.body_end,
             };
-            (found.content.clone(), found.content, Some(span))
+            (found.content, Some(span))
         }
     };
 
-    let outgoing_links: Vec<LinkRef> = params
-        .store
-        .get_outgoing(record.id, Some("wikilink"))?
-        .iter()
-        .filter_map(|(fid, _)| params.store.get_file_by_id(*fid).ok().flatten())
-        .map(|f| LinkRef {
-            path: f.path,
-            docid: f.docid,
-        })
-        .collect();
-    let incoming_links: Vec<LinkRef> = params
-        .store
-        .get_incoming(record.id, Some("wikilink"))?
-        .iter()
-        .filter_map(|(fid, _)| params.store.get_file_by_id(*fid).ok().flatten())
-        .map(|f| LinkRef {
-            path: f.path,
-            docid: f.docid,
-        })
-        .collect();
-    let byte_count = content.len();
-    Ok(NoteContent {
+    Ok(ReadResult::Content(NoteContent {
         path: record.path,
         docid: record.docid,
         content,
-        tags: record.tags,
-        frontmatter,
-        body,
-        outgoing_links,
-        incoming_links,
-        byte_count,
         section: span,
-    })
+    }))
 }
 
 /// A note's headings, read from disk.
@@ -377,6 +425,22 @@ mod tests {
         (tmp, store, root)
     }
 
+    /// The one content-mode read in these tests, unwrapped.
+    fn content_of(res: ReadResult) -> NoteContent {
+        match res {
+            ReadResult::Content(note) => note,
+            ReadResult::Metadata(_) => panic!("expected content mode"),
+        }
+    }
+
+    /// The one metadata-mode read in these tests, unwrapped.
+    fn metadata_of(res: ReadResult) -> NoteMetadata {
+        match res {
+            ReadResult::Metadata(meta) => meta,
+            ReadResult::Content(_) => panic!("expected metadata mode"),
+        }
+    }
+
     #[test]
     fn test_read_by_path() {
         let (_tmp, store, root) = setup_vault();
@@ -385,15 +449,10 @@ mod tests {
             vault_path: &root,
             profile: None,
         };
-        let note = context_read(&params, "note.md", None).unwrap();
+        let note = content_of(context_read(&params, "note.md", None, false).unwrap());
         assert_eq!(note.path, "note.md");
         assert!(note.content.contains("Content here."));
-        assert!(note.body.contains("Content here."));
-        assert!(note.frontmatter.contains("tags:"));
-        assert!(note.tags.contains(&"rust".to_string()));
-        assert_eq!(note.outgoing_links.len(), 1);
-        assert_eq!(note.incoming_links.len(), 1);
-        assert!(note.byte_count > 0);
+        assert!(note.section.is_none());
     }
 
     #[test]
@@ -405,7 +464,7 @@ mod tests {
             profile: None,
         };
         let docid = generate_docid("note.md");
-        let note = context_read(&params, &format!("#{}", docid), None).unwrap();
+        let note = content_of(context_read(&params, &format!("#{}", docid), None, false).unwrap());
         assert_eq!(note.path, "note.md");
     }
 
@@ -420,8 +479,8 @@ mod tests {
             vault_path: &root,
             profile: None,
         };
-        let note = context_read(&params, "ghost.md", None).unwrap();
-        assert!(note.body.contains("File not found on disk"));
+        let note = content_of(context_read(&params, "ghost.md", None, false).unwrap());
+        assert!(note.content.contains("File not found on disk"));
     }
 
     #[test]
@@ -432,8 +491,88 @@ mod tests {
             vault_path: &root,
             profile: None,
         };
-        let note = context_read(&params, "note", None).unwrap();
+        let note = content_of(context_read(&params, "note", None, false).unwrap());
         assert_eq!(note.path, "note.md");
+    }
+
+    /// The whole-note read strips the frontmatter, so a caller reads the prose
+    /// and not the YAML; the frontmatter is a `--metadata` field (#80).
+    #[test]
+    fn whole_note_content_is_frontmatter_stripped() {
+        let (_tmp, store, root) = setup_vault();
+        let params = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+        let note = content_of(context_read(&params, "note.md", None, false).unwrap());
+        assert!(
+            !note.content.contains("tags:"),
+            "frontmatter leaked into content: {}",
+            note.content
+        );
+        assert!(note.content.contains("Content here."));
+    }
+
+    /// Content mode carries the text and nothing else: no links, no
+    /// frontmatter, no parsed tags, no size. Those are the `--metadata`
+    /// read, so a default read does not spend the tokens on them (#80).
+    #[test]
+    fn content_mode_json_carries_no_metadata_fields() {
+        let (_tmp, store, root) = setup_vault();
+        let params = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+        let res = context_read(&params, "note.md", None, false).unwrap();
+        let json = serde_json::to_string(&res).unwrap();
+        for absent in [
+            "outgoing_links",
+            "incoming_links",
+            "frontmatter",
+            "byte_count",
+            "\"tags\"",
+            "\"body\"",
+        ] {
+            assert!(
+                !json.contains(absent),
+                "content mode leaked {absent}: {json}"
+            );
+        }
+    }
+
+    /// `--metadata` returns the note's frontmatter, its links, and its size,
+    /// and no content (#80).
+    #[test]
+    fn metadata_mode_returns_frontmatter_links_and_size() {
+        let (_tmp, store, root) = setup_vault();
+        let params = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+        let meta = metadata_of(context_read(&params, "note.md", None, true).unwrap());
+        assert_eq!(meta.path, "note.md");
+        assert!(meta.frontmatter.contains("tags:"));
+        assert_eq!(meta.outgoing_links.len(), 1);
+        assert_eq!(meta.incoming_links.len(), 1);
+        assert!(meta.byte_count > 0);
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(!json.contains("content"), "metadata leaked content: {json}");
+    }
+
+    /// Metadata describes the whole note, so a section makes no sense in that
+    /// mode and the two are rejected together on every surface (#80).
+    #[test]
+    fn section_and_metadata_cannot_be_combined() {
+        let (_tmp, store, root) = setup_vault();
+        let params = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+        assert!(context_read(&params, "note.md", Some("Note"), true).is_err());
     }
 
     #[test]
@@ -743,9 +882,7 @@ mod tests {
     }
 
     #[test]
-    fn reading_a_section_narrows_the_content_and_keeps_the_file_facts() {
-        // Reuse whatever fixture `test_read_section` builds: a store, a vault
-        // root and a `person.md` holding an `Interactions` section.
+    fn a_section_read_carries_its_heading_and_span() {
         let (store, root, _tmp) = section_fixture();
         let params = ContextParams {
             store: &store,
@@ -753,42 +890,44 @@ mod tests {
             profile: None,
         };
 
-        let whole = context_read(&params, "person.md", None).unwrap();
-        let part = context_read(&params, "person.md", Some("Interactions")).unwrap();
+        let whole = content_of(context_read(&params, "person.md", None, false).unwrap());
+        let part =
+            content_of(context_read(&params, "person.md", Some("Interactions"), false).unwrap());
 
-        // The section's content is a part of the note's.
-        assert!(whole.content.contains(part.content.trim()));
+        // The section's content begins with its heading line (#81) and is a
+        // part of the whole note's content.
+        assert!(
+            part.content.starts_with("## Interactions"),
+            "content: {:?}",
+            part.content
+        );
+        assert!(part.content.contains("Met on 2026-03-26"));
         assert!(part.content.len() < whole.content.len());
+        assert!(whole.content.contains(part.content.trim()));
 
-        // A section carries its own span, measured against the whole file
-        // `find_section` reads — not the frontmatter-stripped body, four
-        // lines shorter in this fixture.
+        // The span is 1-based and inclusive, and it brackets the
+        // heading-inclusive content: line 11 is `## Interactions`, line 13 is
+        // the section's last line.
         let span = part.section.expect("a section read reports its span");
         assert_eq!(span.heading, "Interactions");
         assert_eq!(span.line_start, 11);
         assert_eq!(span.line_end, 13);
         assert!(whole.section.is_none());
 
-        // The file-level facts are the file's, whichever way it is read.
-        assert_eq!(part.path, whole.path);
-        assert_eq!(part.tags, whole.tags);
-        assert!(!part.tags.is_empty(), "the fixture's tag must round-trip");
-        assert_eq!(part.outgoing_links, whole.outgoing_links);
-
         // A heading the note does not have is an error, not an empty section.
-        assert!(context_read(&params, "person.md", Some("Nope")).is_err());
+        assert!(context_read(&params, "person.md", Some("Nope"), false).is_err());
     }
 
     #[test]
-    fn a_link_carries_the_docid_the_graph_view_used_to_print() {
+    fn a_metadata_link_carries_the_docid_the_graph_view_used_to_print() {
         let (store, root, _tmp) = section_fixture();
         let params = ContextParams {
             store: &store,
             vault_path: &root,
             profile: None,
         };
-        let note = context_read(&params, "person.md", None).unwrap();
-        let first = note.outgoing_links.first().expect("a link");
+        let meta = metadata_of(context_read(&params, "person.md", None, true).unwrap());
+        let first = meta.outgoing_links.first().expect("a link");
         assert!(!first.path.is_empty());
         assert!(first.docid.is_some(), "a link names the file's docid");
     }

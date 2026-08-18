@@ -100,7 +100,7 @@ fn build_read() -> serde_json::Value {
     serde_json::json!({
         "get": {
             "operationId": "readNote",
-            "summary": "Read a note's full content with metadata and graph connections.",
+            "summary": "Read a note's content, or its metadata with metadata=true.",
             "parameters": [
                 {
                     "name": "file", "in": "query", "required": true,
@@ -109,11 +109,16 @@ fn build_read() -> serde_json::Value {
                 },
                 {
                     "name": "section", "in": "query", "required": false,
-                    "description": "Read one section by its heading. Omit for the whole note. The heading is an ATX # heading and the match folds case, so 'spells' finds '## Spells'. A section read narrows content and byte_count to that section; the note's tags and links are reported either way.",
+                    "description": "Read one section by its heading, the heading line included. Omit for the whole note. The heading is one heading's own text, or its full path from the top heading down joined with ' > ', and the match folds case, so 'spells' finds '## Spells'. Cannot be combined with metadata.",
                     "schema": { "type": "string" }
+                },
+                {
+                    "name": "metadata", "in": "query", "required": false,
+                    "description": "Return the note's metadata — its frontmatter, its inbound and outbound links, and its size — instead of its content. Describes the whole note, so it cannot be combined with section.",
+                    "schema": { "type": "boolean" }
                 }
             ],
-            "responses": { "200": { "description": "Note content with metadata; outgoing_links and incoming_links are arrays of {path, docid}" } }
+            "responses": { "200": { "description": "Content mode returns {path, docid, content, and section when a section was read}. Metadata mode returns {path, docid, frontmatter, byte_count, and outgoing_links/incoming_links as arrays of {path, docid}}." } }
         }
     })
 }

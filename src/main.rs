@@ -263,24 +263,47 @@ async fn main() -> Result<()> {
                 vault_path: &vault_path,
                 profile: profile.as_ref(),
             };
-            let note =
-                knapper::context::context_read(&params, &args.file, args.section.as_deref())?;
+            let result = knapper::context::context_read(
+                &params,
+                &args.file,
+                args.section.as_deref(),
+                args.metadata,
+            )?;
             if cli.json {
-                println!("{}", serde_json::to_string_pretty(&note)?);
+                println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
-                println!(
-                    "{} {}",
-                    note.path,
-                    note.docid
-                        .as_deref()
-                        .map(|d| format!("(#{})", d))
-                        .unwrap_or_default()
-                );
-                println!("Tags: {}", note.tags.join(", "));
-                println!("Outgoing links: {}", note.outgoing_links.len());
-                println!("Incoming links: {}", note.incoming_links.len());
-                println!("Bytes: {}\n", note.byte_count);
-                println!("{}", note.body);
+                use knapper::context::ReadResult;
+                let ident = |path: &str, docid: &Option<String>| {
+                    format!(
+                        "{} {}",
+                        path,
+                        docid
+                            .as_deref()
+                            .map(|d| format!("(#{})", d))
+                            .unwrap_or_default()
+                    )
+                };
+                match result {
+                    ReadResult::Content(note) => {
+                        println!("{}", ident(&note.path, &note.docid));
+                        println!("{}", note.content);
+                    }
+                    ReadResult::Metadata(meta) => {
+                        println!("{}", ident(&meta.path, &meta.docid));
+                        println!("Bytes: {}", meta.byte_count);
+                        println!("Outgoing links: {}", meta.outgoing_links.len());
+                        for l in &meta.outgoing_links {
+                            println!("  {}", ident(&l.path, &l.docid));
+                        }
+                        println!("Incoming links: {}", meta.incoming_links.len());
+                        for l in &meta.incoming_links {
+                            println!("  {}", ident(&l.path, &l.docid));
+                        }
+                        if !meta.frontmatter.is_empty() {
+                            println!("Frontmatter:\n{}", meta.frontmatter);
+                        }
+                    }
+                }
             }
         }
 

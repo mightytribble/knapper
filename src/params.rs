@@ -96,11 +96,16 @@ pub struct Read {
     /// a bold-only line is a section too, in either spelling — `**Spells**`
     /// and `Spells` name the same one (#69).
     ///
-    /// A section read narrows `content` and `byte_count` to that section; the
-    /// note's tags and links are reported either way, because a section's are
-    /// its file's (#62).
+    /// A section read narrows `content` to that section, its heading line
+    /// included, and reports the section's span (#80, #81).
     #[arg(long)]
     pub section: Option<String>,
+    /// Return the note's metadata — its frontmatter, its inbound and outbound
+    /// links, and its size — instead of its content. It describes the whole
+    /// note, so it cannot be combined with `--section` (#80).
+    #[arg(long, conflicts_with = "section")]
+    #[serde(default)]
+    pub metadata: bool,
 }
 
 #[derive(Debug, Args, Deserialize, JsonSchema)]

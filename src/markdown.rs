@@ -204,6 +204,12 @@ fn normalise(segment: &str) -> String {
 
 /// The span a heading owns: from the line after it to the next heading at or
 /// above its own level, or the end of the file.
+///
+/// `content` is the section's full markdown, the heading line included, so
+/// "give me this section" round-trips and a heading that carries meaning is
+/// not dropped (#81). `body_start`/`body_end` stay the body span alone, which
+/// is what `writer::apply_section_edit` edits, so the heading line keeps its
+/// place through an edit.
 fn section_at(content: &str, headings: &[HeadingInfo], idx: usize) -> Section {
     let lines: Vec<&str> = content.lines().collect();
     let h = &headings[idx];
@@ -218,7 +224,7 @@ fn section_at(content: &str, headings: &[HeadingInfo], idx: usize) -> Section {
         heading: h.clone(),
         body_start,
         body_end,
-        content: lines[body_start..body_end].join("\n"),
+        content: lines[h.line..body_end].join("\n"),
     }
 }
 
@@ -546,12 +552,13 @@ mod tests {
 
     /// An empty section is addressable, because addressing it is how a caller
     /// fills it. The chunker drops a bodyless promoted line from its own set;
-    /// the resolver reads the set before that drop (#69).
+    /// the resolver reads the set before that drop (#69). Its content is the
+    /// heading line alone, and its body span is empty (#81).
     #[test]
     fn a_bodyless_promoted_line_is_addressable() {
         let content = "## Stat Block\n\n**Spells**\n**Notes**\n\nSee below\n";
         let spells = find_section(content, "Spells").unwrap();
-        assert_eq!(spells.content, "");
+        assert_eq!(spells.content, "**Spells**");
         assert_eq!(spells.body_start, spells.body_end);
     }
 
@@ -560,5 +567,35 @@ mod tests {
     fn a_bold_line_inside_a_fence_is_not_addressable() {
         let content = "## Stat Block\n\n```md\n**Spells**\n\nFireball\n```\n";
         assert!(find_section(content, "Spells").is_none());
+    }
+
+    /// A section's content is its markdown, heading line and all, so "give me
+    /// this section" round-trips and a heading that carries meaning — an MP
+    /// cost in the heading text — is not dropped (#81).
+    #[test]
+    fn a_section_content_begins_with_its_heading_line() {
+        let content = "# Title\n\n## Level 1 Sharpen (5 MP)\n\nDeals 2d6.\n\n## Next\n\nOther\n";
+        let section = find_section(content, "Level 1 Sharpen (5 MP)").unwrap();
+        assert!(
+            section.content.starts_with("## Level 1 Sharpen (5 MP)"),
+            "content: {:?}",
+            section.content
+        );
+        assert!(section.content.contains("Deals 2d6."));
+        assert!(!section.content.contains("Other"));
+    }
+
+    /// A promoted section carries its bold line the same way, so the raw
+    /// `**Spells**` a caller round-trips is the one the file holds (#81).
+    #[test]
+    fn a_promoted_section_content_begins_with_its_bold_line() {
+        let content = "## Stat Block\n\n**Spells**\n\nFireball\n";
+        let section = find_section(content, "Spells").unwrap();
+        assert!(
+            section.content.starts_with("**Spells**"),
+            "content: {:?}",
+            section.content
+        );
+        assert!(section.content.contains("Fireball"));
     }
 }

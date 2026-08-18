@@ -208,7 +208,7 @@ impl KnapperServer {
 
     #[tool(
         name = "read",
-        description = "Read a note's full content with metadata, tags, and graph edges. Accepts file path, basename, or #docid."
+        description = "Read a note's content: the whole note's body, or one section's markdown with `section`. With `metadata: true` it returns the note's frontmatter, inbound and outbound links, and size instead — which cannot be combined with `section`. Accepts file path, basename, or #docid."
     )]
     async fn read(
         &self,
@@ -220,9 +220,14 @@ impl KnapperServer {
             vault_path: &self.vault_path,
             profile: self.profile.as_ref().as_ref(),
         };
-        let note = context::context_read(&ctx, &params.0.file, params.0.section.as_deref())
-            .map_err(|e| mcp_err(&e))?;
-        to_json_result(&note)
+        let result = context::context_read(
+            &ctx,
+            &params.0.file,
+            params.0.section.as_deref(),
+            params.0.metadata,
+        )
+        .map_err(|e| mcp_err(&e))?;
+        to_json_result(&result)
     }
 
     #[tool(
@@ -774,7 +779,7 @@ impl rmcp::handler::server::ServerHandler for KnapperServer {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions(
                 "knapper: vault intelligence for Obsidian. \
-                 Read: vault_map to orient, tags for the tag vocabulary, search to find, read for content (a section parameter narrows it), list to filter notes by scope (tags or directory paths), who/project for context bundles, topic for a budgeted bundle of the sections about one subject. \
+                 Read: vault_map to orient, tags for the tag vocabulary, search to find, read for content (a section parameter narrows it to one heading, or metadata for the note's frontmatter, links and size), list to filter notes by scope (tags or directory paths), who/project for context bundles, topic for a budgeted bundle of the sections about one subject. \
                  Write: create for a new note, which needs a `filename` (a bare name or one ending in `.md`) that becomes the note's breadcrumb root, so name it the way it should read as provenance; a colliding filename is refused. update for every change to an existing one — a list of edits over the body, a section or a frontmatter property, applied in one write. \
                  Lifecycle: move to relocate, archive to soft-delete (`undo: true` to restore), delete for permanent removal. \
                  Index: reindex_file to refresh a single file after external edits, index to walk the whole vault (`rebuild: true` builds it again from nothing). \

@@ -57,7 +57,8 @@ pub enum Command {
     /// Search the indexed vault.
     Search(crate::params::Search),
 
-    /// Read a note's full content, or one of its sections.
+    /// Read a note's content, one of its sections with `--section`, or its
+    /// metadata with `--metadata`.
     Read(crate::params::Read),
 
     /// List notes by metadata filters.
