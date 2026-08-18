@@ -75,6 +75,45 @@ The CUDA binary is **701 MB** against 25 MB for the CPU one — statically linke
 two in separate target directories (`CARGO_TARGET_DIR`) if you want both, because a feature change
 relinks the same path and a rebuild each way costs the llama.cpp compile.
 
+## Docker images
+
+The image builds knapper from source inside the container: the `Dockerfile` does `COPY . .` then
+`cargo build --release`, so the host needs only Docker and network access, no Rust and no CUDA
+toolkit. `.dockerignore` keeps `target/`, `.git/` and the dev-only dirs out of the build context, so
+a container build reuses none of the host's artifacts and cannot be polluted by them.
+
+The context is the working tree, so the image bakes in whatever is checked out; the commit does not
+need to reach a remote. Check out the branch you want, then build one or both variants:
+
+```bash
+docker build --build-arg VARIANT=cpu  -t knapper:cpu  .   # ubuntu base, default features
+docker build --build-arg VARIANT=cuda -t knapper:cuda .   # nvidia/cuda devel base, --features cuda
+```
+
+Both are cold from-scratch builds (rustup, apt, the cargo dependency tree, the llama.cpp C++
+compile), so budget ~10 min each and network access.
+
+Building the `cuda` variant needs no CUDA on the host: the toolkit lives in the
+`nvidia/cuda:12.6.3-devel-ubuntu24.04` build stage, not in the `$HOME/.knapper-cuda` install the
+native CUDA section sets up. The NVIDIA Container Toolkit is a **run-time** requirement, for `docker
+run --gpus all`, not a build one. llama.cpp links CUDA statically (see the CUDA section above), so the
+slim `ubuntu:24.04` runtime stage carries no CUDA userspace; `-lcuda` resolves against the driver
+`--gpus all` injects, which is why every `:cuda` invocation needs `--gpus all`, `configure` included.
+
+Validate an image end to end: it builds the image, indexes a fixture vault into a named volume, checks
+MCP `tools/list` over `docker run -i … serve`, and confirms the volume persists across runs.
+
+```bash
+eval/smoke-docker.sh cpu     # or: cuda, on a box with the NVIDIA Container Toolkit
+```
+
+There is no registry push here. `release.yml` builds native binaries only, and the
+`ghcr.io/mightytribble/knapper` publish is a separate, not-yet-live step (`docs/deployment.md`). So
+"build a new image" is this local `docker build`. A client registered as `docker run --rm …
+knapper:cuda serve` picks up a rebuilt tag on its next session, because `--rm` starts a fresh
+container each time; the `knapper-data` volume survives the rebuild untouched, so the store and
+models are reused.
+
 ## There is no `tests/` directory
 
 There is no `tests/integration.rs`, `tests/write_pipeline.rs` or `tests/fixtures/`. None of the three
