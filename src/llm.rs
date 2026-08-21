@@ -1355,6 +1355,39 @@ pub fn format_reranker_input(query: &str, document: &str) -> String {
     )
 }
 
+/// The cross-encoder families knapper can score.
+///
+/// Only Qwen3-Reranker's generative yes/no judge is implemented (see
+/// [`format_reranker_input`] and [`LlamaRerank`]). A GGUF of any other family —
+/// a BGE, Jina or mxbai sequence-classification head — is a different llama.cpp
+/// execution mode, so [`LlamaRerank::new`] refuses it at load rather than run it
+/// through this template and return a meaningless score (#82). The enum is the
+/// seam a second family extends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RerankerFamily {
+    /// Qwen3-Reranker: a causal LM read by the softmax of its yes/no logits.
+    Qwen3,
+}
+
+impl RerankerFamily {
+    /// Detect the family from the model URI, or `None` for one the scorer does
+    /// not handle.
+    ///
+    /// Keys on a loose substring of the repo and filename, because a filename is
+    /// not identity here — the reason [`crate::fingerprint::artifact_digest`]
+    /// hashes bytes. Allowlisting the one family that scores correctly fails
+    /// safe: a valid Qwen model with an odd name is refused and seen, where a
+    /// non-Qwen family run anyway is a wrong score no one sees.
+    pub fn detect(uri: &HfModelUri) -> Option<Self> {
+        let hay = format!("{} {}", uri.repo, uri.filename).to_lowercase();
+        if hay.contains("qwen3-reranker") {
+            Some(Self::Qwen3)
+        } else {
+            None
+        }
+    }
+}
+
 /// Quantized Qwen3 cross-encoder for reranking search results via llama.cpp.
 ///
 /// Loads a Qwen3-Reranker GGUF model and scores (query, document) pairs by
@@ -1404,6 +1437,12 @@ impl LlamaRerank {
             .as_deref()
             .unwrap_or(&defaults.rerank_uri);
         let uri = HfModelUri::parse(uri_str)?;
+        if RerankerFamily::detect(&uri).is_none() {
+            bail!(
+                "unsupported reranker model '{uri_str}': knapper scores only \
+                 Qwen3-Reranker GGUFs. Set [models] rerank to a Qwen3-Reranker model."
+            );
+        }
         let model_path = ensure_model(&uri, models_dir)?;
 
         // Use global backend and llama.cpp's built-in tokenizer (no tokenizer.json required).
@@ -1966,6 +2005,43 @@ mod tests {
         assert!(
             formatted.contains("can only be \"yes\" or \"no\""),
             "the scored tokens are lowercase and the system prompt has to say so"
+        );
+    }
+
+    #[test]
+    fn the_reranker_family_recognizes_qwen3_and_no_other() {
+        let qwen =
+            HfModelUri::parse("hf:Qwen/Qwen3-Reranker-0.6B-GGUF/Qwen3-Reranker-0.6B-Q8_0.gguf")
+                .unwrap();
+        assert_eq!(RerankerFamily::detect(&qwen), Some(RerankerFamily::Qwen3));
+
+        for uri in [
+            "hf:BAAI/bge-reranker-v2-m3-GGUF/bge-reranker-v2-m3-Q8_0.gguf",
+            "hf:jinaai/jina-reranker-v2-base-multilingual-GGUF/model-Q8_0.gguf",
+            "hf:mixedbread-ai/mxbai-rerank-large-v1-GGUF/model.gguf",
+        ] {
+            let parsed = HfModelUri::parse(uri).unwrap();
+            assert_eq!(
+                RerankerFamily::detect(&parsed),
+                None,
+                "a non-Qwen family must not be recognized: {uri}"
+            );
+        }
+    }
+
+    #[test]
+    fn new_refuses_an_unsupported_reranker_before_it_downloads() {
+        let mut config = crate::config::Config::default();
+        config.models.rerank =
+            Some("hf:BAAI/bge-reranker-v2-m3-GGUF/bge-reranker-v2-m3-Q8_0.gguf".to_string());
+        // The path does not exist: the guard must return before `ensure_model`
+        // reads it, so an unsupported model never spends a download.
+        let err = LlamaRerank::new(Path::new("/knapper-nonexistent-models"), &config)
+            .expect_err("a non-Qwen reranker must be refused at load");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unsupported reranker model"),
+            "the error must name the mismatch, got: {msg}"
         );
     }
 
