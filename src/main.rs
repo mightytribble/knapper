@@ -28,8 +28,8 @@ fn prompt_intelligence(data_dir: &std::path::Path) -> Result<bool> {
     if enable {
         let models_dir = data_dir.join("models");
         let defaults = knapper::llm::ModelDefaults::default();
-        println!("Downloading the cross-encoder (~650MB)...");
         let rerank_uri = knapper::llm::HfModelUri::parse(&defaults.rerank_uri)?;
+        println!("Downloading the cross-encoder ({})...", rerank_uri.repo);
         knapper::llm::ensure_model(&rerank_uri, &models_dir)?;
         println!("Done.");
     } else {
@@ -591,10 +591,10 @@ async fn main() -> Result<()> {
                 println!("Intelligence enabled. Models will be downloaded on first search.");
                 let models_dir = data_dir.join("models");
                 let defaults = knapper::llm::ModelDefaults::default();
-                println!("Downloading the cross-encoder (~650MB)...");
                 let rerank_uri = knapper::llm::HfModelUri::parse(
                     cfg.models.rerank.as_deref().unwrap_or(&defaults.rerank_uri),
                 )?;
+                println!("Downloading the cross-encoder ({})...", rerank_uri.repo);
                 knapper::llm::ensure_model(&rerank_uri, &models_dir)?;
                 println!("Done.");
             } else if disable_intelligence {
