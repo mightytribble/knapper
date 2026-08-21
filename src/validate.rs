@@ -2,6 +2,8 @@
 //! vault's `.md` files, read from disk. Read-only, no model, no store.
 
 use serde::Serialize;
+use std::collections::HashMap;
+use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -90,6 +92,79 @@ impl ValidateReport {
     }
 }
 
+/// The vault's file names, for resolving a wikilink the way the indexer does:
+/// by exact relative path, then by a `/`-suffix basename match, shortest path
+/// winning (`indexer::resolve_link_target`). No aliases, no fuzzy matching.
+/// The map is the cache — a lookup is O(1) in the basename bucket.
+pub struct NameSet {
+    /// last path segment (lowercased, with `.md`) -> the full relative paths
+    /// (lowercased) that end in it.
+    by_basename: HashMap<String, Vec<String>>,
+}
+
+impl NameSet {
+    pub fn empty() -> Self {
+        NameSet {
+            by_basename: HashMap::new(),
+        }
+    }
+
+    pub fn from_paths(paths: impl IntoIterator<Item = String>) -> Self {
+        let mut by_basename: HashMap<String, Vec<String>> = HashMap::new();
+        for p in paths {
+            let lower = p.to_lowercase();
+            let base = last_segment(&lower).to_string();
+            by_basename.entry(base).or_default().push(lower);
+        }
+        NameSet { by_basename }
+    }
+
+    pub fn resolve(&self, target: &str) -> bool {
+        let note = note_part(target);
+        if note.is_empty() {
+            return false;
+        }
+        let with_ext = if note.ends_with(".md") {
+            note.to_lowercase()
+        } else {
+            format!("{}.md", note.to_lowercase())
+        };
+        let base = last_segment(&with_ext).to_string();
+        match self.by_basename.get(&base) {
+            Some(candidates) => candidates
+                .iter()
+                .any(|p| *p == with_ext || p.ends_with(&format!("/{with_ext}"))),
+            None => false,
+        }
+    }
+}
+
+/// The note part of a wikilink target: the text before the first `#` or `|`.
+pub fn note_part(target: &str) -> &str {
+    let end = target.find(['#', '|']).unwrap_or(target.len());
+    target[..end].trim()
+}
+
+fn last_segment(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// Build the whole-vault name set from disk, respecting `.gitignore`.
+pub fn build_name_set(root: &Path) -> anyhow::Result<NameSet> {
+    let files = crate::indexer::walk_vault(root, &[], true)?;
+    Ok(NameSet::from_paths(
+        files.iter().filter_map(|p| rel_path(root, p)),
+    ))
+}
+
+/// A file's vault-relative path with forward slashes, or `None` if it is not
+/// under `root`.
+fn rel_path(root: &Path, p: &Path) -> Option<String> {
+    p.strip_prefix(root)
+        .ok()
+        .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,5 +189,37 @@ mod tests {
             !ValidateReport::build(warn(), 1, true).ok,
             "strict gates on a warning"
         );
+    }
+
+    #[test]
+    fn nameset_resolves_like_the_indexer() {
+        let names = NameSet::from_paths([
+            "Lore/Archdragon.md".to_string(),
+            "People/Ada.md".to_string(),
+            "sub/foo.md".to_string(),
+            "foo.md".to_string(),
+        ]);
+        // bare basename, any case
+        assert!(names.resolve("archdragon"));
+        assert!(names.resolve("Archdragon"));
+        // note part only: heading and alias fragments are ignored
+        assert!(names.resolve("Ada#Bio"));
+        assert!(names.resolve("Ada|Ada Lovelace"));
+        // a path target requires that path suffix
+        assert!(names.resolve("sub/foo"));
+        // an unknown target does not resolve
+        assert!(!names.resolve("missing"));
+        assert!(!names.resolve(""));
+    }
+
+    #[test]
+    fn build_name_set_reads_disk_not_a_store() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("Lore")).unwrap();
+        std::fs::write(dir.path().join("Lore/Archdragon.md"), "# Archdragon\n").unwrap();
+        // A file never indexed still resolves, because resolution is disk-truth.
+        let names = build_name_set(dir.path()).unwrap();
+        assert!(names.resolve("Archdragon"));
+        assert!(!names.resolve("Nonexistent"));
     }
 }
