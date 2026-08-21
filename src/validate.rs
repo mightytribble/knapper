@@ -919,12 +919,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::create_dir_all(root.join("Work")).unwrap();
-        std::fs::write(root.join("Work/a.md"), "## Sub only\n\nx\n").unwrap();
         std::fs::write(
-            root.join("home.md"),
-            "# Home\n\nsee [[a]] which lives in Work\n",
+            root.join("Work/a.md"),
+            "## Sub only\n\nsee [[home]] which is out of scope\n",
         )
         .unwrap();
+        std::fs::write(root.join("home.md"), "# Home\n\nbody\n").unwrap();
         let limits = ChunkLimits {
             min_chars: 120,
             target_tokens: 512,
@@ -942,8 +942,10 @@ mod tests {
         let scope = Scope::parse(&["/Work/".to_string()], &[], &[]).unwrap();
         let r = validate_target(root, &Target::Scope(scope), &limits, false).unwrap();
         assert_eq!(r.files_checked, 1);
-        // home.md is outside the scope, and its [[a]] link is NOT reported unresolvable
-        // because the name set is the whole vault; nothing here should be an unresolvable-wikilink
+        // Work/a.md's [[home]] link points out of the /Work/ scope, but it still
+        // resolves: the name set is built from the whole vault, not the scoped
+        // subtree. If the name set were scoped to /Work/, home.md would be absent
+        // and [[home]] would flag UnresolvableWikilink, failing this assertion.
         assert!(
             r.findings
                 .iter()
