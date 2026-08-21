@@ -478,6 +478,28 @@ impl KnapperServer {
     }
 
     #[tool(
+        name = "validate",
+        description = "Check vault markdown for structural defects and indexing-quality problems. Validate one note by path, a scope, or the whole vault. Read-only."
+    )]
+    async fn validate(
+        &self,
+        params: Parameters<crate::params::Validate>,
+    ) -> Result<CallToolResult, McpError> {
+        let target = params.0.target().map_err(|e| mcp_err(&e))?;
+        let min_chars = crate::config::Config::load()
+            .map(|c| c.chunk_min_chars)
+            .unwrap_or_else(|_| crate::config::default_chunk_min_chars());
+        let limits = crate::validate::ChunkLimits {
+            min_chars,
+            target_tokens: crate::chunker::limits::TARGET_TOKENS,
+        };
+        let report =
+            crate::validate::validate_target(&self.vault_path, &target, &limits, params.0.strict)
+                .map_err(|e| mcp_err(&e))?;
+        to_json_result(&report)
+    }
+
+    #[tool(
         name = "migrate",
         description = "Restructure the vault into PARA. Mode 'preview' classifies every note into Projects/Areas/Resources/Archive and returns the proposed moves with confidence scores; 'apply' performs the moves of a preview; 'undo' reverses the last migration."
     )]
