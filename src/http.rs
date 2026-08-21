@@ -288,6 +288,7 @@ pub fn routes() -> Vec<(&'static str, MethodRouter<ApiState>)> {
         ("/api/tags", get(handle_tags)),
         ("/api/vault-map", get(handle_vault_map)),
         ("/api/health", get(handle_health)),
+        ("/api/validate", post(handle_validate)),
         ("/api/status", get(handle_status)),
         // Write endpoints
         ("/api/create", post(handle_create)),
@@ -567,6 +568,27 @@ async fn handle_health(
         inbox_folder: profile_ref.and_then(|p| p.structure.folders.inbox.clone()),
     };
     let report = health::generate_health_report(&store, &config)
+        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    Ok(Json(serde_json::json!(report)))
+}
+
+async fn handle_validate(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(body): Json<crate::params::Validate>,
+) -> Result<impl IntoResponse, ApiError> {
+    authorize(&headers, &state, false)?;
+    let target = body
+        .target()
+        .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
+    let min_chars = crate::config::Config::load()
+        .map(|c| c.chunk_min_chars)
+        .unwrap_or_else(|_| crate::config::default_chunk_min_chars());
+    let limits = crate::validate::ChunkLimits {
+        min_chars,
+        target_tokens: crate::chunker::limits::TARGET_TOKENS,
+    };
+    let report = crate::validate::validate_target(&state.vault_path, &target, &limits, body.strict)
         .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
     Ok(Json(serde_json::json!(report)))
 }
