@@ -15,7 +15,7 @@ pub enum Severity {
 /// One kind of finding. Serializes to its kebab-case name (the stable `rule`
 /// code a JSON consumer and the strict gate key on), and owns its severity so
 /// a check never assigns one by hand.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Rule {
     UnterminatedCodeFence,
@@ -498,6 +498,48 @@ pub fn wikilink_targets(line: &str) -> Vec<String> {
     out
 }
 
+/// The chunker limits the length checks read: the section-body minimum and the
+/// pack target, both in characters for the long-paragraph ceiling.
+pub struct ChunkLimits {
+    pub min_chars: usize,
+    pub target_tokens: usize,
+}
+
+impl ChunkLimits {
+    /// The long-paragraph ceiling: a block this long on its own fills a whole
+    /// chunk's token budget (`TARGET_TOKENS * 4` chars, the chunker's own
+    /// chars-per-token estimate).
+    pub fn long_paragraph_chars(&self) -> usize {
+        self.target_tokens * 4
+    }
+}
+
+/// Run every check over one file's text.
+pub fn validate_file(
+    file: &str,
+    content: &str,
+    names: &NameSet,
+    limits: &ChunkLimits,
+) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    findings.extend(check_code_fences(file, content));
+    findings.extend(check_frontmatter(file, content));
+    findings.extend(check_wikilink_brackets(file, content));
+    findings.extend(check_wikilink_targets(file, content, names));
+    findings.extend(check_titles(file, content));
+    findings.extend(check_duplicate_siblings(file, content));
+    findings.extend(check_empty_sections(file, content));
+    findings.extend(check_short_sections(file, content, limits.min_chars));
+    findings.extend(check_long_paragraphs(
+        file,
+        content,
+        limits.long_paragraph_chars(),
+    ));
+    findings.extend(check_tags(file, content));
+    findings.sort_by_key(|f| (f.line.unwrap_or(0), f.rule as u8));
+    findings
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -691,5 +733,28 @@ mod tests {
         assert_eq!(miss[0].rule, Rule::UnresolvableWikilink);
         // a link inside a fence is not checked
         assert!(check_wikilink_targets(f, "```\n[[Ghost]]\n```\n", &names).is_empty());
+    }
+
+    #[test]
+    fn validate_file_runs_every_check_and_orders_by_line() {
+        let names = NameSet::from_paths(["Real.md".to_string()]);
+        let limits = ChunkLimits {
+            min_chars: 120,
+            target_tokens: 512,
+        };
+        let content = "## Sub only\n\nshort body\n\nsee [[Ghost]]\n";
+        let findings = validate_file("n.md", content, &names, &limits);
+        let rules: std::collections::HashSet<Rule> = findings.iter().map(|f| f.rule).collect();
+        assert!(rules.contains(&Rule::MissingTitle));
+        assert!(rules.contains(&Rule::UnresolvableWikilink));
+        // findings are ordered by line
+        let lines: Vec<usize> = findings.iter().map(|f| f.line.unwrap_or(0)).collect();
+        let mut sorted = lines.clone();
+        sorted.sort_unstable();
+        assert_eq!(lines, sorted);
+
+        // a clean file has no findings
+        let clean = "# Title\n\nThis is a body long enough to clear the minimum chunk size, so no short-section warning fires and the note reads as one healthy block of prose that comfortably exceeds one hundred and twenty characters.\n";
+        assert!(validate_file("c.md", clean, &names, &limits).is_empty());
     }
 }
