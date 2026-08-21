@@ -31,6 +31,7 @@ pub mod store;
 pub mod surface;
 pub mod tags;
 pub mod temporal;
+pub mod validate;
 pub mod vecstore;
 pub mod watcher;
 pub mod writer;
