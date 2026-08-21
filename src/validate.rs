@@ -333,6 +333,101 @@ fn check_empty_sections(file: &str, content: &str) -> Vec<Finding> {
     out
 }
 
+fn check_short_sections(file: &str, content: &str, min_chars: usize) -> Vec<Finding> {
+    if min_chars == 0 {
+        return vec![];
+    }
+    let headings = crate::markdown::parse_headings(content);
+    let lines: Vec<&str> = content.lines().collect();
+    let mut out = Vec::new();
+    for (idx, h) in headings.iter().enumerate() {
+        let body_start = h.line + 1;
+        let body_end = headings.get(idx + 1).map(|n| n.line).unwrap_or(lines.len());
+        let body = lines[body_start..body_end].join("\n");
+        let trimmed = body.trim();
+        let len = trimmed.chars().count();
+        if !trimmed.is_empty() && len < min_chars {
+            out.push(Finding::new(
+                file,
+                Some(h.line + 1),
+                Rule::ShortSection,
+                format!(
+                    "section `{}` body is {len} chars, under the {min_chars}-char minimum; it will merge into the previous chunk",
+                    h.text
+                ),
+            ));
+        }
+    }
+    out
+}
+
+/// True when a block's first line opens a list, table, quote, heading, or is
+/// a fence — none of which is a paragraph.
+fn is_non_paragraph(first_line: &str) -> bool {
+    let t = first_line.trim_start();
+    t.starts_with('#')
+        || t.starts_with('|')
+        || t.starts_with('-')
+        || t.starts_with('*')
+        || t.starts_with('+')
+        || t.starts_with('>')
+        || is_fence(t)
+        || is_ordered_list_item(t)
+}
+
+fn is_ordered_list_item(s: &str) -> bool {
+    let digits: usize = s.chars().take_while(|c| c.is_ascii_digit()).count();
+    digits > 0 && s[digits..].starts_with(['.', ')'])
+}
+
+fn check_long_paragraphs(file: &str, content: &str, max_chars: usize) -> Vec<Finding> {
+    let mut out = Vec::new();
+    let mut in_fence = false;
+    let mut block: Vec<&str> = Vec::new();
+    let mut block_start = 0usize; // 1-based start line of the current block
+
+    let flush = |block: &mut Vec<&str>, start: usize, out: &mut Vec<Finding>| {
+        if !block.is_empty() {
+            if !is_non_paragraph(block[0]) {
+                let text = block.join("\n");
+                if text.chars().count() > max_chars {
+                    out.push(Finding::new(
+                        file,
+                        Some(start),
+                        Rule::LongParagraph,
+                        format!(
+                            "paragraph is {} chars, over the {max_chars}-char ceiling; it fills a whole chunk and may be a semantic run-on",
+                            text.chars().count()
+                        ),
+                    ));
+                }
+            }
+            block.clear();
+        }
+    };
+
+    for (i, line) in content.lines().enumerate() {
+        if is_fence(line) {
+            flush(&mut block, block_start, &mut out);
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        if line.trim().is_empty() {
+            flush(&mut block, block_start, &mut out);
+        } else {
+            if block.is_empty() {
+                block_start = i + 1;
+            }
+            block.push(line);
+        }
+    }
+    flush(&mut block, block_start, &mut out);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -466,5 +561,38 @@ mod tests {
         assert!(empties.iter().any(|x| x.line == Some(1)));
         // a heading with body: not empty
         assert!(check_empty_sections(f, "# T\n\nbody\n").is_empty());
+    }
+
+    #[test]
+    fn length_checks() {
+        let f = "n.md";
+        // a section body under the minimum is flagged; an empty body is not (that
+        // is empty-section's job)
+        let short = check_short_sections(f, "# T\n\ntiny\n", 120);
+        assert_eq!(short.len(), 1);
+        assert_eq!(short[0].rule, Rule::ShortSection);
+        assert!(check_short_sections(f, "# T\n\n", 120).is_empty());
+        // a body over the minimum is not flagged
+        let big = "x".repeat(200);
+        assert!(check_short_sections(f, &format!("# T\n\n{big}\n"), 120).is_empty());
+        // min_chars 0 disables the check
+        assert!(check_short_sections(f, "# T\n\ntiny\n", 0).is_empty());
+
+        // a paragraph over the ceiling is flagged
+        let huge = "word ".repeat(500); // ~2500 chars, one block
+        let r = check_long_paragraphs(f, &format!("# T\n\n{huge}\n"), 2048);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].rule, Rule::LongParagraph);
+        // a long list or table is not one paragraph
+        let list = (0..300)
+            .map(|i| format!("- item {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(check_long_paragraphs(f, &format!("# T\n\n{list}\n"), 2048).is_empty());
+        let table = (0..300)
+            .map(|i| format!("| {i} | x |"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(check_long_paragraphs(f, &format!("# T\n\n{table}\n"), 2048).is_empty());
     }
 }
