@@ -246,8 +246,29 @@ fn check_frontmatter(file: &str, content: &str) -> Vec<Finding> {
     }
 }
 
-fn check_titles(file: &str, content: &str) -> Vec<Finding> {
+/// Headings from the body only: `parse_headings` skips fenced code but not
+/// YAML frontmatter, so a `#`-prefixed line inside a frontmatter block-scalar
+/// value (or a stray `# comment`) would otherwise read as a phantom heading.
+/// The chunker parses headings on the frontmatter-stripped body, so validate
+/// must too. Line numbers stay in full-file coordinates: only headings at or
+/// past the body's start line survive the filter.
+fn content_headings(content: &str) -> Vec<crate::markdown::HeadingInfo> {
     let headings = crate::markdown::parse_headings(content);
+    let (fm, _) = crate::markdown::split_frontmatter(content);
+    match fm {
+        None => headings,
+        Some(fm) => {
+            let body_start = fm.lines().count() + 2;
+            headings
+                .into_iter()
+                .filter(|h| h.line >= body_start)
+                .collect()
+        }
+    }
+}
+
+fn check_titles(file: &str, content: &str) -> Vec<Finding> {
+    let headings = content_headings(content);
     let mut out = Vec::new();
     match headings.first() {
         None => out.push(Finding::new(
@@ -280,7 +301,7 @@ fn check_titles(file: &str, content: &str) -> Vec<Finding> {
 }
 
 fn check_duplicate_siblings(file: &str, content: &str) -> Vec<Finding> {
-    let headings = crate::markdown::parse_headings(content);
+    let headings = content_headings(content);
     let mut out = Vec::new();
     let mut stack: Vec<(u8, String)> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -309,7 +330,7 @@ fn check_duplicate_siblings(file: &str, content: &str) -> Vec<Finding> {
 }
 
 fn check_empty_sections(file: &str, content: &str) -> Vec<Finding> {
-    let headings = crate::markdown::parse_headings(content);
+    let headings = content_headings(content);
     let lines: Vec<&str> = content.lines().collect();
     let mut out = Vec::new();
     for (idx, h) in headings.iter().enumerate() {
@@ -337,7 +358,7 @@ fn check_short_sections(file: &str, content: &str, min_chars: usize) -> Vec<Find
     if min_chars == 0 {
         return vec![];
     }
-    let headings = crate::markdown::parse_headings(content);
+    let headings = content_headings(content);
     let lines: Vec<&str> = content.lines().collect();
     let mut out = Vec::new();
     for (idx, h) in headings.iter().enumerate() {
@@ -467,7 +488,7 @@ fn check_wikilink_targets(file: &str, content: &str, names: &NameSet) -> Vec<Fin
         if in_fence {
             continue;
         }
-        for target in wikilink_targets(line) {
+        for target in crate::graph::extract_wikilink_targets(line) {
             if !names.resolve(&target) {
                 out.push(Finding::new(
                     file,
@@ -476,23 +497,6 @@ fn check_wikilink_targets(file: &str, content: &str, names: &NameSet) -> Vec<Fin
                     format!("wikilink `[[{target}]]` resolves to no file"),
                 ));
             }
-        }
-    }
-    out
-}
-
-/// Every closed `[[...]]` target on a line, inner text verbatim.
-pub fn wikilink_targets(line: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut rest = line;
-    while let Some(open) = rest.find("[[") {
-        let after = &rest[open + 2..];
-        match after.find("]]") {
-            Some(close) => {
-                out.push(after[..close].to_string());
-                rest = &after[close + 2..];
-            }
-            None => break,
         }
     }
     out
@@ -831,6 +835,24 @@ mod tests {
     }
 
     #[test]
+    fn heading_checks_ignore_frontmatter() {
+        let f = "n.md";
+        // a `#`-looking line inside a frontmatter block-scalar value must not
+        // read as a phantom heading: `parse_headings` skips fenced code but
+        // not YAML frontmatter, so without `content_headings` this file would
+        // wrongly report two level-1 titles (the frontmatter line, then the
+        // real one) or misplace the missing-title finding.
+        let content = "---\nsummary: |\n  # Not A Heading\n---\n# Real Title\n\nThis body is long enough to clear the minimum so no short-section fires on the real title section, comfortably over one hundred and twenty characters of prose here.\n";
+        assert!(
+            check_titles(f, content).is_empty(),
+            "exactly one real title should not be flagged as missing or multiple"
+        );
+        let headings = content_headings(content);
+        assert_eq!(headings.len(), 1);
+        assert_eq!(headings[0].text, "Real Title");
+    }
+
+    #[test]
     fn length_checks() {
         let f = "n.md";
         // a section body under the minimum is flagged; an empty body is not (that
@@ -888,6 +910,13 @@ mod tests {
         assert_eq!(miss[0].rule, Rule::UnresolvableWikilink);
         // a link inside a fence is not checked
         assert!(check_wikilink_targets(f, "```\n[[Ghost]]\n```\n", &names).is_empty());
+        // an embed is not a wikilink to resolve: the bespoke extractor used to
+        // treat `image.png` as a note target, which `resolve` then appended
+        // `.md` to and never found
+        assert!(check_wikilink_targets(f, "see ![[image.png]]\n", &names).is_empty());
+        // the table-escaped alias pipe unescapes before resolution
+        let real = NameSet::from_paths(["Real.md".to_string()]);
+        assert!(check_wikilink_targets(f, "see [[Real\\|Display]]\n", &real).is_empty());
     }
 
     #[test]
