@@ -246,6 +246,93 @@ fn check_frontmatter(file: &str, content: &str) -> Vec<Finding> {
     }
 }
 
+fn check_titles(file: &str, content: &str) -> Vec<Finding> {
+    let headings = crate::markdown::parse_headings(content);
+    let mut out = Vec::new();
+    match headings.first() {
+        None => out.push(Finding::new(
+            file,
+            None,
+            Rule::MissingTitle,
+            "file has no heading; expected a level-1 `# Title`".into(),
+        )),
+        Some(h) if h.level != 1 => out.push(Finding::new(
+            file,
+            Some(h.line + 1),
+            Rule::MissingTitle,
+            "file does not open with a level-1 `# Title`".into(),
+        )),
+        _ => {}
+    }
+    let mut seen_first = false;
+    for h in headings.iter().filter(|h| h.level == 1) {
+        if seen_first {
+            out.push(Finding::new(
+                file,
+                Some(h.line + 1),
+                Rule::MultipleTitles,
+                "a second level-1 `#` heading; a file should have one title".into(),
+            ));
+        }
+        seen_first = true;
+    }
+    out
+}
+
+fn check_duplicate_siblings(file: &str, content: &str) -> Vec<Finding> {
+    let headings = crate::markdown::parse_headings(content);
+    let mut out = Vec::new();
+    let mut stack: Vec<(u8, String)> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for h in &headings {
+        while stack.last().is_some_and(|(l, _)| *l >= h.level) {
+            stack.pop();
+        }
+        if h.level >= 2 {
+            let parent: Vec<&str> = stack.iter().map(|(_, t)| t.as_str()).collect();
+            let key = format!("{}\u{0}{}", parent.join(">"), h.text.to_lowercase());
+            if !seen.insert(key) {
+                out.push(Finding::new(
+                    file,
+                    Some(h.line + 1),
+                    Rule::DuplicateSiblingHeadings,
+                    format!(
+                        "duplicate sibling heading `{}` under the same parent",
+                        h.text
+                    ),
+                ));
+            }
+        }
+        stack.push((h.level, h.text.to_lowercase()));
+    }
+    out
+}
+
+fn check_empty_sections(file: &str, content: &str) -> Vec<Finding> {
+    let headings = crate::markdown::parse_headings(content);
+    let lines: Vec<&str> = content.lines().collect();
+    let mut out = Vec::new();
+    for (idx, h) in headings.iter().enumerate() {
+        let body_start = h.line + 1;
+        let body_end = headings.get(idx + 1).map(|n| n.line).unwrap_or(lines.len());
+        let has_body = lines[body_start..body_end]
+            .iter()
+            .any(|l| !l.trim().is_empty());
+        if !has_body {
+            out.push(Finding::new(
+                file,
+                Some(h.line + 1),
+                Rule::EmptySection,
+                format!(
+                    "heading `{}` has no body text before the next heading",
+                    h.text
+                ),
+            ));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,5 +420,51 @@ mod tests {
         // valid frontmatter, and no frontmatter: nothing
         assert!(check_frontmatter(f, "---\ntitle: T\n---\n# T\n").is_empty());
         assert!(check_frontmatter(f, "# T\n\nbody\n").is_empty());
+    }
+
+    #[test]
+    fn heading_checks() {
+        let f = "n.md";
+
+        // missing title: no heading, then a non-level-1 first heading
+        assert_eq!(check_titles(f, "just body\n")[0].rule, Rule::MissingTitle);
+        assert_eq!(check_titles(f, "## Sub\n\nx\n")[0].rule, Rule::MissingTitle);
+        // multiple titles: the second `#` is flagged
+        let r = check_titles(f, "# One\n\nx\n\n# Two\n\ny\n");
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].rule, Rule::MultipleTitles);
+        assert_eq!(r[0].line, Some(5));
+        // a single title, first: nothing
+        assert!(check_titles(f, "# Title\n\nbody\n").is_empty());
+
+        // duplicate siblings under one parent (level 2+)
+        let r = check_duplicate_siblings(f, "# A\n\n## Notes\n\nx\n\n## Notes\n\ny\n");
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].rule, Rule::DuplicateSiblingHeadings);
+        assert_eq!(r[0].line, Some(7));
+        // same text under different parents: nothing
+        assert!(
+            check_duplicate_siblings(
+                f,
+                "# A\n\n## H\n\n### Notes\n\nx\n\n## B\n\n### Notes\n\ny\n"
+            )
+            .is_empty()
+        );
+        // level-1 repeats are multiple-titles' job, not this check's
+        assert!(check_duplicate_siblings(f, "# A\n\nx\n\n# A\n\ny\n").is_empty());
+
+        // empty sections (the three issue #70 shapes)
+        let empties = check_empty_sections(f, "# H1\n## H2\n\nbody\n");
+        assert!(
+            empties
+                .iter()
+                .any(|x| x.line == Some(1) && x.rule == Rule::EmptySection)
+        );
+        let empties = check_empty_sections(f, "### H3\n## H2\n\nbody\n");
+        assert!(empties.iter().any(|x| x.line == Some(1)));
+        let empties = check_empty_sections(f, "## Nobody\n## Body\n\nstuff\n");
+        assert!(empties.iter().any(|x| x.line == Some(1)));
+        // a heading with body: not empty
+        assert!(check_empty_sections(f, "# T\n\nbody\n").is_empty());
     }
 }
