@@ -540,6 +540,161 @@ pub fn validate_file(
     findings
 }
 
+use std::path::PathBuf;
+
+/// What to validate, all resolved under the vault root.
+pub enum Target {
+    Vault,
+    Note(String),
+    Scope(crate::tags::Scope),
+}
+
+/// Validate a target under `root`, disk-truth throughout.
+pub fn validate_target(
+    root: &Path,
+    target: &Target,
+    limits: &ChunkLimits,
+    strict: bool,
+) -> anyhow::Result<ValidateReport> {
+    // A single note walks names lazily: only if it holds a wikilink.
+    if let Target::Note(rel) = target {
+        let path = resolve_note(root, rel)?;
+        let content = std::fs::read_to_string(&path);
+        let file = rel_path(root, &path).unwrap_or_else(|| rel.clone());
+        return Ok(match content {
+            Ok(text) => {
+                let names = if text.contains("[[") {
+                    build_name_set(root)?
+                } else {
+                    NameSet::empty()
+                };
+                ValidateReport::build(validate_file(&file, &text, &names, limits), 1, strict)
+            }
+            Err(e) => ValidateReport::build(
+                vec![Finding::new(
+                    &file,
+                    None,
+                    Rule::FileUnreadable,
+                    format!("cannot read file: {e}"),
+                )],
+                0,
+                strict,
+            ),
+        });
+    }
+
+    // Vault and scope share one walk, which also builds the name set.
+    let all = crate::indexer::walk_vault(root, &[], true)?;
+    let names = NameSet::from_paths(all.iter().filter_map(|p| rel_path(root, p)));
+    let needs_tags = matches!(target, Target::Scope(s)
+        if s.all.iter().chain(&s.any).chain(&s.none).any(|t| matches!(t, crate::tags::ScopeTerm::Tag(_))));
+
+    let mut findings = Vec::new();
+    let mut checked = 0usize;
+    for path in &all {
+        let rel = rel_path(root, path).unwrap_or_else(|| path.to_string_lossy().into_owned());
+        if let Target::Scope(scope) = target {
+            let content_tags = if needs_tags {
+                match std::fs::read_to_string(path) {
+                    Ok(text) => Some(crate::tags::extract(&text)),
+                    Err(e) => {
+                        findings.push(Finding::new(
+                            &rel,
+                            None,
+                            Rule::FileUnreadable,
+                            format!("cannot read file: {e}"),
+                        ));
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            if !scope_admits(&rel, content_tags.as_deref(), scope) {
+                continue;
+            }
+        }
+        findings.extend(check_path(path, &rel, &names, limits));
+        checked += 1;
+    }
+    Ok(ValidateReport::build(findings, checked, strict))
+}
+
+/// Read one file and validate it, or report it unreadable.
+pub fn check_path(path: &Path, rel: &str, names: &NameSet, limits: &ChunkLimits) -> Vec<Finding> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => validate_file(rel, &text, names, limits),
+        Err(e) => vec![Finding::new(
+            rel,
+            None,
+            Rule::FileUnreadable,
+            format!("cannot read file: {e}"),
+        )],
+    }
+}
+
+/// Resolve a vault-relative note reference to a path: exact relative path
+/// first, then a case-insensitive basename over the walk, shortest path.
+fn resolve_note(root: &Path, rel: &str) -> anyhow::Result<PathBuf> {
+    let with_ext = if rel.ends_with(".md") {
+        rel.to_string()
+    } else {
+        format!("{rel}.md")
+    };
+    let direct = root.join(&with_ext);
+    if direct.is_file() {
+        return Ok(direct);
+    }
+    let base = last_segment(&with_ext).to_lowercase();
+    let mut matches: Vec<PathBuf> = crate::indexer::walk_vault(root, &[], true)?
+        .into_iter()
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.to_lowercase() == base)
+                .unwrap_or(false)
+        })
+        .collect();
+    matches.sort_by_key(|p| p.as_os_str().len());
+    matches
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no note matches '{rel}'"))
+}
+
+/// Whether a file, by its relative path and (when read) its tags, satisfies a
+/// scope: every `all` term, at least one `any` term when `any` is non-empty,
+/// and no `none` term. Mirrors `tags::Scope` semantics on disk.
+fn scope_admits(rel: &str, tags: Option<&[crate::tags::Tag]>, scope: &crate::tags::Scope) -> bool {
+    let matches = |term: &crate::tags::ScopeTerm| term_matches(rel, tags, term);
+    scope.all.iter().all(&matches)
+        && (scope.any.is_empty() || scope.any.iter().any(&matches))
+        && !scope.none.iter().any(&matches)
+}
+
+fn term_matches(
+    rel: &str,
+    tags: Option<&[crate::tags::Tag]>,
+    term: &crate::tags::ScopeTerm,
+) -> bool {
+    use crate::tags::{FolderTerm, ScopeTerm, TagTerm};
+    match term {
+        ScopeTerm::Folder(FolderTerm::Exact(d)) => parent_dir(rel) == d.as_str(),
+        ScopeTerm::Folder(FolderTerm::Subtree(d)) => rel.starts_with(&format!("{d}/")),
+        ScopeTerm::Tag(TagTerm::Exact(t)) => {
+            tags.is_some_and(|ts| ts.iter().any(|tag| &tag.path == t))
+        }
+        ScopeTerm::Tag(TagTerm::Subtree(t)) => tags.is_some_and(|ts| {
+            ts.iter()
+                .any(|tag| &tag.path == t || tag.path.starts_with(&format!("{t}/")))
+        }),
+    }
+}
+
+fn parent_dir(rel: &str) -> &str {
+    rel.rsplit_once('/').map(|(d, _)| d).unwrap_or("")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -756,5 +911,63 @@ mod tests {
         // a clean file has no findings
         let clean = "# Title\n\nThis is a body long enough to clear the minimum chunk size, so no short-section warning fires and the note reads as one healthy block of prose that comfortably exceeds one hundred and twenty characters.\n";
         assert!(validate_file("c.md", clean, &names, &limits).is_empty());
+    }
+
+    #[test]
+    fn validate_target_resolves_note_scope_and_vault() {
+        use crate::tags::Scope;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("Work")).unwrap();
+        std::fs::write(root.join("Work/a.md"), "## Sub only\n\nx\n").unwrap();
+        std::fs::write(
+            root.join("home.md"),
+            "# Home\n\nsee [[a]] which lives in Work\n",
+        )
+        .unwrap();
+        let limits = ChunkLimits {
+            min_chars: 120,
+            target_tokens: 512,
+        };
+
+        // whole vault: both files checked
+        let r = validate_target(root, &Target::Vault, &limits, false).unwrap();
+        assert_eq!(r.files_checked, 2);
+
+        // one note by reference
+        let r = validate_target(root, &Target::Note("Work/a.md".into()), &limits, false).unwrap();
+        assert_eq!(r.files_checked, 1);
+
+        // a directory scope checks only its subtree, but a link out of it resolves
+        let scope = Scope::parse(&["/Work/".to_string()], &[], &[]).unwrap();
+        let r = validate_target(root, &Target::Scope(scope), &limits, false).unwrap();
+        assert_eq!(r.files_checked, 1);
+        // home.md is outside the scope, and its [[a]] link is NOT reported unresolvable
+        // because the name set is the whole vault; nothing here should be an unresolvable-wikilink
+        assert!(
+            r.findings
+                .iter()
+                .all(|f| f.rule != Rule::UnresolvableWikilink)
+        );
+
+        // a note reference that resolves to nothing is a hard error
+        assert!(validate_target(root, &Target::Note("nope".into()), &limits, false).is_err());
+    }
+
+    #[test]
+    fn check_path_reports_an_unreadable_file() {
+        let names = NameSet::empty();
+        let limits = ChunkLimits {
+            min_chars: 120,
+            target_tokens: 512,
+        };
+        let findings = check_path(
+            std::path::Path::new("does/not/exist.md"),
+            "exist.md",
+            &names,
+            &limits,
+        );
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule, Rule::FileUnreadable);
     }
 }
