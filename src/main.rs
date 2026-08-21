@@ -83,6 +83,44 @@ fn open_vault(data_dir: &Path) -> Result<(store::Store, PathBuf, Option<VaultPro
     Ok((store, PathBuf::from(&vault_path), profile))
 }
 
+/// The vault root for `validate`: `--vault` if given, else the configured
+/// vault when one is indexed, else an error. Unlike `open_vault`, it does not
+/// require an index — `validate` runs pre-`init`.
+fn resolve_validate_root(vault_arg: Option<PathBuf>, data_dir: &Path) -> Result<PathBuf> {
+    if let Some(v) = vault_arg {
+        return Ok(v);
+    }
+    if index_exists(data_dir) {
+        let store = store::Store::open(&config::db_path(data_dir))?;
+        if let Some(vp) = store.get_meta("vault_path")? {
+            return Ok(PathBuf::from(vp));
+        }
+    }
+    anyhow::bail!("no vault root: pass --vault <dir>, or index a vault first")
+}
+
+fn render_validate_report(report: &knapper::validate::ValidateReport) {
+    use knapper::validate::Severity;
+    println!("Files checked: {}", report.files_checked);
+    println!("Errors:        {}", report.error_count);
+    println!("Warnings:      {}", report.warning_count);
+    for f in &report.findings {
+        let sev = match f.severity {
+            Severity::Error => "error",
+            Severity::Warning => "warn",
+        };
+        let loc = match f.line {
+            Some(n) => format!("{}:{}", f.file, n),
+            None => f.file.clone(),
+        };
+        let rule = serde_json::to_value(f.rule)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default();
+        println!("  {sev} {loc} [{rule}] {}", f.message);
+    }
+}
+
 /// The embedding model, checked against the store it is about to write into.
 ///
 /// A command that indexes what it wrote has to produce rows the rest of the
@@ -426,6 +464,24 @@ async fn main() -> Result<()> {
                 for issue in &report.tag_issues {
                     println!("  tag: {} — {}", issue.file, issue.issue);
                 }
+            }
+        }
+
+        Command::Validate { args, vault } => {
+            let root = resolve_validate_root(vault, &data_dir)?;
+            let target = args.target()?;
+            let limits = knapper::validate::ChunkLimits {
+                min_chars: cfg.chunk_min_chars,
+                target_tokens: knapper::chunker::limits::TARGET_TOKENS,
+            };
+            let report = knapper::validate::validate_target(&root, &target, &limits, args.strict)?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                render_validate_report(&report);
+            }
+            if !report.ok {
+                std::process::exit(1);
             }
         }
 

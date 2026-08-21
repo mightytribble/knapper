@@ -124,6 +124,18 @@ pub enum Command {
     /// Vault health report: orphans, broken links, stale notes, tag hygiene.
     Health(crate::params::Health),
 
+    /// Check vault markdown for structural and indexing problems.
+    #[group(skip)]
+    Validate {
+        #[command(flatten)]
+        args: crate::params::Validate,
+        /// The vault root to check. A running server is bound to its
+        /// configured vault, so this argument is the CLI's alone; pre-init
+        /// it is required.
+        #[arg(long)]
+        vault: Option<PathBuf>,
+    },
+
     /// Clear cached data.
     Clear {
         /// Remove everything including the database and embeddings.

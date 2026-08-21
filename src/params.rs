@@ -619,6 +619,57 @@ pub struct Migrate {
     pub preview: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Args, Deserialize, JsonSchema)]
+pub struct Validate {
+    /// A vault-relative note reference (path or basename) to check one file.
+    /// Omit it to check a scope or the whole vault. Mutually exclusive with
+    /// the scope filters.
+    #[arg(conflicts_with_all = ["scope", "all", "any", "none"])]
+    pub path: Option<String>,
+    /// An alias of `all`. A term starting with `/` is a directory path from
+    /// the vault root instead of a tag, case-sensitive; a trailing `/` scopes
+    /// to its subtree.
+    #[arg(long, value_delimiter = ',')]
+    #[serde(default, deserialize_with = "deserialize_tag_list")]
+    pub scope: Vec<String>,
+    /// Check only notes carrying every term. A directory term (leading `/`,
+    /// case-sensitive, trailing `/` its subtree) scopes by folder instead.
+    #[arg(long, value_delimiter = ',')]
+    #[serde(default, deserialize_with = "deserialize_tag_list")]
+    pub all: Vec<String>,
+    /// Check only notes carrying at least one of these terms.
+    #[arg(long, value_delimiter = ',')]
+    #[serde(default, deserialize_with = "deserialize_tag_list")]
+    pub any: Vec<String>,
+    /// Skip notes carrying any of these terms.
+    #[arg(long, value_delimiter = ',')]
+    #[serde(default, deserialize_with = "deserialize_tag_list")]
+    pub none: Vec<String>,
+    /// Treat warnings as gating: exit non-zero when any warning is present.
+    #[arg(long)]
+    #[serde(default)]
+    pub strict: bool,
+}
+
+impl Validate {
+    /// The addressing target, or an error when a note reference and a scope
+    /// are both given (the servers' equivalent of the CLI's `conflicts_with`).
+    pub fn target(&self) -> anyhow::Result<crate::validate::Target> {
+        let all_terms = crate::tags::merge_scope_alias(self.scope.clone(), self.all.clone());
+        let has_scope = !all_terms.is_empty() || !self.any.is_empty() || !self.none.is_empty();
+        match (&self.path, has_scope) {
+            (Some(_), true) => {
+                anyhow::bail!("a note reference and a scope are mutually exclusive")
+            }
+            (Some(p), false) => Ok(crate::validate::Target::Note(p.clone())),
+            (None, true) => Ok(crate::validate::Target::Scope(crate::tags::Scope::parse(
+                &all_terms, &self.any, &self.none,
+            )?)),
+            (None, false) => Ok(crate::validate::Target::Vault),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -984,5 +1035,60 @@ mod tests {
             edits[0].content,
             Some(crate::writer::EditContent::List(ref v)) if v == &["a".to_string(), "b".to_string()]
         ));
+    }
+
+    /// The target resolves to whichever of a note, a scope or the whole vault
+    /// the request names, and a note and a scope together are refused (#70).
+    #[test]
+    fn validate_target_is_note_scope_or_vault() {
+        // nothing -> whole vault
+        let v = Validate {
+            path: None,
+            scope: vec![],
+            all: vec![],
+            any: vec![],
+            none: vec![],
+            strict: false,
+        };
+        assert!(matches!(
+            v.target().unwrap(),
+            crate::validate::Target::Vault
+        ));
+        // a path -> that note
+        let v = Validate {
+            path: Some("a.md".into()),
+            scope: vec![],
+            all: vec![],
+            any: vec![],
+            none: vec![],
+            strict: false,
+        };
+        assert!(matches!(
+            v.target().unwrap(),
+            crate::validate::Target::Note(_)
+        ));
+        // a scope -> that scope
+        let v = Validate {
+            path: None,
+            scope: vec!["/Work/".into()],
+            all: vec![],
+            any: vec![],
+            none: vec![],
+            strict: false,
+        };
+        assert!(matches!(
+            v.target().unwrap(),
+            crate::validate::Target::Scope(_)
+        ));
+        // path and scope together -> error
+        let v = Validate {
+            path: Some("a".into()),
+            scope: vec!["/Work/".into()],
+            all: vec![],
+            any: vec![],
+            none: vec![],
+            strict: false,
+        };
+        assert!(v.target().is_err());
     }
 }
