@@ -428,6 +428,76 @@ fn check_long_paragraphs(file: &str, content: &str, max_chars: usize) -> Vec<Fin
     out
 }
 
+fn check_tags(file: &str, content: &str) -> Vec<Finding> {
+    let (fm, _) = crate::markdown::split_frontmatter(content);
+    let Some(fm) = fm else {
+        return vec![];
+    };
+    let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(&fm) else {
+        return vec![]; // malformed YAML is check_frontmatter's finding, not this one
+    };
+    let Some(tags) = value.get("tags") else {
+        return vec![];
+    };
+    let ok = match tags {
+        serde_yaml::Value::String(_) | serde_yaml::Value::Null => true,
+        serde_yaml::Value::Sequence(seq) => seq.iter().all(serde_yaml::Value::is_string),
+        _ => false,
+    };
+    if ok {
+        vec![]
+    } else {
+        vec![Finding::new(
+            file,
+            Some(1),
+            Rule::MalformedTags,
+            "frontmatter `tags:` must be a string or a list of strings".into(),
+        )]
+    }
+}
+
+fn check_wikilink_targets(file: &str, content: &str, names: &NameSet) -> Vec<Finding> {
+    let mut out = Vec::new();
+    let mut in_fence = false;
+    for (i, line) in content.lines().enumerate() {
+        if is_fence(line) {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        for target in wikilink_targets(line) {
+            if !names.resolve(&target) {
+                out.push(Finding::new(
+                    file,
+                    Some(i + 1),
+                    Rule::UnresolvableWikilink,
+                    format!("wikilink `[[{target}]]` resolves to no file"),
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// Every closed `[[...]]` target on a line, inner text verbatim.
+pub fn wikilink_targets(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = line;
+    while let Some(open) = rest.find("[[") {
+        let after = &rest[open + 2..];
+        match after.find("]]") {
+            Some(close) => {
+                out.push(after[..close].to_string());
+                rest = &after[close + 2..];
+            }
+            None => break,
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -594,5 +664,32 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(check_long_paragraphs(f, &format!("# T\n\n{table}\n"), 2048).is_empty());
+    }
+
+    #[test]
+    fn semantic_checks() {
+        let f = "n.md";
+        // tags as a string or a list: fine
+        assert!(check_tags(f, "---\ntags: work\n---\n# T\n").is_empty());
+        assert!(check_tags(f, "---\ntags:\n  - work\n  - x\n---\n# T\n").is_empty());
+        // tags as a map or a number: warning
+        assert_eq!(
+            check_tags(f, "---\ntags:\n  a: b\n---\n# T\n")[0].rule,
+            Rule::MalformedTags
+        );
+        assert_eq!(
+            check_tags(f, "---\ntags: 3\n---\n# T\n")[0].rule,
+            Rule::MalformedTags
+        );
+
+        // link resolution against a name set
+        let names = NameSet::from_paths(["Real.md".to_string()]);
+        assert!(check_wikilink_targets(f, "see [[Real]]\n", &names).is_empty());
+        assert!(check_wikilink_targets(f, "see [[Real#Heading]]\n", &names).is_empty());
+        let miss = check_wikilink_targets(f, "see [[Ghost]]\n", &names);
+        assert_eq!(miss.len(), 1);
+        assert_eq!(miss[0].rule, Rule::UnresolvableWikilink);
+        // a link inside a fence is not checked
+        assert!(check_wikilink_targets(f, "```\n[[Ghost]]\n```\n", &names).is_empty());
     }
 }
