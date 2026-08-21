@@ -12,6 +12,7 @@ pub fn build_openapi_spec(server_url: &str) -> serde_json::Value {
     paths.insert("/api/tags".into(), build_tags());
     paths.insert("/api/vault-map".into(), build_vault_map());
     paths.insert("/api/health".into(), build_health());
+    paths.insert("/api/validate".into(), build_validate());
     paths.insert("/api/status".into(), build_status());
 
     // Write endpoints
@@ -171,6 +172,30 @@ fn build_health() -> serde_json::Value {
             "operationId": "getHealth",
             "summary": "Get vault health report with orphans, broken links, stale notes, and inbox status.",
             "responses": { "200": { "description": "Vault health report" } }
+        }
+    })
+}
+
+fn build_validate() -> serde_json::Value {
+    serde_json::json!({
+        "post": {
+            "operationId": "validateVault",
+            "summary": "Check vault markdown for structural and indexing-quality problems.",
+            "requestBody": {
+                "required": false,
+                "content": { "application/json": { "schema": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "A vault-relative note reference to check one file. Mutually exclusive with the scope filters" },
+                        "scope": { "type": "array", "items": { "type": "string" }, "description": "Alias of all. Tag terms, or directory terms starting with / (case-sensitive, trailing / for the subtree)" },
+                        "all": { "type": "array", "items": { "type": "string" }, "description": "Check only notes carrying every term (tag or directory term)" },
+                        "any": { "type": "array", "items": { "type": "string" }, "description": "Check only notes carrying at least one term" },
+                        "none": { "type": "array", "items": { "type": "string" }, "description": "Skip notes carrying any term" },
+                        "strict": { "type": "boolean", "description": "Treat warnings as gating in the ok field" }
+                    }
+                }}}
+            },
+            "responses": { "200": { "description": "A report: findings (each {file, line, severity, rule, message}), files_checked, error_count, warning_count, and ok" } }
         }
     })
 }
@@ -575,6 +600,7 @@ mod tests {
             "listTags",
             "getVaultMap",
             "getHealth",
+            "validateVault",
             "getStatus",
             "createNote",
             "updateNote",

@@ -213,6 +213,17 @@ pub const CAPABILITIES: &[Capability] = &[
         server_only_args: &[],
     },
     Capability {
+        name: "validate",
+        cli: Presence::On,
+        mcp: Presence::On,
+        http: Http::Post,
+        cli_only_args: &[(
+            "vault",
+            "the pre-init vault root; a running server is bound to its configured vault",
+        )],
+        server_only_args: &[],
+    },
+    Capability {
         name: "identity",
         cli: Presence::On,
         mcp: Presence::On,
@@ -639,8 +650,8 @@ mod tests {
     }
 
     #[test]
-    fn there_are_seventeen_capabilities() {
-        assert_eq!(CAPABILITIES.len(), 17);
+    fn there_are_eighteen_capabilities() {
+        assert_eq!(CAPABILITIES.len(), 18);
     }
 
     #[test]
