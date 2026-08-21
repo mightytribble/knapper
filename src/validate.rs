@@ -165,6 +165,87 @@ fn rel_path(root: &Path, p: &Path) -> Option<String> {
         .map(|rel| rel.to_string_lossy().replace('\\', "/"))
 }
 
+fn is_fence(line: &str) -> bool {
+    let t = line.trim_start();
+    t.starts_with("```") || t.starts_with("~~~")
+}
+
+fn check_code_fences(file: &str, content: &str) -> Vec<Finding> {
+    let mut open_line: Option<usize> = None;
+    for (i, line) in content.lines().enumerate() {
+        if is_fence(line) {
+            open_line = match open_line {
+                Some(_) => None,
+                None => Some(i),
+            };
+        }
+    }
+    match open_line {
+        Some(i) => vec![Finding::new(
+            file,
+            Some(i + 1),
+            Rule::UnterminatedCodeFence,
+            "code fence opened here is never closed".into(),
+        )],
+        None => vec![],
+    }
+}
+
+fn check_wikilink_brackets(file: &str, content: &str) -> Vec<Finding> {
+    let mut out = Vec::new();
+    let mut in_fence = false;
+    for (i, line) in content.lines().enumerate() {
+        if is_fence(line) {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        let mut rest = line;
+        while let Some(open) = rest.find("[[") {
+            let after = &rest[open + 2..];
+            match after.find("]]") {
+                Some(close) => rest = &after[close + 2..],
+                None => {
+                    out.push(Finding::new(
+                        file,
+                        Some(i + 1),
+                        Rule::MalformedWikilink,
+                        "wikilink opened with `[[` is not closed with `]]`".into(),
+                    ));
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+fn check_frontmatter(file: &str, content: &str) -> Vec<Finding> {
+    if content.lines().next().map(str::trim) != Some("---") {
+        return vec![]; // no frontmatter block
+    }
+    let (fm, _body) = crate::markdown::split_frontmatter(content);
+    match fm {
+        None => vec![Finding::new(
+            file,
+            Some(1),
+            Rule::MalformedFrontmatter,
+            "frontmatter opened with `---` is never closed".into(),
+        )],
+        Some(fm) => match serde_yaml::from_str::<serde_yaml::Value>(&fm) {
+            Ok(_) => vec![],
+            Err(e) => vec![Finding::new(
+                file,
+                Some(1),
+                Rule::MalformedFrontmatter,
+                format!("frontmatter is not valid YAML: {e}"),
+            )],
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,5 +302,36 @@ mod tests {
         let names = build_name_set(dir.path()).unwrap();
         assert!(names.resolve("Archdragon"));
         assert!(!names.resolve("Nonexistent"));
+    }
+
+    #[test]
+    fn error_checks_flag_malformed_structure() {
+        let f = "note.md";
+        // unterminated fence
+        let r = check_code_fences(f, "# T\n\n```rust\nlet x = 1;\n");
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].rule, Rule::UnterminatedCodeFence);
+        assert_eq!(r[0].line, Some(3));
+        // balanced fence: nothing
+        assert!(check_code_fences(f, "```\ncode\n```\n").is_empty());
+
+        // unclosed wikilink
+        let r = check_wikilink_brackets(f, "see [[Note\n");
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].rule, Rule::MalformedWikilink);
+        // closed wikilink: nothing
+        assert!(check_wikilink_brackets(f, "see [[Note]] and [[Other]]\n").is_empty());
+
+        // unclosed frontmatter
+        let r = check_frontmatter(f, "---\ntitle: T\n# no close\n");
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].rule, Rule::MalformedFrontmatter);
+        // invalid YAML
+        let r = check_frontmatter(f, "---\ntitle: : :\n---\n# T\n");
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].rule, Rule::MalformedFrontmatter);
+        // valid frontmatter, and no frontmatter: nothing
+        assert!(check_frontmatter(f, "---\ntitle: T\n---\n# T\n").is_empty());
+        assert!(check_frontmatter(f, "# T\n\nbody\n").is_empty());
     }
 }
