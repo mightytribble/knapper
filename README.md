@@ -13,8 +13,8 @@ Knapper is under active development and should still be considered experimental.
 Plain vector search treats your notes as isolated documents. But knowledge isn't flat — your notes link to each other, share tags, reference the same people and projects. knapper understands these connections and makes them visible to your agents.
 
 - **5-lane hybrid search** — semantic embeddings + BM25 full-text + graph expansion + cross-encoder reranking + temporal scoring. The content lanes fuse via [Reciprocal Rank Fusion](https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf), graph and temporal candidates join the shortlist by reserved quota, and the cross-encoder sorts it. Lane weights are configurable. Time-aware queries like "what happened last week" or "March 2026 notes" activate the temporal lane automatically.
-- **MCP server for AI agents** — `knapper serve` exposes 17 tools (search, read, list, tags, vault_map, create, update, delete, move, archive, index, reindex_file, status, health, identity, init, migrate) that Claude, Cursor, or any MCP client can call directly.
-- **HTTP REST API** — `knapper serve --http` adds an axum-based HTTP server alongside MCP with 18 REST endpoints, API key authentication, rate limiting, and CORS. Web-based agents and scripts can query your vault with simple `curl` calls.
+- **MCP server for AI agents** — `knapper serve` exposes 18 tools (search, read, list, tags, vault_map, create, update, delete, move, archive, index, reindex_file, status, health, validate, identity, init, migrate) that Claude, Cursor, or any MCP client can call directly.
+- **HTTP REST API** — `knapper serve --http` adds an axum-based HTTP server alongside MCP with 19 REST endpoints, API key authentication, rate limiting, and CORS. Web-based agents and scripts can query your vault with simple `curl` calls.
 - **Section-level editing** — AI agents can read, replace, prepend, or append to a section by heading, to the note's body, or to a frontmatter property — every change is one `update` call carrying a list of edits.
 - **Vault health diagnostics** — detect orphan notes, broken wikilinks, stale content, and tag hygiene issues. Available as MCP tool and CLI command.
 - **Real-time sync** — file watcher keeps the index fresh as you edit in Obsidian. No manual re-indexing needed.
@@ -67,7 +67,7 @@ Your vault (markdown files)
 │  Search: retrieval → RRF fuses lanes        │
 │          → cross-encoder sorts shortlist    │
 │                                             │
-│  17 MCP tools + 18 REST endpoints           │
+│  18 MCP tools + 19 REST endpoints           │
 └─────────────────────────────────────────────┘
         │
         ▼
@@ -104,37 +104,51 @@ knapper index ~/path/to/vault
 **Search:**
 
 ```bash
-knapper search "how does the auth system work"
+knapper search "how does the auth system work" --scores
 ```
 
 ```
- 1. [97%] 02-Areas/Development/Auth-Architecture.md > # Auth Architecture  #6e1b70
-    OAuth 2.0 with PKCE for all client types. Session tokens stored in HTTP-only cookies...
+--- [6e1b70#0] [99%] 02-Areas/Development/Auth-Architecture.md > Auth Architecture (matched: semantic+keyword)
+# Auth Architecture
+How authentication works across our services. Owned by [[Sarah Chen]]; the public contract is in [[API Design]].
 
- 2. [95%] 01-Projects/API-Design.md > # API Design  #e3e350
-    All endpoints require Bearer token authentication. Tokens are issued by the OAuth 2.0...
+## Overview
+We use OAuth 2.0 with PKCE for every client type, including the web app and the [[Mobile App]]. There are no client secrets in any client. The authorization server issues short-lived access tokens (15 minutes) and rotating refresh tokens (30 days, single use).
 
- 3. [91%] 03-Resources/People/Sarah-Chen.md > # Sarah Chen  #4adb39
-    Senior Backend Engineer. Tech lead for authentication and security systems...
+--- [9e2d34#0] [84%] 04-Archive/2024-Legacy-Session-Auth.md > 2024 Legacy Session Auth (matched: semantic+keyword)
+# 2024 Legacy Session Auth
+The pre-v2 approach: a server-side `sessions` table keyed by a random cookie, checked on every request. Retired when [[Auth Architecture]] moved to OAuth 2.0 tokens. Kept for the migration notes.
+
+## Why it was retired
+Every request hit the sessions table, and the table was the single point of failure during the March outage.
+
+--- [6e1b70#3] [35%] 02-Areas/Development/Auth-Architecture.md > Auth Architecture > Session storage (matched: semantic+keyword)
+## Session storage
+The web app keeps the session token in an HTTP-only, SameSite=Strict cookie. Nothing auth-related is stored in localStorage. Mobile clients use the platform keychain. The legacy server-side session table is gone; see [[2024 Legacy Session Auth]] for what it replaced.
 ```
 
-Note how result #3 was found via **graph expansion** — Sarah's note doesn't mention "auth system" directly, but she's linked from the auth architecture doc via `[[Sarah Chen]]`.
+A result is one section of a note, with its full text. Adjacent sections of one note arrive as one block: the first result is the note's head and its `## Overview`, presented together at the stronger section's score. `6e1b70#0` is the note's docid and the section's ordinal, and `matched:` names the lanes that found it. The percentage is the cross-encoder's relevance probability — `--scores` prints it when the reranker is enabled — and a result below `answer_floor` (30% by default) is dropped, so a query the vault cannot answer prints `No relevant content found for this query in the vault.` rather than its nearest miss. `--explain` adds each result's per-lane ranks and scores.
 
-**Claude Code** — Install the plugin (recommended):
+**Claude Code** — Install the plugin (recommended), which registers the MCP server and the skills:
 
 ```bash
 claude plugin marketplace add mightytribble/knapper
 claude plugin install knapper@knapper
 ```
 
-**Connect to Claude Code:**
-
-Or configure MCP manually in `~/.claude/settings.json`:
+Or register the MCP server yourself with the Claude Code CLI:
 
 ```bash
+claude mcp add --scope user knapper -- knapper serve
+```
+
+Or add it by hand to `~/.claude.json` (user scope) or a project's `.mcp.json` (project scope). [docs/deployment.md](docs/deployment.md) has the full setup for each platform.
+
+```json
 {
   "mcpServers": {
     "knapper": {
+      "type": "stdio",
       "command": "knapper",
       "args": ["serve"]
     }
@@ -282,7 +296,7 @@ Returns orphan notes (no links in or out), broken wikilinks, stale notes, and ta
 
 `knapper serve --http` adds a full REST API alongside the MCP server, exposing the same capabilities over HTTP for web agents, scripts, and integrations.
 
-**18 endpoints:**
+**19 endpoints:**
 
 Every capability is one route, and the route is the CLI command's name under `/api/`. `docs/surfaces.md` is the generated table of all three surfaces.
 
@@ -296,6 +310,7 @@ Every capability is one route, and the route is the CLI command's name under `/a
 | GET | `/api/vault-map` | read | Vault structure overview (folders, tags, recent files) |
 | GET | `/api/status` | read | Index status and statistics |
 | GET | `/api/health` | read | Vault health diagnostics |
+| POST | `/api/validate` | read | Check vault markdown for structural and indexing problems — one note (`path`), a scope, or the whole vault; reads the files, not the index |
 | POST | `/api/create` | write | Create a new note |
 | POST | `/api/update` | write | Apply a list of edits to one note in one write |
 | POST | `/api/move` | write | Move note to different folder |
@@ -533,7 +548,7 @@ STYLE:
 
 **Developer second brain** — Index architecture docs, decision records, meeting notes, and code snippets. Search by concept across all of them.
 
-**Research and writing** — Find connections between notes that you didn't explicitly link. The graph lane surfaces related content through shared wikilinks.
+**Research and writing** — Ask a question in prose and get the sections that answer it, each scored by the cross-encoder, with a note's adjacent sections merged into one block; `read --metadata` then follows a note's wikilinks in both directions.
 
 **Team knowledge graphs** — Index a shared docs vault. AI agents can answer "who knows about X?" and "what decisions were made about Y?" by traversing the note graph.
 
@@ -544,7 +559,7 @@ STYLE:
 | Search method | 5-lane hybrid (semantic + BM25 + graph + reranker + temporal): content lanes RRF-fused, cross-encoder sorts | Vector similarity only | Keyword only |
 | Query understanding | Cross-encoder reads each candidate jointly with the query | None | None |
 | Understands note links | Yes (wikilink graph traversal) | No | Limited (backlinks panel) |
-| AI agent access | MCP server (17 tools) + HTTP REST API (18 endpoints) | Custom API needed | No |
+| AI agent access | MCP server (18 tools) + HTTP REST API (19 endpoints) | Custom API needed | No |
 | Write capability | Create/edit/rewrite/delete with smart filing | No | Manual |
 | Vault health | Orphans, broken links, stale notes, tag hygiene | No | Limited |
 | Real-time sync | File watcher, 2s debounce | Manual re-index | N/A |
@@ -560,8 +575,8 @@ knapper is not a replacement for Obsidian — it's the intelligence layer that s
 - Confidence % display: search results show normalized 0-100% confidence instead of raw RRF scores
 - llama.cpp inference via Rust bindings (GGUF models, Metal GPU on macOS, CUDA on Linux)
 - Intelligence opt-in: the cross-encoder lane is off unless enabled
-- MCP server with 17 tools (5 read, 5 write, 5 index and diagnostic, 1 setup, 1 migrate) via stdio
-- HTTP REST API with 18 endpoints, API key auth (`kn_` prefix), rate limiting, CORS — enabled via `knapper serve --http`
+- MCP server with 18 tools (5 read, 5 write, 6 index and diagnostic, 1 setup, 1 migrate) via stdio
+- HTTP REST API with 19 endpoints, API key auth (`kn_` prefix), rate limiting, CORS — enabled via `knapper serve --http`
 - User identity with L0/L1 tiered context for AI agent session starts
 - Section-level reading and editing: target specific headings with replace/prepend/append modes
 - Full note rewriting with automatic frontmatter preservation

@@ -74,6 +74,55 @@ pub struct AgentsConfig {
     pub windsurf: bool,
 }
 
+impl AgentsConfig {
+    /// Record that `agent` is registered and answer what `configure --register`
+    /// prints for it. `None` for an agent knapper does not know, and nothing
+    /// is recorded.
+    pub fn register(&mut self, agent: &str) -> Option<&'static str> {
+        let hint = Self::registration_hint(agent)?;
+        match agent {
+            "claude-code" => self.claude_code = true,
+            "cursor" => self.cursor = true,
+            "windsurf" => self.windsurf = true,
+            _ => return None,
+        }
+        Some(hint)
+    }
+
+    /// What `configure --register <agent>` prints after it records the
+    /// registration: how to add the knapper MCP server to that agent.
+    /// `None` for an agent knapper does not know.
+    pub fn registration_hint(agent: &str) -> Option<&'static str> {
+        match agent {
+            "claude-code" => Some(
+                "Registered Claude Code. Add the MCP server with the Claude Code CLI:\n  \
+                 claude mcp add --scope user knapper -- knapper serve\n\
+                 Or add it by hand to ~/.claude.json (user scope) or a project's .mcp.json:\n  \
+                 \"knapper\": {\n    \
+                 \"type\": \"stdio\",\n    \
+                 \"command\": \"knapper\",\n    \
+                 \"args\": [\"serve\"]\n  \
+                 }",
+            ),
+            "cursor" => Some(
+                "Registered Cursor. Add to ~/.cursor/mcp.json:\n  \
+                 \"knapper\": {\n    \
+                 \"command\": \"knapper\",\n    \
+                 \"args\": [\"serve\"]\n  \
+                 }",
+            ),
+            "windsurf" => Some(
+                "Registered Windsurf. Add to ~/.codeium/windsurf/mcp_config.json:\n  \
+                 \"knapper\": {\n    \
+                 \"command\": \"knapper\",\n    \
+                 \"args\": [\"serve\"]\n  \
+                 }",
+            ),
+            _ => None,
+        }
+    }
+}
+
 /// ChatGPT Actions plugin metadata.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PluginConfig {
@@ -1695,5 +1744,48 @@ vault_purpose = "notes"
         assert_eq!(cfg.models.embed_api.dim, Some(1536));
         assert_eq!(cfg.models.embed_api.timeout_secs, 10);
         assert_eq!(cfg.models.embed_api.max_retries, 2);
+    }
+
+    #[test]
+    fn claude_code_hint_names_the_cli_registration_and_the_file_claude_code_reads() {
+        let hint = AgentsConfig::registration_hint("claude-code").unwrap();
+        assert!(hint.contains("claude mcp add --scope user knapper -- knapper serve"));
+        assert!(hint.contains("~/.claude.json"));
+        assert!(hint.contains(".mcp.json"));
+    }
+
+    #[test]
+    fn claude_code_hint_does_not_send_the_user_to_settings_json() {
+        let hint = AgentsConfig::registration_hint("claude-code").unwrap();
+        assert!(!hint.contains("settings.json"));
+    }
+
+    #[test]
+    fn cursor_and_windsurf_hints_name_their_own_config_files() {
+        assert!(
+            AgentsConfig::registration_hint("cursor")
+                .unwrap()
+                .contains("~/.cursor/mcp.json")
+        );
+        assert!(
+            AgentsConfig::registration_hint("windsurf")
+                .unwrap()
+                .contains("~/.codeium/windsurf/mcp_config.json")
+        );
+    }
+
+    #[test]
+    fn an_unknown_agent_has_no_hint() {
+        assert!(AgentsConfig::registration_hint("emacs").is_none());
+    }
+
+    #[test]
+    fn register_sets_the_agent_flag_and_returns_its_hint() {
+        let mut agents = AgentsConfig::default();
+        let hint = agents.register("cursor").unwrap();
+        assert!(agents.cursor);
+        assert!(!agents.claude_code);
+        assert!(hint.contains("~/.cursor/mcp.json"));
+        assert!(agents.register("emacs").is_none());
     }
 }

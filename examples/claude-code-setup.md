@@ -11,14 +11,23 @@ brew install mightytribble/tap/knapper
 knapper index ~/path/to/vault
 ```
 
-### 2. Add to Claude Code settings
+### 2. Register the MCP server
 
-Add to `~/.claude/settings.json`:
+```bash
+claude mcp add --scope user knapper -- knapper serve
+```
+
+`--scope user` registers knapper for every project; `--scope project` writes a
+shared `.mcp.json` in the current project's root instead.
+
+Or add it by hand to `~/.claude.json` (user scope) or a project's `.mcp.json`
+(project scope).
 
 ```json
 {
   "mcpServers": {
     "knapper": {
+      "type": "stdio",
       "command": "knapper",
       "args": ["serve"]
     }
@@ -28,7 +37,7 @@ Add to `~/.claude/settings.json`:
 
 ### 3. Start using
 
-Claude Code now has access to 20 vault tools. Each one is named after the CLI
+Claude Code now has access to 18 vault tools. Each one is named after the CLI
 command it answers, with `-` written as `_`.
 
 **Read tools:**
@@ -38,11 +47,6 @@ command it answers, with `-` written as `_`.
   terms, creator); `detailed` adds each note's heading outline
 - `tags` — the vault's tag vocabulary, whole or under one term
 - `vault_map` — vault structure overview
-- `who` — person context bundle (their note, the notes mentioning them, their
-  wikilinks both ways; the mention list needs a People folder in `vault.toml`)
-- `project` — project context bundle
-- `topic` — whole notes on a topic, and their one-hop neighbours, within a
-  character budget
 
 **Write tools:**
 - `create` — create a note with smart filing
@@ -57,7 +61,9 @@ command it answers, with `-` written as `_`.
 - `index` — index the configured vault
 - `reindex_file` — re-index one file after an edit made outside knapper
 - `status` — index status and statistics
-- `health` — vault health diagnostics
+- `health` — vault health diagnostics, read from the index
+- `validate` — check vault markdown for structural and indexing problems —
+  one note, a scope, or the whole vault — read from disk, with no model loaded
 - `identity` — user identity (L0) and current context (L1)
 - `init` — first-time onboarding (`mode`: detect or apply)
 - `migrate` — PARA migration (`mode`: preview, apply or undo)
@@ -67,8 +73,8 @@ command it answers, with `-` written as `_`.
 **"What do I know about authentication?"**
 Claude will call `search("authentication")` and get results from semantic, keyword, and graph lanes.
 
-**"Who is working on the API project?"**
-Claude will call `project("API")` to get the project bundle — related notes, team members, active tasks.
+**"What is in my projects folder?"**
+Claude will call `list` with `scope: ["/01-Projects/"]` and `detailed: true` to see every note there with its heading outline, then `read` the ones that matter.
 
 **"Create a meeting note for today's standup"**
 Claude will call `create` with content, tags, and type hint. knapper resolves tags against your registry, discovers wikilinks in the content, and places the note in the best folder.
@@ -79,7 +85,7 @@ The MCP server includes a file watcher. When you edit notes in Obsidian, knapper
 
 ## Tips
 
-- Use `topic` with a `budget` (for example 8000 characters, about 2000 tokens) to feed whole notes into a prompt; use `search` when you want the best-ranked passages instead
+- Scope a `search` or `list` with `all`, `any` and `none` — a tag term such as `type/person`, or a directory term such as `/03-Resources/People/` — to keep a query inside one part of the vault; `tags` lists the vocabulary to scope on
 - `vault_map` helps Claude understand your vault structure before searching
-- `who("Person Name")` gathers a person's note with everything that names or links to it, which is one call for someone's involvement across the vault
+- `read` with a `section` returns one heading's content instead of the whole note, and `read` with `metadata` returns the note's frontmatter and its links both ways
 - The `--explain` flag on CLI search shows per-lane score breakdown — useful for debugging search quality

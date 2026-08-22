@@ -9,12 +9,19 @@ knapper index /path/to/documents
 
 ## Configure MCP Client
 
-**Claude Code** (`~/.claude/settings.json`):
+**Claude Code** — register with the CLI:
+
+```bash
+claude mcp add --scope user knapper -- knapper serve
+```
+
+Or add it by hand to `~/.claude.json` (user scope) or a project's `.mcp.json`
+(project scope). 
 
 ```json
 {
   "mcpServers": {
-    "knapper": { "command": "knapper", "args": ["serve"] }
+    "knapper": { "type": "stdio", "command": "knapper", "args": ["serve"] }
   }
 }
 ```

@@ -681,43 +681,12 @@ async fn main() -> Result<()> {
             }
 
             if let Some(agent) = register {
-                match agent.as_str() {
-                    "claude-code" => {
-                        cfg.agents.claude_code = true;
-                        println!(
-                            "Registered Claude Code. Add to ~/.claude/settings.json:\n  \
-                             \"knapper\": {{\n    \
-                             \"command\": \"knapper\",\n    \
-                             \"args\": [\"serve\"]\n  \
-                             }}"
-                        );
-                    }
-                    "cursor" => {
-                        cfg.agents.cursor = true;
-                        println!(
-                            "Registered Cursor. Add to ~/.cursor/mcp.json:\n  \
-                             \"knapper\": {{\n    \
-                             \"command\": \"knapper\",\n    \
-                             \"args\": [\"serve\"]\n  \
-                             }}"
-                        );
-                    }
-                    "windsurf" => {
-                        cfg.agents.windsurf = true;
-                        println!(
-                            "Registered Windsurf. Add to ~/.codeium/windsurf/mcp_config.json:\n  \
-                             \"knapper\": {{\n    \
-                             \"command\": \"knapper\",\n    \
-                             \"args\": [\"serve\"]\n  \
-                             }}"
-                        );
-                    }
-                    other => {
-                        anyhow::bail!(
-                            "Unknown agent: {other}. Use: claude-code, cursor, or windsurf."
-                        );
-                    }
-                }
+                let hint = cfg.agents.register(&agent).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Unknown agent: {agent}. Use: claude-code, cursor, or windsurf."
+                    )
+                })?;
+                println!("{hint}");
             }
 
             if add_api_key {
