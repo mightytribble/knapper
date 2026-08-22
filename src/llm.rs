@@ -481,6 +481,64 @@ impl EmbedModel for Box<dyn EmbedModel + Send> {
     }
 }
 
+/// Which embedder `config.models.embed` names: the local llama.cpp GGUF path
+/// (`None`, or an `hf:` URI) or a hosted API provider (issue #84).
+#[derive(Debug)]
+pub enum EmbedScheme {
+    Local,
+    Gemini { model_id: String },
+}
+
+/// Parses `[models] embed` into a routable scheme. A `gemini:` id must be
+/// pinned and versioned — ending in a digit — so `gemini:gemini-embedding`
+/// and the moving alias `gemini:gemini-embedding-latest` are rejected rather
+/// than silently re-pointing a store's vectors to a model that changed
+/// underneath it.
+pub fn parse_embed_scheme(uri: Option<&str>) -> Result<EmbedScheme> {
+    match uri {
+        None => Ok(EmbedScheme::Local),
+        Some(u) if u.starts_with("hf:") => Ok(EmbedScheme::Local),
+        Some(u) if u.starts_with("gemini:") => {
+            let model_id = u.trim_start_matches("gemini:").to_string();
+            let versioned = model_id.chars().last().is_some_and(|c| c.is_ascii_digit());
+            anyhow::ensure!(
+                versioned,
+                "gemini model id must be pinned and versioned (ending in a version number), got: {model_id:?}"
+            );
+            Ok(EmbedScheme::Gemini { model_id })
+        }
+        Some(other) => anyhow::bail!("unknown embed model URI scheme: {other}"),
+    }
+}
+
+/// Builds the embedder `config.models.embed` names: the local llama.cpp GGUF
+/// or a hosted API provider, boxed to one trait object either way.
+pub fn load_embedder(
+    models_dir: &Path,
+    config: &crate::config::Config,
+) -> Result<Box<dyn EmbedModel + Send>> {
+    match parse_embed_scheme(config.models.embed.as_deref())? {
+        EmbedScheme::Local => {
+            let e = LlamaEmbed::new(models_dir, config)?;
+            Ok(Box::new(e) as Box<dyn EmbedModel + Send>)
+        }
+        EmbedScheme::Gemini { model_id } => {
+            let api = &config.models.embed_api;
+            let provider = crate::embed_api::Gemini {
+                model_id,
+                endpoint_override: api.endpoint.clone(),
+            };
+            let e = crate::embed_api::ApiEmbedder::new(
+                provider,
+                api.dim,
+                api.timeout_secs,
+                api.max_retries,
+            )?;
+            Ok(Box::new(e) as Box<dyn EmbedModel + Send>)
+        }
+    }
+}
+
 /// Cross-encoder reranker — scores a (query, document) pair.
 pub trait RerankModel: Send {
     /// Return a relevance score in [0.0, 1.0].
@@ -1617,6 +1675,11 @@ impl RerankModel for LlamaRerank {
 mod tests {
     use super::*;
 
+    // Serializes tests that touch the process-global GEMINI_API_KEY env var,
+    // since `cargo test --lib` runs tests in parallel by default. Mirrors the
+    // ENV_LOCK pattern in `embed_api.rs`'s tests.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
     /// Unset means the machine, not llama.cpp's constant 4 (issue #20).
     ///
     /// The bug this guards is silent: inheriting `GGML_DEFAULT_N_THREADS` is not
@@ -2121,5 +2184,49 @@ mod tests {
             !first.is_empty(),
             "there is always a device, even if it is cpu"
         );
+    }
+
+    #[test]
+    fn scheme_routes_local_and_gemini() {
+        assert!(matches!(
+            parse_embed_scheme(None).unwrap(),
+            EmbedScheme::Local
+        ));
+        assert!(matches!(
+            parse_embed_scheme(Some("hf:org/repo/x.gguf")).unwrap(),
+            EmbedScheme::Local
+        ));
+        match parse_embed_scheme(Some("gemini:gemini-embedding-2")).unwrap() {
+            EmbedScheme::Gemini { model_id } => assert_eq!(model_id, "gemini-embedding-2"),
+            _ => panic!("expected Gemini"),
+        }
+    }
+
+    #[test]
+    fn scheme_rejects_moving_alias() {
+        for bad in [
+            "gemini:gemini-embedding-latest",
+            "gemini:gemini-embedding",
+            "gemini:",
+        ] {
+            let err = parse_embed_scheme(Some(bad)).unwrap_err();
+            assert!(
+                err.to_string().contains("versioned"),
+                "{bad} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn load_embedder_builds_gemini_from_config() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: ENV_LOCK serializes every test that touches process env vars.
+        unsafe { std::env::set_var("GEMINI_API_KEY", "k") };
+        let mut cfg = crate::config::Config::default();
+        cfg.models.embed = Some("gemini:gemini-embedding-2".into());
+        cfg.models.embed_api.dim = Some(1536);
+        let e = load_embedder(std::path::Path::new("/nonexistent"), &cfg).unwrap();
+        assert_eq!(e.dim(), 1536);
+        assert!(e.fingerprint().starts_with("gemini/gemini-embedding-2"));
     }
 }
