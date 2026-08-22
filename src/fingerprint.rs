@@ -601,6 +601,28 @@ mod tests {
         assert!(verify(&store, &swapped).is_err());
     }
 
+    /// A narrower regression guard than the test above: `compute()` itself
+    /// must fold `embed_model` into `embedding`, with no `Store` involved.
+    /// The identities are the shape #84 actually introduces — a local
+    /// llama.cpp embedder against a remote Gemini one — rather than a
+    /// placeholder swap, so a change that hashes the two alike (e.g.
+    /// swallowing the model string into a shared constant) fails here even
+    /// if the store-comparison plumbing above still passes. No public
+    /// accessor reads a key's declared `Action` off two bare `Fingerprints`
+    /// values (only `Comparison::actions()` does, and that needs a `Store`
+    /// round trip already covered above), so this stops at the digest.
+    #[test]
+    fn changing_the_embed_model_changes_the_embedding_fingerprint() {
+        let cfg = Config::default();
+        let local = Fingerprints::compute(&cfg, "llama/embeddinggemma/dim=768", None);
+        let gemini = Fingerprints::compute(
+            &cfg,
+            "gemini/gemini-embedding-2/dim=1536/doc=RETRIEVAL_DOCUMENT/qry=RETRIEVAL_QUERY",
+            None,
+        );
+        assert_ne!(local.embedding, gemini.embedding);
+    }
+
     #[test]
     fn a_changed_prefix_composition_demands_a_reindex() {
         // #2's prefix never reaches storage, so no content hash and no chunk
