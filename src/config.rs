@@ -32,6 +32,35 @@ pub struct ModelConfig {
     /// Threads change only how the arithmetic is scheduled, never its result —
     /// see [`crate::llm::resolve_n_threads`].
     pub n_threads: Option<usize>,
+    /// Non-secret knobs for an API-backed embedder (#84). The key is never
+    /// here; it is read from the provider's environment variable at load.
+    #[serde(default)]
+    pub embed_api: EmbedApiConfig,
+}
+
+/// Non-secret configuration for an external embedding API (#84).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EmbedApiConfig {
+    /// Matryoshka-truncated output width. `None` uses the model's native width.
+    pub dim: Option<usize>,
+    /// Per-request timeout in seconds.
+    pub timeout_secs: u64,
+    /// Retry ceiling on rate-limit, server, and transport errors.
+    pub max_retries: u32,
+    /// Endpoint override for a proxy or a test server.
+    pub endpoint: Option<String>,
+}
+
+impl Default for EmbedApiConfig {
+    fn default() -> Self {
+        Self {
+            dim: None,
+            timeout_secs: 30,
+            max_retries: 4,
+            endpoint: None,
+        }
+    }
 }
 
 /// Agent integration configuration.
@@ -1649,5 +1678,22 @@ vault_purpose = "notes"
             omitted.ranking.coalesce_adjacent,
             "a [ranking] table that omits the key keeps the default on"
         );
+    }
+
+    #[test]
+    fn embed_api_section_round_trips_and_defaults() {
+        // Absent section -> defaults.
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.models.embed_api.timeout_secs, 30);
+        assert_eq!(cfg.models.embed_api.max_retries, 4);
+        assert!(cfg.models.embed_api.dim.is_none());
+
+        // Present section parses.
+        let cfg: Config =
+            toml::from_str("[models.embed_api]\ndim = 1536\ntimeout_secs = 10\nmax_retries = 2\n")
+                .unwrap();
+        assert_eq!(cfg.models.embed_api.dim, Some(1536));
+        assert_eq!(cfg.models.embed_api.timeout_secs, 10);
+        assert_eq!(cfg.models.embed_api.max_retries, 2);
     }
 }
