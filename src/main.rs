@@ -131,9 +131,9 @@ fn open_indexing_embedder(
     cfg: &Config,
     data_dir: &Path,
     store: &store::Store,
-) -> Result<knapper::llm::LlamaEmbed> {
+) -> Result<Box<dyn knapper::llm::EmbedModel + Send>> {
     let models_dir = data_dir.join("models");
-    let embedder = knapper::llm::LlamaEmbed::new(&models_dir, cfg)?;
+    let embedder = knapper::llm::load_embedder(&models_dir, cfg)?;
     store.verify_embedding_dim(knapper::llm::EmbedModel::dim(&embedder))?;
     knapper::fingerprint::verify(
         store,

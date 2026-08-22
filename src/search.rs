@@ -1246,7 +1246,7 @@ pub fn run_search(
 ) -> Result<()> {
     let models_dir = data_dir.join("models");
     let mut embedder =
-        crate::llm::LlamaEmbed::new(&models_dir, config).context("loading embedder")?;
+        crate::llm::load_embedder(&models_dir, config).context("loading embedder")?;
 
     let db_path = db_path(data_dir);
     let store = Store::open(&db_path).context("opening store")?;

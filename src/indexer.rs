@@ -632,7 +632,7 @@ pub fn run_index(
     let store = Store::open(&db_path)?;
 
     let models_dir = data_dir.join("models");
-    let mut embedder = crate::llm::LlamaEmbed::new(&models_dir, config)?;
+    let mut embedder = crate::llm::load_embedder(&models_dir, config)?;
 
     let profile = crate::config::Config::load_vault_profile().ok().flatten();
     run_index_inner(

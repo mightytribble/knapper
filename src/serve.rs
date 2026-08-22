@@ -850,7 +850,7 @@ pub async fn run_serve(
 
     let store = Store::open(&db_path)?;
     let config = Config::load()?;
-    let embedder = crate::llm::LlamaEmbed::new(&models_dir, &config)?;
+    let embedder = crate::llm::load_embedder(&models_dir, &config)?;
     store.verify_embedding_dim(embedder.dim())?;
 
     let vault_path_str = store.get_meta("vault_path")?.ok_or_else(|| {
@@ -910,8 +910,7 @@ pub async fn run_serve(
     }
 
     let store_arc = Arc::new(Mutex::new(store));
-    let embedder_arc: Arc<Mutex<Box<dyn EmbedModel + Send>>> =
-        Arc::new(Mutex::new(Box::new(embedder) as Box<dyn EmbedModel + Send>));
+    let embedder_arc: Arc<Mutex<Box<dyn EmbedModel + Send>>> = Arc::new(Mutex::new(embedder));
     let vault_path_arc = Arc::new(vault_path);
     let profile_arc = Arc::new(profile);
     let recent_writes: RecentWrites = Arc::new(Mutex::new(HashMap::new()));
