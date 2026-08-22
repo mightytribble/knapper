@@ -118,6 +118,11 @@ impl<P: EmbedProvider> EmbedModel for ApiEmbedder<P> {
         let body = self.provider.build_query_request(text, self.dim);
         let json = self.post(&body)?;
         let mut vectors = self.provider.parse_vectors(&json)?;
+        anyhow::ensure!(
+            vectors.len() == 1,
+            "provider returned {} vectors for a single query",
+            vectors.len()
+        );
         let mut v = vectors
             .pop()
             .context("query embedding returned no vector")?;
@@ -336,5 +341,28 @@ mod tests {
             let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
             assert!((norm - 1.0).abs() < 1e-5); // L2-normalized
         }
+        // Exact values (not just unit norm) prove position, not just magnitude,
+        // survived the split: a reversed or scrambled sub-batch order would
+        // still pass the unit-norm loop above but fail this.
+        assert_eq!(
+            out,
+            vec![
+                vec![1.0f32, 0.0, 0.0],
+                vec![0.0, 1.0, 0.0],
+                vec![0.0, 0.0, 1.0],
+            ]
+        );
+    }
+
+    #[test]
+    fn embed_query_normalizes_and_sends_one_request() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: ENV_LOCK serializes every test that touches process env vars.
+        unsafe { std::env::set_var("KNAPPER_TEST_KEY", "k") };
+        let (endpoint, count) = spawn_stub(vec![r#"{"vectors":[[0.0,0.0,5.0]]}"#.into()]);
+        let mut e = ApiEmbedder::new(StubProvider { endpoint, cap: 2 }, None, 30, 3).unwrap();
+        let out = e.embed_query("q").unwrap();
+        assert_eq!(*count.lock().unwrap(), 1); // exactly one request
+        assert_eq!(out, vec![0.0f32, 0.0, 1.0]); // L2-normalized
     }
 }
