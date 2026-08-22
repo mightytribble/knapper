@@ -169,6 +169,97 @@ impl<P: EmbedProvider> EmbedModel for ApiEmbedder<P> {
     }
 }
 
+const GEMINI_DOC_TASK: &str = "RETRIEVAL_DOCUMENT";
+const GEMINI_QUERY_TASK: &str = "RETRIEVAL_QUERY";
+const GEMINI_NATIVE_DIM: usize = 3072;
+const GEMINI_MAX_INPUT_TOKENS: usize = 2048;
+const GEMINI_BATCH_CAP: usize = 100;
+
+pub struct Gemini {
+    pub model_id: String,
+    pub endpoint_override: Option<String>,
+}
+
+impl Gemini {
+    fn one_request(
+        &self,
+        text: &str,
+        task: &str,
+        title: Option<&str>,
+        dim: usize,
+    ) -> serde_json::Value {
+        let mut req = serde_json::json!({
+            "model": format!("models/{}", self.model_id),
+            "content": { "parts": [ { "text": text } ] },
+            "taskType": task,
+            "outputDimensionality": dim,
+        });
+        if let Some(t) = title.filter(|t| !t.is_empty()) {
+            req["title"] = serde_json::Value::String(t.to_string());
+        }
+        req
+    }
+}
+
+impl EmbedProvider for Gemini {
+    fn env_var(&self) -> &'static str {
+        "GEMINI_API_KEY"
+    }
+    fn endpoint(&self) -> String {
+        self.endpoint_override.clone().unwrap_or_else(|| {
+            format!(
+                "https://generativelanguage.googleapis.com/v1beta/models/{}:batchEmbedContents",
+                self.model_id
+            )
+        })
+    }
+    fn auth_header(&self, key: &str) -> (String, String) {
+        ("x-goog-api-key".to_string(), key.to_string())
+    }
+    fn native_dim(&self) -> usize {
+        GEMINI_NATIVE_DIM
+    }
+    fn max_input_tokens(&self) -> usize {
+        GEMINI_MAX_INPUT_TOKENS
+    }
+    fn batch_cap(&self) -> usize {
+        GEMINI_BATCH_CAP
+    }
+    fn identity(&self, dim: usize) -> String {
+        format!(
+            "gemini/{}/dim={dim}/doc={GEMINI_DOC_TASK}/qry={GEMINI_QUERY_TASK}",
+            self.model_id
+        )
+    }
+    fn build_document_request(&self, docs: &[EmbedDoc<'_>], dim: usize) -> serde_json::Value {
+        let requests: Vec<_> = docs
+            .iter()
+            .map(|d| self.one_request(d.text, GEMINI_DOC_TASK, Some(d.title), dim))
+            .collect();
+        serde_json::json!({ "requests": requests })
+    }
+    fn build_query_request(&self, text: &str, dim: usize) -> serde_json::Value {
+        serde_json::json!({ "requests": [ self.one_request(text, GEMINI_QUERY_TASK, None, dim) ] })
+    }
+    fn parse_vectors(&self, body: &serde_json::Value) -> Result<Vec<Vec<f32>>> {
+        let arr = body["embeddings"]
+            .as_array()
+            .context("response has no embeddings array")?;
+        arr.iter()
+            .map(|e| {
+                e["values"]
+                    .as_array()
+                    .context("embedding has no values array")
+                    .map(|vals| {
+                        vals.iter()
+                            .map(|x| x.as_f64().unwrap_or(0.0) as f32)
+                            .collect()
+                    })
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,5 +536,62 @@ mod tests {
         let err = e.embed_batch(&[EmbedDoc::untitled("a")]).unwrap_err();
         assert!(err.to_string().contains("embedding request failed"));
         assert_eq!(*count.lock().unwrap(), 3); // initial try + 2 retries
+    }
+
+    #[test]
+    fn gemini_document_request_carries_task_and_title() {
+        let g = Gemini {
+            model_id: "gemini-embedding-2".into(),
+            endpoint_override: None,
+        };
+        let docs = vec![
+            EmbedDoc::new("Dragon", "A large reptile."),
+            EmbedDoc::untitled("plain"),
+        ];
+        let body = g.build_document_request(&docs, 1536);
+        let reqs = body["requests"].as_array().unwrap();
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0]["taskType"], "RETRIEVAL_DOCUMENT");
+        assert_eq!(reqs[0]["title"], "Dragon");
+        assert_eq!(reqs[0]["content"]["parts"][0]["text"], "A large reptile.");
+        assert_eq!(reqs[0]["outputDimensionality"], 1536);
+        // An untitled doc omits the title field rather than sending "".
+        assert!(reqs[1].get("title").is_none());
+    }
+
+    #[test]
+    fn gemini_query_request_uses_query_task_and_no_title() {
+        let g = Gemini {
+            model_id: "gemini-embedding-2".into(),
+            endpoint_override: None,
+        };
+        let body = g.build_query_request("where do dragons live", 1536);
+        assert_eq!(body["requests"][0]["taskType"], "RETRIEVAL_QUERY");
+        assert!(body["requests"][0].get("title").is_none());
+    }
+
+    #[test]
+    fn gemini_parses_values_in_order() {
+        let g = Gemini {
+            model_id: "gemini-embedding-2".into(),
+            endpoint_override: None,
+        };
+        let body: serde_json::Value =
+            serde_json::from_str(r#"{"embeddings":[{"values":[0.1,0.2]},{"values":[0.3,0.4]}]}"#)
+                .unwrap();
+        let vectors = g.parse_vectors(&body).unwrap();
+        assert_eq!(vectors, vec![vec![0.1f32, 0.2], vec![0.3, 0.4]]);
+    }
+
+    #[test]
+    fn gemini_identity_pins_model_and_dim() {
+        let g = Gemini {
+            model_id: "gemini-embedding-2".into(),
+            endpoint_override: None,
+        };
+        assert_eq!(
+            g.identity(1536),
+            "gemini/gemini-embedding-2/dim=1536/doc=RETRIEVAL_DOCUMENT/qry=RETRIEVAL_QUERY"
+        );
     }
 }
