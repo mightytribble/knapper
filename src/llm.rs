@@ -455,6 +455,15 @@ pub trait EmbedModel: Send {
 // This lets `Arc<Mutex<Box<dyn EmbedModel + Send>>>` callers pass
 // `&mut *guard` (which is `&mut Box<dyn EmbedModel + Send>`) to any
 // function taking `&mut impl EmbedModel`.
+//
+// Every method with a default body (`embed_one`, `embed_query`) still needs
+// an explicit forward here. Leaving one out does not fail to compile — it
+// silently falls through to the trait's default, which calls back through
+// `self` (a `Box`, not the inner type), so it never reaches an override the
+// inner type wrote. That is exactly how `embed_query` went missing here
+// before: every call through a `Box` ran the trait default (`embed_one`)
+// instead of `ApiEmbedder`'s query-task-typed override, embedding every
+// search query as a document.
 impl EmbedModel for Box<dyn EmbedModel + Send> {
     fn embed_batch(&mut self, docs: &[EmbedDoc<'_>]) -> Result<Vec<Vec<f32>>> {
         (**self).embed_batch(docs)
@@ -462,6 +471,10 @@ impl EmbedModel for Box<dyn EmbedModel + Send> {
 
     fn embed_one(&mut self, text: &str) -> Result<Vec<f32>> {
         (**self).embed_one(text)
+    }
+
+    fn embed_query(&mut self, text: &str) -> Result<Vec<f32>> {
+        (**self).embed_query(text)
     }
 
     fn token_count(&self, text: &str) -> usize {
@@ -2228,5 +2241,54 @@ mod tests {
         let e = load_embedder(std::path::Path::new("/nonexistent"), &cfg).unwrap();
         assert_eq!(e.dim(), 1536);
         assert!(e.fingerprint().starts_with("gemini/gemini-embedding-2"));
+    }
+
+    /// Overrides `embed_query` but not `embed_one` — the same shape as
+    /// `ApiEmbedder`, which has a query-task-typed `embed_query` and relies on
+    /// the trait's default `embed_one` (-> `embed_batch`). The two paths
+    /// return distinguishable vectors so a call through a `Box<dyn EmbedModel
+    /// + Send>` proves which one it actually took.
+    struct SeamProbe;
+
+    impl EmbedModel for SeamProbe {
+        fn embed_batch(&mut self, docs: &[EmbedDoc<'_>]) -> Result<Vec<Vec<f32>>> {
+            Ok(docs.iter().map(|_| vec![0.0]).collect())
+        }
+
+        fn embed_query(&mut self, _text: &str) -> Result<Vec<f32>> {
+            Ok(vec![1.0])
+        }
+
+        fn token_count(&self, _text: &str) -> usize {
+            0
+        }
+
+        fn dim(&self) -> usize {
+            1
+        }
+
+        fn max_context(&self) -> usize {
+            0
+        }
+
+        fn fingerprint(&self) -> String {
+            "seam-probe".to_string()
+        }
+    }
+
+    /// Regression for the missing `embed_query` forward in the blanket `impl
+    /// EmbedModel for Box<dyn EmbedModel + Send>`. Without that forward, a
+    /// `Box`'s `embed_query` falls through to the trait's default, which
+    /// calls back through the `Box` into `embed_one` — the document path —
+    /// instead of the inner type's `embed_query` override. Every production
+    /// query call (CLI, HTTP, MCP) goes through exactly this kind of `Box`.
+    #[test]
+    fn the_box_forwards_embed_query_not_the_document_default() {
+        let mut boxed: Box<dyn EmbedModel + Send> = Box::new(SeamProbe);
+        assert_eq!(
+            boxed.embed_query("q").unwrap(),
+            vec![1.0],
+            "embed_query through the box must reach the inner override, not embed_one/embed_batch"
+        );
     }
 }
