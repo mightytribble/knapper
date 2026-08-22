@@ -22,13 +22,29 @@ pub trait EmbedProvider: Send {
 
 // fields api_key/agent/max_retries are wired across Tasks 2-3
 #[allow(dead_code)]
-#[derive(Debug)]
 pub struct ApiEmbedder<P: EmbedProvider> {
     provider: P,
     api_key: String,
     dim: usize,
     agent: ureq::Agent,
     max_retries: u32,
+}
+
+// Manual, not derived: a derive would print `api_key` in cleartext on any
+// `{:?}` (a `dbg!()`, an error context capturing `self`, a panic message, a
+// log line) — the same secret-leak the env-only posture forbids, via a
+// different vector. Writing it by hand also drops the `P: Debug` bound a
+// derive would impose, so a provider (e.g. `Gemini`) need not derive `Debug`.
+impl<P: EmbedProvider> std::fmt::Debug for ApiEmbedder<P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiEmbedder")
+            .field("provider", &std::any::type_name::<P>())
+            .field("api_key", &"[redacted]")
+            .field("dim", &self.dim)
+            .field("agent", &self.agent)
+            .field("max_retries", &self.max_retries)
+            .finish()
+    }
 }
 
 impl<P: EmbedProvider> ApiEmbedder<P> {
