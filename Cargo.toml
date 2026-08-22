@@ -23,7 +23,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
 sha2 = "0.10"
-ureq = { version = "2.12", features = ["native-certs"] }
+ureq = { version = "2.12", features = ["native-certs", "json"] }
 indicatif = "0.17"
 dialoguer = "0.12"
 console = "0.16"

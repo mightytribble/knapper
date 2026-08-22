@@ -2865,6 +2865,8 @@ dependencies = [
  "rustls",
  "rustls-native-certs",
  "rustls-pki-types",
+ "serde",
+ "serde_json",
  "url",
  "webpki-roots 0.26.11",
 ]
