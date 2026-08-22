@@ -828,20 +828,33 @@ fn run_index_inner(
 
     // A failing file is skipped rather than propagated: an API embedder can die
     // mid-index, and one bad file must not cost the whole run. `index_file`
-    // embeds before it writes anything (see its step 2 vs. steps 4-8), so a
-    // failure here left the store untouched for this file — a new file has no
-    // row, a changed file keeps its prior row, chunks and content hash. Either
-    // way `diff_vault` re-lists it next run and it is re-attempted (#84).
+    // embeds before it writes anything (see its step 2 vs. steps 4-8), so an
+    // embed failure leaves the store untouched for this file on its own — but
+    // a failure *after* the embed, inside one of `index_file`'s own store
+    // writes (insert_file / insert_chunk_with_vector / reconcile_file_tags),
+    // would otherwise leave that file's partial rows sitting in the ambient
+    // transaction below, to be persisted by the final `store.commit()` along
+    // with everything that actually succeeded. A per-file SAVEPOINT closes
+    // that gap: on `Err` it rolls back exactly this file's writes (a no-op
+    // for the embed-failure case, since nothing was written) so a skipped
+    // file is left exactly as it was either way. A new file then has no row,
+    // a changed file keeps its prior row, chunks and content hash, and
+    // `diff_vault` re-lists it next run and it is re-attempted (#84).
     let mut skipped: Vec<String> = Vec::new();
     store.conn().execute_batch("BEGIN DEFERRED")?;
     for (rel_str, content, hash) in &file_contents {
         pb.set_message(rel_str.clone());
+        store.conn().execute_batch("SAVEPOINT file_sp")?;
         match index_file(rel_str, content, hash, store, embedder, vault_path, config) {
             Ok(result) => {
+                store.conn().execute_batch("RELEASE file_sp")?;
                 total_chunks += result.total_chunks;
                 indexed_rel_paths.push(rel_str.clone());
             }
             Err(e) => {
+                store
+                    .conn()
+                    .execute_batch("ROLLBACK TO file_sp; RELEASE file_sp")?;
                 tracing::warn!(path = %rel_str, error = %e, "embedding failed, skipping file");
                 skipped.push(rel_str.clone());
             }
@@ -2297,6 +2310,105 @@ mod tests {
         assert!(
             store.get_file("bad.md").unwrap().is_some(),
             "bad.md should be re-attempted and indexed once the failure clears"
+        );
+        assert!(
+            store.get_meta("embedding_fingerprint").unwrap().is_some(),
+            "fingerprints should be recorded once a pass has zero skips"
+        );
+    }
+
+    /// The other half of issue #84's contract: a failure *inside* one of
+    /// `index_file`'s own store writes — after the embed already succeeded —
+    /// must not leave that file's partial rows sitting in the loop's ambient
+    /// transaction to be persisted by the final `commit()`.
+    ///
+    /// The module has no injectable `Store` (it is a concrete `rusqlite`
+    /// wrapper), so nothing lets a test make `insert_file` or
+    /// `insert_chunk_with_vector` fail from the outside. A `BEFORE INSERT`
+    /// trigger that `RAISE(ABORT, ...)`s on a poisoned marker gets the same
+    /// effect with no production code touched: it fails the *store write* for
+    /// one chunk, after `index_file` has already embedded successfully and
+    /// already inserted the file's `files` row (step 6 runs before the chunk
+    /// loop), which is exactly the ordering the review finding described.
+    #[test]
+    fn a_failed_store_write_leaves_no_partial_file_row() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write_file(root, "good.md", "# Good\nNothing wrong with this one.");
+        write_file(
+            root,
+            "poison.md",
+            "# Poison\nThis note contains STORE_WRITE_POISON in its body.",
+        );
+
+        let store = Store::open_memory().unwrap();
+        let config = Config::default();
+        let mut embedder = RecordingEmbed::new(256);
+
+        // A single index_file call embeds first (unaffected), then writes the
+        // file row, then the chunk row — the chunk insert is where this fails.
+        store
+            .conn()
+            .execute_batch(
+                "CREATE TRIGGER poison_chunk_write
+                 BEFORE INSERT ON chunks
+                 FOR EACH ROW
+                 WHEN NEW.text LIKE '%STORE_WRITE_POISON%'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'simulated store write failure');
+                 END;",
+            )
+            .unwrap();
+
+        let result = run_index_shared(
+            root,
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        );
+        if let Err(e) = &result {
+            panic!("a failed store write must be skipped, not propagated as an error: {e:#}");
+        }
+
+        assert!(
+            store.get_file("good.md").unwrap().is_some(),
+            "good.md should be indexed despite poison.md's failure"
+        );
+        assert!(
+            store.get_file("poison.md").unwrap().is_none(),
+            "poison.md's files row must be rolled back with its failed chunk write, \
+             not committed as a partial (chunk-less) file — the exact leak the \
+             per-file SAVEPOINT closes"
+        );
+        assert!(
+            store.get_meta("embedding_fingerprint").unwrap().is_none(),
+            "fingerprints must not be recorded on a pass that skipped a file"
+        );
+
+        // Run 2: the trigger is gone, so poison.md is re-attempted and indexes —
+        // proving diff_vault still sees it as new, because it holds no row.
+        store
+            .conn()
+            .execute_batch("DROP TRIGGER poison_chunk_write;")
+            .unwrap();
+        run_index_shared(
+            root,
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
+
+        assert!(store.get_file("good.md").unwrap().is_some());
+        assert!(
+            store.get_file("poison.md").unwrap().is_some(),
+            "poison.md should be re-attempted and indexed once the write succeeds"
         );
         assert!(
             store.get_meta("embedding_fingerprint").unwrap().is_some(),
