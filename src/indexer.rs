@@ -826,12 +826,26 @@ fn run_index_inner(
             .progress_chars("=>-"),
     );
 
+    // A failing file is skipped rather than propagated: an API embedder can die
+    // mid-index, and one bad file must not cost the whole run. `index_file`
+    // embeds before it writes anything (see its step 2 vs. steps 4-8), so a
+    // failure here left the store untouched for this file — a new file has no
+    // row, a changed file keeps its prior row, chunks and content hash. Either
+    // way `diff_vault` re-lists it next run and it is re-attempted (#84).
+    let mut skipped: Vec<String> = Vec::new();
     store.conn().execute_batch("BEGIN DEFERRED")?;
     for (rel_str, content, hash) in &file_contents {
         pb.set_message(rel_str.clone());
-        let result = index_file(rel_str, content, hash, store, embedder, vault_path, config)?;
-        total_chunks += result.total_chunks;
-        indexed_rel_paths.push(rel_str.clone());
+        match index_file(rel_str, content, hash, store, embedder, vault_path, config) {
+            Ok(result) => {
+                total_chunks += result.total_chunks;
+                indexed_rel_paths.push(rel_str.clone());
+            }
+            Err(e) => {
+                tracing::warn!(path = %rel_str, error = %e, "embedding failed, skipping file");
+                skipped.push(rel_str.clone());
+            }
+        }
         pb.inc(1);
     }
     pb.finish_with_message("done");
@@ -944,7 +958,19 @@ fn run_index_inner(
     // Last, and only on the way out (issue #31). A crash anywhere above leaves
     // the previous fingerprints standing, so the next run repeats the work — a
     // store never claims to match code that never finished running against it.
-    crate::fingerprint::record(store, &fingerprints)?;
+    // A skipped file is the same case: this pass did not finish embedding the
+    // vault, so recording now would tell the next run the index is current when
+    // it is not (#84).
+    if skipped.is_empty() {
+        crate::fingerprint::record(store, &fingerprints)?;
+    } else {
+        eprintln!(
+            "{} file(s) were not embedded and were left for a later run: {}",
+            skipped.len(),
+            skipped.join(", ")
+        );
+        eprintln!("Index left unfingerprinted; re-run `knapper index` to complete it.");
+    }
 
     let duration = start.elapsed();
     info!(
@@ -2169,6 +2195,113 @@ mod tests {
         fn fingerprint(&self) -> String {
             self.inner.fingerprint()
         }
+    }
+
+    /// A `MockLlm`-shaped embedder that fails any batch containing a poisoned
+    /// marker, so a test can simulate an API embedder that dies mid-index on
+    /// one file and recovers on a later run (issue #84).
+    struct FlakyEmbed {
+        dim: usize,
+        fail_marker: Option<String>,
+    }
+
+    impl EmbedModel for FlakyEmbed {
+        fn embed_batch(&mut self, docs: &[crate::llm::EmbedDoc<'_>]) -> Result<Vec<Vec<f32>>> {
+            if let Some(m) = &self.fail_marker
+                && docs.iter().any(|d| d.text.contains(m.as_str()))
+            {
+                anyhow::bail!("simulated API failure");
+            }
+            Ok(docs.iter().map(|_| vec![0.1f32; self.dim]).collect())
+        }
+        fn token_count(&self, text: &str) -> usize {
+            text.len() / 4
+        }
+        fn dim(&self) -> usize {
+            self.dim
+        }
+        fn max_context(&self) -> usize {
+            100_000
+        }
+        fn fingerprint(&self) -> String {
+            "flaky/v1".into()
+        }
+    }
+
+    #[test]
+    fn a_failing_file_is_skipped_and_re_attempted_next_run() {
+        // Two files: good.md embeds cleanly, bad.md carries a marker that a
+        // flaky embedder trips on. Run 1 must not error out — it skips bad.md,
+        // indexes good.md, and leaves fingerprints unrecorded so a later run
+        // knows the index is not clean. Run 2, with the embedder fixed,
+        // re-attempts bad.md because it was never written to the store.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write_file(root, "good.md", "# Good\nNothing wrong with this one.");
+        write_file(
+            root,
+            "bad.md",
+            "# Bad\nThis note contains POISON in its body.",
+        );
+
+        let store = Store::open_memory().unwrap();
+        let config = Config::default();
+
+        let mut flaky = FlakyEmbed {
+            dim: 256,
+            fail_marker: Some("POISON".to_string()),
+        };
+        let result = run_index_shared(
+            root,
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut flaky,
+            false,
+            None,
+        );
+        if let Err(e) = &result {
+            panic!("a failing file must be skipped, not propagated as an error: {e:#}");
+        }
+
+        assert!(
+            store.get_file("good.md").unwrap().is_some(),
+            "good.md should be indexed despite bad.md's failure"
+        );
+        assert!(
+            store.get_file("bad.md").unwrap().is_none(),
+            "bad.md must be left untouched in the store after its embed failed"
+        );
+        assert!(
+            store.get_meta("embedding_fingerprint").unwrap().is_none(),
+            "fingerprints must not be recorded on a pass that skipped a file"
+        );
+
+        // Run 2: the embedder is fixed, so bad.md is re-attempted and indexes.
+        let mut fixed = FlakyEmbed {
+            dim: 256,
+            fail_marker: None,
+        };
+        run_index_shared(
+            root,
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut fixed,
+            false,
+            None,
+        )
+        .unwrap();
+
+        assert!(store.get_file("good.md").unwrap().is_some());
+        assert!(
+            store.get_file("bad.md").unwrap().is_some(),
+            "bad.md should be re-attempted and indexed once the failure clears"
+        );
+        assert!(
+            store.get_meta("embedding_fingerprint").unwrap().is_some(),
+            "fingerprints should be recorded once a pass has zero skips"
+        );
     }
 
     fn prefixed_config() -> Config {
