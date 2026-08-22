@@ -247,14 +247,16 @@ impl EmbedProvider for Gemini {
             .context("response has no embeddings array")?;
         arr.iter()
             .map(|e| {
-                e["values"]
+                let vals = e["values"]
                     .as_array()
-                    .context("embedding has no values array")
-                    .map(|vals| {
-                        vals.iter()
-                            .map(|x| x.as_f64().unwrap_or(0.0) as f32)
-                            .collect()
+                    .context("embedding has no values array")?;
+                vals.iter()
+                    .map(|x| {
+                        x.as_f64()
+                            .map(|f| f as f32)
+                            .context("embedding value is not a number")
                     })
+                    .collect::<Result<Vec<f32>>>()
             })
             .collect()
     }
@@ -581,6 +583,17 @@ mod tests {
                 .unwrap();
         let vectors = g.parse_vectors(&body).unwrap();
         assert_eq!(vectors, vec![vec![0.1f32, 0.2], vec![0.3, 0.4]]);
+    }
+
+    #[test]
+    fn gemini_parse_vectors_errors_on_a_non_numeric_value() {
+        let g = Gemini {
+            model_id: "gemini-embedding-2".into(),
+            endpoint_override: None,
+        };
+        let body: serde_json::Value =
+            serde_json::from_str(r#"{"embeddings":[{"values":[0.1,"oops"]}]}"#).unwrap();
+        assert!(g.parse_vectors(&body).is_err());
     }
 
     #[test]
