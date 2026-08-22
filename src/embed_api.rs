@@ -20,8 +20,6 @@ pub trait EmbedProvider: Send {
     fn parse_vectors(&self, body: &serde_json::Value) -> Result<Vec<Vec<f32>>>;
 }
 
-// fields api_key/agent/max_retries are wired across Tasks 2-3
-#[allow(dead_code)]
 pub struct ApiEmbedder<P: EmbedProvider> {
     provider: P,
     api_key: String,
@@ -71,17 +69,42 @@ impl<P: EmbedProvider> ApiEmbedder<P> {
     }
 }
 
+// Retryable: a 429, any 5xx, or a transport-level failure (connect/timeout/
+// read). Any other 4xx is the caller's own bad request and retrying it would
+// only repeat the same rejection.
+fn retryable(err: &ureq::Error) -> bool {
+    match err {
+        ureq::Error::Status(code, _) => *code == 429 || *code >= 500,
+        ureq::Error::Transport(_) => true,
+    }
+}
+
 impl<P: EmbedProvider> ApiEmbedder<P> {
     fn post(&self, body: &serde_json::Value) -> Result<serde_json::Value> {
         let (header, value) = self.provider.auth_header(&self.api_key);
-        let resp = self
-            .agent
-            .post(&self.provider.endpoint())
-            .set(&header, &value)
-            .send_json(body)
-            .context("embedding request failed")?;
-        resp.into_json::<serde_json::Value>()
-            .context("decoding embedding response")
+        let mut attempt = 0u32;
+        loop {
+            let result = self
+                .agent
+                .post(&self.provider.endpoint())
+                .set(&header, &value)
+                .send_json(body);
+            match result {
+                Ok(resp) => {
+                    return resp
+                        .into_json::<serde_json::Value>()
+                        .context("decoding embedding response");
+                }
+                Err(err) if retryable(&err) && attempt < self.max_retries => {
+                    let backoff = std::time::Duration::from_millis(50u64 << attempt);
+                    std::thread::sleep(backoff);
+                    attempt += 1;
+                }
+                Err(err) => {
+                    return Err(anyhow::Error::new(err).context("embedding request failed"));
+                }
+            }
+        }
     }
 }
 
@@ -364,5 +387,63 @@ mod tests {
         let out = e.embed_query("q").unwrap();
         assert_eq!(*count.lock().unwrap(), 1); // exactly one request
         assert_eq!(out, vec![0.0f32, 0.0, 1.0]); // L2-normalized
+    }
+
+    // Extend the stub so it can return non-200 statuses first.
+    fn spawn_status_stub(statuses: Vec<(u16, String)>) -> (String, Arc<Mutex<usize>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = Arc::new(Mutex::new(0usize));
+        let seen = count.clone();
+        let queue = Arc::new(Mutex::new(statuses));
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = std::io::Read::read(&mut stream, &mut buf);
+                *seen.lock().unwrap() += 1;
+                let (code, body) = queue.lock().unwrap().remove(0);
+                let reason = if code == 200 { "OK" } else { "ERR" };
+                let resp = format!(
+                    "HTTP/1.1 {code} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = std::io::Write::write_all(&mut stream, resp.as_bytes());
+            }
+        });
+        (format!("http://{addr}/embed"), count)
+    }
+
+    #[test]
+    fn retries_on_429_then_succeeds() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: ENV_LOCK serializes every test that touches process env vars.
+        unsafe { std::env::set_var("KNAPPER_TEST_KEY", "k") };
+        let (endpoint, count) = spawn_status_stub(vec![
+            (429, "{}".into()),
+            (200, r#"{"vectors":[[1.0,0.0,0.0]]}"#.into()),
+        ]);
+        let mut e = ApiEmbedder::new(StubProvider { endpoint, cap: 8 }, None, 30, 3).unwrap();
+        let out = e.embed_batch(&[EmbedDoc::untitled("a")]).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(*count.lock().unwrap(), 2); // one retry
+    }
+
+    #[test]
+    fn gives_up_after_max_retries() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: ENV_LOCK serializes every test that touches process env vars.
+        unsafe { std::env::set_var("KNAPPER_TEST_KEY", "k") };
+        let (endpoint, count) = spawn_status_stub(vec![
+            (500, "{}".into()),
+            (500, "{}".into()),
+            (500, "{}".into()),
+            (500, "{}".into()),
+        ]);
+        let mut e = ApiEmbedder::new(StubProvider { endpoint, cap: 8 }, None, 30, 2).unwrap();
+        let err = e.embed_batch(&[EmbedDoc::untitled("a")]).unwrap_err();
+        assert!(err.to_string().contains("embedding request failed"));
+        assert_eq!(*count.lock().unwrap(), 3); // initial try + 2 retries
     }
 }
