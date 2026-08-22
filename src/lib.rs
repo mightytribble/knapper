@@ -4,6 +4,7 @@ pub mod coalesce;
 pub mod config;
 pub mod context;
 pub mod docid;
+pub mod embed_api;
 pub mod exclude;
 pub mod fingerprint;
 pub mod fts;
