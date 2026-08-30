@@ -36,6 +36,9 @@ RUN cargo build --release ${KNAPPER_CARGO_FEATURES} \
 # cublasLt_static, culibos), so no CUDA userspace is needed here; -lcuda
 # resolves at run time against the driver that `--gpus all` injects.
 FROM ubuntu:24.04 AS runtime
+LABEL org.opencontainers.image.source="https://github.com/mightytribble/knapper" \
+      org.opencontainers.image.description="Local hybrid search and MCP retrieval for Obsidian-format vaults" \
+      org.opencontainers.image.licenses="MIT"
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /knapper /usr/local/bin/knapper
