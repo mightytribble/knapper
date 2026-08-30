@@ -1028,6 +1028,25 @@ impl Default for ModelDefaults {
     }
 }
 
+/// The embed model name `status` reports: the configured `models.embed`, or
+/// the shipped default when none is set. An `hf:` URI or a bare path reduces
+/// to the model file's stem, because the rest of the URI names a download
+/// location rather than a model; a `gemini:` id keeps its scheme, which is
+/// what says the model is not local.
+pub fn embed_model_display(config: &crate::config::Config) -> String {
+    let defaults = ModelDefaults::default();
+    let uri = config
+        .models
+        .embed
+        .as_deref()
+        .unwrap_or(&defaults.embed_uri);
+    if uri.starts_with("gemini:") {
+        return uri.to_string();
+    }
+    let file = uri.rsplit('/').next().unwrap_or(uri);
+    file.strip_suffix(".gguf").unwrap_or(file).to_string()
+}
+
 /// llama.cpp's own thread default, used only when the machine will say nothing
 /// at all about how many cores it has.
 const FALLBACK_N_THREADS: i32 = 4;
@@ -2290,5 +2309,27 @@ mod tests {
             vec![1.0],
             "embed_query through the box must reach the inner override, not embed_one/embed_batch"
         );
+    }
+
+    /// `status` reports the embed model that is actually configured, not a
+    /// hardcoded name (launch-day bug: it printed all-MiniLM-L6-v2 always).
+    #[test]
+    fn the_status_model_name_is_the_configured_model_not_a_constant() {
+        let cfg = crate::config::Config::default();
+        assert_eq!(embed_model_display(&cfg), "embeddinggemma-300M-Q8_0");
+    }
+
+    #[test]
+    fn an_explicit_hf_uri_displays_as_its_model_file_stem() {
+        let mut cfg = crate::config::Config::default();
+        cfg.models.embed = Some("hf:org/some-model-GGUF/some-model-Q4_K_M.gguf".into());
+        assert_eq!(embed_model_display(&cfg), "some-model-Q4_K_M");
+    }
+
+    #[test]
+    fn a_gemini_model_displays_with_its_scheme() {
+        let mut cfg = crate::config::Config::default();
+        cfg.models.embed = Some("gemini:gemini-embedding-2".into());
+        assert_eq!(embed_model_display(&cfg), "gemini:gemini-embedding-2");
     }
 }

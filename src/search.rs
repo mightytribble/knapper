@@ -1357,7 +1357,7 @@ struct StatusInputs {
     stats: StoreStats,
     edges: EdgeStats,
     index_size: u64,
-    model_name: &'static str,
+    model_name: String,
     intelligence: &'static str,
     date_count: usize,
 }
@@ -1382,7 +1382,7 @@ fn collect_status(store: &Store, data_dir: &Path) -> Result<StatusInputs> {
         stats,
         edges,
         index_size,
-        model_name: "all-MiniLM-L6-v2",
+        model_name: crate::llm::embed_model_display(&config),
         intelligence: if config.intelligence_enabled() {
             "enabled"
         } else {
@@ -1401,7 +1401,7 @@ pub fn run_status(json: bool, data_dir: &Path) -> Result<()> {
         &s.stats,
         &s.edges,
         s.index_size,
-        s.model_name,
+        &s.model_name,
         s.intelligence,
         s.date_count,
         json,
@@ -1424,7 +1424,7 @@ pub fn status_json(store: &Store, data_dir: &Path) -> Result<serde_json::Value> 
         &s.stats,
         &s.edges,
         s.index_size,
-        s.model_name,
+        &s.model_name,
         s.intelligence,
         s.date_count,
     ))
