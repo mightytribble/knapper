@@ -415,6 +415,8 @@ Notes that don't match any signal with sufficient confidence stay in place. Dail
 
 ## ChatGPT Actions
 
+> **Untested in v0.9.** The API half of this path works, but the GPT import step is known to fail on the shipped OpenAPI spec (two endpoint descriptions exceed ChatGPT's 300-character cap), and the setup flow still references the retired plugin-manifest format. The fixes are tracked in [#87](https://github.com/mightytribble/knapper/issues/87) for v1. The HTTP API itself ([above](#http-rest-api)) is supported.
+
 Connect your Obsidian vault to ChatGPT as a custom GPT Action. ChatGPT can search, read, create, and edit your notes through knapper's REST API.
 
 ### Prerequisites
