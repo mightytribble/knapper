@@ -142,7 +142,7 @@ Or register the MCP server yourself with the Claude Code CLI:
 claude mcp add --scope user knapper -- knapper serve
 ```
 
-Or add it by hand to `~/.claude.json` (user scope) or a project's `.mcp.json` (project scope). [docs/deployment.md](docs/deployment.md) has the full setup for each platform.
+Or add it by hand to `~/.claude.json` (user scope) or a project's `.mcp.json` (project scope). [deployment.md](deployment.md) has the full setup for each platform.
 
 ```json
 {
@@ -298,7 +298,7 @@ Returns orphan notes (no links in or out), broken wikilinks, stale notes, and ta
 
 **19 endpoints:**
 
-Every capability is one route, and the route is the CLI command's name under `/api/`. `docs/surfaces.md` is the generated table of all three surfaces.
+Every capability is one route, and the route is the CLI command's name under `/api/`. `surfaces.md` is the generated table of all three surfaces.
 
 | Method | Endpoint | Permission | Description |
 |--------|----------|------------|-------------|

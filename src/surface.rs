@@ -324,7 +324,7 @@ pub fn expected(
     set
 }
 
-/// The capability table as markdown, for `docs/surfaces.md`. Generating it
+/// The capability table as markdown, for `surfaces.md`. Generating it
 /// is what stops the documentation and the code from drifting (#62).
 pub fn render_table() -> String {
     let mut out = String::from(
@@ -657,11 +657,11 @@ mod tests {
     #[test]
     fn the_committed_table_matches_the_rendered_one() {
         let want = render_table();
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/docs/surfaces.md");
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/surfaces.md");
         let got = std::fs::read_to_string(path).unwrap_or_default();
         assert_eq!(
             got, want,
-            "docs/surfaces.md is stale. Write this to it:\n\n{want}"
+            "surfaces.md is stale. Write this to it:\n\n{want}"
         );
     }
 }

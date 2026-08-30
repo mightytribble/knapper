@@ -10,7 +10,7 @@ knapper serve --http --no-auth    # Local dev only (127.0.0.1)
 
 ## Key Endpoints
 
-Every capability is one route, named after the CLI command it answers. The whole table of three surfaces is `docs/surfaces.md`.
+Every capability is one route, named after the CLI command it answers. The whole table of three surfaces is `surfaces.md`.
 
 | Method | Endpoint                | Description                                                      |
 | ------ | ----------------------- | ---------------------------------------------------------------- |

@@ -15,3 +15,7 @@ target-cuda/
 
 # SDD scratch workspace (ledger, briefs, review packages)
 .superpowers/
+
+# dev-only measurement and design noise (kept on disk, out of the repo)
+/docs/
+/eval/
