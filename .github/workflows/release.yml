@@ -92,5 +92,14 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Formula/knapper.rb
+
+          # A re-run of a release whose formula is already current stages
+          # nothing, and `git commit` exits non-zero on an empty commit, which
+          # under `bash -e` fails the job for no fault. Report and stop instead.
+          if git diff --staged --quiet; then
+            echo "Formula is already at ${{ inputs.tag }}; nothing to commit."
+            exit 0
+          fi
+
           git commit -m "Update knapper to ${{ inputs.tag }}"
           git push
