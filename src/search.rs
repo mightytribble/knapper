@@ -85,6 +85,19 @@ pub struct RetrievalTrace {
     pub scope: Option<ScopeTrace>,
     pub semantic_hits: usize,
     pub fts_hits: usize,
+    /// What the calibrated scorer computed for the query itself, or `None` on
+    /// every other path — the legacy stage, a configured cross-encoder, and
+    /// the degraded interleave (spec 2026-08-30).
+    pub calibrated: Option<CalibratedTrace>,
+}
+
+/// What the calibrated scorer computed for the query itself (spec 2026-08-30):
+/// the BM25 upper bound and each term's idf. Per-candidate probabilities are
+/// the `"calibrated"` lane contribution and print with the fusion detail.
+#[derive(Debug, Clone)]
+pub struct CalibratedTrace {
+    pub bound: f64,
+    pub idfs: Vec<(String, f64)>,
 }
 
 /// Configuration for the intelligence search pipeline.
@@ -298,6 +311,9 @@ pub fn search_with_intelligence(
                 semantic_hits: 0,
                 fts_hits: 0,
                 scope: scope_trace,
+                // No lane ran, so there is nothing for the calibrated scorer
+                // to have computed.
+                calibrated: None,
             },
             fts_columns: config.fts.columns(),
         });
@@ -384,12 +400,16 @@ pub fn search_with_intelligence(
         });
     }
 
-    let trace = RetrievalTrace {
+    // Mutable: the sorted stage fills `calibrated` in after it runs, below,
+    // because `apply_calibrated_scores` has not been called yet at this point
+    // in the function.
+    let mut trace = RetrievalTrace {
         query: query.to_string(),
         fts_expr: crate::fts::any_term_expr(query),
         semantic_hits: semantic_hits.len(),
         fts_hits: fts_hits.len(),
         scope: scope_trace,
+        calibrated: None,
     };
 
     // Rescale each lane against its own range on the way into the seed pool.
@@ -539,7 +559,7 @@ pub fn search_with_intelligence(
     // fallback for a *configured* model that fails at call time (§7.3), and a
     // deliberate configuration is not that.
     if enters_sorted {
-        let (final_fused, degraded) = sorted_stage(
+        let (final_fused, degraded, calibrated) = sorted_stage(
             query,
             &query_vec,
             config,
@@ -550,6 +570,7 @@ pub fn search_with_intelligence(
             date_range,
             RRF_K,
         );
+        trace.calibrated = calibrated;
 
         // No limit on the results by default. Limit what the model reads, not
         // what it returns: if one document holds the ten best sections, then ten
@@ -857,7 +878,9 @@ fn build_result(
 /// (spec 2026-08-30) — which is why `query_vec` comes in: the backfill needs
 /// the query's embedding to give a candidate no content lane fetched a cosine.
 ///
-/// Returns the ranked results and whether the order is the degraded one.
+/// Returns the ranked results, whether the order is the degraded one, and the
+/// calibrated trace when the calibrated scorer is what ran (`None` for a
+/// configured cross-encoder, and for the degraded interleave).
 #[allow(clippy::too_many_arguments)]
 fn sorted_stage(
     query: &str,
@@ -869,7 +892,7 @@ fn sorted_stage(
     weights: &crate::config::LaneWeights,
     date_range: Option<(i64, i64)>,
     rrf_k: usize,
-) -> (Vec<FusedResult>, bool) {
+) -> (Vec<FusedResult>, bool, Option<CalibratedTrace>) {
     // Two lanes, not three. The graph is a candidate generator and not a
     // scorer (§3), so it no longer votes here — `weights.graph` is read by the
     // legacy stage and by nothing else.
@@ -918,6 +941,11 @@ fn sorted_stage(
 
     // Which scorer fills `rerank_score`. One slot, two writers: the sort, the
     // floor and the confidence all read the same field, whichever one ran.
+    //
+    // Set only by the calibrated arm below, so a configured cross-encoder and
+    // the degraded interleave both report `None` — there is no bound or idf
+    // to show for either.
+    let mut calibrated_trace: Option<CalibratedTrace> = None;
     let scored = if let Some(reranker) = &mut config.reranker {
         let targets: Vec<RerankTarget<'_>> = pool
             .iter()
@@ -978,6 +1006,7 @@ fn sorted_stage(
             &mut pool,
         );
         tracing::debug!(bound, terms = idfs.len(), "calibrated scores assembled");
+        calibrated_trace = Some(CalibratedTrace { bound, idfs });
         true
     };
 
@@ -985,7 +1014,7 @@ fn sorted_stage(
         let ordered = ranking::degraded_interleave(pool);
         let mut results = ranking::into_fused(ordered, "rerank");
         ranking::degraded_confidence(&mut results);
-        return (results, true);
+        return (results, true, None);
     }
 
     ranking::sort_by_rerank(&mut pool, config.ranking.tiebreak);
@@ -1044,7 +1073,11 @@ fn sorted_stage(
     } else {
         "rerank"
     };
-    (ranking::into_fused(pool, sort_lane), false)
+    (
+        ranking::into_fused(pool, sort_lane),
+        false,
+        calibrated_trace,
+    )
 }
 
 /// Compute the calibrated probability for every pool candidate and store it in
@@ -1374,6 +1407,19 @@ fn format_retrieval(trace: &RetrievalTrace, columns: &[(&str, f64)]) -> String {
     match &trace.fts_expr {
         Some(expr) => out.push_str(&format!("  ← {expr}\n")),
         None => out.push_str("  ← (no searchable term; fts skipped)\n"),
+    }
+    // The query-level half of the calibrated scorer (spec 2026-08-30): the
+    // per-candidate probability already prints as the `"calibrated"` lane
+    // below, in the fusion detail. This line is the bound and idfs it was
+    // computed from, absent on every other path.
+    if let Some(cal) = &trace.calibrated {
+        let idfs = cal
+            .idfs
+            .iter()
+            .map(|(t, i)| format!("idf({t})={i:.2}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        out.push_str(&format!("calibrated: bound={:.2}  {}\n", cal.bound, idfs));
     }
     out.push('\n');
     out
@@ -3948,6 +3994,57 @@ mod tests {
         assert!(
             orthogonal > crate::calibrate::probability(0.0, 0.0, &params),
             "and the keyword backfill must reach it as well: {orthogonal}"
+        );
+    }
+
+    /// The query-level half of `apply_calibrated_scores`'s return (spec
+    /// 2026-08-30): the BM25 upper bound and each term's idf, which reach
+    /// `--explain` beside the per-candidate probability that already prints as
+    /// the `"calibrated"` lane. A reranked run has no bound or idf to report,
+    /// so the line does not print.
+    #[test]
+    fn explain_carries_the_calibrated_bound_and_idfs() {
+        let (_tmp, store, mut embedder) = indexed_vault();
+
+        let calibrated_out = calibrated_search(
+            "warding",
+            &store,
+            &mut embedder,
+            crate::config::CalibratedConfig {
+                floor: 0.0,
+                ..Default::default()
+            },
+        );
+        let report = explain_report(&calibrated_out, 10);
+        assert!(report.contains("calibrated: bound="), "{report}");
+        assert!(report.contains("idf("), "{report}");
+
+        let mut reranker = CountingReranker::new();
+        let mut config = SearchConfig {
+            fts: crate::config::FtsConfig::default(),
+            scope: crate::tags::Scope::default(),
+            reranker: Some(&mut reranker),
+            store: &store,
+            rerank_candidates: 30,
+            lane_weights: crate::config::LaneWeights::default(),
+            rerank: crate::config::RerankConfig::default(),
+            max_chunks_per_file: 3,
+            group_by: GroupBy::Chunk,
+            ranking: sorted_config(crate::config::RankingConfig {
+                coalesce_adjacent: false,
+                ..Default::default()
+            }),
+            calibrated: crate::config::CalibratedConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        };
+        let reranked_out =
+            search_with_intelligence("warding", 20, &mut embedder, &mut config).unwrap();
+        let reranked_report = explain_report(&reranked_out, 10);
+        assert!(
+            !reranked_report.contains("calibrated: bound="),
+            "{reranked_report}"
         );
     }
 
