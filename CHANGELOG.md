@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.9.1 (2026-08-30)
+
+### Calibrated score fusion: the model-free default ranks and abstains
+
+With no cross-encoder configured — the default install — the sorted ranking stage now runs and a three-coefficient logistic sorts the candidate pool, where the build fell to the legacy five-lane fusion order before. Each content lane's score is normalized per query onto an absolute `[0, 1]` evidence scale — BM25 against the query's own upper bound, cosine as the near-absolute signal it already is — and `p = σ(w_s·cos + w_k·bm25n + b)` fuses the pair into one probability per candidate. Results sort by that probability, the answer floor applies to it, and the confidence reported is a probability rather than a share of the top result. No model call runs. Design: `docs/specs/2026-08-30-calibrated-fusion-design.md`.
+
+Measured through `eval/pool.sh` at `top_n = 20` on a 240-file / 1501-chunk vault, three arms over one store: the calibrated path and the cross-encoder abstain on the same nine of twelve non-answers and keep the same three negatives, where the previous model-free order returned a full 14-20 block window for every query — the nonsense control included — and reported 100% on all twenty.
+
+#### Added
+
+- **`[calibrated]`**, a config section read only on the model-free path: `enabled` (default `true`), the fitted coefficients `semantic = 13.878`, `keyword = 13.571`, `intercept = -5.848`, and `floor = 0.75`, the probability below which a candidate is not an answer. Every key is query-time and reaches no fingerprint, so a change re-indexes nothing and a sweep is a config edit. `enabled = false` restores the previous routing — a no-model build takes the legacy stage — byte for byte; `floor = 0.0` removes nothing. With a cross-encoder configured the whole section is inert.
+- **Abstention on the default install.** A query the vault cannot answer returns the empty set with `NO_RELEVANT_CONTENT` on the CLI, over MCP and on `POST /api/search`. The previous model-free path could not abstain at all: `answer_floor` skips a candidate whose score is not a probability, and every score on that path was a fused rank.
+- **`calibrate.rs`**, the fusion arithmetic: FTS5's idf with its clamp, the query's BM25 upper bound `(k1 + 1) · Σ idf`, the `[0, 1]` normalization and the logistic. Pure math with no store and no model, so every formula is tested against hand-computed values.
+- **`--explain` reports the path's working**: the query's BM25 upper bound and each term's idf beside the MATCH expression, and every candidate's probability as a `calibrated` lane contribution.
+
+#### Changed
+
+- **Confidence on the model-free path is an absolute probability.** It was `rrf_score` renormalized against the top result, so the first answer of every query printed 100% however bad it was.
+- **The graph and temporal lanes are judged on the same scale as content candidates** on this path. A graph admission is scored by the logistic rather than slotted by reserved-quota position, so provenance no longer caps rank; its features come from the store when no content lane fetched the candidate.
+- **`into_fused` names its sort lane**, `rerank` or `calibrated`, so `--explain` reports which scorer produced the order and the answer floor applies to whichever probability sorted the pool.
+- **Test count: 1014 → 1035.**
+
 ## 0.9.0 (2026-08-16) — knapper
 
 The project leaves fork status: engraph, forked at v1.7.2, becomes knapper. The binary, the repository (mightytribble/knapper), the data directory (`~/.knapper/`) and the store file (`knapper.db`, with a read fallback to an existing `engraph.db`) carry the new name. The MIT license and the full git history stay; see `NOTICE`. Versions restart at 0.9.x; 1.0.0 marks the v1 milestone: functional Metal and Docker build pipelines.
