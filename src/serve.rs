@@ -56,6 +56,9 @@ pub struct KnapperServer {
     /// positional over the columns the store's index is declared with, so this
     /// has to be the config the store was built from (issue #37).
     fts: crate::config::FtsConfig,
+    /// Calibrated score fusion for the model-free sorted stage, from
+    /// `config.toml` (docs/specs/2026-08-30-calibrated-fusion-design.md).
+    calibrated: crate::config::CalibratedConfig,
     /// The index-time settings — how a note written by an MCP tool is chunked,
     /// and the vector it is embedded as — captured once at startup so every
     /// write tool and every full index this server runs shares one chunking and
@@ -155,6 +158,7 @@ impl KnapperServer {
             lane_weights: self.lane_weights,
             fts: self.fts,
             scope,
+            calibrated: self.calibrated.clone(),
         };
 
         let output =
@@ -941,6 +945,7 @@ pub async fn run_serve(
     let ranking = config.ranking;
     let lane_weights = config.lane_weights;
     let fts = config.fts;
+    let calibrated = config.calibrated.clone();
     // The index-time settings read once, off this startup config, so the write
     // tools, the full index and the watcher all share one chunking and one
     // vector space with the vault (#72).
@@ -977,6 +982,7 @@ pub async fn run_serve(
         ranking,
         lane_weights,
         fts,
+        calibrated: calibrated.clone(),
         index_settings,
         output: output.clone(),
     };
@@ -1005,6 +1011,7 @@ pub async fn run_serve(
             ranking,
             lane_weights,
             fts,
+            calibrated,
             index_settings,
             output,
         };
@@ -1160,6 +1167,12 @@ mod tests {
             ranking: crate::config::RankingConfig::default(),
             lane_weights: crate::config::LaneWeights::default(),
             fts: crate::config::FtsConfig::default(),
+            // These tests assert the pre-calibration paths; the calibrated
+            // sort has its own tests (Task 7).
+            calibrated: crate::config::CalibratedConfig {
+                enabled: false,
+                ..Default::default()
+            },
             index_settings: crate::indexer::IndexSettings {
                 chunk: crate::chunker::ChunkOptions {
                     min_chars: 0,
@@ -1480,6 +1493,12 @@ mod tests {
             ranking: crate::config::RankingConfig::default(),
             lane_weights: crate::config::LaneWeights::default(),
             fts: crate::config::FtsConfig::default(),
+            // These tests assert the pre-calibration paths; the calibrated
+            // sort has its own tests (Task 7).
+            calibrated: crate::config::CalibratedConfig {
+                enabled: false,
+                ..Default::default()
+            },
             index_settings: crate::indexer::IndexSettings {
                 chunk: crate::chunker::ChunkOptions {
                     min_chars: 0,

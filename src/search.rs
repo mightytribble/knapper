@@ -111,6 +111,9 @@ pub struct SearchConfig<'a> {
     pub fts: crate::config::FtsConfig,
     /// The notes this query may answer from (#60). Empty means the whole vault.
     pub scope: crate::tags::Scope,
+    /// Calibrated score fusion for the model-free sorted stage
+    /// (docs/specs/2026-08-30-calibrated-fusion-design.md).
+    pub calibrated: crate::config::CalibratedConfig,
 }
 
 impl<'a> SearchConfig<'a> {
@@ -127,6 +130,7 @@ impl<'a> SearchConfig<'a> {
             lane_weights: config.lane_weights,
             fts: config.fts,
             scope: crate::tags::Scope::default(),
+            calibrated: config.calibrated.clone(),
         }
     }
 }
@@ -1829,6 +1833,12 @@ mod tests {
             },
             lane_weights: crate::config::LaneWeights::default(),
             scope: crate::tags::Scope::default(),
+            // These tests assert the pre-calibration paths; the calibrated
+            // sort has its own tests (Task 7).
+            calibrated: crate::config::CalibratedConfig {
+                enabled: false,
+                ..Default::default()
+            },
         };
         search_with_intelligence(query, top_n, embedder, &mut config).unwrap()
     }
@@ -1879,6 +1889,10 @@ mod tests {
                 coalesce_adjacent: true,
                 ..crate::config::RankingConfig::default()
             },
+            calibrated: crate::config::CalibratedConfig {
+                enabled: false,
+                ..Default::default()
+            },
         };
         let out = search_with_intelligence("warding", 10, &mut embedder, &mut config).unwrap();
         let abjuration: Vec<&InternalSearchResult> = out
@@ -1914,6 +1928,10 @@ mod tests {
                 coalesce_adjacent: false,
                 ..crate::config::RankingConfig::default()
             },
+            calibrated: crate::config::CalibratedConfig {
+                enabled: false,
+                ..Default::default()
+            },
         };
         let out = search_with_intelligence("warding", 10, &mut embedder, &mut config).unwrap();
         let count = out
@@ -1944,6 +1962,10 @@ mod tests {
                     coalesce_adjacent: coalesce,
                     ..crate::config::RankingConfig::default()
                 }),
+                calibrated: crate::config::CalibratedConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
             };
             let out = search_with_intelligence("warding", 20, embedder, &mut config).unwrap();
             out.results.first().map(|r| r.score)
@@ -1979,6 +2001,10 @@ mod tests {
                 ranking: crate::config::RankingConfig {
                     coalesce_adjacent,
                     ..crate::config::RankingConfig::default()
+                },
+                calibrated: crate::config::CalibratedConfig {
+                    enabled: false,
+                    ..Default::default()
                 },
             };
             search_with_intelligence("warding", 10, embedder, &mut config)
@@ -2039,6 +2065,10 @@ mod tests {
                     per_note_cap,
                     ..crate::config::RankingConfig::default()
                 }),
+                calibrated: crate::config::CalibratedConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
             };
             let out = search_with_intelligence("warding", 20, embedder, &mut config).unwrap();
             out.results
@@ -2125,6 +2155,10 @@ mod tests {
                 ..crate::config::RankingConfig::default()
             },
             scope: crate::tags::Scope::default(),
+            calibrated: crate::config::CalibratedConfig {
+                enabled: false,
+                ..Default::default()
+            },
         };
         search_with_intelligence(query, top_n, embedder, &mut config).unwrap()
     }
@@ -2202,6 +2236,15 @@ mod tests {
     ) -> Result<SearchOutput> {
         let mut config = SearchConfig {
             scope,
+            // `SearchConfig::new` takes the loaded config's calibrated
+            // section, which defaults to enabled. Overridden here for the
+            // same reason as `heuristic_search`: these tests assert the
+            // pre-calibration paths, and the calibrated sort has its own
+            // tests (Task 7).
+            calibrated: crate::config::CalibratedConfig {
+                enabled: false,
+                ..Default::default()
+            },
             ..SearchConfig::new(store, &crate::config::Config::default())
         };
         search_with_intelligence(query, 20, embedder, &mut config)
@@ -2566,6 +2609,10 @@ mod tests {
                 max_chunks_per_file: 3,
                 group_by: GroupBy::Chunk,
                 ranking: crate::config::RankingConfig::default(),
+                calibrated: crate::config::CalibratedConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
             };
             search_with_intelligence(query, 10, embedder, &mut config).unwrap();
         }
@@ -2698,6 +2745,10 @@ mod tests {
             max_chunks_per_file: 3,
             group_by: GroupBy::Chunk,
             ranking: sorted_config(crate::config::RankingConfig::default()),
+            calibrated: crate::config::CalibratedConfig {
+                enabled: false,
+                ..Default::default()
+            },
         };
         search_with_intelligence(query, 20, embedder, &mut config).unwrap()
     }
@@ -2889,6 +2940,10 @@ mod tests {
                 max_chunks_per_file: 3,
                 group_by: GroupBy::Chunk,
                 ranking: sorted_config(crate::config::RankingConfig::default()),
+                calibrated: crate::config::CalibratedConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
             };
             let output =
                 search_with_intelligence("warding", 10, &mut embedder, &mut config).unwrap();
@@ -2926,6 +2981,10 @@ mod tests {
                 // and_not_the_results`.
                 ranking: crate::config::RankingConfig {
                     mode: crate::config::RankingMode::Legacy,
+                    ..Default::default()
+                },
+                calibrated: crate::config::CalibratedConfig {
+                    enabled: false,
                     ..Default::default()
                 },
             };
@@ -3018,6 +3077,10 @@ mod tests {
                 max_chunks_per_file: 3,
                 group_by: GroupBy::Chunk,
                 ranking,
+                calibrated: crate::config::CalibratedConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
             };
             let output = search_with_intelligence("warding", 20, embedder, &mut config).unwrap();
             output
@@ -3085,6 +3148,10 @@ mod tests {
                     answer_floor: floor,
                     ..Default::default()
                 },
+                calibrated: crate::config::CalibratedConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
             };
             search_with_intelligence("warding", 20, embedder, &mut config)
                 .unwrap()
@@ -3150,6 +3217,10 @@ mod tests {
                     coalesce_adjacent: false,
                     ..Default::default()
                 }),
+                calibrated: crate::config::CalibratedConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
             };
             search_with_intelligence("warding", 20, embedder, &mut config)
                 .unwrap()
@@ -3195,6 +3266,10 @@ mod tests {
                     graph_reserve: 2,
                     ..Default::default()
                 }),
+                calibrated: crate::config::CalibratedConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
             };
             search_with_intelligence("warding", 10, &mut embedder, &mut config).unwrap();
         }
@@ -3255,6 +3330,10 @@ mod tests {
             max_chunks_per_file: 3,
             group_by: GroupBy::Chunk,
             ranking: sorted_config(crate::config::RankingConfig::default()),
+            calibrated: crate::config::CalibratedConfig {
+                enabled: false,
+                ..Default::default()
+            },
         };
         let output = search_with_intelligence("warding", 10, &mut embedder, &mut config).unwrap();
 
@@ -3286,6 +3365,10 @@ mod tests {
                 coalesce_adjacent: false,
                 ..Default::default()
             }),
+            calibrated: crate::config::CalibratedConfig {
+                enabled: false,
+                ..Default::default()
+            },
         };
         let output = search_with_intelligence("warding", 20, &mut embedder, &mut config).unwrap();
 
@@ -3319,6 +3402,10 @@ mod tests {
             max_chunks_per_file: 3,
             group_by: GroupBy::Chunk,
             ranking: sorted_config(crate::config::RankingConfig::default()),
+            calibrated: crate::config::CalibratedConfig {
+                enabled: false,
+                ..Default::default()
+            },
         };
         let output = search_with_intelligence("warding", 10, &mut embedder, &mut config).unwrap();
 
@@ -3348,6 +3435,10 @@ mod tests {
                 shortlist_cap: 6,
                 ..Default::default()
             }),
+            calibrated: crate::config::CalibratedConfig {
+                enabled: false,
+                ..Default::default()
+            },
         };
         let output = search_with_intelligence("warding", 10, &mut embedder, &mut config).unwrap();
 

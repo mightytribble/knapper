@@ -54,6 +54,9 @@ pub struct ApiState {
     pub lane_weights: crate::config::LaneWeights,
     /// Keyword-lane settings from `config.toml` (issue #37).
     pub fts: crate::config::FtsConfig,
+    /// Calibrated score fusion for the model-free sorted stage, from
+    /// `config.toml` (docs/specs/2026-08-30-calibrated-fusion-design.md).
+    pub calibrated: crate::config::CalibratedConfig,
     /// The index-time settings — how a note written over HTTP is chunked, and
     /// the vector it is embedded as — captured once at startup so every write
     /// endpoint and every full index this server runs shares one chunking and
@@ -412,6 +415,7 @@ async fn handle_search(
         lane_weights: state.lane_weights,
         fts: state.fts,
         scope,
+        calibrated: state.calibrated.clone(),
     };
 
     let output = search::search_with_intelligence(&body.query, top_n, &mut *embedder, &mut config)
@@ -1131,6 +1135,12 @@ mod tests {
             ranking: crate::config::RankingConfig::default(),
             lane_weights: crate::config::LaneWeights::default(),
             fts: crate::config::FtsConfig::default(),
+            // These tests assert the pre-calibration paths; the calibrated
+            // sort has its own tests (Task 7).
+            calibrated: crate::config::CalibratedConfig {
+                enabled: false,
+                ..Default::default()
+            },
             index_settings: crate::indexer::IndexSettings {
                 chunk: crate::chunker::ChunkOptions {
                     min_chars: 0,
