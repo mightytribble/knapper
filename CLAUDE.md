@@ -122,7 +122,7 @@ git tag -a v0.9.x -m "knapper v0.9.x"
 git push origin v0.9.x && git push public v0.9.x
 gh workflow run release.yml --repo mightytribble/knapper -f tag=v0.9.x
 
-# Enable intelligence (downloads ~1.3GB)
+# Enable intelligence (downloads the ~610MB cross-encoder)
 knapper configure --enable-intelligence
 
 # Re-record demo GIF

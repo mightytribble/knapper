@@ -12,7 +12,8 @@ Knapper is under active development and should still be considered experimental.
 
 Plain vector search treats your notes as isolated documents. But knowledge isn't flat — your notes link to each other, share tags, reference the same people and projects. knapper understands these connections and makes them visible to your agents.
 
-- **5-lane hybrid search** — semantic embeddings + BM25 full-text + graph expansion + cross-encoder reranking + temporal scoring. The content lanes fuse via [Reciprocal Rank Fusion](https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf), graph and temporal candidates join the shortlist by reserved quota, and the cross-encoder sorts it. Lane weights are configurable. Time-aware queries like "what happened last week" or "March 2026 notes" activate the temporal lane automatically.
+- **5-lane hybrid search** — semantic embeddings + BM25 full-text + graph expansion + cross-encoder reranking + temporal scoring. The content lanes fuse via [Reciprocal Rank Fusion](https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf), graph and temporal candidates join the shortlist by reserved quota, and one absolute scorer sorts it — a calibrated probability by default, the cross-encoder when intelligence is enabled. Lane weights are configurable. Time-aware queries like "what happened last week" or "March 2026 notes" activate the temporal lane automatically.
+- **Ranks and abstains with no model** — the default install fuses each lane's self-normalized score into a calibrated probability, so a result carries real confidence and a query your vault cannot answer returns nothing rather than a confident wrong answer. Measured on a CPU build: ~22 ms a query against ~13.8 s for the cross-encoder, refusing exactly the same queries it refuses from a sample corpus.
 - **MCP server for AI agents** — `knapper serve` exposes 18 tools (search, read, list, tags, vault_map, create, update, delete, move, archive, index, reindex_file, status, health, validate, identity, init, migrate) that Claude, Cursor, or any MCP client can call directly.
 - **HTTP REST API** — `knapper serve --http` adds an axum-based HTTP server alongside MCP with 19 REST endpoints, API key authentication, rate limiting, and CORS. Web-based agents and scripts can query your vault with simple `curl` calls.
 - **Section-level editing** — AI agents can read, replace, prepend, or append to a section by heading, to the note's body, or to a frontmatter property — every change is one `update` call carrying a list of edits.
@@ -65,7 +66,8 @@ Your vault (markdown files)
 │  + HTTP REST API (--http, optional)         │
 │                                             │
 │  Search: retrieval → RRF fuses lanes        │
-│          → cross-encoder sorts shortlist    │
+│          → calibrated probability sorts,    │
+│            or the cross-encoder if enabled  │
 │                                             │
 │  18 MCP tools + 19 REST endpoints           │
 └─────────────────────────────────────────────┘
@@ -75,7 +77,7 @@ Your vault (markdown files)
 ```
 
 1. **Index** — walks your vault, chunks markdown by headings, embeds with a local GGUF model via llama.cpp (Metal GPU on macOS), stores everything in SQLite with FTS5 + sqlite-vec + a wikilink graph
-2. **Search** — runs the query through up to five lanes (semantic KNN, BM25 keyword, graph expansion, cross-encoder reranking, temporal scoring): the content lanes fuse via RRF at configurable per-lane weights, then the cross-encoder sorts the shortlist
+2. **Search** — runs the query through up to five lanes (semantic KNN, BM25 keyword, graph expansion, cross-encoder reranking, temporal scoring): the content lanes fuse via RRF at configurable per-lane weights, then one absolute scorer sorts the shortlist: a calibrated probability fused from the lane scores, or the cross-encoder when intelligence is enabled
 3. **Serve** — starts an MCP server that AI agents connect to, with a file watcher that re-indexes changes in real time
 
 ## Quick start
