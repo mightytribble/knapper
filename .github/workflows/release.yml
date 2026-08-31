@@ -119,6 +119,64 @@ jobs:
         with:
           ref: ${{ inputs.tag }}
 
+      # Image tags carry the bare version: the release tag is v0.9.1, the
+      # image is 0.9.1-cpu.
+      - name: Derive image version
+        id: ver
+        env:
+          TAG: ${{ inputs.tag }}
+        run: echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # docker/login-action checks that credentials parse, not that they may
+      # write, so a denied push surfaces only once the build is done — which
+      # on the cuda leg is 46 minutes of compilation spent to learn nothing.
+      # Ask the registry up front: opening a blob upload needs write access
+      # and creates no tag, blob or manifest — only an upload session, which
+      # ghcr will not let you cancel (it answers 405) and collects itself.
+      - name: Probe registry write access
+        env:
+          ACTOR: ${{ github.actor }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          repo=mightytribble/knapper
+          settings=https://github.com/users/mightytribble/packages/container/knapper/settings
+
+          bearer=$(curl -sS -u "$ACTOR:$TOKEN" \
+            "https://ghcr.io/token?service=ghcr.io&scope=repository:$repo:pull,push" \
+            | python3 -c 'import sys,json;print(json.load(sys.stdin).get("token",""))') || true
+          if [ -z "$bearer" ]; then
+            echo "::error::ghcr.io issued no push token for $repo."
+            echo "Grant this repository the Write role under Manage Actions access: $settings"
+            exit 1
+          fi
+
+          headers=$(mktemp)
+          code=$(curl -sS -o /dev/null -D "$headers" -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $bearer" \
+            "https://ghcr.io/v2/$repo/blobs/uploads/")
+          if [ "$code" != "202" ]; then
+            echo "::error::ghcr.io refused a write probe for $repo (HTTP $code)."
+            echo "Grant this repository the Write role under Manage Actions access: $settings"
+            exit 1
+          fi
+
+          # Best-effort cancel. ghcr answers 405 here and reclaims the
+          # abandoned session on its own; nothing user-visible is created
+          # either way, so the result is not worth failing the job over.
+          loc=$(grep -i '^location:' "$headers" | tr -d '\r' | awk '{print $2}') || true
+          case "$loc" in /*) loc="https://ghcr.io$loc" ;; esac
+          if [ -n "$loc" ]; then
+            curl -sS -X DELETE -H "Authorization: Bearer $bearer" "$loc" >/dev/null || true
+          fi
+          echo "Registry write access confirmed."
+
       # The cuda build unpacks a ~4 GB devel base and compiles llama.cpp for
       # five GPU architectures. A stock runner does not have room for that
       # beside the preinstalled toolchains it will never use.
@@ -129,21 +187,7 @@ jobs:
                       /usr/local/share/boost "${AGENT_TOOLSDIRECTORY:-}"
           df -h /
 
-      # Image tags carry the bare version: the release tag is v0.9.1, the
-      # image is 0.9.1-cpu.
-      - name: Derive image version
-        id: ver
-        env:
-          TAG: ${{ inputs.tag }}
-        run: echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
-
       - uses: docker/setup-buildx-action@v3
-
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: docker/build-push-action@v6
         with:
