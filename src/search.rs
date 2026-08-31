@@ -1085,16 +1085,25 @@ fn apply_calibrated_scores(
         .filter(|c| !cos.contains_key(&c.key()))
         .map(|c| c.file_id)
         .collect();
-    if !missing_cos.is_empty()
-        && let Ok(rows) = store.vectors_for_files(&missing_cos)
-    {
-        for (file_id, seq, v) in rows {
-            let dot: f64 = v
-                .iter()
-                .zip(query_vec)
-                .map(|(a, b)| f64::from(*a) * f64::from(*b))
-                .sum();
-            cos.entry((file_id, seq)).or_insert(dot);
+    if !missing_cos.is_empty() {
+        match store.vectors_for_files(&missing_cos) {
+            Ok(rows) => {
+                for (file_id, seq, v) in rows {
+                    let dot: f64 = v
+                        .iter()
+                        .zip(query_vec)
+                        .map(|(a, b)| f64::from(*a) * f64::from(*b))
+                        .sum();
+                    cos.entry((file_id, seq)).or_insert(dot);
+                }
+            }
+            // The candidates keep their slot and lose a whole feature: with no
+            // vector the cosine reads as 0.0 and only the keyword lane can
+            // carry them. A lost feature is a ranking change, so it is logged.
+            Err(e) => tracing::warn!(
+                "calibrated cosine backfill unavailable for {} candidates: {e:#}",
+                missing_cos.len()
+            ),
         }
     }
     let missing_bm25: Vec<i64> = pool
@@ -1102,36 +1111,69 @@ fn apply_calibrated_scores(
         .filter(|c| !bm25.contains_key(&c.key()))
         .map(|c| c.file_id)
         .collect();
-    if !missing_bm25.is_empty()
-        && let Ok(rows) = store.fts_search_any(
+    if !missing_bm25.is_empty() {
+        match store.fts_search_any(
             query,
             pool.len().max(1) * 4,
             fts_weights,
             Some(&missing_bm25),
-        )
-    {
-        for r in rows {
-            bm25.entry((r.file_id, r.chunk_seq)).or_insert(r.score);
+        ) {
+            Ok(rows) => {
+                for r in rows {
+                    bm25.entry((r.file_id, r.chunk_seq)).or_insert(r.score);
+                }
+            }
+            // The other half of the same loss: no keyword evidence for these
+            // candidates, so the cosine alone decides where they sort.
+            Err(e) => tracing::warn!(
+                "calibrated keyword backfill unavailable for {} candidates: {e:#}",
+                missing_bm25.len()
+            ),
         }
     }
 
     // The query's own ceiling (spec, "The two normalizations"). The heaviest
     // column weight scales it, because the best row can put every occurrence
     // in the heaviest column.
-    let n_rows = store.chunk_row_count().unwrap_or(0);
+    //
+    // A failed row count is **not** an empty corpus. `idf(0, df)` clamps to the
+    // floor for every term, which collapses the bound and saturates every
+    // keyword match at `bm25n = 1.0` — a failed `SELECT count(*)` would read as
+    // maximal lexical evidence and take the floor's abstention with it. So the
+    // failure reads as no bound instead: no idfs, a bound of 0.0, and
+    // `normalize_bm25` already answers a non-positive bound with no evidence.
+    let n_rows = match store.chunk_row_count() {
+        Ok(n) => Some(n),
+        Err(e) => {
+            tracing::warn!("calibrated bound unavailable, keyword evidence reads as none: {e:#}");
+            None
+        }
+    };
     // `f64` is not `Ord`, so the heaviest weight is a reduce. A declaration
     // with no columns scales by 1.0 and leaves the bound the idfs' own.
     let max_weight = fts_weights.iter().copied().reduce(f64::max).unwrap_or(1.0);
-    let idfs: Vec<(String, f64)> = crate::fts::query_terms(query)
-        .into_iter()
-        .map(|t| {
-            let df = store
-                .fts_doc_frequency(&crate::fts::phrase_expr(&t))
-                .unwrap_or(0);
-            let idf = crate::calibrate::idf(n_rows, df);
-            (t, idf)
-        })
-        .collect();
+    let idfs: Vec<(String, f64)> = match n_rows {
+        None => Vec::new(),
+        Some(n_rows) => crate::fts::query_terms(query)
+            .into_iter()
+            .map(|t| {
+                let df = match store.fts_doc_frequency(&crate::fts::phrase_expr(&t)) {
+                    Ok(df) => df,
+                    Err(e) => {
+                        // Conservative in the safe direction: 0 is the rarest a
+                        // term can be, which raises the bound and lowers every
+                        // `bm25n` measured against it.
+                        tracing::warn!(
+                            "doc frequency unavailable for {t:?}, term reads as rare: {e:#}"
+                        );
+                        0
+                    }
+                };
+                let idf = crate::calibrate::idf(n_rows, df);
+                (t, idf)
+            })
+            .collect(),
+    };
     let bound = crate::calibrate::upper_bound(
         &idfs.iter().map(|(_, i)| *i).collect::<Vec<_>>(),
         max_weight,
@@ -3583,6 +3625,23 @@ mod tests {
             .map(|l| l.raw_score)
     }
 
+    /// An output as a byte-exactness control compares it: the identity of every
+    /// result and both of its numbers, to the bit. A control that compared
+    /// rounded scores would pass a change it was written to catch.
+    fn result_shape(out: &SearchOutput) -> Vec<(String, i64, u64, u64)> {
+        out.results
+            .iter()
+            .map(|r| {
+                (
+                    r.file_path.clone(),
+                    r.chunk_seq,
+                    r.score.to_bits(),
+                    r.confidence.to_bits(),
+                )
+            })
+            .collect()
+    }
+
     /// With no cross-encoder the sorted stage still runs, and the logistic
     /// sorts the pool where the model would. The probability is the confidence,
     /// so a query with no good answer no longer reports 100% for whatever it
@@ -3726,30 +3785,74 @@ mod tests {
             &mut embedder,
         );
 
-        let shape = |o: &SearchOutput| {
-            o.results
-                .iter()
-                .map(|r| {
-                    (
-                        r.file_path.clone(),
-                        r.chunk_seq,
-                        r.score.to_bits(),
-                        r.confidence.to_bits(),
-                    )
-                })
-                .collect::<Vec<_>>()
-        };
         assert!(
-            !shape(&on).is_empty(),
+            !result_shape(&on).is_empty(),
             "the two arms must compare something"
         );
-        assert_eq!(shape(&on), shape(&off));
+        assert_eq!(result_shape(&on), result_shape(&off));
+    }
+
+    /// Byte-exactness invariant 3: `mode = "legacy"` is untouched, and
+    /// `[calibrated]` is inert under it.
+    ///
+    /// Both routing flags read the mode first, so an explicit legacy mode
+    /// reaches neither scorer however the section is set. This is the arm the
+    /// other two controls do not cover: no cross-encoder *and* the calibrated
+    /// section at its shipped default.
+    #[test]
+    fn the_legacy_mode_ignores_the_calibrated_section() {
+        let (_tmp, store, mut embedder) = indexed_vault();
+
+        let run = |calibrated: crate::config::CalibratedConfig, embedder: &mut llm::MockLlm| {
+            let mut config = SearchConfig {
+                fts: crate::config::FtsConfig::default(),
+                scope: crate::tags::Scope::default(),
+                reranker: None,
+                store: &store,
+                rerank_candidates: 30,
+                lane_weights: crate::config::LaneWeights::default(),
+                rerank: crate::config::RerankConfig::default(),
+                max_chunks_per_file: 3,
+                group_by: GroupBy::Chunk,
+                ranking: crate::config::RankingConfig {
+                    mode: crate::config::RankingMode::Legacy,
+                    coalesce_adjacent: false,
+                    ..Default::default()
+                },
+                calibrated,
+            };
+            search_with_intelligence("warding", 20, embedder, &mut config).unwrap()
+        };
+
+        let on = run(crate::config::CalibratedConfig::default(), &mut embedder);
+        let off = run(
+            crate::config::CalibratedConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            &mut embedder,
+        );
+
+        assert!(
+            !result_shape(&on).is_empty(),
+            "the two arms must compare something"
+        );
+        assert_eq!(result_shape(&on), result_shape(&off));
+        assert!(
+            on.fused.iter().all(|f| calibrated_score(f).is_none()),
+            "the legacy stage runs no calibrated scorer"
+        );
     }
 
     /// A graph or temporal admission that no content lane fetched still carries
     /// both features: the cosine from one vector fetch, the BM25 from one
     /// scoped keyword query. Provenance does not decide whether a candidate is
     /// scored.
+    ///
+    /// The same candidate is scored twice, against the chunk's own vector and
+    /// against one orthogonal to it. Only the vector backfill can tell the two
+    /// runs apart, so deleting it makes the two scores equal and fails this
+    /// test — which is what stops it from passing on the keyword half alone.
     #[test]
     fn a_candidate_no_lane_fetched_still_gets_a_probability() {
         let store = Store::open_memory().unwrap();
@@ -3774,53 +3877,77 @@ mod tests {
                     token_count: 9,
                     ..Default::default()
                 },
-                // A unit vector, so its dot product with the query below is 1.0.
+                // A unit vector, so its dot product with the aligned query
+                // below is 1.0 and with the orthogonal one is 0.0.
                 &[1.0, 0.0, 0.0, 0.0],
             )
             .unwrap();
-
-        let mut pool = vec![ranking::Candidate {
-            file_path: path.to_string(),
-            file_id,
-            chunk_seq: 0,
-            heading: None,
-            snippet: String::new(),
-            docid: None,
-            rrf_rank: None,
-            rrf_score: 0.0,
-            graph_rank: Some(1),
-            temporal: false,
-            admitted_by: ranking::Source::Graph,
-            lane_contributions: Vec::new(),
-            rerank_score: None,
-            emit_text: None,
-            emit_token_count: None,
-            emit_truncated: false,
-        }];
+        // Two more rows the term does not match, so `df < N` and the term's idf
+        // is its own value rather than the clamp an all-matching corpus gives.
+        for (seq, text) in [(1, "pottery and rope"), (2, "a rope bridge")] {
+            store
+                .insert_chunk_with_vector(
+                    &crate::store::NewChunk {
+                        file_id,
+                        seq,
+                        text,
+                        vector_id: seq as u64 + 1,
+                        token_count: 4,
+                        ..Default::default()
+                    },
+                    &[0.0, 0.0, 1.0, 0.0],
+                )
+                .unwrap();
+        }
 
         let params = crate::config::CalibratedConfig::default();
-        let (bound, idfs) = apply_calibrated_scores(
-            &store,
-            &params,
-            "warding",
-            &[1.0, 0.0, 0.0, 0.0],
-            &crate::config::FtsConfig::default().weights(),
-            &[],
-            &[],
-            &mut pool,
-        );
+        let score_against = |query_vec: &[f32]| {
+            let mut pool = vec![ranking::Candidate {
+                file_path: path.to_string(),
+                file_id,
+                chunk_seq: 0,
+                heading: None,
+                snippet: String::new(),
+                docid: None,
+                rrf_rank: None,
+                rrf_score: 0.0,
+                graph_rank: Some(1),
+                temporal: false,
+                admitted_by: ranking::Source::Graph,
+                lane_contributions: Vec::new(),
+                rerank_score: None,
+                emit_text: None,
+                emit_token_count: None,
+                emit_truncated: false,
+            }];
+            let (bound, idfs) = apply_calibrated_scores(
+                &store,
+                &params,
+                "warding",
+                query_vec,
+                &crate::config::FtsConfig::default().weights(),
+                &[],
+                &[],
+                &mut pool,
+            );
+            let p = pool[0]
+                .rerank_score
+                .expect("the backfill must score a candidate no lane fetched");
+            (p, bound, idfs.len())
+        };
 
-        assert!(
-            pool[0].rerank_score.is_some(),
-            "the backfill must give an unfetched candidate a score"
-        );
-        assert_eq!(idfs.len(), 1, "one query term, one doc-frequency count");
+        let (aligned, bound, terms) = score_against(&[1.0, 0.0, 0.0, 0.0]);
+        let (orthogonal, _, _) = score_against(&[0.0, 1.0, 0.0, 0.0]);
+
+        assert_eq!(terms, 1, "one query term, one doc-frequency count");
         assert!(bound > 0.0, "one term with a positive idf bounds the query");
-        // Full evidence on both features: the vector is the query's own, and
-        // the chunk is the only row the term matches.
         assert!(
-            pool[0].rerank_score.unwrap() > crate::calibrate::probability(0.0, 0.0, &params),
-            "the features reached the logistic"
+            aligned > orthogonal,
+            "the cosine backfill must reach the logistic: {aligned} against {orthogonal}"
+        );
+        assert!(
+            orthogonal > crate::calibrate::probability(0.0, 0.0, &params),
+            "and the keyword backfill must reach it as well: {orthogonal}"
         );
     }
 
