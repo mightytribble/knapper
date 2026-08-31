@@ -772,8 +772,8 @@ fn target_of(result: &FusedResult) -> RerankTarget<'_> {
 }
 
 /// The sort lane's own score for a result, if one ran — the cross-encoder's
-/// `"rerank"` or the model-free `"calibrated"` logistic (Task 7). Whichever
-/// one sorted the pool, `build_result`'s score reads it here.
+/// `"rerank"` or the model-free `"calibrated"` logistic (spec 2026-08-30).
+/// Whichever one sorted the pool, `build_result`'s score reads it here.
 fn model_score(result: &FusedResult) -> Option<f64> {
     result
         .lane_contributions

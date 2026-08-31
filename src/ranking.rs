@@ -364,9 +364,9 @@ pub fn degraded_interleave(pool: Vec<Candidate>) -> Vec<Candidate> {
 /// whatever it ranked first.
 ///
 /// `sort_lane` names whichever lane produced `rerank_score` — `"rerank"` for
-/// the cross-encoder, `"calibrated"` for the model-free logistic (Task 7) —
-/// so `--explain` says which one sorted the pool instead of calling both of
-/// them "rerank".
+/// the cross-encoder, `"calibrated"` for the model-free logistic (spec
+/// 2026-08-30) — so `--explain` says which one sorted the pool instead of
+/// calling both of them "rerank".
 pub fn into_fused(pool: Vec<Candidate>, sort_lane: &'static str) -> Vec<FusedResult> {
     pool.into_iter()
         .map(|c| {
@@ -781,8 +781,8 @@ mod tests {
     }
 
     /// `into_fused` labels the sort score with whichever lane sorted the
-    /// pool, so `--explain` names the model-free path once it exists
-    /// (Task 7) instead of calling every sort score "rerank".
+    /// pool, so `--explain` names the model-free path (spec 2026-08-30)
+    /// instead of calling every sort score "rerank".
     #[test]
     fn into_fused_labels_the_score_with_the_sort_lane() {
         let c = Candidate {
