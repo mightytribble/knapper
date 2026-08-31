@@ -412,7 +412,15 @@ pub fn search_with_intelligence(
     // it: the cap it applies and the size of the graph lane both belong to the
     // stage that will consume them.
     let sorts_by_model = config.ranking.mode == RankingMode::Sorted && config.reranker.is_some();
-    let cap = if sorts_by_model {
+    // The model-free default (spec 2026-08-30): with no cross-encoder the
+    // sorted stage still runs, and the calibrated logistic sorts the pool.
+    // `[calibrated] enabled = false` is the control and restores the legacy
+    // routing below, byte for byte.
+    let sorts_calibrated = config.ranking.mode == RankingMode::Sorted
+        && config.reranker.is_none()
+        && config.calibrated.enabled;
+    let enters_sorted = sorts_by_model || sorts_calibrated;
+    let cap = if enters_sorted {
         config.ranking.shortlist_cap
     } else {
         config.max_chunks_per_file
@@ -486,7 +494,7 @@ pub fn search_with_intelligence(
             // A reserve larger than the lane is allowed to produce would be a
             // quota nothing can fill — starvation dressed as a routing
             // guarantee. Below the default this changes nothing.
-            max_expansions: if sorts_by_model {
+            max_expansions: if enters_sorted {
                 config.ranking.graph_reserve.max(default_expansions)
             } else {
                 default_expansions
@@ -514,18 +522,26 @@ pub fn search_with_intelligence(
     // legacy stage below is what it is measured against, and reproduces the
     // pre-#30 order byte for byte.
     //
-    // **A build with no cross-encoder configured takes the legacy stage.** The
-    // sorted stage's whole claim is that the model's absolute score is a better
-    // order than fused rank; with no model there is no such score, and what
-    // would remain is an interleave with nothing behind it standing in for a
-    // fusion that #9, #26, #28 and #29 each tuned against these probes.
-    // Measured with intelligence off, the interleave costs two tracked targets
-    // and gains one. So it is kept for what it is documented as — the fallback
-    // when a model that *should* be there is not (§7.3) — and a deliberate
-    // configuration is not that.
-    if sorts_by_model {
+    // **The sorted stage runs with a model or with the calibrated scorer.**
+    // Its claim is that an absolute score is a better order than fused rank.
+    // A cross-encoder gives one, and where there is no model the calibrated
+    // logistic gives one too: each content lane is normalized onto the same
+    // `[0, 1]` evidence scale and three fitted coefficients fuse the pair
+    // (spec 2026-08-30). So a build with no cross-encoder is the default
+    // install and it ranks with that probability.
+    //
+    // A build with no cross-encoder **and `[calibrated] enabled = false`**
+    // takes the legacy stage below, which is the control: it reproduces the
+    // pre-change order byte for byte and keeps the fusion that #9, #26, #28
+    // and #29 each tuned against these probes.
+    //
+    // The interleave is unchanged and is neither of these two paths: it is the
+    // fallback for a *configured* model that fails at call time (§7.3), and a
+    // deliberate configuration is not that.
+    if enters_sorted {
         let (final_fused, degraded) = sorted_stage(
             query,
+            &query_vec,
             config,
             &semantic_results,
             &fts_results,
@@ -832,13 +848,20 @@ fn build_result(
     }
 }
 
-/// The ranking stage of issue #30: the graph reaches the cross-encoder by
-/// reserved quota, and the cross-encoder sorts what reaches it.
+/// The ranking stage of issue #30: the graph reaches the scorer by reserved
+/// quota, and the scorer sorts what reaches it.
+///
+/// Which scorer that is depends on the build. A configured cross-encoder sorts
+/// the shortlist, as it always has. With no cross-encoder the calibrated
+/// logistic sorts it instead, from the two content lanes' own scores
+/// (spec 2026-08-30) — which is why `query_vec` comes in: the backfill needs
+/// the query's embedding to give a candidate no content lane fetched a cosine.
 ///
 /// Returns the ranked results and whether the order is the degraded one.
 #[allow(clippy::too_many_arguments)]
 fn sorted_stage(
     query: &str,
+    query_vec: &[f32],
     config: &mut SearchConfig<'_>,
     semantic_results: &[RankedResult],
     fts_results: &[RankedResult],
@@ -893,8 +916,8 @@ fn sorted_stage(
         "shortlist assembled"
     );
 
-    // `Some` by construction — the caller checked, because a build with no
-    // cross-encoder configured never enters this stage at all.
+    // Which scorer fills `rerank_score`. One slot, two writers: the sort, the
+    // floor and the confidence all read the same field, whichever one ran.
     let scored = if let Some(reranker) = &mut config.reranker {
         let targets: Vec<RerankTarget<'_>> = pool
             .iter()
@@ -939,7 +962,23 @@ fn sorted_stage(
             }
         }
     } else {
-        false
+        // No model was ever configured: routing admitted this build because
+        // `[calibrated] enabled`, so the logistic sorts where the model would
+        // (spec 2026-08-30). The Err arm above keeps the interleave: a model
+        // that should be there failing is a different finding from a build
+        // that never had one.
+        let (bound, idfs) = apply_calibrated_scores(
+            config.store,
+            &config.calibrated,
+            query,
+            query_vec,
+            &config.fts.weights(),
+            semantic_results,
+            fts_results,
+            &mut pool,
+        );
+        tracing::debug!(bound, terms = idfs.len(), "calibrated scores assembled");
+        true
     };
 
     if !scored {
@@ -955,14 +994,24 @@ fn sorted_stage(
     // this is the last point where `rerank_score` is still an `Option`. The
     // floor must tell "the model gave this a low score" apart from "nothing
     // scored this", and `confidence` reduces both to one f64.
+    //
+    // Each scorer brings its own floor, because each was fit against its own
+    // scores: `[ranking] answer_floor` for the cross-encoder, `[calibrated]
+    // floor` for the logistic. One number cannot mean both.
+    let calibrated_ran = config.reranker.is_none();
+    let floor = if calibrated_ran {
+        config.calibrated.floor
+    } else {
+        config.ranking.answer_floor
+    };
     let supported = pool.len();
-    let dropped = ranking::apply_answer_floor(&mut pool, config.ranking.answer_floor);
+    let dropped = ranking::apply_answer_floor(&mut pool, floor);
     if dropped > 0 {
         // The cost per query. The fit uses the best score of each query, and
         // the floor applies to a whole list, so how much of the list it removes
         // is a separate measurement from whether it returns nothing correctly.
         tracing::debug!(
-            floor = config.ranking.answer_floor,
+            floor,
             scored = supported,
             dropped,
             surviving = pool.len(),
@@ -988,7 +1037,113 @@ fn sorted_stage(
         "graph reserve, after the sort"
     );
 
-    (ranking::into_fused(pool, "rerank"), false)
+    // Name the lane that sorted, so `--explain` does not call the logistic a
+    // cross-encoder.
+    let sort_lane = if calibrated_ran {
+        "calibrated"
+    } else {
+        "rerank"
+    };
+    (ranking::into_fused(pool, sort_lane), false)
+}
+
+/// Compute the calibrated probability for every pool candidate and store it in
+/// `rerank_score` — the slot the cross-encoder writes, so the sort, the floor
+/// and the confidence all read one field (spec 2026-08-30).
+///
+/// Features come from the lanes when the lanes fetched the candidate, and from
+/// the store when they did not (a graph or temporal admission): one vector
+/// fetch and dot product for the cosine, one scoped FTS query for the BM25.
+/// The dot product is the cosine because the embedders L2-normalize what they
+/// return, which is the same assumption `search_vec`'s distance rests on.
+///
+/// Returns the query's BM25 upper bound and per-term idfs for the trace.
+#[allow(clippy::too_many_arguments)]
+fn apply_calibrated_scores(
+    store: &Store,
+    params: &crate::config::CalibratedConfig,
+    query: &str,
+    query_vec: &[f32],
+    fts_weights: &[f64],
+    semantic_results: &[RankedResult],
+    fts_results: &[RankedResult],
+    pool: &mut [ranking::Candidate],
+) -> (f64, Vec<(String, f64)>) {
+    let mut cos: HashMap<(i64, i64), f64> = semantic_results
+        .iter()
+        .map(|r| ((r.file_id, r.chunk_seq), r.score))
+        .collect();
+    let mut bm25: HashMap<(i64, i64), f64> = fts_results
+        .iter()
+        .map(|r| ((r.file_id, r.chunk_seq), r.score))
+        .collect();
+
+    // Backfill for candidates no content lane fetched. The pool is ~40 rows,
+    // so both reads are noise beside the query embed that already ran.
+    let missing_cos: Vec<i64> = pool
+        .iter()
+        .filter(|c| !cos.contains_key(&c.key()))
+        .map(|c| c.file_id)
+        .collect();
+    if !missing_cos.is_empty()
+        && let Ok(rows) = store.vectors_for_files(&missing_cos)
+    {
+        for (file_id, seq, v) in rows {
+            let dot: f64 = v
+                .iter()
+                .zip(query_vec)
+                .map(|(a, b)| f64::from(*a) * f64::from(*b))
+                .sum();
+            cos.entry((file_id, seq)).or_insert(dot);
+        }
+    }
+    let missing_bm25: Vec<i64> = pool
+        .iter()
+        .filter(|c| !bm25.contains_key(&c.key()))
+        .map(|c| c.file_id)
+        .collect();
+    if !missing_bm25.is_empty()
+        && let Ok(rows) = store.fts_search_any(
+            query,
+            pool.len().max(1) * 4,
+            fts_weights,
+            Some(&missing_bm25),
+        )
+    {
+        for r in rows {
+            bm25.entry((r.file_id, r.chunk_seq)).or_insert(r.score);
+        }
+    }
+
+    // The query's own ceiling (spec, "The two normalizations"). The heaviest
+    // column weight scales it, because the best row can put every occurrence
+    // in the heaviest column.
+    let n_rows = store.chunk_row_count().unwrap_or(0);
+    // `f64` is not `Ord`, so the heaviest weight is a reduce. A declaration
+    // with no columns scales by 1.0 and leaves the bound the idfs' own.
+    let max_weight = fts_weights.iter().copied().reduce(f64::max).unwrap_or(1.0);
+    let idfs: Vec<(String, f64)> = crate::fts::query_terms(query)
+        .into_iter()
+        .map(|t| {
+            let df = store
+                .fts_doc_frequency(&crate::fts::phrase_expr(&t))
+                .unwrap_or(0);
+            let idf = crate::calibrate::idf(n_rows, df);
+            (t, idf)
+        })
+        .collect();
+    let bound = crate::calibrate::upper_bound(
+        &idfs.iter().map(|(_, i)| *i).collect::<Vec<_>>(),
+        max_weight,
+    );
+
+    for c in pool.iter_mut() {
+        let key = c.key();
+        let s = cos.get(&key).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+        let k = crate::calibrate::normalize_bm25(bm25.get(&key).copied().unwrap_or(0.0), bound);
+        c.rerank_score = Some(crate::calibrate::probability(s, k, params));
+    }
+    (bound, idfs)
 }
 
 /// Chunk keys whose note falls in the query's date range, best match first.
@@ -3383,6 +3538,289 @@ mod tests {
                 .count(),
             3,
             "the legacy stage caps the results at max_chunks_per_file"
+        );
+    }
+    // ── The calibrated sort: the model-free default (spec 2026-08-30) ──
+
+    /// A no-model query over `indexed_vault`'s corpus, with the `[calibrated]`
+    /// section the caller gives.
+    ///
+    /// `sorted_config` holds `[ranking] answer_floor` at 0.0, so a result the
+    /// floor removes was removed by `[calibrated] floor` and by nothing else.
+    fn calibrated_search(
+        query: &str,
+        store: &Store,
+        embedder: &mut llm::MockLlm,
+        calibrated: crate::config::CalibratedConfig,
+    ) -> SearchOutput {
+        let mut config = SearchConfig {
+            fts: crate::config::FtsConfig::default(),
+            scope: crate::tags::Scope::default(),
+            reranker: None,
+            store,
+            rerank_candidates: 30,
+            lane_weights: crate::config::LaneWeights::default(),
+            rerank: crate::config::RerankConfig::default(),
+            max_chunks_per_file: 3,
+            group_by: GroupBy::Chunk,
+            // This test exercises the ranking pipeline. The ranking pipeline is
+            // below coalescing. Coalescing has its own tests (#39).
+            ranking: sorted_config(crate::config::RankingConfig {
+                coalesce_adjacent: false,
+                ..Default::default()
+            }),
+            calibrated,
+        };
+        search_with_intelligence(query, 20, embedder, &mut config).unwrap()
+    }
+
+    /// The sort score of a result, if the calibrated logistic produced it.
+    fn calibrated_score(result: &FusedResult) -> Option<f64> {
+        result
+            .lane_contributions
+            .iter()
+            .find(|l| l.lane_name == "calibrated")
+            .map(|l| l.raw_score)
+    }
+
+    /// With no cross-encoder the sorted stage still runs, and the logistic
+    /// sorts the pool where the model would. The probability is the confidence,
+    /// so a query with no good answer no longer reports 100% for whatever it
+    /// ranked first.
+    #[test]
+    fn the_model_free_default_sorts_by_calibrated_probability() {
+        let (_tmp, store, mut embedder) = indexed_vault();
+
+        let out = calibrated_search(
+            "warding",
+            &store,
+            &mut embedder,
+            crate::config::CalibratedConfig {
+                floor: 0.0,
+                ..Default::default()
+            },
+        );
+
+        assert!(
+            !out.degraded,
+            "the calibrated sort is not the degraded ordering"
+        );
+        assert!(!out.fused.is_empty(), "the query retrieved nothing to sort");
+
+        let top = &out.fused[0];
+        let p = calibrated_score(top).expect("the sort score is labeled calibrated");
+        assert!(
+            (top.confidence - p * 100.0).abs() < 1e-9,
+            "confidence is the probability"
+        );
+        assert!(
+            out.fused.iter().all(|f| calibrated_score(f).is_some()),
+            "every candidate the pool held was scored, provenance regardless"
+        );
+        assert!(
+            out.fused
+                .windows(2)
+                .all(|w| calibrated_score(&w[0]).unwrap_or(0.0)
+                    >= calibrated_score(&w[1]).unwrap_or(0.0)),
+            "sorted by the probability"
+        );
+    }
+
+    /// The floor of this path is `[calibrated] floor` and not
+    /// `[ranking] answer_floor`. A floor the logistic cannot reach empties the
+    /// response; `0.0` is the floor's own control and removes nothing.
+    #[test]
+    fn the_floor_bounds_the_calibrated_result() {
+        let (_tmp, store, mut embedder) = indexed_vault();
+
+        // Sigma is open above 0 and below 1, so no candidate reaches 1.0.
+        let floored = calibrated_search(
+            "warding",
+            &store,
+            &mut embedder,
+            crate::config::CalibratedConfig {
+                floor: 1.0,
+                ..Default::default()
+            },
+        );
+        assert!(
+            floored.results.is_empty(),
+            "an unreachable floor empties the result"
+        );
+
+        let open = calibrated_search(
+            "warding",
+            &store,
+            &mut embedder,
+            crate::config::CalibratedConfig {
+                floor: 0.0,
+                ..Default::default()
+            },
+        );
+        assert!(!open.results.is_empty(), "0.0 removes nothing");
+    }
+
+    /// The control (spec, "Where it sits in the pipeline"): `enabled = false`
+    /// sends a no-model build to the legacy stage exactly as before, so its
+    /// confidence is a share of the best score again and no lane is labeled
+    /// `calibrated`.
+    #[test]
+    fn enabled_false_restores_the_legacy_routing() {
+        let (_tmp, store, mut embedder) = indexed_vault();
+
+        let out = calibrated_search(
+            "warding",
+            &store,
+            &mut embedder,
+            crate::config::CalibratedConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        );
+
+        assert!(!out.fused.is_empty(), "the query retrieved nothing");
+        assert_eq!(
+            out.fused[0].confidence, 100.0,
+            "legacy confidence normalizes the top to 100%"
+        );
+        assert!(
+            out.fused.iter().all(|f| calibrated_score(f).is_none()),
+            "the legacy stage runs no calibrated scorer"
+        );
+    }
+
+    /// With a cross-encoder configured the whole `[calibrated]` section is
+    /// inert: the model sorts, its `answer_floor` applies, and the output does
+    /// not move whatever the section holds.
+    #[test]
+    fn a_configured_cross_encoder_ignores_the_calibrated_section() {
+        let (_tmp, store, mut embedder) = indexed_vault();
+
+        let run = |calibrated: crate::config::CalibratedConfig, embedder: &mut llm::MockLlm| {
+            let mut reranker = llm::MockLlm::new(8);
+            let mut config = SearchConfig {
+                fts: crate::config::FtsConfig::default(),
+                scope: crate::tags::Scope::default(),
+                reranker: Some(&mut reranker),
+                store: &store,
+                rerank_candidates: 30,
+                lane_weights: crate::config::LaneWeights::default(),
+                rerank: crate::config::RerankConfig::default(),
+                max_chunks_per_file: 3,
+                group_by: GroupBy::Chunk,
+                ranking: sorted_config(crate::config::RankingConfig {
+                    coalesce_adjacent: false,
+                    ..Default::default()
+                }),
+                calibrated,
+            };
+            search_with_intelligence("warding", 20, embedder, &mut config).unwrap()
+        };
+
+        let on = run(crate::config::CalibratedConfig::default(), &mut embedder);
+        let off = run(
+            crate::config::CalibratedConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            &mut embedder,
+        );
+
+        let shape = |o: &SearchOutput| {
+            o.results
+                .iter()
+                .map(|r| {
+                    (
+                        r.file_path.clone(),
+                        r.chunk_seq,
+                        r.score.to_bits(),
+                        r.confidence.to_bits(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            !shape(&on).is_empty(),
+            "the two arms must compare something"
+        );
+        assert_eq!(shape(&on), shape(&off));
+    }
+
+    /// A graph or temporal admission that no content lane fetched still carries
+    /// both features: the cosine from one vector fetch, the BM25 from one
+    /// scoped keyword query. Provenance does not decide whether a candidate is
+    /// scored.
+    #[test]
+    fn a_candidate_no_lane_fetched_still_gets_a_probability() {
+        let store = Store::open_memory().unwrap();
+        let path = "rules/linked.md";
+        let file_id = store
+            .insert_file(
+                path,
+                "hash",
+                100,
+                &crate::docid::generate_docid(path),
+                None,
+                None,
+            )
+            .unwrap();
+        store
+            .insert_chunk_with_vector(
+                &crate::store::NewChunk {
+                    file_id,
+                    seq: 0,
+                    text: "a warding effect that stops a spell mid-cast",
+                    vector_id: 1,
+                    token_count: 9,
+                    ..Default::default()
+                },
+                // A unit vector, so its dot product with the query below is 1.0.
+                &[1.0, 0.0, 0.0, 0.0],
+            )
+            .unwrap();
+
+        let mut pool = vec![ranking::Candidate {
+            file_path: path.to_string(),
+            file_id,
+            chunk_seq: 0,
+            heading: None,
+            snippet: String::new(),
+            docid: None,
+            rrf_rank: None,
+            rrf_score: 0.0,
+            graph_rank: Some(1),
+            temporal: false,
+            admitted_by: ranking::Source::Graph,
+            lane_contributions: Vec::new(),
+            rerank_score: None,
+            emit_text: None,
+            emit_token_count: None,
+            emit_truncated: false,
+        }];
+
+        let params = crate::config::CalibratedConfig::default();
+        let (bound, idfs) = apply_calibrated_scores(
+            &store,
+            &params,
+            "warding",
+            &[1.0, 0.0, 0.0, 0.0],
+            &crate::config::FtsConfig::default().weights(),
+            &[],
+            &[],
+            &mut pool,
+        );
+
+        assert!(
+            pool[0].rerank_score.is_some(),
+            "the backfill must give an unfetched candidate a score"
+        );
+        assert_eq!(idfs.len(), 1, "one query term, one doc-frequency count");
+        assert!(bound > 0.0, "one term with a positive idf bounds the query");
+        // Full evidence on both features: the vector is the query's own, and
+        // the chunk is the only row the term matches.
+        assert!(
+            pool[0].rerank_score.unwrap() > crate::calibrate::probability(0.0, 0.0, &params),
+            "the features reached the logistic"
         );
     }
 
