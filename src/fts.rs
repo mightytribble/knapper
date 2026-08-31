@@ -28,6 +28,27 @@ pub fn phrase_expr(query: &str) -> String {
     quote_token(query)
 }
 
+/// The query's searchable tokens: whitespace-split, alphanumeric-bearing,
+/// case-insensitively deduplicated, first spelling kept. This is the token
+/// list behind [`any_term_expr`], exposed on its own because the calibrated
+/// bound needs the terms themselves — one doc-frequency count each — and not
+/// the joined MATCH expression (spec 2026-08-30).
+pub fn query_terms(query: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    query
+        .split_whitespace()
+        // A token with no alphanumerics contributes no searchable term. FTS5
+        // tolerates one (`"-"` matches nothing rather than erroring), but it
+        // would still be noise in `--explain`.
+        .filter(|t| t.chars().any(|c| c.is_alphanumeric()))
+        // Repeats change nothing about which rows match, and reading
+        // `"the" OR "the"` in an explain trace invites a bug hunt that ends
+        // nowhere.
+        .filter(|t| seen.insert(t.to_lowercase()))
+        .map(str::to_string)
+        .collect()
+}
+
 /// A MATCH expression satisfied by **any** token of the query, each still
 /// literal: `"dragon" OR "human" OR "form"`.
 ///
@@ -47,20 +68,7 @@ pub fn phrase_expr(query: &str) -> String {
 /// punctuation — so the caller can skip the round trip rather than issue a
 /// MATCH that can only return nothing.
 pub fn any_term_expr(query: &str) -> Option<String> {
-    let mut seen = std::collections::HashSet::new();
-    let terms: Vec<String> = query
-        .split_whitespace()
-        // A token with no alphanumerics contributes no searchable term. FTS5
-        // tolerates one (`"-"` matches nothing rather than erroring), but it
-        // would still be noise in `--explain`.
-        .filter(|t| t.chars().any(|c| c.is_alphanumeric()))
-        // Repeats change nothing about which rows match, and reading
-        // `"the" OR "the"` in an explain trace invites a bug hunt that ends
-        // nowhere.
-        .filter(|t| seen.insert(t.to_lowercase()))
-        .map(quote_token)
-        .collect();
-
+    let terms: Vec<String> = query_terms(query).iter().map(|t| quote_token(t)).collect();
     if terms.is_empty() {
         return None;
     }
@@ -69,11 +77,26 @@ pub fn any_term_expr(query: &str) -> Option<String> {
 
 #[cfg(test)]
 mod expr_tests {
-    use super::{any_term_expr, phrase_expr};
+    use super::{any_term_expr, phrase_expr, query_terms};
 
     #[test]
     fn a_phrase_expression_quotes_the_whole_query() {
         assert_eq!(phrase_expr("human form"), r#""human form""#);
+    }
+
+    #[test]
+    fn query_terms_is_the_token_list_behind_any_term_expr() {
+        assert_eq!(query_terms("storm wolf"), vec!["storm", "wolf"]);
+        assert_eq!(
+            query_terms("The the THE wolf"),
+            vec!["The", "wolf"],
+            "case-insensitive dedup, first spelling kept"
+        );
+        assert_eq!(
+            query_terms("- -- ---"),
+            Vec::<String>::new(),
+            "no alphanumerics, no terms"
+        );
     }
 
     #[test]
