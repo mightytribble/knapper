@@ -47,16 +47,40 @@ jobs:
         with:
           ref: ${{ inputs.tag }}
 
-      - name: Compute source tarball SHA256
+      # Three artifacts: the two release binaries the formula installs
+      # directly, and the source tarball the platforms without one build.
+      - name: Compute artifact SHA256s
         id: sha
         run: |
-          url="https://github.com/mightytribble/knapper/archive/refs/tags/${{ inputs.tag }}.tar.gz"
-          sha=$(curl -sL "$url" | sha256sum | cut -d' ' -f1)
-          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+          base=https://github.com/mightytribble/knapper
+          rel="$base/releases/download/${{ inputs.tag }}"
+
+          # -f matters here. Without it a missing asset hands its 404 page to
+          # sha256sum, and the formula ships a hash of HTML that fails for
+          # every user. With -f, pipefail turns that into a failed job.
+          hash() { curl -fsSL "$1" | sha256sum | cut -d' ' -f1; }
+
+          src=$(hash "$base/archive/refs/tags/${{ inputs.tag }}.tar.gz")
+          mac=$(hash "$rel/knapper-macos-arm64.tar.gz")
+          lnx=$(hash "$rel/knapper-linux-x86_64.tar.gz")
+
+          for h in "$src" "$mac" "$lnx"; do
+            case "$h" in
+              [0-9a-f]*) [ "${#h}" -eq 64 ] || { echo "::error::not a sha256: $h"; exit 1; } ;;
+              *) echo "::error::not a sha256: $h"; exit 1 ;;
+            esac
+          done
+
+          {
+            echo "src=$src"
+            echo "mac=$mac"
+            echo "linux=$lnx"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Update Homebrew formula
         env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAG: ${{ inputs.tag }}
         run: |
           git clone https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/mightytribble/homebrew-tap.git
           cd homebrew-tap
@@ -65,16 +89,51 @@ jobs:
           class Knapper < Formula
             desc "Local hybrid search and MCP retrieval for Obsidian-format vaults"
             homepage "https://github.com/mightytribble/knapper"
-            url "https://github.com/mightytribble/knapper/archive/refs/tags/TAG.tar.gz"
-            sha256 "SHA256"
             license "MIT"
-            head "https://github.com/mightytribble/knapper.git", branch: "main"
+            version "@@VERSION@@"
 
-            depends_on "cmake" => :build
-            depends_on "rust" => :build
+            # Apple Silicon and Linux x86_64 install the released binary,
+            # which links nothing outside the system libraries. Every other
+            # platform builds from source, so no one loses an install path.
+            on_macos do
+              on_arm do
+                url "https://github.com/mightytribble/knapper/releases/download/@@TAG@@/knapper-macos-arm64.tar.gz"
+                sha256 "@@MAC_SHA@@"
+              end
+              on_intel do
+                url "https://github.com/mightytribble/knapper/archive/refs/tags/@@TAG@@.tar.gz"
+                sha256 "@@SRC_SHA@@"
+                depends_on "cmake" => :build
+                depends_on "rust" => :build
+              end
+            end
+
+            on_linux do
+              on_intel do
+                url "https://github.com/mightytribble/knapper/releases/download/@@TAG@@/knapper-linux-x86_64.tar.gz"
+                sha256 "@@LINUX_SHA@@"
+              end
+              on_arm do
+                url "https://github.com/mightytribble/knapper/archive/refs/tags/@@TAG@@.tar.gz"
+                sha256 "@@SRC_SHA@@"
+                depends_on "cmake" => :build
+                depends_on "rust" => :build
+              end
+            end
+
+            head do
+              url "https://github.com/mightytribble/knapper.git", branch: "main"
+              depends_on "cmake" => :build
+              depends_on "rust" => :build
+            end
 
             def install
-              system "cargo", "install", *std_cargo_args
+              prebuilt = (OS.mac? && Hardware::CPU.arm?) || (OS.linux? && Hardware::CPU.intel?)
+              if build.head? || !prebuilt
+                system "cargo", "install", *std_cargo_args
+              else
+                bin.install "knapper"
+              end
             end
 
             test do
@@ -83,8 +142,13 @@ jobs:
           end
           FORMULA
 
-          sed -i "s|TAG|${{ inputs.tag }}|g" Formula/knapper.rb
-          sed -i "s|SHA256|${{ steps.sha.outputs.sha256 }}|g" Formula/knapper.rb
+          # @@..@@ placeholders rather than bare words: a plain s|TAG|...|g
+          # would also rewrite any occurrence of those letters in a URL.
+          sed -i "s|@@TAG@@|${{ inputs.tag }}|g" Formula/knapper.rb
+          sed -i "s|@@VERSION@@|${TAG#v}|g" Formula/knapper.rb
+          sed -i "s|@@SRC_SHA@@|${{ steps.sha.outputs.src }}|g" Formula/knapper.rb
+          sed -i "s|@@MAC_SHA@@|${{ steps.sha.outputs.mac }}|g" Formula/knapper.rb
+          sed -i "s|@@LINUX_SHA@@|${{ steps.sha.outputs.linux }}|g" Formula/knapper.rb
 
           # Remove leading whitespace from heredoc
           sed -i 's/^          //' Formula/knapper.rb
