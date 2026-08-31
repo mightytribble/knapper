@@ -1,6 +1,6 @@
 # knapper
 
-**Local hybrid search and MCP retrieval for Obsidian-format vaults.** knapper indexes a markdown vault into section-level chunks and serves them to AI agents — Claude Code over [MCP](https://modelcontextprotocol.io), any tool over a REST API. Semantic embeddings, full-text search, wikilink graph traversal, and cross-encoder reranking run in one local binary. No API keys, no cloud.
+**Local hybrid search, retrieval and editing MCP for Obsidian-format vaults.** knapper indexes a markdown vault into section-level chunks and serves them to AI agents — Claude Code over [MCP](https://modelcontextprotocol.io), any tool over a REST API. Semantic embeddings, full-text search, wikilink graph traversal, and cross-encoder reranking run in one local binary. No API keys, no cloud.
 
 **knapper** will work with any hierachy of markdown files, but it's targeted at Obsidian vaults and leverages Obsidian frontmatter conventions for tagging and other fields. 
 
@@ -10,17 +10,20 @@ Knapper is under active development and should still be considered experimental.
 
 ## Why knapper?
 
-Plain vector search treats your notes as isolated documents. But knowledge isn't flat — your notes link to each other, share tags, reference the same people and projects. knapper understands these connections and makes them visible to your agents.
+You have notes in Obsidian (or other markdown) and you want an LLM (perhaps via Claude Code or Codex) to work with them. You could use filesystem tools, but grep and glob are slow and token-heavy: fine for a small number of documents but for larger collections they eat context, they're slow, and their effectiveness degrades quickly.
 
-- **5-lane hybrid search** — semantic embeddings + BM25 full-text + graph expansion + cross-encoder reranking + temporal scoring. The content lanes fuse via [Reciprocal Rank Fusion](https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf), graph and temporal candidates join the shortlist by reserved quota, and one absolute scorer sorts it — a calibrated probability by default, the cross-encoder when intelligence is enabled. Lane weights are configurable. Time-aware queries like "what happened last week" or "March 2026 notes" activate the temporal lane automatically.
-- **Ranks and abstains with no model** — the default install fuses each lane's self-normalized score into a calibrated probability, so a result carries real confidence and a query your vault cannot answer returns nothing rather than a confident wrong answer. Measured on a CPU build: ~22 ms a query against ~13.8 s for the cross-encoder, refusing exactly the same queries it refuses from a sample corpus.
+Knapper solves this by providing your LLM with effective search, realtime indexing (so you can edit in Obsidian and your changes are immediately visible to the LLM), and efficient document updating. No more bloating your context with unneccesary full file reads and slow keyword searches! Its hybrid search combines semantic, keyword, and graph results into one pipeline with citations, so the LLM knows exactly where the results came from and how. Section level retrieval and edits make working with large documents fast and token light. And we mention this is all fast and local?
+
+- **5-lane hybrid search...** — semantic embeddings + BM25 full-text + graph expansion + cross-encoder reranking + temporal scoring. The content lanes fuse via Reciprocal Rank Fusion, and graph and temporal candidates join the shortlist by reserved quota. One absolute scorer then sorts it: by default a **calibrated convex combination** of the lanes' own scores extending TM2C2 — [score fusion rather than rank fusion](https://arxiv.org/abs/2210.11934), with BM25 measured against each query's own theoretical maximum so a score means the same thing from one query to the next — and the cross-encoder when intelligence is enabled. Lane weights are configurable. Time-aware queries like "what happened last week" or "March 2026 notes" activate the temporal lane automatically.
+- **...that knows what it doesn't know...** — Conventional semantic and BM25 search will return results even if they're not relevant, which not only wastes tokens but can actively lead an LLM astray. Knapper scores every result as a calibrated probability and drops anything below a confidence floor — when nothing clears it you get nothing back, rather than a plausible-looking wrong answer.
+- **...quickly.** — Against a 240-note test vault the default path refuses exactly the same unanswerable queries as the local cross-encoder, missing on only one particularly tricky question compared to it — but much, much faster: 22 ms a query instead of 13.8 seconds on a CPU-only system.
 - **MCP server for AI agents** — `knapper serve` exposes 18 tools (search, read, list, tags, vault_map, create, update, delete, move, archive, index, reindex_file, status, health, validate, identity, init, migrate) that Claude, Cursor, or any MCP client can call directly.
 - **HTTP REST API** — `knapper serve --http` adds an axum-based HTTP server alongside MCP with 19 REST endpoints, API key authentication, rate limiting, and CORS. Web-based agents and scripts can query your vault with simple `curl` calls.
 - **Section-level editing** — AI agents can read, replace, prepend, or append to a section by heading, to the note's body, or to a frontmatter property — every change is one `update` call carrying a list of edits.
 - **Vault health diagnostics** — detect orphan notes, broken wikilinks, stale content, and tag hygiene issues. Available as MCP tool and CLI command.
 - **Real-time sync** — file watcher keeps the index fresh as you edit in Obsidian. No manual re-indexing needed.
 - **Smart write pipeline** — AI agents can create, edit, rewrite, and delete notes with automatic tag resolution, wikilink discovery, and folder placement based on semantic similarity.
-- **Fully local** — [llama.cpp](https://github.com/ggml-org/llama.cpp) inference with GGUF models (~300MB mandatory, ~650MB optional for the cross-encoder). Metal GPU-accelerated on macOS (88 files indexed in 70s), CUDA build available for local GPU. No API keys, no cloud.
+- **Fully local** — [llama.cpp](https://github.com/ggml-org/llama.cpp) inference with GGUF models (~300MB mandatory, ~650MB optional for the cross-encoder). Metal GPU-accelerated on macOS, CUDA build available for local GPU. No API keys, no cloud required, but Google Gemini Embeddings supported if you want them.
 
 ## The Split from Engraph
 
@@ -28,6 +31,7 @@ I originally investigated Engraph because it seemed to meet my needs - proper hy
 
 Main Changes from Engraph:
 
+- Hybrid search has been completely re-written and improved with empirical testing.
 - The search lanes now correctly include the `graph` lane, with a 1-hop personal page rank implementation.
 - Searches can be filtered by tag and directory either by inclusion, exclusion, or a combination thereof, using a common vocabulary.
 - The chunker has been completely re-worked and optimized for markdown ingest (chunking by section, handling empty sections, etc).
@@ -36,12 +40,6 @@ Main Changes from Engraph:
 - breadcrumbs now correctly contribute to search results.
 - CUDA builds are now possible, utilizing local GPU resources to vastly improve embedding and cross-encoding times (approx x30 speedup).
 - Dead and aspirational code has been removed, pending new implementations.
-
-## What problem it solves
-
-You have hundreds of markdown notes. You want your AI coding assistant to understand what you've written — not just search keywords, but follow the connections between notes, understand context, and write new notes that fit your vault's structure.
-
-Existing options are either cloud-dependent (Notion AI, Mem), limited to keyword search (Obsidian's built-in), or require you to copy-paste context manually. knapper gives AI agents direct, structured access to your entire vault through a standard protocol.
 
 ## How it works
 
@@ -93,7 +91,15 @@ brew install mightytribble/tap/knapper
 
 # From source (requires CMake for llama.cpp)
 cargo install --git https://github.com/mightytribble/knapper
+
+# Docker (Linux/WSL2), CPU or CUDA. Images are linux/amd64 only, so x86_64
+# hosts — Windows on ARM is not supported. The CUDA image carries its own
+# toolkit: the host needs Docker and the NVIDIA Container Toolkit, never nvcc.
+docker pull ghcr.io/mightytribble/knapper:cuda    # or :cpu, or :latest for cpu
+docker pull ghcr.io/mightytribble/knapper:0.9.1-cuda      # version-pinned
 ```
+
+[deployment.md](deployment.md) has the full container flow — data volume, `--gpus all`, and wiring the MCP stdio server through `docker run -i`.
 
 **Index your vault:**
 
@@ -576,6 +582,12 @@ STYLE:
 
 knapper is not a replacement for Obsidian — it's the intelligence layer that sits between your vault and your AI tools.
 
+## When to use CUDA vs. CPU Builds, local embedder vs. cloud
+
+Knapper is designed to be fast and usable with the default settings, using only a local EmbeddingGemma model, on OS X or Linux (and in Windows via WSL or Docker). On Linux and WSL2 the Docker images are the least painful route to either build: `VARIANT=cuda` bundles the CUDA toolkit inside the image, so the host never needs `nvcc` or a matching toolkit — only Docker and the NVIDIA Container Toolkit at run time. Embedding is faster with CUDA, but the real speedup is if you want to use a cross-encoder: if you have the GPU RAM and can afford to run it, a 4B parameter cross-encoder gives marginally better results than default at the cost of ~400ms per query.
+
+Similarly, Gemini Embedding 2 gives superior results to EmbeddingGemma, at the cost of, well, money, latency (it's still plenty fast), and a willingness to send traffic to Google. Options are good: pick what works best for you.
+
 ## Current capabilities
 
 - 5-lane hybrid search (semantic + FTS5 + graph + cross-encoder reranker + temporal): content lanes RRF-fused, graph and temporal routed into the shortlist by reserved quota, cross-encoder sorts it (legacy mode fuses all five by weighted RRF)
@@ -599,7 +611,6 @@ knapper is not a replacement for Obsidian — it's the intelligence layer that s
 - Content-based folder role detection (people, daily, archive) by content patterns
 - PARA migration: AI-assisted vault restructuring into Projects/Areas/Resources/Archive with preview, apply, and undo workflow
 - Configurable model overrides for multilingual support
-- 962 unit tests, CI on macOS + Ubuntu
 
 ## Configuration
 
@@ -654,6 +665,18 @@ enabled = false
 # download. It runs at query time, so a switch needs no re-index.
 # rerank = "hf:gscoppino/Qwen3-Reranker-4B-GGUF-llama_cpp/Qwen3-Reranker-4B-Q4_K_M.gguf"  # ~2.5 GB
 # rerank = "hf:gscoppino/Qwen3-Reranker-4B-GGUF-llama_cpp/Qwen3-Reranker-4B.Q8_0.gguf"    # ~4.3 GB
+# Hosted embeddings instead of the local GGUF. The id must be pinned and
+# versioned: "gemini:gemini-embedding" and "-latest" are rejected, so a moving
+# alias cannot re-point an existing store's vectors at a model that changed
+# underneath them. The key is read from GEMINI_API_KEY and never written here.
+# embed = "gemini:gemini-embedding-2"
+
+# Non-secret knobs for the hosted embedder above.
+# [models.embed_api]
+# dim = 1536           # Matryoshka truncation; unset uses the native 3072
+# timeout_secs = 30
+# max_retries = 4      # on 429, 5xx and transport errors
+# endpoint = "..."     # proxy or test-server override
 
 # Registered AI agents
 [agents]
@@ -664,6 +687,8 @@ Search returns **sections**. A note whose "Counterspell" and "Dispel Magic" sect
 
 `embedding_prefix` puts the document's name, path, tags, aliases and the chunk's ancestor headings into the text that is **embedded**, while what is stored, displayed and keyword-matched stays the raw chunk. It is off by default: because the prefix is the same string for every chunk of a document, it separates documents from each other at the cost of separating a document's own sections, and on the test vault that lost more on exact-name lookup than it gained on conceptual queries (`eval/probes.md`). Each component is switchable so the trade can be measured per vault.
 
+`models.embed` takes a hosted provider as well as a local GGUF: `gemini:<versioned-id>` routes embedding to the Gemini API, reading the key from `GEMINI_API_KEY` — environment only, never written to config. The id has to end in a version number, so a moving alias cannot silently re-point an existing store's vectors. Documents batch at 100 per request and inputs are capped at 2048 tokens; `[models.embed_api]` bounds the call and can truncate the 3072-wide output. The embedder is a fingerprint component, so switching re-indexes the vault — and see the calibration note above: the model-free floor is fit against the local embedder, so a hosted one wants `[calibrated] floor = 0.0` or a refit.
+
 The keyword lane indexes each chunk's **full text**. `chunks.snippet` — the leading 200 characters — is the display field only; it is not what BM25 searches.
 
 `exclude` takes `.gitignore`-style globs, matched against paths relative to the vault root. A pattern with no `/` matches at any depth (`*-index.md` catches `lore/lore-index.md`); a trailing `/` means a directory and everything under it; an embedded `/` anchors the pattern to the vault root (`drafts/**`). Excluding a path that is already indexed removes it from the store — chunks, vectors, FTS entries and graph edges — on the next index run.
@@ -673,7 +698,7 @@ All data stored in `~/.knapper/` — single SQLite database (~10MB typical), GGU
 ## Development
 
 ```bash
-cargo test --lib          # 962 unit tests, no network (requires CMake for llama.cpp)
+cargo test --lib          # runs unit tests, no network (requires CMake for llama.cpp)
 cargo clippy -- -D warnings
 cargo fmt --check
 ```
@@ -682,7 +707,7 @@ cargo fmt --check
 
 Contributions welcome. Please open an issue first to discuss what you'd like to change.
 
-The codebase is 35 Rust modules behind a lib crate. `CLAUDE.md` in the repo root has detailed architecture documentation for AI-assisted development.
+The codebase is 41 Rust modules behind a lib crate. `CLAUDE.md` in the repo root has detailed architecture documentation for AI-assisted development.
 
 ## Attribution
 

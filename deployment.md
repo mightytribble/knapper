@@ -6,41 +6,44 @@ own machine. Three install tiers, one per target environment:
 | Tier | How you run knapper | GPU |
 |---|---|---|
 | macOS (Apple Silicon) | native binary | Metal |
-| Linux / WSL2 + NVIDIA | Docker, `:cuda` tag | CUDA |
-| Linux x86_64, CPU only | Docker, `:cpu` tag | none |
+| Linux x86_64, CPU only | native binary, or Docker `:cpu` | none |
+| Linux / WSL2 + NVIDIA (x86_64) | Docker `:cuda`, or a source build | CUDA |
+
+**On Linux, Docker is an option and not a requirement.** Every release
+carries a native `knapper-linux-x86_64` binary, and Homebrew installs that
+same binary on Linux — either is a simpler install than a container, and
+the Docker sections below are written for people who want one. If you want
+GPU offload, use the `:cuda` image or a source build with
+`--features cuda`.
+
+The container images are **x86_64 only** — `linux/amd64`, with no arm64
+variant — so Docker Desktop on Windows works on an Intel or AMD machine
+and **Windows on ARM is not supported**. Apple Silicon is served by the
+native macOS binary, not by a container.
 
 One vault per install. Re-indexing a different vault path replaces the
 active one; running several vaults side by side needs a separate data
 directory per vault (`--data-dir` or `KNAPPER_HOME`) and is not covered here.
 
-**What's live today:**
-
-- The from-source build (macOS) and the local Docker build (Linux/WSL2) work
-  now, from this repository.
-- `brew install mightytribble/tap/knapper` and `docker pull
-  ghcr.io/mightytribble/knapper:...` are not live yet — the tap and the
-  container registry push are a separate, gated release step. Both sections
-  below show the interim path and note where the future one-liner goes once
-  it ships.
-- The `git clone https://github.com/mightytribble/knapper` commands below
-  assume the repository is public, which is part of that same gated step.
-  If you're reading this before it lands, you already have a checkout —
-  this file lives in it.
-
 ## macOS (Apple Silicon, Metal)
 
-**Intended path**, once the tap is live:
+**Homebrew.** On Apple Silicon this installs the released binary. On an
+Intel Mac there is no published binary, so the formula builds from source
+and pulls in CMake and Rust as build dependencies:
 
 ```bash
 brew install mightytribble/tap/knapper
-knapper configure --enable-intelligence
-knapper index ~/Vault
 ```
 
-**Interim path (works now): build from source.**
+**Or take the release binary**, which is already compiled:
 
-Requires [CMake](https://cmake.org/) — `llama.cpp`'s C++ layer builds from
-it — and a Rust toolchain.
+```bash
+curl -sL https://github.com/mightytribble/knapper/releases/latest/download/knapper-macos-arm64.tar.gz | tar xz
+```
+
+**Or build it yourself**, which is how you run something newer than the
+last release. Requires [CMake](https://cmake.org/) — `llama.cpp`'s C++
+layer builds from it — and a Rust toolchain.
 
 ```bash
 git clone https://github.com/mightytribble/knapper
@@ -48,9 +51,9 @@ cd knapper
 cargo build --release
 ```
 
-Metal is auto-detected on macOS; no build flag is needed. The binary lands
-at `target/release/knapper`. Put it on your `PATH`, or call it by its full
-path in the steps below.
+Metal is auto-detected on macOS; no build flag is needed. A self-built
+binary lands at `target/release/knapper`. However you installed it, put it
+on your `PATH` or call it by its full path in the steps below.
 
 **Enable the reranker (optional, ~650 MB download).** Search runs without it;
 this adds the cross-encoder lane:
@@ -107,22 +110,33 @@ path to the binary as `command` instead.
 - [Docker](https://docs.docker.com/engine/install/)
 - The [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html), so `docker run --gpus all` can reach your GPU.
 
-**Two rules, both load-bearing:**
+**Two cautions:**
 
 - **Mount the vault at the same container path for both `index` and
   `serve`** — `/vault` in the examples below. `serve` reads the vault path
   that was baked into the store at index time; mount it anywhere else and
   `serve` looks for a vault that isn't there.
-- **Keep the vault on the WSL Linux filesystem, not `/mnt/c`.** The
-  real-time file watcher uses inotify, and inotify events do not reliably
-  cross from a Windows-filesystem vault into a Linux container — edits made
-  outside the container go unseen until you re-index by hand. Keep the
-  vault under your Linux home (e.g. `~/vault`), not under `/mnt/c/Users/...`.
+- **Prefer the WSL Linux filesystem over `/mnt/c`.** Edits are still seen
+  either way: inotify does not cross from a Windows-filesystem vault into a
+  Linux container, so the watcher detects that mount and polls instead
+  (`[watcher] backend`, default `auto`). What a Windows-side vault costs is
+  speed — every read crosses the 9p/virtiofs boundary, which slows indexing
+  and makes each poll pass more expensive. Keep the vault under your Linux
+  home (e.g. `~/vault`) when you can.
 
 **Get the image.**
 
-The published image (`ghcr.io/mightytribble/knapper:cuda`) is not pushed
-yet. Until it is, build it locally from a checkout of this repository:
+A published image exists:
+
+```bash
+docker pull ghcr.io/mightytribble/knapper:cuda
+docker tag ghcr.io/mightytribble/knapper:cuda knapper:cuda
+```
+
+`:cuda` tracks the latest release and `:0.9.1-cuda` pins one. The second
+line retags it locally, so every command below can read `knapper:cuda`
+whichever way you got the image. To run something newer than the last
+release, build from a checkout instead:
 
 ```bash
 git clone https://github.com/mightytribble/knapper
@@ -134,14 +148,7 @@ Building the image needs only Docker and network access — the CUDA
 toolkit and `nvcc` live inside the `nvidia/cuda:12.6.3-devel-ubuntu24.04`
 build stage, not on your host. (The NVIDIA Container Toolkit above is a
 run-time requirement, for `docker run --gpus all`; it is not needed to
-build the image.) Once the image is published, this step becomes:
-
-```bash
-docker pull ghcr.io/mightytribble/knapper:cuda
-```
-
-— substitute `ghcr.io/mightytribble/knapper:cuda` for `knapper:cuda` in the
-commands below when you switch to the published tag.
+build the image.)
 
 **Create a data volume.** This holds the SQLite store and the downloaded
 models, so they survive between container runs:
@@ -230,10 +237,7 @@ not `~/.claude/settings.json` (see the note in the macOS section above):
 }
 ```
 
-Use the same `/home/you/vault` path you indexed with. Once the published
-image is available, replace `knapper:cuda` with
-`ghcr.io/mightytribble/knapper:cuda` here too (in both the `claude mcp
-add` command and the JSON).
+Use the same `/home/you/vault` path you indexed with.
 
 `-i` keeps stdin open and is required — it's how the MCP stdio handshake
 reaches the container. `--rm` cleans up the container when the client
@@ -241,14 +245,37 @@ disconnects; Claude Code starts a fresh one per session.
 
 ## Linux x86_64 (CPU)
 
-Same Docker path as the CUDA tier, without `--gpus all` and with the `:cpu`
-tag. The two rules above (same mount path for index and serve, vault on the
+Two ways in: the native binary, or the `:cpu` container.
+
+**Native binary — no Docker involved:**
+
+```bash
+curl -sL https://github.com/mightytribble/knapper/releases/latest/download/knapper-linux-x86_64.tar.gz | tar xz
+```
+
+`brew install mightytribble/tap/knapper` installs the same binary. Put it
+on your `PATH` and the commands are the ones in the macOS section above —
+`knapper index`, `knapper configure`, `claude mcp add` — none of which is
+macOS-specific apart from Metal.
+
+**Or run it in a container**, which is the rest of this section: the same
+Docker path as the CUDA tier, without `--gpus all` and with the `:cpu` tag.
+The two rules above (same mount path for index and serve, vault on the
 Linux filesystem under WSL2) apply here too.
 
 **Get the image.**
 
-The published image (`ghcr.io/mightytribble/knapper:cpu`) is not pushed
-yet. Until it is, build it locally from a checkout of this repository:
+A published image exists:
+
+```bash
+docker pull ghcr.io/mightytribble/knapper:cpu
+docker tag ghcr.io/mightytribble/knapper:cpu knapper:cpu
+```
+
+`:cpu` tracks the latest release, `:0.9.1-cpu` pins one, and `:latest` is
+an alias for `:cpu`. The second line retags it locally, so every command
+below can read `knapper:cpu` whichever way you got the image. To run
+something newer than the last release, build from a checkout instead:
 
 ```bash
 git clone https://github.com/mightytribble/knapper
@@ -257,14 +284,7 @@ docker build --build-arg VARIANT=cpu -t knapper:cpu .
 ```
 
 This needs only Docker and network access — no GPU toolkit is involved on
-this tier. Once the image is published, this step becomes:
-
-```bash
-docker pull ghcr.io/mightytribble/knapper:cpu
-```
-
-— substitute `ghcr.io/mightytribble/knapper:cpu` for `knapper:cpu` in the
-commands below when you switch to the published tag.
+this tier.
 
 **Create a data volume:**
 
@@ -343,10 +363,7 @@ not `~/.claude/settings.json` (see the note in the macOS section above):
 }
 ```
 
-Use the same `/home/you/vault` path you indexed with. Once the published
-image is available, replace `knapper:cpu` with
-`ghcr.io/mightytribble/knapper:cpu` here too (in both the `claude mcp add`
-command and the JSON).
+Use the same `/home/you/vault` path you indexed with.
 
 ## Verifying the install
 
