@@ -376,6 +376,46 @@ impl Default for RerankConfig {
     }
 }
 
+/// Calibrated score fusion for the model-free path
+/// (docs/specs/2026-08-30-calibrated-fusion-design.md).
+///
+/// Read only when `[ranking] mode = "sorted"` runs with no cross-encoder
+/// configured; with one configured the whole section is inert. Every key is
+/// query-time and reaches no fingerprint, so a sweep is a config edit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CalibratedConfig {
+    /// The calibrated sort itself. `false` restores the pre-change routing —
+    /// a no-model build takes the legacy stage — byte for byte. The control.
+    pub enabled: bool,
+    /// w_s: what raw cosine is worth to the logistic.
+    pub semantic: f64,
+    /// w_k: what upper-bound-normalized BM25 is worth.
+    pub keyword: f64,
+    /// b: the logistic's intercept.
+    pub intercept: f64,
+    /// The probability below which a candidate is not an answer — the
+    /// `answer_floor` of this path. `0.0` removes nothing and is the floor's
+    /// own control.
+    pub floor: f64,
+}
+
+impl Default for CalibratedConfig {
+    fn default() -> Self {
+        // The pin fit: 33 tier-1 positives against 1228 labeled negatives,
+        // leave-one-query-out validated. Provenance in
+        // eval/calibrated-fusion-report-2026-08-30.txt; the fit's tool is
+        // eval/calibrated-fusion-eval.py.
+        Self {
+            enabled: true,
+            semantic: 13.878,
+            keyword: 13.571,
+            intercept: -5.848,
+            floor: 0.75,
+        }
+    }
+}
+
 /// What leads a chunk's breadcrumb — the segment before the heading stack
 /// (issue #46).
 ///
@@ -835,6 +875,10 @@ pub struct Config {
     /// What the keyword lane indexes beside the chunk body (issue #37).
     #[serde(default)]
     pub fts: FtsConfig,
+    /// Calibrated score fusion for the model-free path
+    /// (docs/specs/2026-08-30-calibrated-fusion-design.md).
+    #[serde(default)]
+    pub calibrated: CalibratedConfig,
     /// What leads a chunk's breadcrumb, before the heading stack (issue #46).
     /// A chunker-digest component, so changing it re-indexes the vault.
     #[serde(default)]
@@ -948,6 +992,7 @@ impl Default for Config {
             ranking: RankingConfig::default(),
             lane_weights: LaneWeights::default(),
             fts: FtsConfig::default(),
+            calibrated: CalibratedConfig::default(),
             agents: AgentsConfig::default(),
             http: HttpConfig::default(),
             identity: IdentityConfig::default(),
@@ -1787,5 +1832,31 @@ vault_purpose = "notes"
         assert!(!agents.claude_code);
         assert!(hint.contains("~/.cursor/mcp.json"));
         assert!(agents.register("emacs").is_none());
+    }
+
+    #[test]
+    fn calibrated_defaults_are_the_pin_fit() {
+        let c = CalibratedConfig::default();
+        assert!(c.enabled);
+        assert_eq!(c.semantic, 13.878);
+        assert_eq!(c.keyword, 13.571);
+        assert_eq!(c.intercept, -5.848);
+        assert_eq!(c.floor, 0.75);
+    }
+
+    #[test]
+    fn calibrated_reads_partial_tables_and_omission_keeps_the_defaults() {
+        let off: Config = toml::from_str("[calibrated]\nenabled = false\n").unwrap();
+        assert!(!off.calibrated.enabled);
+        assert_eq!(
+            off.calibrated.floor, 0.75,
+            "an omitted key keeps its default"
+        );
+
+        let omitted: Config = toml::from_str("[ranking]\nanswer_floor = 0.0\n").unwrap();
+        assert!(
+            omitted.calibrated.enabled,
+            "a config with no [calibrated] table ships enabled"
+        );
     }
 }
