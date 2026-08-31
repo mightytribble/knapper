@@ -929,6 +929,48 @@ impl Store {
         Ok(())
     }
 
+    /// How many rows the keyword index covers — BM25's N, for the calibrated
+    /// bound (spec 2026-08-30).
+    pub fn chunk_row_count(&self) -> Result<u64> {
+        Ok(self
+            .conn
+            .query_row("SELECT count(*) FROM chunks", [], |row| {
+                row.get::<_, i64>(0)
+            })? as u64)
+    }
+
+    /// Every chunk vector of the named files, for pool candidates no content
+    /// lane fetched (a graph or temporal admission). Decoded the way
+    /// [`Self::get_all_vectors`] decodes; rows with no vector are skipped.
+    pub fn vectors_for_files(&self, file_ids: &[i64]) -> Result<Vec<(i64, i64, Vec<f32>)>> {
+        if file_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let array: rusqlite::vtab::array::Array = std::rc::Rc::new(
+            file_ids
+                .iter()
+                .copied()
+                .map(rusqlite::types::Value::from)
+                .collect::<Vec<_>>(),
+        );
+        let mut stmt = self.conn.prepare(
+            "SELECT file_id, seq, vector FROM chunks
+             WHERE file_id IN rarray(?1) AND vector IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([array], |row| {
+            let file_id: i64 = row.get(0)?;
+            let seq: i64 = row.get(1)?;
+            let blob: Vec<u8> = row.get(2)?;
+            let vector = blob
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect();
+            Ok((file_id, seq, vector))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
     /// Get all stored vectors with their IDs.
     /// Returns (vector_id, vector) pairs.
     pub fn get_all_vectors(&self) -> Result<Vec<(u64, Vec<f32>)>> {
@@ -1426,6 +1468,18 @@ impl Store {
             Some(expr) => self.fts_search_expr(&expr, limit, weights, scope),
             None => Ok(Vec::new()),
         }
+    }
+
+    /// How many chunks match one FTS5 expression — `df(t)` for the calibrated
+    /// bound. Callers quote a single term with [`crate::fts::phrase_expr`]; the
+    /// count is rows matching in any indexed column, which is the population
+    /// the scorer's idf is computed over.
+    pub fn fts_doc_frequency(&self, term_expr: &str) -> Result<u64> {
+        Ok(self.conn.query_row(
+            "SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH ?1",
+            [term_expr],
+            |row| row.get::<_, i64>(0),
+        )? as u64)
     }
 
     /// Run a prepared FTS5 MATCH expression. Callers build the expression with
@@ -6164,5 +6218,119 @@ mod tests {
             "undead.md carries two of them"
         );
         assert!(axes.contains(&("habitat".to_string(), 1)));
+    }
+
+    // ── Calibrated-fusion readers (spec 2026-08-30) ────────────────
+
+    /// Two files, three chunks: "storm wolf" is in two of them, "basilisk"
+    /// in the third alone. Each chunk carries a vector, for
+    /// `vectors_for_files` to read back.
+    fn seed_calibrated_fixture(store: &Store) -> (i64, i64) {
+        let file_a = store
+            .insert_file(
+                "notes/a.md",
+                "ha",
+                100,
+                &generate_docid("notes/a.md"),
+                None,
+                None,
+            )
+            .unwrap();
+        let file_b = store
+            .insert_file(
+                "notes/b.md",
+                "hb",
+                100,
+                &generate_docid("notes/b.md"),
+                None,
+                None,
+            )
+            .unwrap();
+
+        store
+            .insert_chunk_with_vector(
+                &NewChunk {
+                    file_id: file_a,
+                    seq: 0,
+                    text: "a storm wolf howls at the storm",
+                    vector_id: 1,
+                    token_count: 7,
+                    ..Default::default()
+                },
+                &[0.1, 0.2, 0.3, 0.4],
+            )
+            .unwrap();
+        store
+            .insert_chunk_with_vector(
+                &NewChunk {
+                    file_id: file_a,
+                    seq: 1,
+                    text: "a basilisk turns prey to stone",
+                    vector_id: 2,
+                    token_count: 6,
+                    ..Default::default()
+                },
+                &[0.5, 0.6, 0.7, 0.8],
+            )
+            .unwrap();
+        store
+            .insert_chunk_with_vector(
+                &NewChunk {
+                    file_id: file_b,
+                    seq: 0,
+                    text: "a storm wolf pack hunts by night",
+                    vector_id: 3,
+                    token_count: 7,
+                    ..Default::default()
+                },
+                &[0.9, 1.0, 1.1, 1.2],
+            )
+            .unwrap();
+
+        (file_a, file_b)
+    }
+
+    #[test]
+    fn chunk_row_count_counts_the_chunks_table() {
+        let store = Store::open_memory().unwrap();
+        seed_calibrated_fixture(&store);
+        assert_eq!(store.chunk_row_count().unwrap(), 3);
+    }
+
+    #[test]
+    fn fts_doc_frequency_counts_rows_matching_one_term() {
+        let store = Store::open_memory().unwrap();
+        seed_calibrated_fixture(&store);
+        assert_eq!(
+            store
+                .fts_doc_frequency(&crate::fts::phrase_expr("storm"))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            store
+                .fts_doc_frequency(&crate::fts::phrase_expr("basilisk"))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .fts_doc_frequency(&crate::fts::phrase_expr("absent"))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn vectors_for_files_returns_the_named_files_vectors_and_no_others() {
+        let store = Store::open_memory().unwrap();
+        let (file_a, _file_b) = seed_calibrated_fixture(&store);
+
+        let rows = store.vectors_for_files(&[file_a]).unwrap();
+        assert!(rows.iter().all(|(f, _, _)| *f == file_a));
+        assert!(!rows.is_empty());
+        let (_, _, v) = &rows[0];
+        assert_eq!(v.len(), 4, "decoded to the width it was written at");
+        assert!(store.vectors_for_files(&[]).unwrap().is_empty());
     }
 }
