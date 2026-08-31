@@ -200,6 +200,8 @@ knapper configure --enable-intelligence
 
 Without it, search already ranks by a calibrated probability fused from the semantic and keyword lanes' own scores, and abstains (`No relevant content found for this query in the vault.`) below its own floor. What the cross-encoder still buys is ordering on the hardest queries — the ones where a candidate merely mentions the query's words rather than answering it, which no fusion of lane scores alone can tell apart.
 
+That probability's coefficients and floor are fit against the default local embedder. The keyword half normalizes itself against each query's own upper bound, but the semantic half is one model's cosine scale, so another `models.embed` moves the floor in an unknown direction and the path then abstains on every query or on none. On a non-default embedder set `[calibrated] floor = 0.0`, or refit the four numbers with `eval/calibrated-fusion-eval.py`.
+
 ## Example usage
 
 **Search with the cross-encoder lane:**

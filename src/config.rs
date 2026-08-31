@@ -382,6 +382,16 @@ impl Default for RerankConfig {
 /// Read only when `[ranking] mode = "sorted"` runs with no cross-encoder
 /// configured; with one configured the whole section is inert. Every key is
 /// query-time and reaches no fingerprint, so a sweep is a config edit.
+///
+/// **The coefficients and the floor are fit against the default local
+/// embedder.** `bm25n` normalizes itself per query and per corpus, but raw
+/// cosine is one model's similarity scale: at `bm25n = 0` the shipped floor
+/// asks for `cos >= 0.5006`, a threshold read off that model's distribution.
+/// A non-default `models.embed` — an API embedder or another `hf:` GGUF —
+/// moves the scale in an unknown direction, and the failure is silent: the
+/// path abstains on every query, or on none. Set `floor = 0.0` on a
+/// non-default embedder, or refit the four numbers with
+/// `eval/calibrated-fusion-eval.py`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CalibratedConfig {

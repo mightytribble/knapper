@@ -20,11 +20,17 @@ pub fn idf(n_rows: u64, doc_freq: u64) -> f64 {
 }
 
 /// The query's maximum attainable BM25: each term saturates at
-/// `idf · (k1 + 1)` as its frequency grows, scaled by the heaviest column
-/// weight, because the best row can put every occurrence in the heaviest
-/// column.
-pub fn upper_bound(idfs: &[f64], max_column_weight: f64) -> f64 {
-    (K1 + 1.0) * max_column_weight * idfs.iter().sum::<f64>()
+/// `idf · (k1 + 1)` as its frequency grows, summed over the query's terms.
+///
+/// The `[fts]` column weights do not scale the bound. FTS5 folds a weight into
+/// the term *frequency* before the saturating ratio (`fts5_aux.c`:
+/// `aFreq[ip] += w`, then `idf · tf·(k1+1) / (tf + k1·(…))`), so the ceiling is
+/// `idf · (k1 + 1)` whatever the weights are. A heavier weight moves a row's
+/// score toward that same ceiling instead of raising it. This is also the
+/// formula `eval/calibrated-fusion-eval.py` fits the coefficients with, so the
+/// binary and the refit tool must agree here (spec 2026-08-30).
+pub fn upper_bound(idfs: &[f64]) -> f64 {
+    (K1 + 1.0) * idfs.iter().sum::<f64>()
 }
 
 /// The fraction of the maximal possible lexical match for this query, in
@@ -64,10 +70,15 @@ mod tests {
     }
 
     #[test]
-    fn the_bound_is_k1_plus_one_times_the_idf_sum_scaled_by_the_top_weight() {
-        assert!((upper_bound(&[2.0, 3.0], 1.0) - 11.0).abs() < 1e-9);
-        assert!((upper_bound(&[2.0, 3.0], 2.0) - 22.0).abs() < 1e-9);
-        assert_eq!(upper_bound(&[], 1.0), 0.0);
+    fn the_bound_is_k1_plus_one_times_the_idf_sum() {
+        assert!((upper_bound(&[2.0, 3.0]) - 11.0).abs() < 1e-9);
+        // Each term contributes its own saturation ceiling and nothing else,
+        // so the bound is additive over the query's terms. Nothing outside the
+        // idfs scales it — the `[fts]` column weights included.
+        assert!(
+            (upper_bound(&[2.0, 3.0]) - (upper_bound(&[2.0]) + upper_bound(&[3.0]))).abs() < 1e-9
+        );
+        assert_eq!(upper_bound(&[]), 0.0);
     }
 
     #[test]

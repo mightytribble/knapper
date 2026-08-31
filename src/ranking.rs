@@ -249,7 +249,9 @@ pub fn build_pool(
     (pool, shape)
 }
 
-/// Order the pool by what the cross-encoder said.
+/// Order the pool by whichever probability filled `rerank_score` — the
+/// cross-encoder's, or the calibrated logistic's on a build with no model
+/// (spec 2026-08-30).
 ///
 /// Descending by score; unscored candidates sort last. The tie-break is what
 /// makes the order reproducible — see [`Tiebreak`].
@@ -312,10 +314,14 @@ pub fn apply_answer_floor(pool: &mut Vec<Candidate>, floor: f64) -> usize {
     before - pool.len()
 }
 
-/// The documented fallback when no cross-encoder is available: three content
-/// candidates, then one from the other sources, repeating.
+/// The documented fallback for a *configured* cross-encoder that fails at call
+/// time: three content candidates, then one from the other sources, repeating.
 ///
-/// With no model there is no sort, so the fallback has to be *defined* rather
+/// It is not the model-free path. A build with no cross-encoder configured is
+/// sorted by the calibrated logistic (spec 2026-08-30); this runs only when a
+/// model that should be there returned an error.
+///
+/// With no score there is no sort, so the fallback has to be *defined* rather
 /// than left as whatever the fused order happened to be — otherwise the
 /// reserved candidates, which exist precisely because fusion under-ranks them,
 /// are ranked by the thing they were routed around. Each stream keeps its own

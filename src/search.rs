@@ -589,8 +589,10 @@ pub fn search_with_intelligence(
             .iter()
             .take(top_n)
             .map(|f| {
-                // The cross-encoder's own number, not a fused one. This is the
-                // absolute score layer 2 thresholds on for abstention.
+                // Whichever scorer sorted the pool — the cross-encoder or
+                // the calibrated logistic — its own number, not a fused one.
+                // This is the absolute score layer 2 thresholds on for
+                // abstention.
                 let score = model_score(f).unwrap_or(f.rrf_score);
                 build_result(config.store, f, config.rerank, score)
             })
@@ -819,9 +821,10 @@ fn finalize_search_output(
 /// from the store here rather than carried on `FusedResult`.
 ///
 /// `score` is supplied by the caller rather than derived here, because the two
-/// ranking stages read it differently: the sorted stage reports the
-/// cross-encoder's own probability, the legacy stage the fused RRF score it
-/// has always been the byte-for-byte control for.
+/// ranking stages read it differently: the sorted stage reports the probability
+/// its scorer produced — the cross-encoder's, or the calibrated logistic's when
+/// no model is configured — and the legacy stage the fused RRF score it has
+/// always been the byte-for-byte control for.
 fn build_result(
     store: &Store,
     f: &FusedResult,
@@ -990,11 +993,12 @@ fn sorted_stage(
             }
         }
     } else {
-        // No model was ever configured: routing admitted this build because
+        // No model is configured here — either none was asked for, or one was
+        // asked for and did not load. Routing admitted this build because
         // `[calibrated] enabled`, so the logistic sorts where the model would
         // (spec 2026-08-30). The Err arm above keeps the interleave: a model
-        // that should be there failing is a different finding from a build
-        // that never had one.
+        // that loaded and then failed at call time is a different finding from
+        // no model at all.
         let (bound, idfs) = apply_calibrated_scores(
             config.store,
             &config.calibrated,
@@ -1165,9 +1169,11 @@ fn apply_calibrated_scores(
         }
     }
 
-    // The query's own ceiling (spec, "The two normalizations"). The heaviest
-    // column weight scales it, because the best row can put every occurrence
-    // in the heaviest column.
+    // The query's own ceiling (spec, "The two normalizations"). The `[fts]`
+    // column weights do not enter it: each term's contribution saturates at
+    // `idf · (k1 + 1)`, and FTS5 folds a weight into the frequency before that
+    // ratio, so a heavier weight moves the score toward the same ceiling
+    // instead of raising it.
     //
     // A failed row count is **not** an empty corpus. `idf(0, df)` clamps to the
     // floor for every term, which collapses the bound and saturates every
@@ -1182,9 +1188,6 @@ fn apply_calibrated_scores(
             None
         }
     };
-    // `f64` is not `Ord`, so the heaviest weight is a reduce. A declaration
-    // with no columns scales by 1.0 and leaves the bound the idfs' own.
-    let max_weight = fts_weights.iter().copied().reduce(f64::max).unwrap_or(1.0);
     let idfs: Vec<(String, f64)> = match n_rows {
         None => Vec::new(),
         Some(n_rows) => crate::fts::query_terms(query)
@@ -1207,10 +1210,7 @@ fn apply_calibrated_scores(
             })
             .collect(),
     };
-    let bound = crate::calibrate::upper_bound(
-        &idfs.iter().map(|(_, i)| *i).collect::<Vec<_>>(),
-        max_weight,
-    );
+    let bound = crate::calibrate::upper_bound(&idfs.iter().map(|(_, i)| *i).collect::<Vec<_>>());
 
     for c in pool.iter_mut() {
         let key = c.key();
@@ -3822,7 +3822,21 @@ mod tests {
             search_with_intelligence("warding", 20, embedder, &mut config).unwrap()
         };
 
-        let on = run(crate::config::CalibratedConfig::default(), &mut embedder);
+        // Every field is loud, not defaulted. Two arms that differ only in
+        // `enabled` leave the coefficients and the floor equal, so they test
+        // one field of five: the reranked path could read `[calibrated] floor`
+        // or scale by `[calibrated] semantic` and both arms would still agree.
+        // A section this wrong that changes nothing is the invariant.
+        let on = run(
+            crate::config::CalibratedConfig {
+                enabled: true,
+                semantic: 99.0,
+                keyword: 99.0,
+                intercept: 99.0,
+                floor: 0.99,
+            },
+            &mut embedder,
+        );
         let off = run(
             crate::config::CalibratedConfig {
                 enabled: false,
