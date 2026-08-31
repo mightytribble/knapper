@@ -942,6 +942,18 @@ impl Store {
     /// Every chunk vector of the named files, for pool candidates no content
     /// lane fetched (a graph or temporal admission). Decoded the way
     /// [`Self::get_all_vectors`] decodes; rows with no vector are skipped.
+    ///
+    /// It reads a whole file's vectors rather than the pool's own rows. The
+    /// pool holds `(file_id, seq)` pairs, but `rarray` binds one flat list of
+    /// one type, so narrowing this needs the signature to take pairs and a
+    /// `WHERE (file_id, seq) IN (VALUES ...)` built at call time — not a
+    /// filter that can be added to the clause below. Filtering the result in
+    /// Rust saves nothing, because avoiding the fetch is the point. The
+    /// over-fetch is bounded: it fires only for candidates no content lane
+    /// found, so the file count is at most `graph_reserve + temporal_reserve`,
+    /// and the waste per file is that note's chunk count. At the measured
+    /// corpus the whole calibrated path costs 1.7 ms a query, so this is
+    /// recorded rather than fixed.
     pub fn vectors_for_files(&self, file_ids: &[i64]) -> Result<Vec<(i64, i64, Vec<f32>)>> {
         if file_ids.is_empty() {
             return Ok(Vec::new());
