@@ -101,8 +101,10 @@ Single vault only. Re-indexing a different vault path triggers a confirmation pr
 ## CI/CD
 
 - CI: `cargo fmt --check` + `cargo clippy -- -D warnings` + `cargo test --lib` on macOS + Ubuntu. Ubuntu step installs CMake. **Manual dispatch only in this fork** (`gh workflow run ci.yml`) — it does not run on push or PR, so those three commands are the local gate before every commit.
-- Release: native builds on macOS arm64 (macos-14) + Linux x86_64 (ubuntu-latest). Manual dispatch only (`gh workflow run release.yml -f tag=v0.9.x`); it does not fire on tag pushes
-- Homebrew: `mightytribble/homebrew-tap` — formula builds from source tarball. Depends on `cmake` + `rust`.
+- Remotes: `origin` is `mightytribble/knapper-private`, `public` is `mightytribble/knapper`, `upstream` is the pre-fork `devwhodevs/engraph`. Releases are published on **public**, so `main` and the tag go to both remotes and the workflow is dispatched against public.
+- Release: native builds on macOS arm64 (macos-14) + Linux x86_64 (ubuntu-latest). Manual dispatch only (`gh workflow run release.yml --repo mightytribble/knapper -f tag=v0.9.x`); it does not fire on tag pushes. Bump `Cargo.toml` and add a `CHANGELOG.md` entry in the same commit as the tag.
+- Homebrew: `mightytribble/homebrew-tap` — formula builds from source tarball. Depends on `cmake` + `rust`. The `update-homebrew` job **regenerates the whole formula** from a heredoc in `release.yml`, so an edit made in the tap by hand is overwritten by the next release; change the heredoc, not the tap. It pushes with `HOMEBREW_TAP_TOKEN`, a fine-grained PAT held on the **public** repo with `Contents: write` on the tap alone. Without it the binaries still publish and only the formula goes stale, which is a quiet failure: `brew` keeps serving the previous version.
+- `/docs/` and `/eval/` are gitignored — development measurement and design material, kept on disk and out of the repo. `CLAUDE.md`, `README.md` and the specs all reference files there that a clone does not contain, and nothing under either path should be forced into a commit.
 
 ## Common tasks
 
@@ -113,9 +115,12 @@ cargo test --lib
 # Build release
 cargo build --release
 
-# Release: tag, push, then dispatch the workflow manually with the tag as input
-git tag v0.9.x && git push origin v0.9.x
-gh workflow run release.yml -f tag=v0.9.x
+# Release: bump Cargo.toml + CHANGELOG.md first, then tag both remotes and
+# dispatch against public, which is where the release and its assets land.
+git push origin main && git push public main
+git tag -a v0.9.x -m "knapper v0.9.x"
+git push origin v0.9.x && git push public v0.9.x
+gh workflow run release.yml --repo mightytribble/knapper -f tag=v0.9.x
 
 # Enable intelligence (downloads ~1.3GB)
 knapper configure --enable-intelligence
