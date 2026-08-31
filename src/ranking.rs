@@ -357,18 +357,23 @@ pub fn degraded_interleave(pool: Vec<Candidate>) -> Vec<Candidate> {
 /// Render the ranked pool for `--explain` and for the result list.
 ///
 /// `rrf_score` keeps meaning the fused score it always meant — the sort key is
-/// the cross-encoder's, and it is reported as its own lane contribution rather
+/// the sort lane's, and it is reported as its own lane contribution rather
 /// than written over a field named after something else. `confidence` is the
-/// cross-encoder's probability as a percentage, which is an absolute number for
+/// sort lane's probability as a percentage, which is an absolute number for
 /// the first time: a query with no good answer no longer reports 100% for
 /// whatever it ranked first.
-pub fn into_fused(pool: Vec<Candidate>) -> Vec<FusedResult> {
+///
+/// `sort_lane` names whichever lane produced `rerank_score` — `"rerank"` for
+/// the cross-encoder, `"calibrated"` for the model-free logistic (Task 7) —
+/// so `--explain` says which one sorted the pool instead of calling both of
+/// them "rerank".
+pub fn into_fused(pool: Vec<Candidate>, sort_lane: &'static str) -> Vec<FusedResult> {
     pool.into_iter()
         .map(|c| {
             let mut lane_contributions = c.lane_contributions;
             if let Some(score) = c.rerank_score {
                 lane_contributions.push(LaneContribution {
-                    lane_name: "rerank".to_string(),
+                    lane_name: sort_lane.to_string(),
                     rank: 0,
                     raw_score: score,
                     weighted_contribution: score,
@@ -751,7 +756,7 @@ mod tests {
                 ..from_fused(fused("also-nothing.md", 0, 0.4), 2)
             },
         ];
-        let results = into_fused(pool);
+        let results = into_fused(pool, "rerank");
         assert!((results[0].confidence - 4.0).abs() < 1e-9);
         assert!((results[1].confidence - 2.0).abs() < 1e-9);
     }
@@ -764,7 +769,7 @@ mod tests {
             rerank_score: Some(0.75),
             ..from_fused(fused("a.md", 3, 0.0312), 4)
         }];
-        let results = into_fused(pool);
+        let results = into_fused(pool, "rerank");
 
         assert!((results[0].rrf_score - 0.0312).abs() < 1e-9);
         let rerank = results[0]
@@ -773,6 +778,30 @@ mod tests {
             .find(|l| l.lane_name == "rerank")
             .expect("the sort key is not in the explain output");
         assert!((rerank.raw_score - 0.75).abs() < 1e-9);
+    }
+
+    /// `into_fused` labels the sort score with whichever lane sorted the
+    /// pool, so `--explain` names the model-free path once it exists
+    /// (Task 7) instead of calling every sort score "rerank".
+    #[test]
+    fn into_fused_labels_the_score_with_the_sort_lane() {
+        let c = Candidate {
+            rerank_score: Some(0.9),
+            ..from_fused(fused("a.md", 3, 0.0312), 4)
+        };
+        let fused = into_fused(vec![c], "calibrated");
+        assert!(
+            fused[0]
+                .lane_contributions
+                .iter()
+                .any(|l| l.lane_name == "calibrated")
+        );
+        assert!(
+            fused[0]
+                .lane_contributions
+                .iter()
+                .all(|l| l.lane_name != "rerank")
+        );
     }
 
     /// A budget smaller than the reserves is a configuration, not a panic.

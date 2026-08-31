@@ -734,12 +734,14 @@ fn target_of(result: &FusedResult) -> RerankTarget<'_> {
     }
 }
 
-/// The cross-encoder's own score for a result, if it ran.
+/// The sort lane's own score for a result, if one ran — the cross-encoder's
+/// `"rerank"` or the model-free `"calibrated"` logistic (Task 7). Whichever
+/// one sorted the pool, `build_result`'s score reads it here.
 fn model_score(result: &FusedResult) -> Option<f64> {
     result
         .lane_contributions
         .iter()
-        .find(|l| l.lane_name == "rerank")
+        .find(|l| l.lane_name == "rerank" || l.lane_name == "calibrated")
         .map(|l| l.raw_score)
 }
 
@@ -942,7 +944,7 @@ fn sorted_stage(
 
     if !scored {
         let ordered = ranking::degraded_interleave(pool);
-        let mut results = ranking::into_fused(ordered);
+        let mut results = ranking::into_fused(ordered, "rerank");
         ranking::degraded_confidence(&mut results);
         return (results, true);
     }
@@ -986,7 +988,7 @@ fn sorted_stage(
         "graph reserve, after the sort"
     );
 
-    (ranking::into_fused(pool), false)
+    (ranking::into_fused(pool, "rerank"), false)
 }
 
 /// Chunk keys whose note falls in the query's date range, best match first.
