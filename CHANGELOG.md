@@ -6,6 +6,8 @@
 
 - Frontmatter writes preserve the note (#92). `create` writes the caller's frontmatter as given, and no longer adds `created`, `created_by` or placement keys. A property edit keeps the key's position and the note's list style, and an empty list writes an empty list instead of deleting the key. `archive` and `unarchive` edit the block instead of rebuilding it, so an archive round trip keeps the note's other keys, its comments and its blank lines byte for byte. `archive` refuses a note that already holds `archived`, `archived_at` or `archived_from`, naming the key it found, rather than lose the note's own value or drop it silently on unarchive. `unarchive` drops a leftover `archived` tag from a note archived by an earlier version of knapper, so the tag does not return to the vocabulary. A value knapper cannot address as a line — a nested mapping, an anchor, a block scalar — refuses the write and names what it found. The placement-correction learning loop no longer fires for a newly created note, because `create` no longer writes the `suggested_folder` and `created_by` keys the loop reads.
 
+- An edited note stays in the index (#93). A rename that replaces a file makes the debouncer report a removal of the target path ahead of the events that describe the new file. The watcher read that removal as a deletion and dropped the note, and the change behind it was the write pipeline's own, which the recent-write check suppresses — so `search`, `list` and `read` lost a note that was still on disk and correct, and a later `index` counted it as a new file. A removal whose path still holds a file is no longer a deletion.
+
 ## 0.9.1 (2026-08-30)
 
 ### Calibrated score fusion: the model-free default ranks and abstains

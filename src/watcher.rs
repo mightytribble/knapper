@@ -323,6 +323,19 @@ fn process_debounced_events(
             }
             EventKind::Remove(_) => {
                 for path in paths {
+                    // A removal whose path still holds a file is not a
+                    // deletion. A rename that replaces a file — every atomic
+                    // save, `writer::atomic_write` included — makes the
+                    // debouncer synthesize one for the target path ahead of the
+                    // events that describe the new file. Passing it on drops
+                    // the note from the index, and the change behind it is the
+                    // writer's own, which `is_recent_write` suppresses: the
+                    // note is left on disk and out of search until something
+                    // re-indexes it (#93). `Deleted` means the file is gone,
+                    // and disk is what says so.
+                    if path.exists() {
+                        continue;
+                    }
                     result.push(WatchEvent::Deleted(path.clone()));
                 }
             }
@@ -898,5 +911,113 @@ mod tests {
                 "magic {magic:#x} should not poll"
             );
         }
+    }
+
+    /// The debouncer reports an atomic save as a removal of the target path
+    /// followed by the events that describe the new file, and the removal is
+    /// what a `serve` session's own writes produce: `writer::atomic_write`
+    /// renames a temp file over the note. Taking that removal at face value
+    /// drops the note from the index, and the change that follows it is the
+    /// writer's own, which `is_recent_write` suppresses — so nothing puts the
+    /// note back and it stays on disk and out of search (#93).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_atomic_save_over_a_note_is_not_a_deletion() {
+        use super::{WatchEvent, start_producer};
+        use crate::exclude::ExcludeMatcher;
+        use std::time::Duration;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let vault = tmp.path().to_path_buf();
+        let note = vault.join("note.md");
+        std::fs::write(&note, "# Note\n\nfirst\n").unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<WatchEvent>>(64);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let producer = start_producer(
+            vault.clone(),
+            ExcludeMatcher::new(&[]).unwrap(),
+            tx,
+            shutdown_rx,
+            WatcherBackend::Native,
+            Duration::from_millis(200),
+        );
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        // The debouncer synthesizes the removal only when the target path is
+        // already in its queue, which is any write inside the debounce window
+        // — a second `update` to the same note, or an editor that saved it.
+        std::fs::write(&note, "# Note\n\nsecond\n").unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // What `writer::atomic_write` does.
+        let temp = note.with_extension("md.tmp");
+        std::fs::write(&temp, "# Note\n\nthird\n").unwrap();
+        std::fs::rename(&temp, &note).unwrap();
+
+        let mut seen: Vec<WatchEvent> = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+        while let Ok(Some(batch)) = tokio::time::timeout(
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+            rx.recv(),
+        )
+        .await
+        {
+            seen.extend(batch);
+        }
+        let _ = shutdown_tx.send(());
+        let _ = producer.join();
+
+        assert!(
+            !seen
+                .iter()
+                .any(|e| matches!(e, WatchEvent::Deleted(p) if p == &note)),
+            "a note the rename replaced is still on disk: {seen:?}"
+        );
+        assert!(
+            seen.iter()
+                .any(|e| matches!(e, WatchEvent::Changed(p) if p == &note)),
+            "the write itself has to reach the consumer: {seen:?}"
+        );
+    }
+
+    /// The other half of the same rule: a path that is gone is gone, and the
+    /// store has to let go of it (#93).
+    #[test]
+    fn a_removal_is_a_deletion_when_the_path_is_gone() {
+        use super::{WatchEvent, process_debounced_events};
+        use crate::exclude::ExcludeMatcher;
+        use notify::{
+            Event,
+            event::{EventKind, RemoveKind},
+        };
+        use notify_debouncer_full::DebouncedEvent;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let vault = tmp.path().to_path_buf();
+        let kept = vault.join("kept.md");
+        let gone = vault.join("gone.md");
+        std::fs::write(&kept, "# Kept\n").unwrap();
+
+        let removal = |path: &std::path::Path| {
+            DebouncedEvent::new(
+                Event {
+                    kind: EventKind::Remove(RemoveKind::Any),
+                    paths: vec![path.to_path_buf()],
+                    attrs: Default::default(),
+                },
+                std::time::Instant::now(),
+            )
+        };
+
+        let events = process_debounced_events(
+            &[removal(&kept), removal(&gone)],
+            &vault,
+            &ExcludeMatcher::new(&[]).unwrap(),
+        );
+
+        assert!(
+            matches!(events.as_slice(), [WatchEvent::Deleted(p)] if p == &gone),
+            "only the path that is gone is a deletion: {events:?}"
+        );
     }
 }
