@@ -1141,31 +1141,24 @@ pub fn delete_note(
                 std::fs::create_dir_all(parent)?;
             }
 
-            // Move file on disk
+            // A soft delete relocates the note and leaves it indexed, so it is
+            // the same operation `move_note` performs and it moves the row the
+            // same way. It used to delete the row and insert a fresh one, which
+            // cascaded the note's chunks, vectors, keyword rows and edges away
+            // and put none of them back — the note stayed in `files` and left
+            // every search, which is issue #27's failure in this path.
+            // `update_file_path` keeps the id, and everything keyed on the id
+            // follows: the chunks, the tag rows and the unresolved links (#98).
+            //
+            // Only the docid is recomputed. It is a hash of the path, so it
+            // moves when the path does; the content does not change, so the
+            // stored hash and the tags still describe the file.
+            let new_docid = generate_docid(&new_rel_path);
+            store.update_file_path(&file_record.path, &new_rel_path, &new_docid)?;
+
+            // The store is consistent before the disk changes, so a failed
+            // rename leaves the note where the store says it is.
             std::fs::rename(&old_path, &new_full_path)?;
-
-            // Update store: remove old record, insert under new path
-            let docid = file_record.docid.as_deref().unwrap_or("").to_string();
-            let created_by = file_record.created_by.clone();
-            let mtime = file_record.mtime;
-
-            let content = std::fs::read_to_string(&new_full_path)?;
-            let content_hash = compute_content_hash(&content);
-
-            // The row is replaced, so the new id holds no links: read the ids
-            // the old row releases, write the new row's rows, then prune (#60).
-            let released_tags = store.file_tag_ids(file_record.id)?;
-            store.delete_file(file_record.id)?;
-            let file_id = store.insert_file(
-                &new_rel_path,
-                &content_hash,
-                mtime,
-                &docid,
-                created_by.as_deref(),
-                None,
-            )?;
-            store.reconcile_file_tags(file_id, &crate::tags::extract(&content))?;
-            store.prune_unused_tags(&released_tags)?;
 
             Ok(())
         }
@@ -3303,6 +3296,117 @@ mod tests {
         assert_eq!(
             apply_note_edits(note, &edits).unwrap(),
             "---\ntags: [a]\n---\n\n## Contains\n\n- [[One]]\n- [[Two]]\n- [[Three]]\n\n## Notes\n\nEnd.\n"
+        );
+    }
+
+    /// A hard delete takes the note off disk and out of the index, so the
+    /// broken links it was reporting go with it. They used to survive: the
+    /// table was keyed on a path string rather than on `files(id)`, so the
+    /// cascade every other per-file table rides never reached it, and
+    /// `delete_file_hard` did not clear it by hand either. `health` then named
+    /// a source file that no longer existed, and no rebuild could clear the
+    /// row, because only the file's own re-index deletes one (#98).
+    #[test]
+    fn a_hard_delete_takes_the_notes_unresolved_links_with_it() {
+        let (_tmp, store, vault, _embedder) = vault_with("gone.md", "# Gone\n\n[[Nowhere]]\n");
+        assert_eq!(
+            store.get_unresolved_links().unwrap().len(),
+            1,
+            "the note reports one broken link while it exists"
+        );
+
+        delete_note(&store, &vault, "gone.md", DeleteMode::Hard, "04-Archive/").unwrap();
+
+        assert!(
+            store.get_unresolved_links().unwrap().is_empty(),
+            "a deleted note reports nothing: {:?}",
+            store.get_unresolved_links().unwrap()
+        );
+    }
+
+    /// Archiving removes the note from the index, so it stops reporting
+    /// broken links for the same reason a hard delete does (#98).
+    #[test]
+    fn archiving_a_note_takes_its_unresolved_links_with_it() {
+        let (_tmp, store, vault, _embedder) =
+            vault_with("lore/Probe.md", "# Probe\n\n[[Nowhere]]\n");
+        assert_eq!(store.get_unresolved_links().unwrap().len(), 1);
+
+        archive_note("lore/Probe.md", &store, &vault, None).unwrap();
+
+        assert!(
+            store.get_unresolved_links().unwrap().is_empty(),
+            "an archived note reports nothing: {:?}",
+            store.get_unresolved_links().unwrap()
+        );
+    }
+
+    /// A move keeps the note's id, so its broken links follow it to the new
+    /// path rather than staying behind at the old one — which is what a table
+    /// keyed on a path string did, leaving `health` naming a path no file has
+    /// and the next index adding a second row at the new one (#98).
+    #[test]
+    fn a_move_carries_the_notes_unresolved_links_to_its_new_path() {
+        let (_tmp, store, vault, _embedder) = vault_with("inbox/n.md", "# N\n\n[[Nowhere]]\n");
+        std::fs::create_dir_all(vault.join("lore")).unwrap();
+
+        move_note("inbox/n.md", "lore", &store, &vault).unwrap();
+
+        assert_eq!(
+            store.get_unresolved_links().unwrap(),
+            vec![("lore/n.md".to_string(), "Nowhere".to_string())],
+            "the link is reported against the path the note now has"
+        );
+    }
+
+    /// A soft delete moves the note and leaves it indexed, so it is still
+    /// searchable under its new path — which is what `delete_note` documents.
+    ///
+    /// It was indexed and unsearchable: the path change was a `delete_file`
+    /// plus an `insert_file`, and the cascade off the old row took the note's
+    /// chunks, its vectors, its keyword rows and its edges while nothing put
+    /// them back. That is issue #27's failure, fixed in `move_note` and left
+    /// live here. `update_file_path` is the primitive that keeps the id, and
+    /// keeping the id keeps all of it — the note's unresolved links included,
+    /// since #98 keys those on the id too.
+    #[test]
+    fn a_soft_delete_keeps_the_note_indexed_under_its_new_path() {
+        let (_tmp, store, vault, _embedder) = vault_with(
+            "Saltmere.md",
+            "# Saltmere\n\nThe coast road runs north to [[Nowhere]].\n",
+        );
+        let before = store.get_file("Saltmere.md").unwrap().unwrap();
+        let chunks_before = store.get_chunks_by_file(before.id).unwrap().len();
+        assert!(chunks_before > 0, "the note has chunks to begin with");
+
+        delete_note(
+            &store,
+            &vault,
+            "Saltmere.md",
+            DeleteMode::Soft,
+            "04-Archive/",
+        )
+        .unwrap();
+
+        let after = store
+            .get_file("04-Archive/Saltmere.md")
+            .unwrap()
+            .expect("the note is indexed at its new path");
+        assert_eq!(after.id, before.id, "the row moves; it is not replaced");
+        assert_eq!(
+            store.get_chunks_by_file(after.id).unwrap().len(),
+            chunks_before,
+            "and its chunks move with it"
+        );
+        assert_eq!(
+            after.docid.as_deref(),
+            Some(generate_docid("04-Archive/Saltmere.md").as_str()),
+            "the docid is derived from the path, so it follows the path"
+        );
+        assert_eq!(
+            store.get_unresolved_links().unwrap(),
+            vec![("04-Archive/Saltmere.md".to_string(), "Nowhere".to_string())],
+            "and so do the broken links it reports"
         );
     }
 }

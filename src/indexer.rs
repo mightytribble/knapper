@@ -266,13 +266,12 @@ fn resolve_link_target(store: &Store, target: &str) -> Result<Option<i64>> {
 /// before re-recording, so this is safe to call repeatedly during
 /// incremental indexing.
 pub fn build_edges_for_file(store: &Store, file_id: i64, content: &str) -> Result<()> {
-    let source_path = match store.get_file_by_id(file_id)? {
-        Some(f) => f.path,
-        None => return Ok(()), // file vanished mid-index; no-op
-    };
+    if store.get_file_by_id(file_id)?.is_none() {
+        return Ok(()); // file vanished mid-index; no-op
+    }
 
     // Clear stale unresolved entries for this file before re-recording.
-    store.clear_unresolved_links_for_file(&source_path)?;
+    store.clear_unresolved_links_for_file(file_id)?;
 
     // Which passage each link came from. A link in more than one chunk gets an
     // edge from each — the multiplicity the old file-level UNIQUE discarded.
@@ -289,7 +288,7 @@ pub fn build_edges_for_file(store: &Store, file_id: i64, content: &str) -> Resul
 
     for (link, from_seqs) in sources {
         let Some(target_id) = resolve_link_target(store, &link.target)? else {
-            store.insert_unresolved_link(&source_path, &link.target)?;
+            store.insert_unresolved_link(file_id, &link.target)?;
             continue;
         };
         if target_id == file_id {
@@ -591,11 +590,9 @@ pub fn remove_file(rel_path: &str, store: &Store) -> Result<()> {
     // step 3 does, and it needs the ids read before the cascade (#60).
     let released_tags = store.file_tag_ids(file.id)?;
     // No FTS delete: `chunks` CASCADEs off the `files` row below, and the
-    // keyword index follows the chunks (issue #37).
-    // `unresolved_links` is keyed by path, not file id, so `delete_file` does not
-    // reach it — the rows would outlive the file and keep reporting broken links
-    // from a note that is no longer indexed.
-    store.clear_unresolved_links_for_file(&file.path)?;
+    // keyword index follows the chunks (issue #37). `unresolved_links` rides
+    // the same cascade since #98, so the file's broken links need no call of
+    // their own either.
     store.delete_file(file.id)?;
     store.prune_unused_tags(&released_tags)?;
 
@@ -3435,5 +3432,59 @@ mod tests {
             .query_row("SELECT path FROM tags", [], |row| row.get(0))
             .unwrap();
         assert_eq!(left, "shared");
+    }
+
+    /// The orphan sweep at the head of every index removes the `files` row of
+    /// a note the vault no longer has, and the note's broken links go with it.
+    ///
+    /// They used to stay: the sweep is `verify_index_integrity`, one more
+    /// `delete_file` caller that a table keyed on the source **path** escaped.
+    /// Nothing else could reach the row either — only a file's own re-index
+    /// deletes one, and a file that is gone is never re-indexed — so a rebuild
+    /// re-read all 239 notes and reported the same ghosts afterwards (#98).
+    #[test]
+    fn a_rebuild_removes_a_note_that_is_no_longer_on_disk() {
+        use crate::llm::MockLlm;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write_file(root, "keeper.md", "# Keeper\n\nStays.\n");
+        write_file(root, "vanishes.md", "# Vanishes\n\n[[Nowhere]]\n");
+
+        let store = Store::open_memory().unwrap();
+        let mut embedder = MockLlm::new(256);
+        let config = Config::default();
+        let index = |store: &Store, embedder: &mut MockLlm, rebuild: bool| {
+            run_index_shared(
+                root,
+                &config,
+                crate::indexer::IndexSettings::from_config(&config),
+                store,
+                embedder,
+                rebuild,
+                None,
+            )
+            .unwrap()
+        };
+
+        index(&store, &mut embedder, false);
+        assert_eq!(store.get_unresolved_links().unwrap().len(), 1);
+
+        std::fs::remove_file(root.join("vanishes.md")).unwrap();
+        index(&store, &mut embedder, true);
+
+        assert!(
+            store.get_file("vanishes.md").unwrap().is_none(),
+            "a rebuild drops the row of a file the vault no longer has"
+        );
+        assert!(
+            store.get_unresolved_links().unwrap().is_empty(),
+            "and the broken links it reported go with it: {:?}",
+            store.get_unresolved_links().unwrap()
+        );
+        assert!(
+            store.get_file("keeper.md").unwrap().is_some(),
+            "the file that is still there is still indexed"
+        );
     }
 }
