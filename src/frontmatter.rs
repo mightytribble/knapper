@@ -91,6 +91,24 @@ impl ListItem {
             None => yaml_scalar(&self.value),
         }
     }
+
+    /// The item's rendered text as it will sit inside `[...]`. An item's own
+    /// source can carry a trailing `# comment` that is harmless at the end
+    /// of its original scalar line, but the same text placed before a `,`
+    /// inside brackets makes the comment swallow the rest of the sequence —
+    /// `render_list`'s block-style arm never hits this, because there a
+    /// comment sits at the end of its own line either way. Falling back to a
+    /// fresh `yaml_scalar` loses the comment, but a comment that belonged to
+    /// the key the write named is a smaller loss than frontmatter nothing
+    /// downstream can parse (#92, C2).
+    fn render_in_flow(&self) -> String {
+        let text = self.render();
+        if serde_yaml::from_str::<serde_yaml::Value>(&format!("k: [{text}]")).is_ok() {
+            text
+        } else {
+            yaml_scalar(&self.value)
+        }
+    }
 }
 
 /// A note's frontmatter block, opened for editing.
@@ -385,7 +403,7 @@ impl Block {
         }
         match style {
             ListStyle::Inline => {
-                let body: Vec<String> = items.iter().map(ListItem::render).collect();
+                let body: Vec<String> = items.iter().map(ListItem::render_in_flow).collect();
                 format!("{key}: [{}]{}", body.join(", "), self.newline)
             }
             ListStyle::Block { indent } => {
@@ -593,6 +611,15 @@ fn classify(text: &str) -> Value {
     else {
         return Value::Opaque("a value that is not one mapping entry");
     };
+    // A line the entry's own span folded in that `key_of` did not recognise
+    // as a key of its own — a quoted `"other key": v`, say — still parses as
+    // a second entry in this text's mapping. Taking `.next()` without this
+    // check would silently classify by the *first* entry's shape and let an
+    // edit overwrite the whole span, discarding the second key with no
+    // error (#92).
+    if map.len() != 1 {
+        return Value::Opaque("a value that is not one mapping entry");
+    }
     let Some(v) = map.values().next() else {
         return Value::Opaque("a value that is not one mapping entry");
     };
@@ -992,6 +1019,37 @@ mod tests {
         );
     }
 
+    /// A scalar's own source is everything after its colon, comment
+    /// included. Promoted straight into `[...]`, the comment used to run to
+    /// the line's end and swallow the closing bracket, so the note stopped
+    /// parsing for every other reader in the crate. The fix drops the
+    /// comment rather than write YAML nothing downstream can read (#92, C2).
+    #[test]
+    fn promoting_a_commented_scalar_into_an_inline_list_writes_parseable_yaml() {
+        let text = "---\nother: [z]\ntags: work # keep\n---\n";
+        let out = edited(text, |b| b.add_to_list("tags", "new"));
+        assert_eq!(out, "---\nother: [z]\ntags: [work, new]\n---\n");
+        // The promise this exists to keep: the result must itself parse.
+        let (_open, inner, _close, _after) = split_fences(&out).unwrap().unwrap();
+        assert!(
+            parse_items(inner).is_ok(),
+            "the written frontmatter must parse: {out}"
+        );
+    }
+
+    /// The same shape with a quoted scalar, which the finding calls out as
+    /// corrupting the same way.
+    #[test]
+    fn promoting_a_quoted_commented_scalar_into_an_inline_list_writes_parseable_yaml() {
+        let text = "---\ntags: \"work\" # keep\n---\n";
+        let out = edited(text, |b| b.add_to_list("tags", "new"));
+        let (_open, inner, _close, _after) = split_fences(&out).unwrap().unwrap();
+        assert!(
+            parse_items(inner).is_ok(),
+            "the written frontmatter must parse: {out}"
+        );
+    }
+
     #[test]
     fn adding_an_item_the_list_already_holds_changes_nothing() {
         let text = "---\ntags: [a, b]\n---\n";
@@ -1045,6 +1103,28 @@ mod tests {
         assert_eq!(
             edited("---\r\nname: Probe\r\n---\r\n", |b| b.set_scalar("x", "1")),
             "---\r\nname: Probe\r\nx: '1'\r\n---\r\n"
+        );
+    }
+
+    /// A quoted key `key_of` does not recognise folds into the entry above
+    /// it, so the entry's own span is really two mapping keys. Before this
+    /// guard, `classify` took `map.values().next()` and reported the
+    /// entry's shape from whichever key parsed first, so an edit to `name`
+    /// silently deleted `"other key"` along with it (#92, C1).
+    #[test]
+    fn a_quoted_key_folded_into_the_previous_entry_refuses_the_edit_instead_of_deleting_it() {
+        let text = "---\nname: X\n\"other key\": v\ntags: [a]\n---\n\nBody.\n";
+        let mut block = Block::parse(text).unwrap().unwrap();
+        assert_eq!(
+            block.value("name"),
+            Some(&Value::Opaque("a value that is not one mapping entry"))
+        );
+        let err = block.set_scalar("name", "Y").unwrap_err();
+        assert!(err.to_string().contains("`name`"), "{err}");
+        assert_eq!(
+            block.render(),
+            text,
+            "the refused write must not touch the file"
         );
     }
 
