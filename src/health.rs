@@ -197,8 +197,9 @@ mod tests {
     fn test_find_broken_links() {
         let store = setup_health_store();
         // Record an unresolved link (wikilink target that doesn't exist).
+        let source = store.get_file("linked.md").unwrap().unwrap().id;
         store
-            .insert_unresolved_link("linked.md", "nonexistent.md")
+            .insert_unresolved_link(source, "nonexistent.md")
             .unwrap();
         let broken = find_broken_links(&store).unwrap();
         assert_eq!(broken.len(), 1);
@@ -222,9 +223,8 @@ mod tests {
         store
             .insert_file("00-Inbox/unsorted.md", "h2", 100, "d2", None, None)
             .unwrap();
-        store
-            .insert_unresolved_link("note.md", "missing.md")
-            .unwrap();
+        let source = store.get_file("note.md").unwrap().unwrap().id;
+        store.insert_unresolved_link(source, "missing.md").unwrap();
 
         let config = HealthConfig {
             daily_folder: Some("daily/".to_string()),

@@ -130,6 +130,23 @@ CREATE TABLE IF NOT EXISTS file_tags (
 );
 CREATE INDEX IF NOT EXISTS file_tags_tag ON file_tags(tag_id);";
 
+/// The wikilink targets that resolved to no file, per source note (#98).
+///
+/// Keyed on `files(id)` and not on the source path, so it rides the same
+/// cascade every other per-file table rides. A path key made this the one such
+/// table `DELETE FROM files` could not reach, which left every removal path
+/// owing a manual cleanup — one of six paid it, so a deleted note went on
+/// reporting broken links from a file that was no longer there, and nothing
+/// short of deleting the store could clear the row.
+const UNRESOLVED_LINKS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS unresolved_links (
+    id         INTEGER PRIMARY KEY,
+    file_id    INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    target     TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(file_id, target)
+);
+CREATE INDEX IF NOT EXISTS idx_unresolved_file ON unresolved_links(file_id);";
+
 /// Reduce a heading to the form two spellings of the same section share.
 ///
 /// Strips the leading `#`s a stored heading carries and a link's does not,
@@ -734,18 +751,31 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_cli_events_ts ON cli_events(timestamp);",
         )?;
 
-        // Unresolved links table — tracks wikilink targets that couldn't be
-        // resolved to a file during indexing. Used by health analysis.
-        self.conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS unresolved_links (
-                id          INTEGER PRIMARY KEY,
-                source_file TEXT NOT NULL,
-                target      TEXT NOT NULL,
-                created_at  TEXT NOT NULL DEFAULT (datetime('now')),
-                UNIQUE(source_file, target)
-            );
-            CREATE INDEX IF NOT EXISTS idx_unresolved_source ON unresolved_links(source_file);",
-        )?;
+        // Unresolved links table — the wikilink targets that resolved to no
+        // file, per source note. Read by health analysis.
+        if self.column_exists("unresolved_links", "source_file")? {
+            // Rekey on `files(id)` (#98). The unique key changes, which
+            // `ALTER TABLE` cannot do, so the table is rebuilt.
+            //
+            // A row carries across only where its `source_file` still names a
+            // file the store holds. That is the whole repair: a row whose path
+            // names nothing is a note that has already gone, and it is
+            // precisely the row no code path could reach — so the rows dropped
+            // here are exactly the ghosts a carried store was reporting, and
+            // the rows kept are exactly the ones a re-index would rewrite.
+            self.conn.execute_batch(&format!(
+                "ALTER TABLE unresolved_links RENAME TO unresolved_links_pre98;
+                 -- The old index followed the rename and still owns its name.
+                 DROP INDEX IF EXISTS idx_unresolved_source;
+                 {UNRESOLVED_LINKS_SCHEMA}
+                 INSERT OR IGNORE INTO unresolved_links (file_id, target, created_at)
+                     SELECT f.id, u.target, u.created_at
+                     FROM unresolved_links_pre98 u
+                     JOIN files f ON f.path = u.source_file;
+                 DROP TABLE unresolved_links_pre98;"
+            ))?;
+        }
+        self.conn.execute_batch(UNRESOLVED_LINKS_SCHEMA)?;
 
         // Migration log table — records PARA migration batch operations.
         self.conn.execute_batch(
@@ -2803,7 +2833,11 @@ impl Store {
         // 3. Delete from edges (both directions)
         self.delete_edges_for_file(file_id)?;
 
-        // 4. Delete from files (CASCADE handles chunks table)
+        // 4. Delete from files. The CASCADE off `files(id)` takes the chunks,
+        //    the keyword index behind them, the `file_tags` rows and the
+        //    file's `unresolved_links` — the last of those only since #98,
+        //    when the table stopped keying on the source path. Nothing here
+        //    needs a manual cleanup for them.
         self.delete_file(file_id)?;
 
         Ok(())
@@ -2812,28 +2846,38 @@ impl Store {
     // ── Unresolved Links ─────────────────────────────────────────
 
     /// Record a wikilink target that could not be resolved during indexing.
-    pub fn insert_unresolved_link(&self, source_file: &str, target: &str) -> Result<()> {
+    ///
+    /// The source is the file's id, so the row goes when the file's row goes.
+    pub fn insert_unresolved_link(&self, file_id: i64, target: &str) -> Result<()> {
         self.conn.execute(
-            "INSERT OR IGNORE INTO unresolved_links (source_file, target) VALUES (?1, ?2)",
-            params![source_file, target],
+            "INSERT OR IGNORE INTO unresolved_links (file_id, target) VALUES (?1, ?2)",
+            params![file_id, target],
         )?;
         Ok(())
     }
 
-    /// Remove all unresolved links originating from the given source file.
-    pub fn clear_unresolved_links_for_file(&self, source_file: &str) -> Result<()> {
+    /// Remove all unresolved links originating from the given file.
+    ///
+    /// For a re-index, which rewrites what the file's own text says. A removal
+    /// needs no call: the cascade off `files(id)` is what takes those rows.
+    pub fn clear_unresolved_links_for_file(&self, file_id: i64) -> Result<()> {
         self.conn.execute(
-            "DELETE FROM unresolved_links WHERE source_file = ?1",
-            params![source_file],
+            "DELETE FROM unresolved_links WHERE file_id = ?1",
+            params![file_id],
         )?;
         Ok(())
     }
 
-    /// Return all unresolved links (source_file, target) pairs.
+    /// Return all unresolved links as (source path, target) pairs.
+    ///
+    /// The path comes from the join rather than from the row, so a reported
+    /// source is by construction a path the index holds — and a note that
+    /// moved is reported where it is now, not where it was (#98).
     pub fn get_unresolved_links(&self) -> Result<Vec<(String, String)>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT source_file, target FROM unresolved_links ORDER BY source_file")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT f.path, u.target FROM unresolved_links u \
+             JOIN files f ON f.id = u.file_id ORDER BY f.path, u.target",
+        )?;
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
@@ -6478,5 +6522,48 @@ mod tests {
         let (_, _, v) = &rows[0];
         assert_eq!(v.len(), 4, "decoded to the width it was written at");
         assert!(store.vectors_for_files(&[]).unwrap().is_empty());
+    }
+
+    /// A store written before #98 keys `unresolved_links` on the source
+    /// **path**, so it holds rows for files that are no longer indexed and
+    /// nothing can reach them. The migration rekeys the table on `files(id)`
+    /// and carries across only the rows whose path still names a file — which
+    /// leaves exactly the reachable ones and drops exactly the ghosts, so a
+    /// carried store reports a clean `health` without being deleted (#98).
+    #[test]
+    fn the_migration_drops_the_unresolved_links_of_files_the_store_no_longer_holds() {
+        let store = Store::open_memory().unwrap();
+        let file_id = store
+            .insert_file("live.md", "hash", 100, "abc123", None, None)
+            .unwrap();
+
+        // Put the pre-#98 table back and fill it the way that build did.
+        store
+            .conn
+            .execute_batch(
+                "DROP TABLE unresolved_links;
+                 CREATE TABLE unresolved_links (
+                     id          INTEGER PRIMARY KEY,
+                     source_file TEXT NOT NULL,
+                     target      TEXT NOT NULL,
+                     created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+                     UNIQUE(source_file, target)
+                 );
+                 CREATE INDEX idx_unresolved_source ON unresolved_links(source_file);
+                 INSERT INTO unresolved_links (source_file, target)
+                     VALUES ('live.md', 'Nowhere'), ('deleted.md', 'Nowhere');",
+            )
+            .unwrap();
+
+        store.migrate().unwrap();
+
+        assert_eq!(
+            store.get_unresolved_links().unwrap(),
+            vec![("live.md".to_string(), "Nowhere".to_string())],
+            "the ghost row goes and the reachable one carries across"
+        );
+        // And the carried row is keyed on the file, so the cascade reaches it.
+        store.delete_file(file_id).unwrap();
+        assert!(store.get_unresolved_links().unwrap().is_empty());
     }
 }
