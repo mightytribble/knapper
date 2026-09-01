@@ -1067,6 +1067,18 @@ pub fn archive_note(
     // key the note carried is still there when it comes back (#92).
     let content = std::fs::read_to_string(&old_path)?;
     let mut block = crate::frontmatter::Block::parse_or_open(&content)?;
+    // A note that already holds one of these three keys cannot be archived
+    // without losing something: overwriting the note's own value, or —
+    // since `unarchive` removes exactly these three — leaving no way to
+    // tell the note's own key from the one this write adds. Refusing is
+    // the honest answer; the file is not touched (#92, I7).
+    for key in ["archived", "archived_at", "archived_from"] {
+        if block.value(key).is_some() {
+            bail!(
+                "note already holds `{key}`; knapper cannot archive it without losing that note's own value"
+            );
+        }
+    }
     let tags = block.list("tags");
     block.set_bool("archived", true)?;
     block.set_scalar("archived_at", &today_date())?;
@@ -1145,9 +1157,18 @@ pub fn unarchive_note(
     block.remove("archived")?;
     block.remove("archived_at")?;
     block.remove("archived_from")?;
+    // A note archived by a version of knapper before #92 got `archived`
+    // written into its own `tags` list, alongside the three keys above.
+    // This build's `archive` no longer does that, but an old note still
+    // carries the tag, and it must not come back into the vocabulary just
+    // because the note is unarchived.
+    block.remove_from_list("tags", "archived")?;
     let tags = block.list("tags");
     // A note that had no block before it was archived gets none back.
-    let restored_content = if block.is_empty() {
+    // `is_empty` counts keys only, so a block holding just a comment or a
+    // blank line still reports empty; checking `is_blank` instead keeps
+    // those bytes rather than discarding the fences around them (#92, I2).
+    let restored_content = if block.is_blank() {
         block.body().to_string()
     } else {
         block.render()
@@ -1972,6 +1993,28 @@ mod tests {
         );
     }
 
+    /// `archive` overwrites the note's own value and `unarchive` then
+    /// removes the key, so a note that already holds `archived_at` loses
+    /// it in the round trip. Refusing is the only choice that neither
+    /// loses the note's own value nor leaves a key behind (#92, I7).
+    #[test]
+    fn archiving_a_note_that_already_holds_archived_at_is_refused() {
+        let (_tmp, store, root) = setup_vault();
+        let content = "---\nname: X\narchived_at: 1999-01-01\n---\n\nBody\n";
+        std::fs::write(root.join("n.md"), content).unwrap();
+        store
+            .insert_file("n.md", "hash", 100, "refuse1", None, None)
+            .unwrap();
+
+        let err = archive_note("n.md", &store, &root, None).unwrap_err();
+        assert!(err.to_string().contains("archived_at"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("n.md")).unwrap(),
+            content,
+            "a refused archive must not touch the file"
+        );
+    }
+
     #[test]
     fn archiving_a_note_takes_the_tags_that_go_unused_with_it() {
         let (_tmp, store, root) = setup_vault();
@@ -2174,6 +2217,101 @@ mod tests {
         .unwrap();
 
         assert_eq!(std::fs::read_to_string(vault.join("n.md")).unwrap(), note);
+    }
+
+    /// `Block::is_empty` counts keys only, so a block holding just a
+    /// comment reported empty the same way a note with no block at all
+    /// does. `unarchive_note` used to fall back to `block.body()` for both,
+    /// discarding the fences and the comment along with them (#92, I2).
+    #[test]
+    fn an_archive_round_trip_on_a_note_with_a_comment_only_block_returns_the_file_byte_for_byte() {
+        let note = "---\n# why this note exists\n---\n\nBody\n";
+        let (_tmp, store, vault, mut embedder) = vault_with("n.md", note);
+
+        archive_note("n.md", &store, &vault, None).unwrap();
+        unarchive_note(
+            "04-Archive/n.md",
+            &store,
+            &mut embedder,
+            EmbedComposition::default(),
+            test_chunk_opts(),
+            &vault,
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read_to_string(vault.join("n.md")).unwrap(), note);
+    }
+
+    /// A block that is present but holds no key at all — `---\n---\n` — and
+    /// a note with no block are indistinguishable once archived: both
+    /// leave the archived block holding exactly the three archive keys and
+    /// nothing else, so `unarchive_note`'s only honest choice between them
+    /// is the one that does not regress the no-block round trip above.
+    /// This does not restore the original `---\n---\n` fences — a known
+    /// limit of a fix confined to `unarchive_note` (#92, I2 — see the final
+    /// fix report for why `archive_note` would have to change too).
+    #[test]
+    fn a_truly_empty_block_and_no_block_restore_the_same_way() {
+        let note = "---\n---\n\nBody\n";
+        let (_tmp, store, vault, mut embedder) = vault_with("n.md", note);
+
+        archive_note("n.md", &store, &vault, None).unwrap();
+        unarchive_note(
+            "04-Archive/n.md",
+            &store,
+            &mut embedder,
+            EmbedComposition::default(),
+            test_chunk_opts(),
+            &vault,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(vault.join("n.md")).unwrap(),
+            "Body\n",
+            "an empty block cannot be told apart from no block at unarchive time"
+        );
+    }
+
+    /// A note archived by a version of knapper before #92 wrote `archived`
+    /// into its own `tags` list, on top of the `archived: true` key this
+    /// build reads (see `git show 9bae927:src/writer.rs`, the
+    /// `.filter(|t| t != "archived")` this restores). Unarchiving it must
+    /// not let the leftover tag back into the vocabulary (#92, I6).
+    #[test]
+    fn unarchiving_a_legacy_note_strips_the_archived_tag_it_carried() {
+        use crate::llm::MockLlm;
+
+        let (_tmp, store, vault) = setup_vault();
+        std::fs::create_dir_all(vault.join("04-Archive")).unwrap();
+        std::fs::write(
+            vault.join("04-Archive/n.md"),
+            "---\ntags: [work, archived]\narchived: true\narchived_at: 2020-01-01\narchived_from: n.md\n---\n\nBody.\n",
+        )
+        .unwrap();
+        let mut embedder = MockLlm::new(256);
+
+        let result = unarchive_note(
+            "04-Archive/n.md",
+            &store,
+            &mut embedder,
+            EmbedComposition::default(),
+            test_chunk_opts(),
+            &vault,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.tags,
+            vec!["work"],
+            "the leftover archived tag must not report back"
+        );
+        let written = std::fs::read_to_string(vault.join("n.md")).unwrap();
+        assert_eq!(
+            written, "---\ntags: [work]\n---\n\nBody.\n",
+            "got {written}"
+        );
+        assert_eq!(stored_tags(&store, "n.md"), vec!["work"]);
     }
 
     /// A vault of one note, indexed, ready for `update_note`.

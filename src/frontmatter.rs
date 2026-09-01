@@ -212,6 +212,15 @@ impl Block {
         !self.items.iter().any(|i| matches!(i, Item::Entry { .. }))
     }
 
+    /// True when the block holds nothing at all — no key, and no comment or
+    /// blank line either. A block of comments alone is [`Block::is_empty`]
+    /// (it counts keys only), but it is not blank: a caller that drops the
+    /// block whenever it is merely empty of keys throws the comments away
+    /// with it (#92, I2).
+    pub fn is_blank(&self) -> bool {
+        self.items.is_empty()
+    }
+
     /// The note's content below the block, past the blank line that
     /// separates them, byte for byte.
     pub fn body(&self) -> &str {
