@@ -8,6 +8,7 @@ pub mod docid;
 pub mod embed_api;
 pub mod exclude;
 pub mod fingerprint;
+pub mod frontmatter;
 pub mod fts;
 pub mod fusion;
 pub mod graph;
