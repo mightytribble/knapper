@@ -99,8 +99,10 @@ pub struct Block {
     open_fence: String,
     items: Vec<Item>,
     close_fence: String,
-    /// What goes between the closing fence and the body. Empty for a parsed
-    /// block, whose body already carries whatever followed the fence.
+    /// What goes between the closing fence and the body: the blank line
+    /// that separates them, when the text after the fence opens with one,
+    /// and empty otherwise. A parsed block and an opened one agree on this,
+    /// so `body()` means the same thing for both.
     separator: String,
     body: String,
     /// The line ending the note uses, for an item an edit constructs fresh.
@@ -114,9 +116,10 @@ impl Block {
     /// key opens one with [`Block::open`]. An error means a block is there
     /// that no line edit can address, and the caller must not write.
     pub fn parse(text: &str) -> Result<Option<Block>> {
-        let Some((open, inner, close, body)) = split_fences(text)? else {
+        let Some((open, inner, close, after)) = split_fences(text)? else {
             return Ok(None);
         };
+        let (separator, body) = split_separator(after);
         let items = parse_items(inner)?;
         let mut seen: Vec<&str> = Vec::new();
         for item in &items {
@@ -133,7 +136,7 @@ impl Block {
             open_fence: open.to_string(),
             items,
             close_fence: close.to_string(),
-            separator: String::new(),
+            separator: separator.to_string(),
             body: body.to_string(),
             newline: newline_of(text).to_string(),
         }))
@@ -191,7 +194,8 @@ impl Block {
         !self.items.iter().any(|i| matches!(i, Item::Entry { .. }))
     }
 
-    /// Everything after the block, byte for byte.
+    /// The note's content below the block, past the blank line that
+    /// separates them, byte for byte.
     pub fn body(&self) -> &str {
         &self.body
     }
@@ -490,6 +494,22 @@ fn split_fences(text: &str) -> Result<Option<(&str, &str, &str, &str)>> {
         offset += line.len();
     }
     bail!("frontmatter opens with `---` and never closes")
+}
+
+/// Split the text after a closing fence into the blank line that separates
+/// it from the body, when there is one, and the body itself. Claims at most
+/// one line ending, so a second blank line stays part of the body — this is
+/// [`Block::open`]'s own split, run in reverse over what [`split_fences`]
+/// returned, so a parsed block and an opened one agree on what `body()`
+/// means (#92).
+fn split_separator(after: &str) -> (&str, &str) {
+    if let Some(rest) = after.strip_prefix("\r\n") {
+        (&after[..2], rest)
+    } else if let Some(rest) = after.strip_prefix('\n') {
+        (&after[..1], rest)
+    } else {
+        ("", after)
+    }
 }
 
 /// Cut the text between the fences into items. An entry runs from its key
@@ -875,11 +895,30 @@ mod tests {
     }
 
     #[test]
-    fn the_body_is_everything_after_the_closing_fence() {
+    fn the_body_is_what_follows_the_blank_line_after_the_block() {
         let block = Block::parse("---\nname: X\n---\n\nBody.\n")
             .unwrap()
             .unwrap();
-        assert_eq!(block.body(), "\nBody.\n");
+        assert_eq!(block.body(), "Body.\n");
+    }
+
+    #[test]
+    fn a_parsed_blocks_separator_and_body_recombine_to_what_followed_the_fence() {
+        let with_blank_line = Block::parse("---\nname: X\n---\n\nBody.\n")
+            .unwrap()
+            .unwrap();
+        assert_eq!(with_blank_line.separator, "\n");
+        assert_eq!(with_blank_line.body, "Body.\n");
+
+        let with_no_blank_line = Block::parse("---\nname: X\n---\nBody.\n").unwrap().unwrap();
+        assert_eq!(with_no_blank_line.separator, "");
+        assert_eq!(with_no_blank_line.body, "Body.\n");
+
+        let crlf = Block::parse("---\r\nname: X\r\n---\r\n\r\nBody.\r\n")
+            .unwrap()
+            .unwrap();
+        assert_eq!(crlf.separator, "\r\n");
+        assert_eq!(crlf.body, "Body.\r\n");
     }
 
     /// Parse, apply `edit`, render.

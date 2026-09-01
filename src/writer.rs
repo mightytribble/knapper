@@ -2072,6 +2072,10 @@ mod tests {
         .unwrap();
         assert!(vault.join("Projects/n.md").exists());
         assert!(!archived.exists());
+        assert_eq!(
+            std::fs::read_to_string(vault.join("Projects/n.md")).unwrap(),
+            "# N\n\nbody\n"
+        );
     }
 
     /// A vault holding one note at `rel`, indexed and ready to archive.
@@ -2146,6 +2150,30 @@ mod tests {
             std::fs::read_to_string(vault.join("lore/Probe.md")).unwrap(),
             note
         );
+    }
+
+    /// A note with no frontmatter block at all takes `Block::parse_or_open`
+    /// down the `open` path on archive and back through `parse` on
+    /// unarchive — the two paths must agree on where the block ends and the
+    /// body begins, or the round trip gains or loses the blank line between
+    /// them (#92).
+    #[test]
+    fn an_archive_round_trip_on_a_note_with_no_frontmatter_returns_the_file_byte_for_byte() {
+        let note = "# N\n\nbody\n";
+        let (_tmp, store, vault, mut embedder) = vault_with("n.md", note);
+
+        archive_note("n.md", &store, &vault, None).unwrap();
+        unarchive_note(
+            "04-Archive/n.md",
+            &store,
+            &mut embedder,
+            EmbedComposition::default(),
+            test_chunk_opts(),
+            &vault,
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read_to_string(vault.join("n.md")).unwrap(), note);
     }
 
     /// A vault of one note, indexed, ready for `update_note`.
