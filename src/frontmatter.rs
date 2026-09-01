@@ -56,6 +56,43 @@ impl Item {
     }
 }
 
+/// One item of a list, read out of an entry for a list edit. `value` is what
+/// an edit's `item` argument is matched against; `source` is the item's own
+/// text, quotes and all, for an item the block already held. An item a write
+/// supplies fresh has no source of its own and renders through `yaml_scalar`
+/// instead, so an edit changes only the items it names.
+struct ListItem {
+    value: String,
+    source: Option<String>,
+}
+
+impl ListItem {
+    /// An item a write supplies fresh.
+    fn fresh(value: String) -> Self {
+        ListItem {
+            value,
+            source: None,
+        }
+    }
+
+    /// An item read from the block, keeping its own source text.
+    fn existing(value: String, source: String) -> Self {
+        ListItem {
+            value,
+            source: Some(source),
+        }
+    }
+
+    /// The item's rendered text: its own source when it has one, else fresh
+    /// through `yaml_scalar`.
+    fn render(&self) -> String {
+        match &self.source {
+            Some(source) => source.clone(),
+            None => yaml_scalar(&self.value),
+        }
+    }
+}
+
 /// A note's frontmatter block, opened for editing.
 #[derive(Debug, Clone)]
 pub struct Block {
@@ -162,37 +199,42 @@ impl Block {
         Ok(())
     }
 
-    /// Write `key` as a list. An empty list is written `[]` in any style,
-    /// because block style with no items reads back as null.
+    /// Write `key` as a list. Every item comes from the caller, so every item
+    /// is serialised fresh through `yaml_scalar`. An empty list is written
+    /// `[]` in any style, because block style with no items reads back as
+    /// null.
     pub fn set_list(&mut self, key: &str, items: &[String]) -> Result<()> {
         let style = self.list_style_for(key)?;
-        let text = self.render_list(key, items, style);
+        let items: Vec<ListItem> = items.iter().cloned().map(ListItem::fresh).collect();
+        let text = self.render_list(key, &items, style);
         self.put(key, text, Value::List(style));
         Ok(())
     }
 
     /// Add `item` to `key`'s list, creating the list when the key is absent
     /// and promoting it when the key holds a scalar. An item the list already
-    /// holds changes nothing.
+    /// holds changes nothing. Every existing item keeps its own source text;
+    /// only the added item is serialised through `yaml_scalar`.
     pub fn add_to_list(&mut self, key: &str, item: &str) -> Result<()> {
         let style = self.list_style_for(key)?;
         let mut items = self.items_of(key);
-        if items.iter().any(|i| i == item) {
+        if items.iter().any(|i| i.value == item) {
             return Ok(());
         }
-        items.push(item.to_string());
+        items.push(ListItem::fresh(item.to_string()));
         let text = self.render_list(key, &items, style);
         self.put(key, text, Value::List(style));
         Ok(())
     }
 
     /// Remove `item` from `key`'s list. A scalar equal to `item` removes the
-    /// key; an absent key changes nothing.
+    /// key; an absent key changes nothing. Every surviving item keeps its own
+    /// source text.
     pub fn remove_from_list(&mut self, key: &str, item: &str) -> Result<()> {
         let Some(idx) = self.find(key) else {
             return Ok(());
         };
-        self.check_editable(key)?;
+        self.check_editable_at(key, idx)?;
         if matches!(
             self.items[idx],
             Item::Entry {
@@ -207,7 +249,7 @@ impl Block {
         }
         let style = self.list_style_for(key)?;
         let mut items = self.items_of(key);
-        items.retain(|i| i != item);
+        items.retain(|i| i.value != item);
         let text = self.render_list(key, &items, style);
         self.put(key, text, Value::List(style));
         Ok(())
@@ -231,11 +273,18 @@ impl Block {
 
     /// Fail when `key` holds a value no line edit can address.
     fn check_editable(&self, key: &str) -> Result<()> {
-        if let Some(idx) = self.find(key)
-            && let Item::Entry {
-                value: Value::Opaque(found),
-                ..
-            } = self.items[idx]
+        match self.find(key) {
+            Some(idx) => self.check_editable_at(key, idx),
+            None => Ok(()),
+        }
+    }
+
+    /// `check_editable`, given the item's index instead of scanning for it.
+    fn check_editable_at(&self, key: &str, idx: usize) -> Result<()> {
+        if let Item::Entry {
+            value: Value::Opaque(found),
+            ..
+        } = self.items[idx]
         {
             bail!(
                 "cannot edit `{key}`: its value is {found}, and knapper edits a scalar or a flat list"
@@ -273,30 +322,34 @@ impl Block {
     }
 
     /// The items `key` holds: its list's, or its scalar as one item, or none.
-    fn items_of(&self, key: &str) -> Vec<String> {
+    /// Each keeps the source text that reproduces it.
+    fn items_of(&self, key: &str) -> Vec<ListItem> {
         let Some(idx) = self.find(key) else {
             return Vec::new();
         };
         match self.items[idx] {
             Item::Entry {
-                value: Value::List(_),
+                value: Value::List(style),
                 ..
-            } => list_items(self.items[idx].text()),
+            } => list_items(self.items[idx].text(), style),
             Item::Entry {
                 value: Value::Scalar,
                 ..
-            } => vec![scalar_of(self.items[idx].text())],
+            } => {
+                let text = self.items[idx].text();
+                vec![ListItem::existing(scalar_of(text), scalar_source(text))]
+            }
             _ => Vec::new(),
         }
     }
 
-    fn render_list(&self, key: &str, items: &[String], style: ListStyle) -> String {
+    fn render_list(&self, key: &str, items: &[ListItem], style: ListStyle) -> String {
         if items.is_empty() {
             return format!("{key}: []{}", self.newline);
         }
         match style {
             ListStyle::Inline => {
-                let body: Vec<String> = items.iter().map(|i| yaml_scalar(i)).collect();
+                let body: Vec<String> = items.iter().map(ListItem::render).collect();
                 format!("{key}: [{}]{}", body.join(", "), self.newline)
             }
             ListStyle::Block { indent } => {
@@ -305,7 +358,7 @@ impl Block {
                 for item in items {
                     out.push_str(&pad);
                     out.push_str("- ");
-                    out.push_str(&yaml_scalar(item));
+                    out.push_str(&item.render());
                     out.push_str(&self.newline);
                 }
                 out
@@ -535,8 +588,24 @@ fn scalar_of(text: &str) -> String {
     }
 }
 
-/// The items a list entry holds, in order.
-fn list_items(text: &str) -> Vec<String> {
+/// A scalar entry's own source text: what follows `key: ` on its line,
+/// quotes and all.
+fn scalar_source(text: &str) -> String {
+    value_text(text).trim().to_string()
+}
+
+/// The items a list entry holds, each keeping the source text that
+/// reproduces it.
+fn list_items(text: &str, style: ListStyle) -> Vec<ListItem> {
+    list_values(text)
+        .into_iter()
+        .zip(list_sources(text, style))
+        .map(|(value, source)| ListItem::existing(value, source))
+        .collect()
+}
+
+/// The items' parsed values, in order.
+fn list_values(text: &str) -> Vec<String> {
     match serde_yaml::from_str::<serde_yaml::Value>(text) {
         Ok(serde_yaml::Value::Mapping(map)) => match map.values().next() {
             Some(serde_yaml::Value::Sequence(items)) => items.iter().map(scalar_string).collect(),
@@ -544,6 +613,60 @@ fn list_items(text: &str) -> Vec<String> {
         },
         _ => Vec::new(),
     }
+}
+
+/// The items' own source text, in order: the bracket contents split on
+/// commas outside quotes for inline style, or the text after `- ` on each
+/// item line, line ending stripped, for block style.
+fn list_sources(text: &str, style: ListStyle) -> Vec<String> {
+    match style {
+        ListStyle::Inline => {
+            let head = value_text(text).trim();
+            let inner = head
+                .strip_prefix('[')
+                .and_then(|s| s.strip_suffix(']'))
+                .unwrap_or_default();
+            split_flow_items(inner)
+        }
+        ListStyle::Block { .. } => text
+            .lines()
+            .filter_map(|l| l.trim_start().strip_prefix("- "))
+            .map(str::to_string)
+            .collect(),
+    }
+}
+
+/// Split a flow sequence's inner text on commas that are not inside a `'` or
+/// `"` quoted scalar, each piece trimmed of surrounding spaces. `classify`
+/// already guarantees every item is a scalar, so this has only to respect
+/// quotes and never has to handle nesting.
+fn split_flow_items(inner: &str) -> Vec<String> {
+    if inner.trim().is_empty() {
+        return Vec::new();
+    }
+    let mut items = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    for c in inner.chars() {
+        match quote {
+            Some(q) if c == q => {
+                quote = None;
+                current.push(c);
+            }
+            Some(_) => current.push(c),
+            None if c == '\'' || c == '"' => {
+                quote = Some(c);
+                current.push(c);
+            }
+            None if c == ',' => {
+                items.push(current.trim().to_string());
+                current.clear();
+            }
+            None => current.push(c),
+        }
+    }
+    items.push(current.trim().to_string());
+    items
 }
 
 #[cfg(test)]
@@ -802,6 +925,33 @@ mod tests {
         assert_eq!(block.scalar("archived_from").as_deref(), Some("Areas/n.md"));
         assert_eq!(block.scalar("n").as_deref(), Some("3"));
         assert_eq!(block.scalar("absent"), None);
+    }
+
+    #[test]
+    fn an_inline_list_of_numbers_gains_an_item_and_the_numbers_stay_numbers() {
+        let text = "---\nratings: [1, 2, 3]\n---\n";
+        assert_eq!(
+            edited(text, |b| b.add_to_list("ratings", "4")),
+            "---\nratings: [1, 2, 3, '4']\n---\n"
+        );
+    }
+
+    #[test]
+    fn a_block_list_of_quoted_items_loses_one_and_the_survivors_keep_their_quotes() {
+        let text = "---\ntags:\n  - 'a'\n  - 'b'\n  - 'c'\n---\n";
+        assert_eq!(
+            edited(text, |b| b.remove_from_list("tags", "b")),
+            "---\ntags:\n  - 'a'\n  - 'c'\n---\n"
+        );
+    }
+
+    #[test]
+    fn an_inline_item_that_was_quoted_stays_quoted_when_a_neighbour_is_removed() {
+        let text = "---\ntags: [a, 'b c', plain]\n---\n";
+        assert_eq!(
+            edited(text, |b| b.remove_from_list("tags", "a")),
+            "---\ntags: ['b c', plain]\n---\n"
+        );
     }
 
     #[test]
