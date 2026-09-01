@@ -124,7 +124,7 @@ pub struct Section {
     pub heading: HeadingInfo,
     pub body_start: usize,
     pub body_end: usize,
-    pub content: String,
+    pub body: String,
 }
 
 /// The section a caller named, or `None`.
@@ -205,11 +205,14 @@ fn normalise(segment: &str) -> String {
 /// The span a heading owns: from the line after it to the next heading at or
 /// above its own level, or the end of the file.
 ///
-/// `content` is the section's full markdown, the heading line included, so
-/// "give me this section" round-trips and a heading that carries meaning is
-/// not dropped (#81). `body_start`/`body_end` stay the body span alone, which
-/// is what `writer::apply_section_edit` edits, so the heading line keeps its
-/// place through an edit.
+/// `body` is the section's body and not its heading line, because that is
+/// what `writer::apply_section_edit` writes: the heading on disk keeps its
+/// place through an edit, and a body carrying one writes it twice (#96). The
+/// heading is `heading`, which is what a caller reassembles the section's
+/// markdown from (#81). The blank lines that separate the body from its
+/// heading and from the next section are not part of it either, because the
+/// edit supplies those, so a body read here and written back through
+/// `update` leaves the file byte for byte.
 fn section_at(content: &str, headings: &[HeadingInfo], idx: usize) -> Section {
     let lines: Vec<&str> = content.lines().collect();
     let h = &headings[idx];
@@ -224,8 +227,26 @@ fn section_at(content: &str, headings: &[HeadingInfo], idx: usize) -> Section {
         heading: h.clone(),
         body_start,
         body_end,
-        content: lines[h.line..body_end].join("\n"),
+        body: unpadded(&lines[body_start.min(lines.len())..body_end]),
     }
+}
+
+/// The lines as one string, with the blank ones at either end dropped.
+///
+/// A section's body is written back under a heading that supplies its own
+/// blank line, so the separators are the edit's and not the body's (#96).
+/// The trim is line-wise rather than `str::trim`, so an indented first line —
+/// a code block, a nested list item — keeps the indent that gives it meaning.
+fn unpadded(lines: &[&str]) -> String {
+    let first = lines.iter().position(|l| !l.trim().is_empty());
+    let Some(first) = first else {
+        return String::new();
+    };
+    let last = lines
+        .iter()
+        .rposition(|l| !l.trim().is_empty())
+        .expect("a slice with a first non-blank line has a last one");
+    lines[first..=last].join("\n")
 }
 
 pub fn split_frontmatter(content: &str) -> (Option<String>, String) {
@@ -279,8 +300,8 @@ mod tests {
         let content = "# Title\n\n## Interactions\n\nEntry 1\nEntry 2\n\n## Links\n\nSome links\n";
         let section = find_section(content, "Interactions").unwrap();
         assert_eq!(section.heading.text, "Interactions");
-        assert!(section.content.contains("Entry 1"));
-        assert!(!section.content.contains("Some links"));
+        assert!(section.body.contains("Entry 1"));
+        assert!(!section.body.contains("Some links"));
     }
 
     #[test]
@@ -293,9 +314,9 @@ mod tests {
     fn test_find_section_with_subsections() {
         let content = "# Title\n\n## Interactions\n\nEntry\n\n### Sub-detail\n\nMore\n\n## Links\n\nSome links\n";
         let section = find_section(content, "Interactions").unwrap();
-        assert!(section.content.contains("Entry"));
-        assert!(section.content.contains("Sub-detail"));
-        assert!(!section.content.contains("Some links"));
+        assert!(section.body.contains("Entry"));
+        assert!(section.body.contains("Sub-detail"));
+        assert!(!section.body.contains("Some links"));
     }
 
     #[test]
@@ -409,19 +430,19 @@ mod tests {
         assert!(
             find_section(content, "History")
                 .unwrap()
-                .content
+                .body
                 .contains("Founding")
         );
         assert!(
             find_section(content, "About the Empire > Current Events > History")
                 .unwrap()
-                .content
+                .body
                 .contains("Recent")
         );
         assert!(
             find_section(content, "About the Empire > History")
                 .unwrap()
-                .content
+                .body
                 .contains("Founding")
         );
     }
@@ -452,7 +473,7 @@ mod tests {
         assert!(
             find_section(content, "A > B")
                 .unwrap()
-                .content
+                .body
                 .contains("Body")
         );
     }
@@ -465,7 +486,7 @@ mod tests {
         assert!(
             find_section(content, "A > B")
                 .unwrap()
-                .content
+                .body
                 .contains("Body")
         );
     }
@@ -479,7 +500,7 @@ mod tests {
         assert!(
             find_section(content, "A > Notes")
                 .unwrap()
-                .content
+                .body
                 .contains("First")
         );
     }
@@ -497,8 +518,8 @@ mod tests {
     fn a_promoted_line_is_addressable_bare_and_by_path() {
         let content = "## Stat Block\n\nAC 20\n\n**Spells**\n\nFireball\n\n## Lore\n\nOld\n";
         let bare = find_section(content, "Spells").unwrap();
-        assert!(bare.content.contains("Fireball"));
-        assert!(!bare.content.contains("Old"));
+        assert!(bare.body.contains("Fireball"));
+        assert!(!bare.body.contains("Old"));
         let path = find_section(content, "Stat Block > Spells").unwrap();
         assert_eq!(path.heading.line, bare.heading.line);
         assert!(path.heading.promoted);
@@ -518,7 +539,7 @@ mod tests {
         assert!(
             find_section(content, "Stat Block > **Spells**")
                 .unwrap()
-                .content
+                .body
                 .contains("Fireball")
         );
     }
@@ -531,7 +552,7 @@ mod tests {
         assert!(
             find_section(content, "History")
                 .unwrap()
-                .content
+                .body
                 .contains("Atx body")
         );
     }
@@ -543,22 +564,24 @@ mod tests {
         let content =
             "## Stat Block\n\n**Abilities**\n\nFlight\n\n**Spells**\n\nFireball\n\n# Lore\n\nOld\n";
         let abilities = find_section(content, "Abilities").unwrap();
-        assert!(abilities.content.contains("Flight"));
-        assert!(!abilities.content.contains("Fireball"));
+        assert!(abilities.body.contains("Flight"));
+        assert!(!abilities.body.contains("Fireball"));
         let spells = find_section(content, "Spells").unwrap();
-        assert!(spells.content.contains("Fireball"));
-        assert!(!spells.content.contains("Old"));
+        assert!(spells.body.contains("Fireball"));
+        assert!(!spells.body.contains("Old"));
     }
 
     /// An empty section is addressable, because addressing it is how a caller
     /// fills it. The chunker drops a bodyless promoted line from its own set;
-    /// the resolver reads the set before that drop (#69). Its content is the
-    /// heading line alone, and its body span is empty (#81).
+    /// the resolver reads the set before that drop (#69). Its body is empty,
+    /// and so is its body span: the heading is `heading` and not content
+    /// (#96).
     #[test]
     fn a_bodyless_promoted_line_is_addressable() {
         let content = "## Stat Block\n\n**Spells**\n**Notes**\n\nSee below\n";
         let spells = find_section(content, "Spells").unwrap();
-        assert_eq!(spells.content, "**Spells**");
+        assert_eq!(spells.heading.text, "Spells");
+        assert_eq!(spells.body, "");
         assert_eq!(spells.body_start, spells.body_end);
     }
 
@@ -569,33 +592,27 @@ mod tests {
         assert!(find_section(content, "Spells").is_none());
     }
 
-    /// A section's content is its markdown, heading line and all, so "give me
-    /// this section" round-trips and a heading that carries meaning — an MP
-    /// cost in the heading text — is not dropped (#81).
+    /// A section's body is its body and not its heading line: the heading
+    /// carries meaning — an MP cost in the heading text — and it is carried
+    /// by `heading`, where a caller reads it without writing it back into
+    /// the note (#81, #96).
     #[test]
-    fn a_section_content_begins_with_its_heading_line() {
+    fn a_section_body_is_the_body_below_its_heading() {
         let content = "# Title\n\n## Level 1 Sharpen (5 MP)\n\nDeals 2d6.\n\n## Next\n\nOther\n";
         let section = find_section(content, "Level 1 Sharpen (5 MP)").unwrap();
-        assert!(
-            section.content.starts_with("## Level 1 Sharpen (5 MP)"),
-            "content: {:?}",
-            section.content
-        );
-        assert!(section.content.contains("Deals 2d6."));
-        assert!(!section.content.contains("Other"));
+        assert_eq!(section.heading.text, "Level 1 Sharpen (5 MP)");
+        assert_eq!(section.body, "Deals 2d6.");
+        assert!(!section.body.contains("Other"));
     }
 
-    /// A promoted section carries its bold line the same way, so the raw
-    /// `**Spells**` a caller round-trips is the one the file holds (#81).
+    /// A promoted section reads the same way: the raw `**Spells**` is the
+    /// heading, and the body is what sits under it (#81, #96).
     #[test]
-    fn a_promoted_section_content_begins_with_its_bold_line() {
+    fn a_promoted_section_body_is_the_body_below_its_bold_line() {
         let content = "## Stat Block\n\n**Spells**\n\nFireball\n";
         let section = find_section(content, "Spells").unwrap();
-        assert!(
-            section.content.starts_with("**Spells**"),
-            "content: {:?}",
-            section.content
-        );
-        assert!(section.content.contains("Fireball"));
+        assert_eq!(section.heading.text, "Spells");
+        assert!(section.heading.promoted);
+        assert_eq!(section.body, "Fireball");
     }
 }

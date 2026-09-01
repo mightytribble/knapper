@@ -619,6 +619,23 @@ pub fn apply_section_edit(
     let section = crate::markdown::find_section(content, heading)
         .ok_or_else(|| anyhow::anyhow!("section '{}' not found", heading))?;
 
+    // Content that opens with a heading at or above the section's own level
+    // is #96's mistake. Such a line ends the section rather than filling it,
+    // so it cannot be body text — and it is exactly what a caller wrote back
+    // when `read` still carried the heading in its content. The write used to
+    // report success and leave the note holding the heading twice, so it is
+    // refused, and the message names the field that changes a heading (#96).
+    if let Some(opening) = opening_heading(new)
+        && opening.level <= section.heading.level
+    {
+        let line = new.lines().nth(opening.line).unwrap_or("").trim();
+        bail!(
+            "content for section '{heading}' opens with `{line}`, which ends the section \
+             rather than fills it. The content is the body alone; pass `heading` to rename \
+             the section"
+        );
+    }
+
     // Apply the edit based on mode
     let lines: Vec<&str> = content.lines().collect();
     let before = &lines[..section.body_start];
@@ -661,6 +678,18 @@ pub fn apply_section_edit(
     }
     // Join with newlines, ensuring we don't double up
     Ok(keep_final_newline(content, result_parts.join("\n")))
+}
+
+/// The heading a text opens with, when its first non-blank line is one.
+///
+/// `headings_with_promotions` is what decides it, so a bold-only line counts
+/// as a heading and one inside a code fence does not — the same rule
+/// `find_section` addresses sections by (#44, #69).
+fn opening_heading(text: &str) -> Option<crate::markdown::HeadingInfo> {
+    let first = text.lines().position(|line| !line.trim().is_empty())?;
+    crate::markdown::headings_with_promotions(text)
+        .into_iter()
+        .find(|h| h.line == first)
 }
 
 /// Give `edited` the final newline `original` had, or take the one it did not.
@@ -1375,6 +1404,44 @@ mod tests {
         let doc = "# Note\n\n## Spells\n\nbody\n";
         let err = apply_section_edit(doc, "Nowhere", "x", EditMode::Replace).unwrap_err();
         assert!(format!("{err}").contains("Nowhere"));
+    }
+
+    /// The mistake #96 was: content opening with the section's own heading
+    /// wrote that heading a second time, and said nothing. Such a line ends
+    /// the section it was meant to fill, so it cannot be body text — the
+    /// edit is refused, and the message names the field a rename uses (#96,
+    /// #97).
+    #[test]
+    fn a_section_edit_refuses_content_that_opens_with_a_heading_of_its_own_level() {
+        let doc = "# Note\n\n## Alpha\n\nAlpha body.\n\n## Beta\n\nBeta body.\n";
+        for content in ["## Alpha\n\nAlpha body.", "# Note\n\nAlpha body."] {
+            let err = apply_section_edit(doc, "Alpha", content, EditMode::Replace)
+                .expect_err("a heading at or above the section's level is refused");
+            let msg = format!("{err}");
+            assert!(msg.contains("heading"), "{msg}");
+        }
+    }
+
+    /// A deeper heading is ordinary section content: it sits inside the
+    /// section rather than ending it, so a subsection is written as it always
+    /// was (#96).
+    #[test]
+    fn a_section_edit_takes_a_deeper_heading_as_content() {
+        let doc = "# Note\n\n## Alpha\n\nAlpha body.\n";
+        let out =
+            apply_section_edit(doc, "Alpha", "### Detail\n\nMore.", EditMode::Replace).unwrap();
+        assert!(out.contains("### Detail"));
+        assert!(out.contains("More."));
+    }
+
+    /// A promoted bold line is ended by any heading, so content that opens
+    /// with one is refused for a promoted section too (#44, #96).
+    #[test]
+    fn a_promoted_section_edit_refuses_content_that_opens_with_its_bold_line() {
+        let doc = "## Stat Block\n\n**Spells**\n\nFireball\n";
+        let err = apply_section_edit(doc, "Spells", "**Spells**\n\nMeteor", EditMode::Replace)
+            .expect_err("a bold line ends a promoted section");
+        assert!(format!("{err}").contains("heading"));
     }
 
     #[test]
