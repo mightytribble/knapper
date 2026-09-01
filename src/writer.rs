@@ -123,55 +123,6 @@ pub fn normalize_filename(name: &str) -> String {
     }
 }
 
-/// Optional placement suggestion metadata for inbox notes.
-pub struct PlacementSuggestion {
-    pub suggested_folder: String,
-    pub confidence: f64,
-    pub reason: String,
-}
-
-/// Build YAML frontmatter string.
-pub fn build_frontmatter(
-    tags: &[String],
-    created_by: Option<&str>,
-    aliases: Option<&[String]>,
-    suggestion: Option<&PlacementSuggestion>,
-) -> String {
-    let mut fm = String::from("---\n");
-
-    if !tags.is_empty() {
-        fm.push_str("tags:\n");
-        for tag in tags {
-            fm.push_str(&format!("  - {}\n", tag));
-        }
-    }
-
-    if let Some(aliases) = aliases
-        && !aliases.is_empty()
-    {
-        fm.push_str("aliases:\n");
-        for alias in aliases {
-            fm.push_str(&format!("  - {}\n", alias));
-        }
-    }
-
-    fm.push_str(&format!("created: {}\n", today_date()));
-
-    if let Some(by) = created_by {
-        fm.push_str(&format!("created_by: {}\n", by));
-    }
-
-    // Placement suggestion for inbox notes — user sees why it landed here
-    if let Some(s) = suggestion {
-        fm.push_str(&format!("suggested_folder: {}\n", s.suggested_folder));
-        fm.push_str(&format!("confidence: {:.2}\n", s.confidence));
-        fm.push_str(&format!("reason: \"{}\"\n", s.reason));
-    }
-
-    fm.push_str("---\n\n");
-    fm
-}
-
 /// Split content into (frontmatter_string, body_string).
 /// If no frontmatter, returns ("", content).
 pub fn split_frontmatter(content: &str) -> (String, String) {
@@ -1112,32 +1063,15 @@ pub fn archive_note(
     let new_rel_path = format!("{}/{}", archive_folder, file_record.path);
     let new_full_path = vault_path.join(&new_rel_path);
 
-    // Read content and inject archive frontmatter
+    // Archive's three keys go into the block the note already has, so every
+    // key the note carried is still there when it comes back (#92).
     let content = std::fs::read_to_string(&old_path)?;
-    let (old_fm, body) = split_frontmatter(&content);
-
-    // Keep the note's own `tags:` property and add the archive tag. The source
-    // is the property, not `FileRecord.tags`: the junction also holds the body
-    // hashtags (#60), which stay in the body.
-    let (_, mut tags, _) = parse_frontmatter_fields(&old_fm);
-    if !tags.contains(&"archived".to_string()) {
-        tags.push("archived".to_string());
-    }
-
-    let archive_fm = format!(
-        "---\n\
-         archived: true\n\
-         archived_at: {}\n\
-         archived_from: {}\n\
-         tags:\n{}\
-         ---\n\n",
-        today_date(),
-        file_record.path,
-        tags.iter()
-            .map(|t| format!("  - {}\n", t))
-            .collect::<String>(),
-    );
-    let new_content = format!("{}{}", archive_fm, body);
+    let mut block = crate::frontmatter::Block::parse_or_open(&content)?;
+    let tags = block.list("tags");
+    block.set_bool("archived", true)?;
+    block.set_scalar("archived_at", &today_date())?;
+    block.set_scalar("archived_from", &file_record.path)?;
+    let new_content = block.render();
 
     // Ensure target directory
     if let Some(parent) = new_full_path.parent() {
@@ -1192,17 +1126,12 @@ pub fn unarchive_note(
     }
 
     let content = std::fs::read_to_string(&archive_path)?;
-    let (fm_str, body) = split_frontmatter(&content);
-
-    // Extract archived_from from frontmatter
-    let original_path = fm_str
-        .lines()
-        .find(|l| l.starts_with("archived_from:"))
-        .and_then(|l| l.strip_prefix("archived_from:"))
-        .map(|s| s.trim().to_string())
-        .ok_or_else(|| {
-            anyhow::anyhow!("no archived_from in frontmatter — cannot determine original location")
-        })?;
+    let mut block = crate::frontmatter::Block::parse(&content)?.ok_or_else(|| {
+        anyhow::anyhow!("no archived_from in frontmatter — cannot determine original location")
+    })?;
+    let original_path = block.scalar("archived_from").ok_or_else(|| {
+        anyhow::anyhow!("no archived_from in frontmatter — cannot determine original location")
+    })?;
 
     let restore_full_path = vault_path.join(&original_path);
 
@@ -1213,32 +1142,16 @@ pub fn unarchive_note(
         );
     }
 
-    // Rebuild frontmatter without archive fields
-    let mut tags: Vec<String> = fm_str
-        .lines()
-        .skip_while(|l| !l.starts_with("tags:"))
-        .skip(1)
-        .take_while(|l| l.starts_with("  - "))
-        .filter_map(|l| l.strip_prefix("  - "))
-        .map(|s| s.trim().to_string())
-        .filter(|t| t != "archived")
-        .collect();
-    if tags.is_empty() {
-        // Try inline tags format
-        if let Some(line) = fm_str.lines().find(|l| l.starts_with("tags:"))
-            && let Some(rest) = line.strip_prefix("tags:")
-        {
-            let rest = rest.trim().trim_start_matches('[').trim_end_matches(']');
-            tags = rest
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty() && s != "archived")
-                .collect();
-        }
-    }
-
-    let new_fm = build_frontmatter(&tags, None, None, None);
-    let restored_content = format!("{}{}", new_fm, body);
+    block.remove("archived")?;
+    block.remove("archived_at")?;
+    block.remove("archived_from")?;
+    let tags = block.list("tags");
+    // A note that had no block before it was archived gets none back.
+    let restored_content = if block.is_empty() {
+        block.body().to_string()
+    } else {
+        block.render()
+    };
 
     // Ensure target directory
     if let Some(parent) = restore_full_path.parent() {
@@ -1570,33 +1483,6 @@ mod tests {
     }
 
     #[test]
-    fn test_build_frontmatter() {
-        let fm = build_frontmatter(
-            &["work".to_string(), "knapper".to_string()],
-            Some("claude-code"),
-            None,
-            None,
-        );
-        assert!(fm.starts_with("---\n"));
-        assert!(fm.ends_with("---\n\n"));
-        assert!(fm.contains("work"));
-        assert!(fm.contains("created_by: claude-code"));
-    }
-
-    #[test]
-    fn test_build_frontmatter_with_aliases() {
-        let fm = build_frontmatter(
-            &["test".to_string()],
-            Some("writer"),
-            Some(&["alias1".to_string(), "alias2".to_string()]),
-            None,
-        );
-        assert!(fm.contains("aliases:"));
-        assert!(fm.contains("  - alias1"));
-        assert!(fm.contains("  - alias2"));
-    }
-
-    #[test]
     fn test_split_frontmatter() {
         let content = "---\ntags: [a]\n---\n\nBody text";
         let (fm, body) = split_frontmatter(content);
@@ -1632,24 +1518,6 @@ mod tests {
         assert_eq!(date.len(), 10);
         assert_eq!(&date[4..5], "-");
         assert_eq!(&date[7..8], "-");
-    }
-
-    #[test]
-    fn test_build_frontmatter_with_suggestion() {
-        let suggestion = PlacementSuggestion {
-            suggested_folder: "02-Areas/Development".to_string(),
-            confidence: 0.58,
-            reason: "semantic similarity: 0.580".to_string(),
-        };
-        let fm = build_frontmatter(
-            &["work".to_string()],
-            Some("claude-code"),
-            None,
-            Some(&suggestion),
-        );
-        assert!(fm.contains("suggested_folder: 02-Areas/Development"));
-        assert!(fm.contains("confidence: 0.58"));
-        assert!(fm.contains("reason: \"semantic similarity: 0.580\""));
     }
 
     #[test]
@@ -2159,7 +2027,9 @@ mod tests {
         let written = std::fs::read_to_string(root.join("04-Archive/n.md")).unwrap();
         let (fm, _) = split_frontmatter(&written);
         let (_, property_tags, _) = parse_frontmatter_fields(&fm);
-        assert_eq!(property_tags, vec!["work", "archived"]);
+        // archive no longer writes an `archived` tag (#92): `archived: true`
+        // and the note's place under the archive folder already say it.
+        assert_eq!(property_tags, vec!["work"]);
         assert!(written.contains("#todo"), "the body tag stays in the body");
     }
 
@@ -2202,6 +2072,80 @@ mod tests {
         .unwrap();
         assert!(vault.join("Projects/n.md").exists());
         assert!(!archived.exists());
+    }
+
+    /// A vault holding one note at `rel`, indexed and ready to archive.
+    fn vault_with(
+        rel: &str,
+        text: &str,
+    ) -> (
+        tempfile::TempDir,
+        Store,
+        std::path::PathBuf,
+        crate::llm::MockLlm,
+    ) {
+        use crate::llm::MockLlm;
+
+        let (tmp, store, vault) = setup_vault();
+        if let Some(parent) = std::path::Path::new(rel).parent() {
+            std::fs::create_dir_all(vault.join(parent)).unwrap();
+        }
+        std::fs::write(vault.join(rel), text).unwrap();
+        let mut embedder = MockLlm::new(256);
+        let config = crate::config::Config::default();
+        crate::indexer::run_index_shared(
+            &vault,
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
+        (tmp, store, vault, embedder)
+    }
+
+    #[test]
+    fn archiving_keeps_every_key_the_note_already_carried() {
+        let note = "---\nname: Probe\naliases: []\ntags: [type/lore]\n---\n\nBody.\n";
+        let (_tmp, store, vault, _embedder) = vault_with("lore/Probe.md", note);
+
+        archive_note("lore/Probe.md", &store, &vault, None).unwrap();
+
+        let archived = std::fs::read_to_string(vault.join("04-Archive/lore/Probe.md")).unwrap();
+        assert!(
+            archived.starts_with("---\nname: Probe\naliases: []\ntags: [type/lore]\n"),
+            "{archived}"
+        );
+        assert!(archived.contains("archived: true"), "{archived}");
+        assert!(
+            archived.contains("archived_from: lore/Probe.md"),
+            "{archived}"
+        );
+        assert!(archived.ends_with("---\n\nBody.\n"), "{archived}");
+    }
+
+    #[test]
+    fn an_archive_round_trip_returns_the_file_byte_for_byte() {
+        let note = "---\nname: Probe\naliases: []\ntags: [type/lore]\n---\n\nBody.\n";
+        let (_tmp, store, vault, mut embedder) = vault_with("lore/Probe.md", note);
+
+        archive_note("lore/Probe.md", &store, &vault, None).unwrap();
+        unarchive_note(
+            "04-Archive/lore/Probe.md",
+            &store,
+            &mut embedder,
+            EmbedComposition::default(),
+            test_chunk_opts(),
+            &vault,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(vault.join("lore/Probe.md")).unwrap(),
+            note
+        );
     }
 
     /// A vault of one note, indexed, ready for `update_note`.

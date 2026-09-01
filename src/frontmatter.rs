@@ -208,6 +208,12 @@ impl Block {
         }
     }
 
+    /// The items `key`'s list holds, in order. A scalar reads back as one
+    /// item, and a key the block does not hold reads back as none.
+    pub fn list(&self, key: &str) -> Vec<String> {
+        self.items_of(key).into_iter().map(|i| i.value).collect()
+    }
+
     /// Write `key` as a scalar, quoted when YAML needs it.
     pub fn set_scalar(&mut self, key: &str, value: &str) -> Result<()> {
         self.check_editable(key)?;
@@ -1021,6 +1027,17 @@ mod tests {
         assert_eq!(block.scalar("archived_from").as_deref(), Some("Areas/n.md"));
         assert_eq!(block.scalar("n").as_deref(), Some("3"));
         assert_eq!(block.scalar("absent"), None);
+    }
+
+    #[test]
+    fn a_list_reads_back_its_items_however_it_is_written() {
+        let block = Block::parse("---\ninline: [a, b]\nblock:\n  - c\n  - d\nscalar: e\n---\n")
+            .unwrap()
+            .unwrap();
+        assert_eq!(block.list("inline"), vec!["a", "b"]);
+        assert_eq!(block.list("block"), vec!["c", "d"]);
+        assert_eq!(block.list("scalar"), vec!["e"]);
+        assert_eq!(block.list("absent"), Vec::<String>::new());
     }
 
     #[test]
