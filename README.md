@@ -19,7 +19,7 @@ Knapper solves this by providing your LLM with effective search, realtime indexi
 - **...quickly.** — Against a 240-note test vault the default path refuses exactly the same unanswerable queries as the local cross-encoder, missing on only one particularly tricky question compared to it — but much, much faster: 22 ms a query instead of 13.8 seconds on a CPU-only system.
 - **MCP server for AI agents** — `knapper serve` exposes 18 tools (search, read, list, tags, vault_map, create, update, delete, move, archive, index, reindex_file, status, health, validate, identity, init, migrate) that Claude, Cursor, or any MCP client can call directly.
 - **HTTP REST API** — `knapper serve --http` adds an axum-based HTTP server alongside MCP with 19 REST endpoints, API key authentication, rate limiting, and CORS. Web-based agents and scripts can query your vault with simple `curl` calls.
-- **Section-level editing** — AI agents can read, replace, prepend, or append to a section by heading, to the note's body, or to a frontmatter property — every change is one `update` call carrying a list of edits.
+- **Section-level editing** — AI agents can read, replace, prepend, append to or rename a section by heading, edit the note's body, or edit a frontmatter property — every change is one `update` call carrying a list of edits, and what `read` returns is what `update` takes back.
 - **Vault health diagnostics** — detect orphan notes, broken wikilinks, stale content, and tag hygiene issues. Available as MCP tool and CLI command.
 - **Real-time sync** — file watcher keeps the index fresh as you edit in Obsidian. No manual re-indexing needed.
 - **Smart write pipeline** — AI agents can create, edit, rewrite, and delete notes with automatic tag resolution, wikilink discovery, and folder placement based on semantic similarity.
@@ -272,6 +272,16 @@ knapper update "Meeting Notes" --section "Action Items" --mode append --content=
 ```
 
 Targets the "Action Items" section by heading, appends content without touching the rest of the note. Write `--content=` with an equals sign when the value starts with a `-`: the shell passes the text through untouched, and clap reads a leading `-` as a flag.
+
+A section's content is the body **below** the heading, which is what `knapper read --section` returns: read a section, change it, write it back, and the note is the note it was. Content that opens with a heading at or above the section's own level is refused, because such a line would end the section rather than fill it.
+
+**Rename a section:**
+
+```bash
+knapper update "The Roads of New Visland" --section "Norlund to Westport via Bend" --heading "Norlund to Bend"
+```
+
+Renames the section and leaves its body alone; add `--content` to rewrite the body in the same write. The note keeps the heading's own markup, so a `###` stays a `###` and a promoted bold line keeps its markers — `--heading` carries the text. A name another section of the note already holds is refused, since two sections of one name leave both unaddressable by name.
 
 **Rewrite a note (preserves frontmatter):**
 

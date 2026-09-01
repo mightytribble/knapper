@@ -866,6 +866,7 @@ async fn main() -> Result<()> {
             file,
             section,
             property,
+            heading,
             mode,
             content,
             edits,
@@ -879,10 +880,13 @@ async fn main() -> Result<()> {
             // that names an impossible target writes nothing (#62).
             let request = knapper::params::Update::from_cli(
                 file,
-                section,
-                property,
-                mode,
-                content,
+                knapper::params::CliEdit {
+                    section,
+                    property,
+                    heading,
+                    mode,
+                    content,
+                },
                 edits,
                 || content_or_stdin(None),
             )?;

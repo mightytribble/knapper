@@ -88,6 +88,12 @@ pub enum Command {
         /// The frontmatter property to edit.
         #[arg(long)]
         property: Option<String>,
+        /// The section's new heading text, which renames the section
+        /// `--section` names. The note keeps the heading's own markup, so a
+        /// `###` stays a `###`; `--content` is optional beside it, because a
+        /// rename does not restate the body (#97).
+        #[arg(long, requires = "section")]
+        heading: Option<String>,
         /// What the edit does to what it names. `remove` is for a property
         /// alone.
         #[arg(long, value_enum, default_value = "replace")]
@@ -99,7 +105,7 @@ pub enum Command {
         content: Vec<String>,
         /// A JSON array of edits, applied in one write. It replaces the flags
         /// above, which are the one-edit form of the same grammar (#62).
-        #[arg(long, conflicts_with_all = ["section", "property", "mode", "content"])]
+        #[arg(long, conflicts_with_all = ["section", "property", "heading", "mode", "content"])]
         edits: Option<String>,
     },
 
@@ -445,6 +451,38 @@ mod tests {
             }
             other => panic!("got {other:?}"),
         }
+
+        // `--heading` renames the section `--section` names, so it needs one,
+        // and a rename does not restate the body, so it takes no `--content`
+        // (#97).
+        let cli = Cli::try_parse_from([
+            "knapper",
+            "update",
+            "roads.md",
+            "--section",
+            "Norlund to Westport via Bend",
+            "--heading",
+            "Norlund to Bend",
+        ])
+        .expect("a rename parses with no content");
+        match cli.command {
+            Command::Update {
+                section,
+                heading,
+                content,
+                ..
+            } => {
+                assert_eq!(section.as_deref(), Some("Norlund to Westport via Bend"));
+                assert_eq!(heading.as_deref(), Some("Norlund to Bend"));
+                assert!(content.is_empty());
+            }
+            other => panic!("got {other:?}"),
+        }
+
+        assert!(
+            Cli::try_parse_from(["knapper", "update", "note.md", "--heading", "New"]).is_err(),
+            "a heading names no section to rename"
+        );
 
         let cli = Cli::try_parse_from(["knapper", "update", "note.md", "--edits", "[]"])
             .expect("the list form parses");

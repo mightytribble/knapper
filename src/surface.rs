@@ -145,6 +145,10 @@ pub const CAPABILITIES: &[Capability] = &[
                 "the one edit's target property; a command line carries no `edits` list",
             ),
             (
+                "heading",
+                "the one edit's new heading for the section it renames; a command line carries no `edits` list",
+            ),
+            (
                 "mode",
                 "what the one edit does; a command line carries no `edits` list",
             ),

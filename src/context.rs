@@ -997,6 +997,7 @@ mod tests {
             &original,
             &[crate::writer::NoteEdit {
                 target: crate::writer::EditTarget::Section("Alpha".into()),
+                heading: None,
                 mode: crate::writer::EditMode::Replace,
                 content: Some(crate::writer::EditContent::Text(body)),
             }],
@@ -1052,6 +1053,7 @@ mod tests {
             &original,
             &[crate::writer::NoteEdit {
                 target: crate::writer::EditTarget::Body,
+                heading: None,
                 mode: crate::writer::EditMode::Replace,
                 content: Some(crate::writer::EditContent::Text(body)),
             }],

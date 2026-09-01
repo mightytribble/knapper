@@ -212,7 +212,7 @@ impl KnapperServer {
 
     #[tool(
         name = "read",
-        description = "Read a note's content: the whole note's body, or one section's markdown with `section`. With `metadata: true` it returns the note's frontmatter, inbound and outbound links, and size instead — which cannot be combined with `section`. Accepts file path, basename, or #docid."
+        description = "Read a note's content: the whole note's body, or one section's body with `section`, which carries the section's `heading` and `level` beside the content rather than in it. What this returns is what `update` takes back: a body edit or a section `replace` handed this content writes the file it came from. With `metadata: true` it returns the note's frontmatter, inbound and outbound links, and size instead — which cannot be combined with `section`. Accepts file path, basename, or #docid."
     )]
     async fn read(
         &self,
@@ -341,6 +341,8 @@ impl KnapperServer {
              Each edit names its target. `section` is one heading. `property` is one frontmatter key. An edit that names neither targets the note's body, and an edit that names both is an error. \
              `mode` is `replace`, `append`, `prepend` or `remove`. `remove` is for a property alone. \
              `content` is a string, or a list of strings to set a list-valued property such as tags or aliases. A body edit and a section edit take a string. \
+             A section edit's content is the body **below** the heading: content that opens with a heading at or above the section's own level is refused, because such a line ends the section rather than fills it. \
+             `heading` renames the section `section` names, and it is the heading's text — the note keeps its markup, so a `##` stays a `##`. `content` is optional beside it, since a rename does not restate the body. A name another section of the note already holds is refused. \
              A body edit always keeps the note's frontmatter: content that starts with its own `---` block gives the note two of them. Change the frontmatter with `property` edits in the same list. \
              Three things differ from the calls this replaces. A note changed outside knapper and not yet re-indexed fails with an mtime conflict. \
              Replacing a note's frontmatter wholesale has no spelling here — `rewrite`'s `preserve_frontmatter: false` is gone, not renamed, and write the new frontmatter with `property` edits instead. \
