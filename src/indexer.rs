@@ -1134,6 +1134,7 @@ mod tests {
             file: "note.md".into(),
             edits: vec![crate::writer::NoteEdit {
                 target: crate::writer::EditTarget::Body,
+                heading: None,
                 mode: crate::writer::EditMode::Append,
                 content: Some(crate::writer::EditContent::Text("the new line".into())),
             }],

@@ -290,6 +290,16 @@ pub struct Edit {
     /// where it is and in the list style the note already uses, and a list
     /// with no items writes an empty list.
     pub property: Option<String>,
+    /// The section's new heading text, when the edit renames it. It renames
+    /// the section `section` names, so an edit that carries a heading and no
+    /// section is refused, and `content` is optional beside it, because a
+    /// rename does not restate the body.
+    ///
+    /// The value is the heading's text and the note keeps its markup: a
+    /// `###` stays a `###` and a promoted bold line keeps its markers. A name
+    /// another section of the note already holds is refused, since two
+    /// sections of one name leave both unaddressable by name (#97).
+    pub heading: Option<String>,
     /// `replace`, `append`, `prepend` or `remove`.
     pub mode: EditMode,
     /// A string, or a list of strings for a list-valued property.
@@ -337,6 +347,7 @@ impl Edit {
         };
         Ok(crate::writer::NoteEdit {
             target,
+            heading: self.heading.clone(),
             mode: self.mode.into(),
             content: content_of(self.content.as_ref())?,
         })
@@ -367,6 +378,20 @@ fn content_of(
     })
 }
 
+/// The one edit `knapper update`'s flag form names, as the command line
+/// spells it: the target — `--section`, `--property`, or neither for the
+/// body — the `--heading` that renames a section, and what the edit does to
+/// what it names. `--edits` is the whole grammar and this is the one-edit
+/// form of the same thing, so both build one [`Update`] (#62, #97).
+#[derive(Debug)]
+pub struct CliEdit {
+    pub section: Option<String>,
+    pub property: Option<String>,
+    pub heading: Option<String>,
+    pub mode: EditMode,
+    pub content: Vec<String>,
+}
+
 impl Update {
     /// The writer's edit list this request means. Every edit is read before
     /// any of them is applied, so a request that names an impossible target
@@ -384,13 +409,14 @@ impl Update {
     /// repeating the flag is the list a list-valued property reads. The value
     /// is never split, because prose holds commas and there would be no way
     /// to write one (#62).
-    pub fn from_cli_edit(
-        file: String,
-        section: Option<String>,
-        property: Option<String>,
-        mode: EditMode,
-        content: Vec<String>,
-    ) -> Self {
+    pub fn from_cli_edit(file: String, edit: CliEdit) -> Self {
+        let CliEdit {
+            section,
+            property,
+            heading,
+            mode,
+            content,
+        } = edit;
         let content = match content.len() {
             0 => None,
             1 => Some(serde_json::Value::String(
@@ -405,6 +431,7 @@ impl Update {
             edits: vec![Edit {
                 section,
                 property,
+                heading,
                 mode,
                 content,
             }],
@@ -433,37 +460,51 @@ impl Update {
     /// spelling for a deliberate one.
     pub fn from_cli(
         file: String,
-        section: Option<String>,
-        property: Option<String>,
-        mode: EditMode,
-        content: Vec<String>,
+        edit: CliEdit,
         edits: Option<String>,
         read_stdin: impl FnOnce() -> anyhow::Result<String>,
     ) -> anyhow::Result<Self> {
+        let CliEdit {
+            section,
+            property,
+            heading,
+            mode,
+            content,
+        } = edit;
         if let Some(json) = edits {
             let edits = serde_json::from_str::<Vec<Edit>>(&json)
                 .map_err(|e| anyhow::anyhow!("--edits is not a JSON array of edits: {e}"))?;
             return Ok(Update { file, edits });
         }
-        let content = if content.is_empty() && !matches!(mode, EditMode::Remove) {
-            let text = read_stdin()?;
-            let targets_text = property.is_none();
-            if text.trim().is_empty() && targets_text && matches!(mode, EditMode::Replace) {
-                anyhow::bail!(
-                    "a replace of {} read no content from stdin. \
+        // A rename does not restate the body, so `--heading` with no
+        // `--content` is a complete edit and there is nothing to read (#97).
+        let content =
+            if content.is_empty() && !matches!(mode, EditMode::Remove) && heading.is_none() {
+                let text = read_stdin()?;
+                let targets_text = property.is_none();
+                if text.trim().is_empty() && targets_text && matches!(mode, EditMode::Replace) {
+                    anyhow::bail!(
+                        "a replace of {} read no content from stdin. \
                      Pass --content, or --content \"\" to blank it deliberately",
-                    match &section {
-                        Some(heading) => format!("section '{heading}'"),
-                        None => "the note's body".to_string(),
-                    }
-                );
-            }
-            vec![text]
-        } else {
-            content
-        };
+                        match &section {
+                            Some(heading) => format!("section '{heading}'"),
+                            None => "the note's body".to_string(),
+                        }
+                    );
+                }
+                vec![text]
+            } else {
+                content
+            };
         Ok(Update::from_cli_edit(
-            file, section, property, mode, content,
+            file,
+            CliEdit {
+                section,
+                property,
+                heading,
+                mode,
+                content,
+            },
         ))
     }
 }
@@ -818,10 +859,13 @@ mod tests {
     fn one_cli_content_reaches_the_writer_as_one_string() {
         let u = Update::from_cli_edit(
             "n.md".into(),
-            Some("Notes".into()),
-            None,
-            EditMode::Replace,
-            vec!["Hello, world".into()],
+            CliEdit {
+                section: Some("Notes".into()),
+                property: None,
+                heading: None,
+                mode: EditMode::Replace,
+                content: vec!["Hello, world".into()],
+            },
         );
         let edits = u.to_writer_edits().unwrap();
         assert!(
@@ -839,10 +883,13 @@ mod tests {
     fn a_repeated_cli_content_reaches_the_writer_as_a_list() {
         let u = Update::from_cli_edit(
             "n.md".into(),
-            None,
-            Some("tags".into()),
-            EditMode::Replace,
-            vec!["a".into(), "b".into()],
+            CliEdit {
+                section: None,
+                property: Some("tags".into()),
+                heading: None,
+                mode: EditMode::Replace,
+                content: vec!["a".into(), "b".into()],
+            },
         );
         let edits = u.to_writer_edits().unwrap();
         assert!(
@@ -861,10 +908,13 @@ mod tests {
     fn no_cli_content_is_no_content() {
         let u = Update::from_cli_edit(
             "n.md".into(),
-            None,
-            Some("status".into()),
-            EditMode::Remove,
-            vec![],
+            CliEdit {
+                section: None,
+                property: Some("status".into()),
+                heading: None,
+                mode: EditMode::Remove,
+                content: vec![],
+            },
         );
         let edits = u.to_writer_edits().unwrap();
         assert!(edits[0].content.is_none());
@@ -883,13 +933,62 @@ mod tests {
         let stdin = stdin.to_string();
         Update::from_cli(
             "n.md".into(),
-            section.map(String::from),
-            property.map(String::from),
-            mode,
-            content,
+            CliEdit {
+                section: section.map(String::from),
+                property: property.map(String::from),
+                heading: None,
+                mode,
+                content,
+            },
             edits.map(String::from),
             move || Ok(stdin),
         )
+    }
+
+    /// The same, for the call that renames the section it names (#97).
+    fn from_cli_rename(
+        section: &str,
+        heading: &str,
+        content: Vec<String>,
+        stdin: &str,
+    ) -> anyhow::Result<Update> {
+        let stdin = stdin.to_string();
+        Update::from_cli(
+            "n.md".into(),
+            CliEdit {
+                section: Some(section.to_string()),
+                property: None,
+                heading: Some(heading.to_string()),
+                mode: EditMode::Replace,
+                content,
+            },
+            None,
+            move || Ok(stdin),
+        )
+    }
+
+    /// A rename does not restate the body, so `--heading` with no `--content`
+    /// is a whole edit: it reads no stdin, and the refusal that guards an
+    /// empty piped replace does not fire on it (#97).
+    #[test]
+    fn a_rename_with_no_content_reads_no_stdin() {
+        let u = from_cli_rename("Old name", "New name", vec![], "").unwrap();
+        let edits = u.to_writer_edits().unwrap();
+        assert!(edits[0].content.is_none());
+        assert_eq!(edits[0].heading.as_deref(), Some("New name"));
+    }
+
+    /// A rename that also writes a body is one edit, and the content is the
+    /// body alone (#97).
+    #[test]
+    fn a_rename_carries_content_when_it_is_given_some() {
+        let u = from_cli_rename("Old name", "New name", vec!["The new body.".into()], "").unwrap();
+        let edits = u.to_writer_edits().unwrap();
+        assert_eq!(edits[0].heading.as_deref(), Some("New name"));
+        assert!(matches!(
+            edits[0].content,
+            Some(crate::writer::EditContent::Text(ref t)) if t == "The new body."
+        ));
     }
 
     /// An omitted `--content` reads stdin, which is how `write append` took a
@@ -958,10 +1057,13 @@ mod tests {
 
         let u = Update::from_cli(
             "n.md".into(),
-            None,
-            Some("status".into()),
-            EditMode::Remove,
-            vec![],
+            CliEdit {
+                section: None,
+                property: Some("status".into()),
+                heading: None,
+                mode: EditMode::Remove,
+                content: vec![],
+            },
             None,
             unreadable,
         )
@@ -970,10 +1072,13 @@ mod tests {
 
         let u = Update::from_cli(
             "n.md".into(),
-            None,
-            None,
-            EditMode::Replace,
-            vec![],
+            CliEdit {
+                section: None,
+                property: None,
+                heading: None,
+                mode: EditMode::Replace,
+                content: vec![],
+            },
             Some(r#"[{"mode":"append","content":"x"}]"#.into()),
             unreadable,
         )
@@ -982,10 +1087,13 @@ mod tests {
 
         let err = Update::from_cli(
             "n.md".into(),
-            None,
-            None,
-            EditMode::Replace,
-            vec![],
+            CliEdit {
+                section: None,
+                property: None,
+                heading: None,
+                mode: EditMode::Replace,
+                content: vec![],
+            },
             Some("not json".into()),
             unreadable,
         )
@@ -1000,6 +1108,7 @@ mod tests {
             edits: vec![Edit {
                 section: Some("H".into()),
                 property: Some("tags".into()),
+                heading: None,
                 mode: EditMode::Replace,
                 content: None,
             }],
@@ -1015,6 +1124,7 @@ mod tests {
             edits: vec![Edit {
                 section: None,
                 property: None,
+                heading: None,
                 mode: EditMode::Append,
                 content: Some(serde_json::json!("line")),
             }],
@@ -1030,6 +1140,7 @@ mod tests {
             edits: vec![Edit {
                 section: None,
                 property: Some("tags".into()),
+                heading: None,
                 mode: EditMode::Replace,
                 content: Some(serde_json::json!(["a", "b"])),
             }],

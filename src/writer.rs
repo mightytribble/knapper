@@ -73,6 +73,10 @@ pub enum EditContent {
 #[derive(Debug, Clone)]
 pub struct NoteEdit {
     pub target: EditTarget,
+    /// The section's new heading text, when the edit renames it. A heading
+    /// names the section an edit is already addressing, so it belongs to
+    /// `EditTarget::Section` and to no other target (#97).
+    pub heading: Option<String>,
     pub mode: EditMode,
     pub content: Option<EditContent>,
 }
@@ -619,6 +623,23 @@ pub fn apply_section_edit(
     let section = crate::markdown::find_section(content, heading)
         .ok_or_else(|| anyhow::anyhow!("section '{}' not found", heading))?;
 
+    // Content that opens with a heading at or above the section's own level
+    // is #96's mistake. Such a line ends the section rather than filling it,
+    // so it cannot be body text — and it is exactly what a caller wrote back
+    // when `read` still carried the heading in its content. The write used to
+    // report success and leave the note holding the heading twice, so it is
+    // refused, and the message names the field that changes a heading (#96).
+    if let Some(opening) = opening_heading(new)
+        && opening.level <= section.heading.level
+    {
+        let line = new.lines().nth(opening.line).unwrap_or("").trim();
+        bail!(
+            "content for section '{heading}' opens with `{line}`, which ends the section \
+             rather than fills it. The content is the body alone; pass `heading` to rename \
+             the section"
+        );
+    }
+
     // Apply the edit based on mode
     let lines: Vec<&str> = content.lines().collect();
     let before = &lines[..section.body_start];
@@ -661,6 +682,79 @@ pub fn apply_section_edit(
     }
     // Join with newlines, ensuring we don't double up
     Ok(keep_final_newline(content, result_parts.join("\n")))
+}
+
+/// Rewrite one section's heading line, and nothing else in the note (#97).
+///
+/// A heading is an identifier: `read` addresses a section by it and the
+/// breadcrumbs `search` returns are keyed on it. The only route to changing
+/// one used to be a whole-note body replace, which means restating every
+/// section that was not being renamed.
+///
+/// The new value is the heading's **text**. The note keeps the markup it
+/// already gave the line, so a `###` stays a `###` and a promoted bold line
+/// keeps the markers that make it a section — and a value that is itself
+/// markup is refused, because writing it would give the line two sets.
+///
+/// A name another section of the note already holds is refused too: two
+/// sections of one name leave both unaddressable by bare name.
+pub fn rename_section(content: &str, heading: &str, new_heading: &str) -> Result<String> {
+    let section = crate::markdown::find_section(content, heading)
+        .ok_or_else(|| anyhow::anyhow!("section '{}' not found", heading))?;
+
+    let text = new_heading.trim();
+    if text.is_empty() {
+        bail!("a rename of section '{heading}' needs a heading to rename it to");
+    }
+    if opening_heading(text).is_some() {
+        bail!(
+            "`{text}` is heading markup and `heading` is a heading's text: the note keeps the \
+             markup it already has, so pass the text alone"
+        );
+    }
+    if let Some(existing) = crate::markdown::find_section(content, text)
+        && existing.heading.line != section.heading.line
+    {
+        bail!(
+            "section '{}' already holds the name `{text}`, and two sections of one name leave \
+             both unaddressable by name",
+            existing.heading.text
+        );
+    }
+
+    let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
+    lines[section.heading.line] =
+        renamed_heading_line(&lines[section.heading.line], &section.heading, text);
+    Ok(keep_final_newline(content, lines.join("\n")))
+}
+
+/// The heading line `old` becomes when its text is `text`.
+///
+/// The markup is the note's and the text is the caller's, so an ATX heading
+/// keeps its depth and a promoted line keeps its own markers — the `__` form
+/// as readily as the `**` one, and the trailing colon that `bold_heading_text`
+/// allows (#44, #97).
+fn renamed_heading_line(old: &str, heading: &crate::markdown::HeadingInfo, text: &str) -> String {
+    let indent: String = old.chars().take_while(|c| c.is_whitespace()).collect();
+    if !heading.promoted {
+        return format!("{indent}{} {text}", "#".repeat(heading.level as usize));
+    }
+    let body = old.trim();
+    let marker = if body.starts_with("__") { "__" } else { "**" };
+    let colon = if body.ends_with(':') { ":" } else { "" };
+    format!("{indent}{marker}{text}{marker}{colon}")
+}
+
+/// The heading a text opens with, when its first non-blank line is one.
+///
+/// `headings_with_promotions` is what decides it, so a bold-only line counts
+/// as a heading and one inside a code fence does not — the same rule
+/// `find_section` addresses sections by (#44, #69).
+fn opening_heading(text: &str) -> Option<crate::markdown::HeadingInfo> {
+    let first = text.lines().position(|line| !line.trim().is_empty())?;
+    crate::markdown::headings_with_promotions(text)
+        .into_iter()
+        .find(|h| h.line == first)
 }
 
 /// Give `edited` the final newline `original` had, or take the one it did not.
@@ -799,6 +893,16 @@ fn apply_property_edit(
 /// one parse and one render. The block splices onto the note's own body, so
 /// no number of property edits moves the body a line.
 pub fn apply_note_edits(content: &str, edits: &[NoteEdit]) -> Result<String> {
+    // A heading renames the section an edit names, so an edit that carries
+    // one and names something else is refused before any of the list is
+    // applied — the rule the whole list already follows: a request that names
+    // an impossible target writes nothing (#62, #97).
+    for edit in edits {
+        if edit.heading.is_some() && !matches!(edit.target, EditTarget::Section(_)) {
+            bail!("a heading renames the section an edit names, so it needs `section`");
+        }
+    }
+
     let mut text = content.to_string();
     let mut rest = edits;
     while let Some(edit) = rest.first() {
@@ -831,8 +935,17 @@ pub fn apply_note_edits(content: &str, edits: &[NoteEdit]) -> Result<String> {
                 if edit.mode == EditMode::Remove {
                     bail!("Remove has no meaning for a section");
                 }
-                let new = text_of(edit)?;
-                text = apply_section_edit(&text, heading, &new, edit.mode)?;
+                // A rename does not restate the body, so content is optional
+                // when the edit names a heading — and the body edit runs
+                // first, so both halves of one edit name the section by the
+                // name the note still holds (#97).
+                if edit.content.is_some() || edit.heading.is_none() {
+                    let new = text_of(edit)?;
+                    text = apply_section_edit(&text, heading, &new, edit.mode)?;
+                }
+                if let Some(new_heading) = &edit.heading {
+                    text = rename_section(&text, heading, new_heading)?;
+                }
                 rest = &rest[1..];
             }
         }
@@ -1377,11 +1490,172 @@ mod tests {
         assert!(format!("{err}").contains("Nowhere"));
     }
 
+    /// The mistake #96 was: content opening with the section's own heading
+    /// wrote that heading a second time, and said nothing. Such a line ends
+    /// the section it was meant to fill, so it cannot be body text — the
+    /// edit is refused, and the message names the field a rename uses (#96,
+    /// #97).
+    #[test]
+    fn a_section_edit_refuses_content_that_opens_with_a_heading_of_its_own_level() {
+        let doc = "# Note\n\n## Alpha\n\nAlpha body.\n\n## Beta\n\nBeta body.\n";
+        for content in ["## Alpha\n\nAlpha body.", "# Note\n\nAlpha body."] {
+            let err = apply_section_edit(doc, "Alpha", content, EditMode::Replace)
+                .expect_err("a heading at or above the section's level is refused");
+            let msg = format!("{err}");
+            assert!(msg.contains("heading"), "{msg}");
+        }
+    }
+
+    /// A deeper heading is ordinary section content: it sits inside the
+    /// section rather than ending it, so a subsection is written as it always
+    /// was (#96).
+    #[test]
+    fn a_section_edit_takes_a_deeper_heading_as_content() {
+        let doc = "# Note\n\n## Alpha\n\nAlpha body.\n";
+        let out =
+            apply_section_edit(doc, "Alpha", "### Detail\n\nMore.", EditMode::Replace).unwrap();
+        assert!(out.contains("### Detail"));
+        assert!(out.contains("More."));
+    }
+
+    /// A promoted bold line is ended by any heading, so content that opens
+    /// with one is refused for a promoted section too (#44, #96).
+    #[test]
+    fn a_promoted_section_edit_refuses_content_that_opens_with_its_bold_line() {
+        let doc = "## Stat Block\n\n**Spells**\n\nFireball\n";
+        let err = apply_section_edit(doc, "Spells", "**Spells**\n\nMeteor", EditMode::Replace)
+            .expect_err("a bold line ends a promoted section");
+        assert!(format!("{err}").contains("heading"));
+    }
+
+    /// One section edit that names a `heading`: the heading line is rewritten
+    /// and its level is the level the note already gave it, because the field
+    /// carries the text and not the markup (#97).
+    #[test]
+    fn a_rename_writes_the_new_text_and_keeps_the_heading_s_level() {
+        let doc =
+            "# Roads\n\n### Norlund to Westport via Bend\n\nThe old route.\n\n## Notes\n\nEnd.\n";
+        let out = apply_note_edits(
+            doc,
+            &[NoteEdit {
+                target: EditTarget::Section("Norlund to Westport via Bend".into()),
+                heading: Some("Norlund to Bend".into()),
+                mode: EditMode::Replace,
+                content: Some(EditContent::Text("The road as it now runs.".into())),
+            }],
+        )
+        .unwrap();
+        assert!(out.contains("### Norlund to Bend"), "{out:?}");
+        assert!(!out.contains("Westport"), "{out:?}");
+        assert!(out.contains("The road as it now runs."));
+        assert!(out.contains("## Notes"));
+    }
+
+    /// A rename on its own does not restate the body: an edit with a heading
+    /// and no content renames the section and leaves every other byte of the
+    /// note as it was (#97).
+    #[test]
+    fn a_rename_with_no_content_leaves_the_body_byte_for_byte() {
+        let doc = "---\ntags: [a]\n---\n\n## Alpha\n\n- one\n- two\n\n## Beta\n\nEnd.\n";
+        let out = apply_note_edits(
+            doc,
+            &[NoteEdit {
+                target: EditTarget::Section("Alpha".into()),
+                heading: Some("Alfa".into()),
+                mode: EditMode::Replace,
+                content: None,
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "---\ntags: [a]\n---\n\n## Alfa\n\n- one\n- two\n\n## Beta\n\nEnd.\n"
+        );
+    }
+
+    /// Two sections of one name leave both unaddressable by bare name, so a
+    /// rename onto a name the note already holds is refused (#97).
+    #[test]
+    fn a_rename_onto_a_name_the_note_already_holds_is_refused() {
+        let doc = "# Note\n\n## Alpha\n\nOne.\n\n## Beta\n\nTwo.\n";
+        let err = apply_note_edits(
+            doc,
+            &[NoteEdit {
+                target: EditTarget::Section("Alpha".into()),
+                heading: Some("beta".into()),
+                mode: EditMode::Replace,
+                content: None,
+            }],
+        )
+        .expect_err("a name the note already holds is refused");
+        assert!(format!("{err}").contains("Beta"), "{err}");
+    }
+
+    /// A promoted bold line is renamed in its own markup: the field carries
+    /// the text, so the markers that make the line a section stay (#44, #97).
+    #[test]
+    fn a_rename_of_a_promoted_line_keeps_its_bold_markers() {
+        let doc = "## Stat Block\n\n**Spells**\n\nFireball\n";
+        let out = apply_note_edits(
+            doc,
+            &[NoteEdit {
+                target: EditTarget::Section("Spells".into()),
+                heading: Some("Cantrips".into()),
+                mode: EditMode::Replace,
+                content: None,
+            }],
+        )
+        .unwrap();
+        assert_eq!(out, "## Stat Block\n\n**Cantrips**\n\nFireball\n");
+    }
+
+    /// The field carries a heading's text and the note keeps its markup, so a
+    /// value that is itself markup is refused rather than written into the
+    /// line a second time (#97).
+    #[test]
+    fn a_rename_refuses_a_value_that_is_heading_markup() {
+        let doc = "# Note\n\n## Alpha\n\nOne.\n";
+        for value in ["### Alfa", "**Alfa**"] {
+            let err = apply_note_edits(
+                doc,
+                &[NoteEdit {
+                    target: EditTarget::Section("Alpha".into()),
+                    heading: Some(value.into()),
+                    mode: EditMode::Replace,
+                    content: None,
+                }],
+            )
+            .expect_err("markup is not a heading's text");
+            assert!(format!("{err}").contains("text"), "{err}");
+        }
+    }
+
+    /// A heading names the section it renames, so an edit that carries one
+    /// and names no section is refused (#97).
+    #[test]
+    fn a_rename_of_the_body_or_a_property_is_refused() {
+        let doc = "---\ntags: [a]\n---\n\nBody.\n";
+        for target in [EditTarget::Body, EditTarget::Property("tags".into())] {
+            let err = apply_note_edits(
+                doc,
+                &[NoteEdit {
+                    target,
+                    heading: Some("Alfa".into()),
+                    mode: EditMode::Replace,
+                    content: Some(EditContent::Text("x".into())),
+                }],
+            )
+            .expect_err("only a section has a heading");
+            assert!(format!("{err}").contains("section"), "{err}");
+        }
+    }
+
     #[test]
     fn a_property_edit_keeps_the_key_in_place_and_in_its_style() {
         let note = "---\nname: Probe\naliases: []\ntags: [type/lore, realm/rudd]\n---\n\nBody.\n";
         let edits = vec![NoteEdit {
             target: EditTarget::Property("tags".into()),
+            heading: None,
             mode: EditMode::Replace,
             content: Some(EditContent::List(vec![
                 "type/lore".into(),
@@ -1399,6 +1673,7 @@ mod tests {
         let note = "---\nname: Probe\naliases: [Old]\n---\n\nBody.\n";
         let edits = vec![NoteEdit {
             target: EditTarget::Property("aliases".into()),
+            heading: None,
             mode: EditMode::Replace,
             content: Some(EditContent::List(vec![])),
         }];
@@ -1414,16 +1689,19 @@ mod tests {
         let edits = vec![
             NoteEdit {
                 target: EditTarget::Property("tags".into()),
+                heading: None,
                 mode: EditMode::Append,
                 content: Some(EditContent::Text("b".into())),
             },
             NoteEdit {
                 target: EditTarget::Property("status".into()),
+                heading: None,
                 mode: EditMode::Replace,
                 content: Some(EditContent::Text("draft".into())),
             },
             NoteEdit {
                 target: EditTarget::Property("name".into()),
+                heading: None,
                 mode: EditMode::Remove,
                 content: None,
             },
@@ -1440,11 +1718,13 @@ mod tests {
         let edits = vec![
             NoteEdit {
                 target: EditTarget::Property("name".into()),
+                heading: None,
                 mode: EditMode::Replace,
                 content: Some(EditContent::Text("Renamed".into())),
             },
             NoteEdit {
                 target: EditTarget::Body,
+                heading: None,
                 mode: EditMode::Replace,
                 content: Some(EditContent::Text("New body.".into())),
             },
@@ -1460,6 +1740,7 @@ mod tests {
         let note = "---\nname: Probe\nnested:\n  inner: 1\n---\n\nBody.\n";
         let edits = vec![NoteEdit {
             target: EditTarget::Property("nested".into()),
+            heading: None,
             mode: EditMode::Replace,
             content: Some(EditContent::Text("flat".into())),
         }];
@@ -2462,6 +2743,7 @@ mod tests {
             file: "note.md".into(),
             edits: vec![NoteEdit {
                 target,
+                heading: None,
                 mode,
                 content: content.map(|c| EditContent::Text(c.to_string())),
             }],
@@ -2544,6 +2826,7 @@ mod tests {
                 file: "nonexistent.md".into(),
                 edits: vec![NoteEdit {
                     target: EditTarget::Body,
+                    heading: None,
                     mode: EditMode::Append,
                     content: Some(EditContent::Text("x".into())),
                 }],
@@ -2630,11 +2913,13 @@ mod tests {
                 edits: vec![
                     NoteEdit {
                         target: EditTarget::Property("status".into()),
+                        heading: None,
                         mode: EditMode::Replace,
                         content: Some(EditContent::Text("active".into())),
                     },
                     NoteEdit {
                         target: EditTarget::Property("tags".into()),
+                        heading: None,
                         mode: EditMode::Append,
                         content: Some(EditContent::Text("new-tag".into())),
                     },
@@ -2780,11 +3065,13 @@ mod tests {
                 edits: vec![
                     NoteEdit {
                         target: EditTarget::Section("Spells".into()),
+                        heading: None,
                         mode: EditMode::Replace,
                         content: Some(EditContent::Text("new".into())),
                     },
                     NoteEdit {
                         target: EditTarget::Property("tags".into()),
+                        heading: None,
                         mode: EditMode::Append,
                         content: Some(EditContent::Text("b".into())),
                     },
@@ -2807,6 +3094,7 @@ mod tests {
             (
                 NoteEdit {
                     target: EditTarget::Property("status".into()),
+                    heading: None,
                     mode: EditMode::Replace,
                     content: Some(EditContent::Text("done".into())),
                 },
@@ -2816,6 +3104,7 @@ mod tests {
             (
                 NoteEdit {
                     target: EditTarget::Property("tags".into()),
+                    heading: None,
                     mode: EditMode::Replace,
                     content: Some(EditContent::List(vec!["x".into(), "y".into()])),
                 },
@@ -2825,6 +3114,7 @@ mod tests {
             (
                 NoteEdit {
                     target: EditTarget::Property("keep".into()),
+                    heading: None,
                     mode: EditMode::Remove,
                     content: None,
                 },
@@ -2834,6 +3124,7 @@ mod tests {
             (
                 NoteEdit {
                     target: EditTarget::Property("tags".into()),
+                    heading: None,
                     mode: EditMode::Remove,
                     content: Some(EditContent::Text("a".into())),
                 },
@@ -2847,6 +3138,7 @@ mod tests {
             (
                 NoteEdit {
                     target: EditTarget::Property("status".into()),
+                    heading: None,
                     mode: EditMode::Append,
                     content: Some(EditContent::Text("wip".into())),
                 },
@@ -2856,6 +3148,7 @@ mod tests {
             (
                 NoteEdit {
                     target: EditTarget::Property("status".into()),
+                    heading: None,
                     mode: EditMode::Append,
                     content: Some(EditContent::Text("wip".into())),
                 },
@@ -2883,6 +3176,7 @@ mod tests {
             doc,
             &[NoteEdit {
                 target: EditTarget::Property("tags".into()),
+                heading: None,
                 mode: EditMode::Append,
                 content: Some(EditContent::Text("b".into())),
             }],
@@ -2895,11 +3189,13 @@ mod tests {
             &[
                 NoteEdit {
                     target: EditTarget::Property("tags".into()),
+                    heading: None,
                     mode: EditMode::Append,
                     content: Some(EditContent::Text("b".into())),
                 },
                 NoteEdit {
                     target: EditTarget::Property("status".into()),
+                    heading: None,
                     mode: EditMode::Replace,
                     content: Some(EditContent::Text("done".into())),
                 },
@@ -2944,6 +3240,7 @@ mod tests {
             file: "note.md".into(),
             edits: vec![NoteEdit {
                 target: EditTarget::Property("status".into()),
+                heading: None,
                 mode: EditMode::Replace,
                 content: Some(EditContent::Text("active".into())),
             }],
@@ -2999,6 +3296,7 @@ mod tests {
             "---\ntags: [a]\n---\n\n## Contains\n\n- [[One]]\n- [[Two]]\n\n## Notes\n\nEnd.\n";
         let edits = vec![NoteEdit {
             target: EditTarget::Section("Contains".into()),
+            heading: None,
             mode: EditMode::Append,
             content: Some(EditContent::Text("- [[Three]]".into())),
         }];

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.3 (unreleased)
+
+### Added
+
+- `update` renames the section it edits (#97). An edit takes a `heading`, the section's new heading text, beside the `section` that names it: `knapper update <note> --section "Norlund to Westport via Bend" --heading "Norlund to Bend"`, and the same field on MCP and HTTP. `content` is optional beside it, because a rename does not restate the body. The note keeps the heading's own markup — a `###` stays a `###`, a promoted bold line keeps its markers — since the field carries the text. A name another section of the note already holds is refused, because two sections of one name leave both unaddressable by name. Renaming a section used to have no spelling at all: `replace` swaps the body and keeps the heading, and the only route left was a whole-note body replace, which means restating every section that was not being renamed.
+
+### Fixed
+
+- `read`'s output can be written straight back through `update` (#96). The two disagreed about where content begins, in two places, and both round trips corrupted the note silently. A section read carried its heading line, and a section `replace` writes the body under the heading already on disk, so feeding a read straight back wrote the heading twice — and again on every repeat. A whole-note read counted the blank line under the frontmatter as the body's first, and a body `replace` counts it as the block's last, so each round trip gained a blank line. A section read now returns the body alone and names the section's `heading` and `level` beside it, which is what a caller reassembles the markdown from; a note's body starts where `frontmatter::split_body` says it does, which is the splitter the body edit already used. Content for a section that opens with a heading at or above the section's own level — what a caller holding an older read would send — is now refused rather than written, since such a line ends the section instead of filling it. On the CLI, `read --section` names the section beside the note on its first line, in the markup `list --detailed` uses.
+
 ## 0.9.2 (2026-08-31)
 
 A patch release over 0.9.1. A note written through knapper keeps the rest of

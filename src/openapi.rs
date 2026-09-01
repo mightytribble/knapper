@@ -110,7 +110,7 @@ fn build_read() -> serde_json::Value {
                 },
                 {
                     "name": "section", "in": "query", "required": false,
-                    "description": "Read one section by its heading, the heading line included. Omit for the whole note. The heading is one heading's own text, or its full path from the top heading down joined with ' > ', and the match folds case, so 'spells' finds '## Spells'. Cannot be combined with metadata.",
+                    "description": "Read one section by its heading. The content is the section's body; its heading and level come back beside it, so this output can be written straight back through update. Omit for the whole note. The heading is one heading's own text, or its full path from the top heading down joined with ' > ', and the match folds case, so 'spells' finds '## Spells'. Cannot be combined with metadata.",
                     "schema": { "type": "string" }
                 },
                 {
@@ -119,7 +119,7 @@ fn build_read() -> serde_json::Value {
                     "schema": { "type": "boolean" }
                 }
             ],
-            "responses": { "200": { "description": "Content mode returns {path, docid, content, and section when a section was read}. Metadata mode returns {path, docid, frontmatter, byte_count, and outgoing_links/incoming_links as arrays of {path, docid}}." } }
+            "responses": { "200": { "description": "Content mode returns {path, docid, content, and section when a section was read, which is {heading, level, line_start, line_end} — level absent for a promoted bold line}. Metadata mode returns {path, docid, frontmatter, byte_count, and outgoing_links/incoming_links as arrays of {path, docid}}." } }
         }
     })
 }
@@ -230,7 +230,7 @@ fn build_update() -> serde_json::Value {
         "post": {
             "operationId": "updateNote",
             "summary": "Change an existing note. Applies a list of edits in order, in one write.",
-            "description": "Each edit names its target: `section` for one heading, `property` for one frontmatter key, and neither for the note's body. An edit naming both is an error. `content` is a string, or a list of strings for a list-valued property such as tags or aliases; a body edit and a section edit take a string. A body edit always keeps the note's frontmatter, so change the frontmatter with `property` edits in the same list. Three things differ from the append/edit/rewrite/edit-frontmatter/update-metadata calls this replaces. A note changed outside knapper and not yet re-indexed fails with an mtime conflict. Replacing a note's frontmatter wholesale has no spelling here: rewrite's `preserve_frontmatter: false` is gone rather than renamed, and the new frontmatter is written with `property` edits instead. A whole-note tag or alias replacement no longer stamps a `modified_by` property on the note.",
+            "description": "Each edit names its target: `section` for one heading, `property` for one frontmatter key, and neither for the note's body. An edit naming both is an error. `content` is a string, or a list of strings for a list-valued property such as tags or aliases; a body edit and a section edit take a string. A section edit's content is the body below the heading — content opening with a heading at or above the section's own level is refused, since such a line ends the section rather than fills it — and `heading` is how a section is renamed. A body edit always keeps the note's frontmatter, so change the frontmatter with `property` edits in the same list. Three things differ from the append/edit/rewrite/edit-frontmatter/update-metadata calls this replaces. A note changed outside knapper and not yet re-indexed fails with an mtime conflict. Replacing a note's frontmatter wholesale has no spelling here: rewrite's `preserve_frontmatter: false` is gone rather than renamed, and the new frontmatter is written with `property` edits instead. A whole-note tag or alias replacement no longer stamps a `modified_by` property on the note.",
             "requestBody": {
                 "required": true,
                 "content": { "application/json": { "schema": {
@@ -249,6 +249,7 @@ fn build_update() -> serde_json::Value {
                                 "properties": {
                                     "section": { "type": "string", "description": "Heading of the section to edit. Omit this and property to edit the body" },
                                     "property": { "type": "string", "description": "Frontmatter property to edit. Naming a section as well is an error" },
+                                    "heading": { "type": "string", "description": "New heading text for the section this edit names, which renames it. The note keeps the heading's markup, content is optional beside it, and a name another section already holds is refused" },
                                     "mode": { "type": "string", "enum": ["replace", "prepend", "append", "remove"], "description": "What the edit does. remove is for a property alone" },
                                     "content": {
                                         "description": "A string, or a list of strings to set a list-valued property",

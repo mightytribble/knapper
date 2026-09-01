@@ -323,7 +323,22 @@ async fn main() -> Result<()> {
                 };
                 match result {
                     ReadResult::Content(note) => {
-                        println!("{}", ident(&note.path, &note.docid));
+                        // The content is the section's body, so the heading is
+                        // printed here or it is not printed at all — in the
+                        // markup the outline uses, `#` depth or the bold form
+                        // of a promoted line (#68, #96).
+                        let heading = note.section.as_ref().map(|span| match span.level {
+                            Some(level) => {
+                                format!("{} {}", "#".repeat(level as usize), span.heading)
+                            }
+                            None => format!("**{}**", span.heading),
+                        });
+                        match heading {
+                            Some(heading) => {
+                                println!("{} > {heading}", ident(&note.path, &note.docid))
+                            }
+                            None => println!("{}", ident(&note.path, &note.docid)),
+                        }
                         println!("{}", note.content);
                     }
                     ReadResult::Metadata(meta) => {
@@ -866,6 +881,7 @@ async fn main() -> Result<()> {
             file,
             section,
             property,
+            heading,
             mode,
             content,
             edits,
@@ -879,10 +895,13 @@ async fn main() -> Result<()> {
             // that names an impossible target writes nothing (#62).
             let request = knapper::params::Update::from_cli(
                 file,
-                section,
-                property,
-                mode,
-                content,
+                knapper::params::CliEdit {
+                    section,
+                    property,
+                    heading,
+                    mode,
+                    content,
+                },
                 edits,
                 || content_or_stdin(None),
             )?;

@@ -62,13 +62,25 @@ pub struct LinkRef {
 }
 
 /// Where a section sits in its file. `read` reports it when a section was
-/// asked for, and nothing when the whole note was (#62). `line_start` and
-/// `line_end` are 1-based and inclusive, and they bracket the returned
-/// content: `line_start` is the heading's own line, because a section read
-/// carries its heading (#81), and `line_end` is the section's last line.
+/// asked for, and nothing when the whole note was (#62).
+///
+/// `heading` and `level` are the section's heading, which the content no
+/// longer carries: content is the body alone, so that a caller can write it
+/// straight back through `update` (#96). The two fields are what a caller
+/// reassembles the section's markdown from, and what a rename reads before
+/// it writes a new heading through `update`'s `heading` (#97).
+///
+/// `line_start` and `line_end` are 1-based and inclusive and they bracket
+/// the section: `line_start` is the heading's own line, one above the
+/// content, and `line_end` is the section's last line.
 #[derive(Debug, Serialize)]
 pub struct SectionSpan {
     pub heading: String,
+    /// The `#` depth of an ATX heading, and absent for a promoted bold line,
+    /// which has no depth of its own — the convention the outline follows
+    /// (#44, #69).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub level: Option<u8>,
     pub line_start: usize,
     pub line_end: usize,
 }
@@ -238,20 +250,21 @@ pub fn context_read(
     };
 
     // The whole note's body with the frontmatter stripped, or one section's
-    // markdown with its heading line included (#80, #81). `find_section`
+    // body with its heading named beside it (#80, #96). `find_section`
     // resolves a section by its heading text or its full heading path, and a
     // promoted bold line is one it reaches (#53, #69).
     let (content, span) = match section {
-        None => (split_frontmatter(&content_str).1, None),
+        None => (note_body(&content_str), None),
         Some(heading) => {
             let found = crate::markdown::find_section(&content_str, heading)
                 .ok_or_else(|| anyhow::anyhow!("Section not found: {heading}"))?;
             let span = SectionSpan {
                 heading: found.heading.text.clone(),
+                level: (!found.heading.promoted).then_some(found.heading.level),
                 line_start: found.heading.line + 1,
                 line_end: found.body_end,
             };
-            (found.content, Some(span))
+            (found.body, Some(span))
         }
     };
 
@@ -261,6 +274,25 @@ pub fn context_read(
         content,
         section: span,
     }))
+}
+
+/// A note's body, as `update`'s body edit defines it: everything below the
+/// frontmatter block and the one line ending that separates the two, which is
+/// `frontmatter::split_body`'s own split. `read` used
+/// `markdown::split_frontmatter`, which counts that separator as the body's
+/// first line instead, so a caller that read a body and wrote it straight
+/// back gained a blank line on every round trip. One function decides where
+/// a note's body begins and both ends of the round trip read it (#96).
+///
+/// A block that opens and never closes has no knowable end and `split_body`
+/// refuses it. The whole text is the body then, which is what
+/// `split_frontmatter` answers for the same note, so a note knapper could
+/// read before is a note it can still read.
+fn note_body(content: &str) -> String {
+    match crate::frontmatter::split_body(content) {
+        Ok(Some((_, body))) => body,
+        _ => content.to_string(),
+    }
 }
 
 /// A note's headings, read from disk.
@@ -881,8 +913,13 @@ mod tests {
         (store, root, tmp)
     }
 
+    /// A section read returns the section's body and names its heading
+    /// beside it. The heading is not in the content, because `update`'s
+    /// section `replace` writes the heading already on disk and content
+    /// carrying one writes it twice (#96). `heading` and `level` are what a
+    /// caller reassembles the section's markdown from (#81).
     #[test]
-    fn a_section_read_carries_its_heading_and_span() {
+    fn a_section_read_returns_the_body_and_names_its_heading() {
         let (store, root, _tmp) = section_fixture();
         let params = ContextParams {
             store: &store,
@@ -894,28 +931,80 @@ mod tests {
         let part =
             content_of(context_read(&params, "person.md", Some("Interactions"), false).unwrap());
 
-        // The section's content begins with its heading line (#81) and is a
-        // part of the whole note's content.
-        assert!(
-            part.content.starts_with("## Interactions"),
-            "content: {:?}",
-            part.content
-        );
-        assert!(part.content.contains("Met on 2026-03-26"));
-        assert!(part.content.len() < whole.content.len());
-        assert!(whole.content.contains(part.content.trim()));
+        // The content is the section's body, and a part of the whole note's.
+        assert_eq!(part.content, "Met on 2026-03-26. See [[colleague]].");
+        assert!(!part.content.contains("## Interactions"));
+        assert!(whole.content.contains(&part.content));
 
-        // The span is 1-based and inclusive, and it brackets the
-        // heading-inclusive content: line 11 is `## Interactions`, line 13 is
-        // the section's last line.
+        // The span is 1-based and inclusive and it brackets the section:
+        // line 11 is `## Interactions`, the heading the content sits under,
+        // and line 13 is the section's last line.
         let span = part.section.expect("a section read reports its span");
         assert_eq!(span.heading, "Interactions");
+        assert_eq!(span.level, Some(2));
         assert_eq!(span.line_start, 11);
         assert_eq!(span.line_end, 13);
         assert!(whole.section.is_none());
 
         // A heading the note does not have is an error, not an empty section.
         assert!(context_read(&params, "person.md", Some("Nope"), false).is_err());
+    }
+
+    /// A promoted bold line is a section a caller can read, and it has no
+    /// depth of its own, so the span carries none — the convention
+    /// `list --detailed` already follows (#44, #69).
+    #[test]
+    fn a_promoted_section_read_carries_no_level() {
+        let (store, root, _tmp) = section_fixture();
+        std::fs::write(
+            root.join("creature.md"),
+            "# Wyrm\n\n## Stat Block\n\n**Spells**\n\nFireball\n",
+        )
+        .unwrap();
+        store
+            .insert_file("creature.md", "hash", 100, "cre321", None, None)
+            .unwrap();
+        let params = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+
+        let part = content_of(context_read(&params, "creature.md", Some("Spells"), false).unwrap());
+        let span = part.section.expect("a section read reports its span");
+        assert_eq!(part.content, "Fireball");
+        assert_eq!(span.heading, "Spells");
+        assert_eq!(span.level, None);
+    }
+
+    /// The section half of the same round trip: what a section read returns
+    /// is what a section `replace` takes back, and the file is the file it
+    /// came from — no second heading, however many times it is repeated
+    /// (#96).
+    #[test]
+    fn a_section_read_can_be_written_straight_back() {
+        let (store, root, _tmp) = section_fixture();
+        let original = spaced_note(&root, &store);
+        let params = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+
+        let body =
+            content_of(context_read(&params, "repro.md", Some("Alpha"), false).unwrap()).content;
+        let written = crate::writer::apply_note_edits(
+            &original,
+            &[crate::writer::NoteEdit {
+                target: crate::writer::EditTarget::Section("Alpha".into()),
+                heading: None,
+                mode: crate::writer::EditMode::Replace,
+                content: Some(crate::writer::EditContent::Text(body)),
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(written, original);
     }
 
     #[test]
@@ -930,5 +1019,47 @@ mod tests {
         let first = meta.outgoing_links.first().expect("a link");
         assert!(!first.path.is_empty());
         assert!(first.docid.is_some(), "a link names the file's docid");
+    }
+
+    /// A note whose body is separated from its frontmatter by a blank line,
+    /// which is the shape the round trip turns on: `markdown::split_frontmatter`
+    /// counts that line as the body's first, and `frontmatter::split_body`
+    /// counts it as the block's last (#96).
+    fn spaced_note(root: &std::path::Path, store: &Store) -> String {
+        let content = "---\nname: Repro\ntags: [type/lore]\n---\n\nLead paragraph.\n\n## Alpha\n\nAlpha body.\n";
+        std::fs::write(root.join("repro.md"), content).unwrap();
+        store
+            .insert_file("repro.md", "hash", 100, "rep789", None, None)
+            .unwrap();
+        content.to_string()
+    }
+
+    /// `read`'s output is what `update` takes back. A whole-note read returns
+    /// the note's body, and a body `replace` handed that body writes the file
+    /// it came from, byte for byte — no blank line gained, however many times
+    /// it is repeated (#96).
+    #[test]
+    fn a_whole_note_read_can_be_written_straight_back() {
+        let (store, root, _tmp) = section_fixture();
+        let original = spaced_note(&root, &store);
+        let params = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+
+        let body = content_of(context_read(&params, "repro.md", None, false).unwrap()).content;
+        let written = crate::writer::apply_note_edits(
+            &original,
+            &[crate::writer::NoteEdit {
+                target: crate::writer::EditTarget::Body,
+                heading: None,
+                mode: crate::writer::EditMode::Replace,
+                content: Some(crate::writer::EditContent::Text(body)),
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(written, original);
     }
 }
