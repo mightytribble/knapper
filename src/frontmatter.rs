@@ -67,8 +67,6 @@ pub struct Block {
     separator: String,
     body: String,
     /// The line ending the note uses, for an item an edit constructs fresh.
-    /// Unread until an edit operation exists to read it (Task 2).
-    #[allow(dead_code)]
     newline: String,
 }
 
@@ -133,6 +131,198 @@ impl Block {
     /// Everything after the block, byte for byte.
     pub fn body(&self) -> &str {
         &self.body
+    }
+
+    /// The value `key` holds, when it holds a scalar.
+    pub fn scalar(&self, key: &str) -> Option<String> {
+        let idx = self.find(key)?;
+        match self.items[idx] {
+            Item::Entry {
+                value: Value::Scalar,
+                ..
+            } => Some(scalar_of(self.items[idx].text())),
+            _ => None,
+        }
+    }
+
+    /// Write `key` as a scalar, quoted when YAML needs it.
+    pub fn set_scalar(&mut self, key: &str, value: &str) -> Result<()> {
+        self.check_editable(key)?;
+        let text = format!("{key}: {}{}", yaml_scalar(value), self.newline);
+        self.put(key, text, Value::Scalar);
+        Ok(())
+    }
+
+    /// Write `key` as a bare `true` or `false`, which a quoted scalar would
+    /// not be.
+    pub fn set_bool(&mut self, key: &str, value: bool) -> Result<()> {
+        self.check_editable(key)?;
+        let text = format!("{key}: {value}{}", self.newline);
+        self.put(key, text, Value::Scalar);
+        Ok(())
+    }
+
+    /// Write `key` as a list. An empty list is written `[]` in any style,
+    /// because block style with no items reads back as null.
+    pub fn set_list(&mut self, key: &str, items: &[String]) -> Result<()> {
+        let style = self.list_style_for(key)?;
+        let text = self.render_list(key, items, style);
+        self.put(key, text, Value::List(style));
+        Ok(())
+    }
+
+    /// Add `item` to `key`'s list, creating the list when the key is absent
+    /// and promoting it when the key holds a scalar. An item the list already
+    /// holds changes nothing.
+    pub fn add_to_list(&mut self, key: &str, item: &str) -> Result<()> {
+        let style = self.list_style_for(key)?;
+        let mut items = self.items_of(key);
+        if items.iter().any(|i| i == item) {
+            return Ok(());
+        }
+        items.push(item.to_string());
+        let text = self.render_list(key, &items, style);
+        self.put(key, text, Value::List(style));
+        Ok(())
+    }
+
+    /// Remove `item` from `key`'s list. A scalar equal to `item` removes the
+    /// key; an absent key changes nothing.
+    pub fn remove_from_list(&mut self, key: &str, item: &str) -> Result<()> {
+        let Some(idx) = self.find(key) else {
+            return Ok(());
+        };
+        self.check_editable(key)?;
+        if matches!(
+            self.items[idx],
+            Item::Entry {
+                value: Value::Scalar,
+                ..
+            }
+        ) {
+            if scalar_of(self.items[idx].text()) == item {
+                self.items.remove(idx);
+            }
+            return Ok(());
+        }
+        let style = self.list_style_for(key)?;
+        let mut items = self.items_of(key);
+        items.retain(|i| i != item);
+        let text = self.render_list(key, &items, style);
+        self.put(key, text, Value::List(style));
+        Ok(())
+    }
+
+    /// Remove `key` and the lines it owns. An absent key changes nothing.
+    pub fn remove(&mut self, key: &str) -> Result<()> {
+        if let Some(idx) = self.find(key) {
+            self.items.remove(idx);
+        }
+        Ok(())
+    }
+
+    // ── internals ────────────────────────────────────────────────
+
+    fn find(&self, key: &str) -> Option<usize> {
+        self.items
+            .iter()
+            .position(|i| matches!(i, Item::Entry { key: k, .. } if k == key))
+    }
+
+    /// Fail when `key` holds a value no line edit can address.
+    fn check_editable(&self, key: &str) -> Result<()> {
+        if let Some(idx) = self.find(key)
+            && let Item::Entry {
+                value: Value::Opaque(found),
+                ..
+            } = self.items[idx]
+        {
+            bail!(
+                "cannot edit `{key}`: its value is {found}, and knapper edits a scalar or a flat list"
+            );
+        }
+        Ok(())
+    }
+
+    /// The style a list write to `key` takes: the key's own when it is a
+    /// list, else the style the block already uses.
+    fn list_style_for(&self, key: &str) -> Result<ListStyle> {
+        self.check_editable(key)?;
+        match self.find(key).map(|idx| &self.items[idx]) {
+            Some(Item::Entry {
+                value: Value::List(style),
+                ..
+            }) => Ok(*style),
+            _ => Ok(self.new_list_style()),
+        }
+    }
+
+    /// The style a key knapper adds takes: the first list already in the
+    /// block, or block style at two spaces when the block holds none.
+    fn new_list_style(&self) -> ListStyle {
+        self.items
+            .iter()
+            .find_map(|i| match i {
+                Item::Entry {
+                    value: Value::List(style),
+                    ..
+                } => Some(*style),
+                _ => None,
+            })
+            .unwrap_or(ListStyle::Block { indent: 2 })
+    }
+
+    /// The items `key` holds: its list's, or its scalar as one item, or none.
+    fn items_of(&self, key: &str) -> Vec<String> {
+        let Some(idx) = self.find(key) else {
+            return Vec::new();
+        };
+        match self.items[idx] {
+            Item::Entry {
+                value: Value::List(_),
+                ..
+            } => list_items(self.items[idx].text()),
+            Item::Entry {
+                value: Value::Scalar,
+                ..
+            } => vec![scalar_of(self.items[idx].text())],
+            _ => Vec::new(),
+        }
+    }
+
+    fn render_list(&self, key: &str, items: &[String], style: ListStyle) -> String {
+        if items.is_empty() {
+            return format!("{key}: []{}", self.newline);
+        }
+        match style {
+            ListStyle::Inline => {
+                let body: Vec<String> = items.iter().map(|i| yaml_scalar(i)).collect();
+                format!("{key}: [{}]{}", body.join(", "), self.newline)
+            }
+            ListStyle::Block { indent } => {
+                let pad = " ".repeat(indent);
+                let mut out = format!("{key}:{}", self.newline);
+                for item in items {
+                    out.push_str(&pad);
+                    out.push_str("- ");
+                    out.push_str(&yaml_scalar(item));
+                    out.push_str(&self.newline);
+                }
+                out
+            }
+        }
+    }
+
+    fn put(&mut self, key: &str, text: String, value: Value) {
+        let entry = Item::Entry {
+            key: key.to_string(),
+            value,
+            text,
+        };
+        match self.find(key) {
+            Some(idx) => self.items[idx] = entry,
+            None => self.items.push(entry),
+        }
     }
 }
 
@@ -318,6 +508,44 @@ fn classify(text: &str) -> Value {
     }
 }
 
+/// One scalar as YAML, quoted when it has to be.
+fn yaml_scalar(value: &str) -> String {
+    serde_yaml::to_string(&serde_yaml::Value::String(value.to_string()))
+        .unwrap_or_else(|_| value.to_string())
+        .trim_end()
+        .to_string()
+}
+
+fn scalar_string(v: &serde_yaml::Value) -> String {
+    match v {
+        serde_yaml::Value::String(s) => s.clone(),
+        serde_yaml::Value::Bool(b) => b.to_string(),
+        serde_yaml::Value::Number(n) => n.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// The scalar a one-entry mapping's value holds.
+fn scalar_of(text: &str) -> String {
+    match serde_yaml::from_str::<serde_yaml::Value>(text) {
+        Ok(serde_yaml::Value::Mapping(map)) => {
+            map.values().next().map(scalar_string).unwrap_or_default()
+        }
+        _ => String::new(),
+    }
+}
+
+/// The items a list entry holds, in order.
+fn list_items(text: &str) -> Vec<String> {
+    match serde_yaml::from_str::<serde_yaml::Value>(text) {
+        Ok(serde_yaml::Value::Mapping(map)) => match map.values().next() {
+            Some(serde_yaml::Value::Sequence(items)) => items.iter().map(scalar_string).collect(),
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,5 +655,165 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(block.body(), "\nBody.\n");
+    }
+
+    /// Parse, apply `edit`, render.
+    fn edited(text: &str, edit: impl FnOnce(&mut Block) -> Result<()>) -> String {
+        let mut block = Block::parse(text).unwrap().expect("a block");
+        edit(&mut block).unwrap();
+        block.render()
+    }
+
+    #[test]
+    fn an_edit_keeps_the_key_in_its_place_and_its_style() {
+        let text = "---\nname: Probe\naliases: []\ntags: [type/lore, realm/rudd]\n---\n\nBody.\n";
+        assert_eq!(
+            edited(text, |b| b.set_list("tags", &["type/history".into()])),
+            "---\nname: Probe\naliases: []\ntags: [type/history]\n---\n\nBody.\n"
+        );
+    }
+
+    #[test]
+    fn a_block_style_list_stays_block_style_at_its_own_indent() {
+        let text = "---\ntags:\n    - a\n    - b\nname: Probe\n---\n";
+        assert_eq!(
+            edited(text, |b| b.add_to_list("tags", "c")),
+            "---\ntags:\n    - a\n    - b\n    - c\nname: Probe\n---\n"
+        );
+    }
+
+    #[test]
+    fn an_empty_list_writes_an_empty_list_and_keeps_the_key() {
+        let text = "---\nname: Probe\ntags:\n  - a\n---\n";
+        assert_eq!(
+            edited(text, |b| b.set_list("tags", &[])),
+            "---\nname: Probe\ntags: []\n---\n"
+        );
+    }
+
+    #[test]
+    fn a_comment_and_a_blank_line_survive_an_edit_to_a_neighbour() {
+        let text = "---\n# why this note exists\nname: Probe\n\ntags: [a]\n---\n";
+        assert_eq!(
+            edited(text, |b| b.set_scalar("name", "Renamed")),
+            "---\n# why this note exists\nname: Renamed\n\ntags: [a]\n---\n"
+        );
+    }
+
+    #[test]
+    fn a_key_that_is_new_is_appended_in_the_style_the_block_already_uses() {
+        let inline = "---\nname: Probe\ntags: [a]\n---\n";
+        assert_eq!(
+            edited(inline, |b| b.add_to_list("aliases", "Other")),
+            "---\nname: Probe\ntags: [a]\naliases: [Other]\n---\n"
+        );
+        let blocked = "---\nname: Probe\ntags:\n  - a\n---\n";
+        assert_eq!(
+            edited(blocked, |b| b.add_to_list("aliases", "Other")),
+            "---\nname: Probe\ntags:\n  - a\naliases:\n  - Other\n---\n"
+        );
+        let none = "---\nname: Probe\n---\n";
+        assert_eq!(
+            edited(none, |b| b.add_to_list("aliases", "Other")),
+            "---\nname: Probe\naliases:\n  - Other\n---\n"
+        );
+    }
+
+    #[test]
+    fn a_scalar_is_promoted_when_a_list_operation_names_it() {
+        let text = "---\ntags: work\n---\n";
+        assert_eq!(
+            edited(text, |b| b.add_to_list("tags", "archived")),
+            "---\ntags:\n  - work\n  - archived\n---\n"
+        );
+    }
+
+    #[test]
+    fn adding_an_item_the_list_already_holds_changes_nothing() {
+        let text = "---\ntags: [a, b]\n---\n";
+        assert_eq!(edited(text, |b| b.add_to_list("tags", "b")), text);
+    }
+
+    #[test]
+    fn removing_an_item_leaves_the_others_in_their_style() {
+        let text = "---\ntags: [a, b, c]\n---\n";
+        assert_eq!(
+            edited(text, |b| b.remove_from_list("tags", "b")),
+            "---\ntags: [a, c]\n---\n"
+        );
+    }
+
+    #[test]
+    fn removing_a_key_removes_its_lines_and_nothing_else() {
+        let text = "---\nname: Probe\ntags:\n  - a\n  - b\naliases: []\n---\n\nBody.\n";
+        assert_eq!(
+            edited(text, |b| b.remove("tags")),
+            "---\nname: Probe\naliases: []\n---\n\nBody.\n"
+        );
+    }
+
+    #[test]
+    fn removing_a_key_the_block_does_not_hold_changes_nothing() {
+        let text = "---\nname: Probe\n---\n";
+        assert_eq!(edited(text, |b| b.remove("absent")), text);
+        assert_eq!(edited(text, |b| b.remove_from_list("absent", "x")), text);
+    }
+
+    #[test]
+    fn a_value_that_needs_quoting_gets_it() {
+        let text = "---\nname: Probe\n---\n";
+        assert_eq!(
+            edited(text, |b| b.set_scalar("reason", "semantic similarity: 0.5")),
+            "---\nname: Probe\nreason: 'semantic similarity: 0.5'\n---\n"
+        );
+    }
+
+    #[test]
+    fn a_bool_is_written_unquoted() {
+        assert_eq!(
+            edited("---\nname: Probe\n---\n", |b| b.set_bool("archived", true)),
+            "---\nname: Probe\narchived: true\n---\n"
+        );
+    }
+
+    #[test]
+    fn a_crlf_block_keeps_crlf_on_the_key_it_gains() {
+        assert_eq!(
+            edited("---\r\nname: Probe\r\n---\r\n", |b| b.set_scalar("x", "1")),
+            "---\r\nname: Probe\r\nx: '1'\r\n---\r\n"
+        );
+    }
+
+    #[test]
+    fn an_edit_to_an_opaque_value_is_refused_and_writes_nothing() {
+        let text = "---\nname: Probe\nnested:\n  inner: 1\n---\n";
+        let mut block = Block::parse(text).unwrap().unwrap();
+        let err = block.set_list("nested", &["a".into()]).unwrap_err();
+        assert!(err.to_string().contains("nested mapping"), "{err}");
+        assert!(err.to_string().contains("`nested`"), "{err}");
+        assert_eq!(block.render(), text);
+    }
+
+    #[test]
+    fn a_scalar_reads_back_as_the_value_it_holds() {
+        let block = Block::parse("---\narchived_from: Areas/n.md\nn: 3\n---\n")
+            .unwrap()
+            .unwrap();
+        assert_eq!(block.scalar("archived_from").as_deref(), Some("Areas/n.md"));
+        assert_eq!(block.scalar("n").as_deref(), Some("3"));
+        assert_eq!(block.scalar("absent"), None);
+    }
+
+    #[test]
+    fn an_operation_and_its_inverse_return_the_original_bytes() {
+        for text in [
+            "---\nname: Probe\ntags: [a, b]\n---\n\nBody.\n",
+            "---\ntags:\n  - a\n  - b\nname: Probe\n---\n\nBody.\n",
+        ] {
+            let mut block = Block::parse(text).unwrap().unwrap();
+            block.add_to_list("tags", "zz").unwrap();
+            block.remove_from_list("tags", "zz").unwrap();
+            assert_eq!(block.render(), text);
+        }
     }
 }
