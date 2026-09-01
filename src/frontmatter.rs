@@ -97,16 +97,22 @@ impl ListItem {
     /// of its original scalar line, but the same text placed before a `,`
     /// inside brackets makes the comment swallow the rest of the sequence —
     /// `render_list`'s block-style arm never hits this, because there a
-    /// comment sits at the end of its own line either way. Falling back to a
-    /// fresh `yaml_scalar` loses the comment, but a comment that belonged to
-    /// the key the write named is a smaller loss than frontmatter nothing
-    /// downstream can parse (#92, C2).
+    /// comment sits at the end of its own line either way. A source (or a
+    /// fresh value) can also hold an unquoted comma: nothing above a flow
+    /// sequence's own commas tells its items apart, so a comma with no
+    /// quoting around it does not fail to parse, it silently becomes one
+    /// more item. The check below must therefore confirm the text reparses
+    /// to *exactly one* item equal to this one's own value, not merely that
+    /// it parses at all — and the fallback must itself be safe to sit
+    /// inside `[...]`, because a fallback that renders the value the same
+    /// way the failed check just read it reproduces the same corruption
+    /// (#92, C2; R1 regression).
     fn render_in_flow(&self) -> String {
         let text = self.render();
-        if serde_yaml::from_str::<serde_yaml::Value>(&format!("k: [{text}]")).is_ok() {
+        if reparses_to_one_flow_item(&text, &self.value) {
             text
         } else {
-            yaml_scalar(&self.value)
+            flow_safe_scalar(&self.value)
         }
     }
 }
@@ -735,6 +741,41 @@ fn yaml_scalar(value: &str) -> String {
         .to_string()
 }
 
+/// Whether `text`, placed inside `[...]`, reparses to exactly one item equal
+/// to `value`. Parsing at all is not enough: a comma with no quoting around
+/// it is legal wherever it sits, so text holding one can parse cleanly into
+/// *two* items instead of failing (#92, R1 regression).
+fn reparses_to_one_flow_item(text: &str, value: &str) -> bool {
+    let Ok(serde_yaml::Value::Mapping(map)) =
+        serde_yaml::from_str::<serde_yaml::Value>(&format!("k: [{text}]"))
+    else {
+        return false;
+    };
+    matches!(
+        map.values().next(),
+        Some(serde_yaml::Value::Sequence(items))
+            if items.len() == 1 && items.first().map(scalar_string).as_deref() == Some(value)
+    )
+}
+
+/// `value` as YAML, safe to place inside `[...]`. `yaml_scalar` decides
+/// quoting for a value read alone at the top level, where a comma is
+/// nothing special — it is what a flow item's own source already went
+/// through, and what an unquoted item freshly added to an existing inline
+/// list is rendered through too, so it is exactly the rendering
+/// [`reparses_to_one_flow_item`] just found unsafe. Single-quoting always
+/// closes a flow item against every character flow syntax gives meaning to
+/// — `,`, `#`, `:`, `[`, `]`, `{`, `}` — with only its own quote to escape,
+/// doubled.
+fn flow_safe_scalar(value: &str) -> String {
+    let plain = yaml_scalar(value);
+    if reparses_to_one_flow_item(&plain, value) {
+        plain
+    } else {
+        format!("'{}'", value.replace('\'', "''"))
+    }
+}
+
 fn scalar_string(v: &serde_yaml::Value) -> String {
     match v {
         serde_yaml::Value::String(s) => s.clone(),
@@ -1091,6 +1132,19 @@ mod tests {
         );
     }
 
+    /// The block between the fences, parsed as YAML rather than merely
+    /// itemized: `parse_items` bails only on a structurally unrecognised
+    /// top-level line, so it accepts a value a real YAML parser would split
+    /// into more than one item (#92, R1 regression) and would have accepted
+    /// even the original C2 corruption's comment-swallowed-bracket text if
+    /// the rest of the block still looked like lines. A promise that "the
+    /// written frontmatter must parse" is only as strong as what parses it.
+    fn assert_block_parses_as_yaml(out: &str) -> serde_yaml::Value {
+        let (_open, inner, _close, _after) = split_fences(out).unwrap().unwrap();
+        serde_yaml::from_str::<serde_yaml::Value>(inner)
+            .unwrap_or_else(|e| panic!("the written frontmatter must parse as YAML: {e}\n{out}"))
+    }
+
     /// A scalar's own source is everything after its colon, comment
     /// included. Promoted straight into `[...]`, the comment used to run to
     /// the line's end and swallow the closing bracket, so the note stopped
@@ -1101,11 +1155,16 @@ mod tests {
         let text = "---\nother: [z]\ntags: work # keep\n---\n";
         let out = edited(text, |b| b.add_to_list("tags", "new"));
         assert_eq!(out, "---\nother: [z]\ntags: [work, new]\n---\n");
-        // The promise this exists to keep: the result must itself parse.
-        let (_open, inner, _close, _after) = split_fences(&out).unwrap().unwrap();
-        assert!(
-            parse_items(inner).is_ok(),
-            "the written frontmatter must parse: {out}"
+        // The promise this exists to keep: the result must itself parse,
+        // and parse to the two items the write actually meant to write.
+        let parsed = assert_block_parses_as_yaml(&out);
+        assert_eq!(
+            parsed.get("tags"),
+            Some(&serde_yaml::Value::Sequence(vec![
+                serde_yaml::Value::String("work".into()),
+                serde_yaml::Value::String("new".into()),
+            ])),
+            "must read back as exactly the two items it was meant to hold: {out}"
         );
     }
 
@@ -1115,10 +1174,101 @@ mod tests {
     fn promoting_a_quoted_commented_scalar_into_an_inline_list_writes_parseable_yaml() {
         let text = "---\ntags: \"work\" # keep\n---\n";
         let out = edited(text, |b| b.add_to_list("tags", "new"));
-        let (_open, inner, _close, _after) = split_fences(&out).unwrap().unwrap();
-        assert!(
-            parse_items(inner).is_ok(),
-            "the written frontmatter must parse: {out}"
+        let parsed = assert_block_parses_as_yaml(&out);
+        assert_eq!(
+            parsed.get("tags"),
+            Some(&serde_yaml::Value::Sequence(vec![
+                serde_yaml::Value::String("work".into()),
+                serde_yaml::Value::String("new".into()),
+            ])),
+            "must read back as exactly the two items it was meant to hold: {out}"
+        );
+    }
+
+    /// R1: the fix wave's own flow-safety check asked only "does this parse
+    /// at all", which a value holding a comma passes — into *two* items,
+    /// not one, with no error at any point. Reproduced against the exact
+    /// input the finding gives: a quoted, commented scalar with a comma,
+    /// next to another key already in inline style so the promoted `tags`
+    /// list takes that style too.
+    #[test]
+    fn promoting_a_commented_scalar_holding_a_comma_keeps_it_one_quoted_item() {
+        let text = "---\nother: [z]\ntags: \"a, b\" # keep\n---\n\nBody.\n";
+        let out = edited(text, |b| b.add_to_list("tags", "new"));
+        assert_eq!(
+            out, "---\nother: [z]\ntags: ['a, b', new]\n---\n\nBody.\n",
+            "the comma-bearing value must stay one quoted item, not split in two"
+        );
+        let parsed = assert_block_parses_as_yaml(&out);
+        assert_eq!(
+            parsed.get("tags"),
+            Some(&serde_yaml::Value::Sequence(vec![
+                serde_yaml::Value::String("a, b".into()),
+                serde_yaml::Value::String("new".into()),
+            ])),
+        );
+    }
+
+    /// The same comma, with no trailing comment. The source is already a
+    /// safely double-quoted scalar, so it needs no requoting and keeps its
+    /// own quote character rather than being normalised to single quotes.
+    #[test]
+    fn promoting_a_scalar_holding_a_comma_with_no_comment_keeps_its_own_quoting() {
+        let text = "---\nother: [z]\ntags: \"a, b\"\n---\n\nBody.\n";
+        assert_eq!(
+            edited(text, |b| b.add_to_list("tags", "new")),
+            "---\nother: [z]\ntags: [\"a, b\", new]\n---\n\nBody.\n"
+        );
+    }
+
+    /// A value already single-quoted around its own comma. Already flow
+    /// safe, so its own source text survives untouched.
+    #[test]
+    fn a_single_quoted_value_holding_a_comma_keeps_its_own_quoting() {
+        let text = "---\nother: [z]\ntags: 'a, b'\n---\n";
+        assert_eq!(
+            edited(text, |b| b.add_to_list("tags", "new")),
+            "---\nother: [z]\ntags: ['a, b', new]\n---\n"
+        );
+    }
+
+    /// A `#` with no space before it is not a YAML comment, so the fix must
+    /// not treat it as one or requote a value that was already flow safe.
+    #[test]
+    fn a_hash_that_is_not_a_comment_is_kept_verbatim() {
+        let text = "---\nother: [z]\ntags: tag#one\n---\n";
+        assert_eq!(
+            edited(text, |b| b.add_to_list("tags", "new")),
+            "---\nother: [z]\ntags: [tag#one, new]\n---\n"
+        );
+    }
+
+    /// The ordinary case the fix must not disturb: a plain scalar with
+    /// nothing that needs escaping keeps its own source text, unquoted,
+    /// exactly as promoting into an inline list already did.
+    #[test]
+    fn an_ordinary_uncommented_scalar_keeps_its_own_source_text() {
+        let text = "---\nother: [z]\ntags: work\n---\n";
+        assert_eq!(
+            edited(text, |b| b.add_to_list("tags", "new")),
+            "---\nother: [z]\ntags: [work, new]\n---\n"
+        );
+    }
+
+    /// Not R1 itself, and not something this fix set out to change: a
+    /// *fresh* caller-supplied value holding a comma, added to a list that
+    /// is already inline, reaches the same `render_in_flow` fallback as an
+    /// existing item's promoted source, so fixing the fallback closes this
+    /// shape too. Before the fix, `flow_safe_scalar` did not exist and the
+    /// old fallback (`yaml_scalar(&self.value)`) was identical to the text
+    /// the check had just rejected, so it changed nothing and the comma
+    /// still leaked through unquoted.
+    #[test]
+    fn a_fresh_value_holding_a_comma_added_to_an_inline_list_is_quoted() {
+        let text = "---\naliases: [x]\n---\n";
+        assert_eq!(
+            edited(text, |b| b.add_to_list("aliases", "Smith, John")),
+            "---\naliases: [x, 'Smith, John']\n---\n"
         );
     }
 
