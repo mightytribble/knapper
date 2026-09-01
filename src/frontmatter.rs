@@ -391,7 +391,29 @@ impl Block {
                 ..
             } => {
                 let text = self.items[idx].text();
-                vec![ListItem::existing(scalar_of(text), scalar_source(text))]
+                let value = scalar_of(text);
+                let source = scalar_source(text);
+                // A bare `tags:` with nothing after the colon classifies as
+                // a null scalar: both its value and its own source text are
+                // empty. Reading that back as one list item wrote a phantom
+                // `- ` blank entry ahead of whatever a list write added — a
+                // bare key with no value is a common Obsidian template
+                // shape, so this hit `create --tags` on a templated note
+                // (#92, I3).
+                if value.is_empty() && source.is_empty() {
+                    Vec::new()
+                } else if text.lines().count() > 1 {
+                    // `scalar_source` reads only the entry's first line, so
+                    // a multi-line plain scalar — `name: some\n  continued`,
+                    // whose value is `some continued` — would promote to a
+                    // list item holding only `some` if it kept that source.
+                    // Falling back to a fresh serialisation of the parsed
+                    // value loses the folding style but keeps every word
+                    // (#92, I4).
+                    vec![ListItem::fresh(value)]
+                } else {
+                    vec![ListItem::existing(value, source)]
+                }
             }
             _ => Vec::new(),
         }
@@ -496,12 +518,18 @@ fn split_fences(text: &str) -> Result<Option<(&str, &str, &str, &str)>> {
     let Some(first) = lines.first() else {
         return Ok(None);
     };
-    if strip_ending(first) != "---" {
+    // `crate::markdown::split_frontmatter` — the reader every other module
+    // uses — compares `line.trim() == "---"`, so `--- ` with trailing
+    // whitespace already is frontmatter to it. Comparing exactly here made
+    // the same line invisible to this module, so `parse_or_open` opened a
+    // second block above what every reader already treated as the note's
+    // real one (#92, I1).
+    if strip_ending(first).trim_end() != "---" {
         return Ok(None);
     }
     let mut offset = first.len();
     for line in &lines[1..] {
-        if strip_ending(line) == "---" {
+        if strip_ending(line).trim_end() == "---" {
             return Ok(Some((
                 first,
                 &text[first.len()..offset],
@@ -1010,6 +1038,33 @@ mod tests {
         );
     }
 
+    /// A bare `tags:` with nothing after the colon is a common Obsidian
+    /// template shape. `items_of`'s scalar arm used to read it back as one
+    /// list item holding an empty string, so promoting it into a list wrote
+    /// a phantom blank entry ahead of whatever the caller added (#92, I3).
+    #[test]
+    fn a_bare_key_with_no_value_gains_only_the_item_a_write_adds() {
+        let text = "---\nname: X\ntags:\n---\n";
+        assert_eq!(
+            edited(text, |b| b.add_to_list("tags", "x")),
+            "---\nname: X\ntags:\n  - x\n---\n"
+        );
+    }
+
+    /// `scalar_source` reads only an entry's first line. Promoting a
+    /// multi-line plain scalar with that source used to drop its
+    /// continuation line — `name: some\n  continued`, whose YAML value is
+    /// `some continued`, promoted to a list item holding only `some` (#92,
+    /// I4).
+    #[test]
+    fn promoting_a_multi_line_scalar_keeps_its_continuation() {
+        let text = "---\nname: some\n  continued\n---\n";
+        assert_eq!(
+            edited(text, |b| b.add_to_list("name", "x")),
+            "---\nname:\n  - some continued\n  - x\n---\n"
+        );
+    }
+
     #[test]
     fn a_scalar_is_promoted_when_a_list_operation_names_it() {
         let text = "---\ntags: work\n---\n";
@@ -1214,15 +1269,30 @@ mod tests {
         assert_eq!(block.render(), text);
     }
 
+    /// A trailing comma in a flow list — `tags: [a, b,]` — is legal YAML,
+    /// classifies as an addressable inline list, and reaches this same
+    /// guard: `split_flow_items` reads the trailing comma as one more
+    /// split, so its sources come back one longer than the two values
+    /// `serde_yaml` parses. The guard's fallback is what makes this read
+    /// back as two items and add a third correctly rather than losing one.
+    #[test]
+    fn a_trailing_comma_in_a_flow_list_reaches_the_guard_through_the_public_api() {
+        let text = "---\ntags: [a, b,]\n---\n";
+        assert_eq!(
+            edited(text, |b| b.add_to_list("tags", "c")),
+            "---\ntags: [a, b, c]\n---\n"
+        );
+    }
+
     #[test]
     fn the_count_guard_keeps_every_item_when_sources_and_values_disagree() {
-        // (a)-(c) close every public-API path that could produce a
-        // source/value count mismatch, so this drives the internal
-        // `list_items` directly: an inline entry's text paired with the
-        // block style's source extraction finds no `- ` lines, so sources
-        // come back empty against three parsed values, and the guard must
-        // fall back to re-serialising every item rather than lose the two
-        // the zip would otherwise drop.
+        // The trailing-comma case above reaches this guard through the
+        // public API; this test drives the internal `list_items` directly
+        // for a second shape that also reaches it: an inline entry's text
+        // paired with the block style's source extraction finds no `- `
+        // lines, so sources come back empty against three parsed values,
+        // and the guard must fall back to re-serialising every item rather
+        // than lose the two the zip would otherwise drop.
         let items = list_items("tags: [a, b, c]\n", ListStyle::Block { indent: 2 });
         assert_eq!(items.len(), 3);
         assert_eq!(
@@ -1266,6 +1336,23 @@ mod tests {
     fn a_note_with_a_block_is_parsed_rather_than_opened() {
         let block = Block::parse_or_open("---\nname: X\n---\n\nBody.\n").unwrap();
         assert_eq!(block.render(), "---\nname: X\n---\n\nBody.\n");
+    }
+
+    /// `crate::markdown::split_frontmatter` compares `line.trim() == "---"`,
+    /// so every other reader in the crate already treats a fence with
+    /// trailing whitespace as frontmatter. Before this fix `split_fences`
+    /// compared exactly and saw no block, so `parse_or_open` opened a
+    /// second one above what the rest of the crate reads as the note's
+    /// real properties, demoting them to body text (#92, I1).
+    #[test]
+    fn a_fence_with_trailing_whitespace_is_parsed_not_reopened() {
+        let mut block = Block::parse_or_open("--- \nname: X\n---\n\nBody\n").unwrap();
+        block.add_to_list("tags", "new").unwrap();
+        assert_eq!(
+            block.render(),
+            "--- \nname: X\ntags:\n  - new\n---\n\nBody\n",
+            "one block, not two, and the fence's own whitespace kept verbatim"
+        );
     }
 
     #[test]
