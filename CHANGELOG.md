@@ -8,6 +8,8 @@
 
 - An edited note stays in the index (#93). A rename that replaces a file makes the debouncer report a removal of the target path ahead of the events that describe the new file. The watcher read that removal as a deletion and dropped the note, and the change behind it was the write pipeline's own, which the recent-write check suppresses — so `search`, `list` and `read` lost a note that was still on disk and correct, and a later `index` counted it as a new file. A removal whose path still holds a file is no longer a deletion.
 
+- An edit keeps the newline the note ended on (#94). Both edit transforms rebuild the text out of `lines()` and trimmed fragments, and neither carried the note's last byte: a section edit dropped the newline the note ended on, and a replace of the note's last section added one it never had. Either way the write touched a line the caller did not name, so a one-line addition read in `git diff` as that line plus a rewrite of the last one. The final newline now follows the note, in both directions.
+
 ## 0.9.1 (2026-08-30)
 
 ### Calibrated score fusion: the model-free default ranks and abstains

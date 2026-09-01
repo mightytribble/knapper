@@ -660,7 +660,29 @@ pub fn apply_section_edit(
         result_parts.push(after.join("\n"));
     }
     // Join with newlines, ensuring we don't double up
-    Ok(result_parts.join("\n"))
+    Ok(keep_final_newline(content, result_parts.join("\n")))
+}
+
+/// Give `edited` the final newline `original` had, or take the one it did not.
+///
+/// A note's last byte belongs to the note. Both edit transforms rebuild the
+/// text out of `lines()` and trimmed fragments, and neither carries that byte:
+/// a section edit dropped the newline the note ended on, and a replace of the
+/// note's last section added one it never had. Either way the write touched a
+/// line the caller did not name, which reads in `git diff` as a rewrite of the
+/// last line beside the edit that was actually asked for (#94).
+fn keep_final_newline(original: &str, edited: String) -> String {
+    let mut edited = edited;
+    match (original.ends_with('\n'), edited.ends_with('\n')) {
+        (true, false) => edited.push('\n'),
+        // One newline, not every trailing one: the rest of the tail is the
+        // caller's content and this is not the call that trims it.
+        (false, true) => {
+            edited.pop();
+        }
+        _ => {}
+    }
+    edited
 }
 
 /// The display name of an edit mode, for `EditResult::mode`.
@@ -718,17 +740,18 @@ pub fn apply_body_edit(
             EditMode::Prepend => format!("{}\n{}", new.trim_end(), old_body),
             EditMode::Remove => old_body,
         };
-        return Ok(format!("{block}{new_body}"));
+        return Ok(keep_final_newline(content, format!("{block}{new_body}")));
     }
     // No existing frontmatter to preserve — or `preserve_frontmatter` is
     // false — so join the whole text; `Append` and `Prepend` still keep the
     // note's own content either way.
-    Ok(match mode {
+    let edited = match mode {
         EditMode::Replace => new.to_string(),
         EditMode::Append => format!("{}\n{}", content.trim_end(), new),
         EditMode::Prepend => format!("{}\n{}", new.trim_end(), content),
         EditMode::Remove => content.to_string(),
-    })
+    };
+    Ok(keep_final_newline(content, edited))
 }
 
 /// The text one edit writes. A body and a section take one string, so a list
@@ -1447,16 +1470,21 @@ mod tests {
     /// `Block::body()` is the text past the blank line that separates it
     /// from the block, so nothing here has to trim or re-add that break —
     /// `block.render()` supplies it once, from the block's own `separator`
-    /// field, however many times a body is appended to (#62, #92 I5).
+    /// field, however many times a body is appended to (#62, #92 I5). The
+    /// newline the note ended on is the note's and survives each append the
+    /// same way (#94).
     #[test]
     fn successive_body_appends_add_no_blank_line_of_their_own() {
         let doc = "---\ntags:\n  - a\n---\n\nbody line\n";
 
         let once = apply_body_edit(doc, "first", EditMode::Append, true).unwrap();
-        assert_eq!(once, "---\ntags:\n  - a\n---\n\nbody line\nfirst");
+        assert_eq!(once, "---\ntags:\n  - a\n---\n\nbody line\nfirst\n");
 
         let twice = apply_body_edit(&once, "second", EditMode::Append, true).unwrap();
-        assert_eq!(twice, "---\ntags:\n  - a\n---\n\nbody line\nfirst\nsecond");
+        assert_eq!(
+            twice,
+            "---\ntags:\n  - a\n---\n\nbody line\nfirst\nsecond\n"
+        );
     }
 
     /// The same text with and without the frontmatter split, which is what
@@ -2927,6 +2955,56 @@ mod tests {
         assert_eq!(
             updated,
             "---\nstatus: active\n---\n\n# Content\nbody text\n"
+        );
+    }
+
+    /// A note's final newline is not a thing an edit names, and a write must
+    /// not take it. Both transforms rebuild the text out of `lines()` and
+    /// trimmed fragments, neither of which carries the byte the note ended
+    /// on, so every `update` rewrote the note's last line: a pure addition
+    /// read as a rewrite in `git diff`, and on a note whose last line is
+    /// content the churn landed on the content (#94).
+    #[test]
+    fn a_body_replace_keeps_the_newline_the_note_ended_on() {
+        let doc = "---\ntags: [a]\n---\n\nfirst line\nlast line\n";
+        assert_eq!(
+            apply_body_edit(doc, "first line\nlast line", EditMode::Replace, true).unwrap(),
+            doc
+        );
+    }
+
+    #[test]
+    fn a_section_append_keeps_the_newline_the_note_ended_on() {
+        let doc = "# Note\n\n## Spells\n\nFireball\n\n## Rank\n\nS\n";
+        let out = apply_section_edit(doc, "Spells", "Meteor", EditMode::Append).unwrap();
+        assert!(out.ends_with("## Rank\n\nS\n"), "{out:?}");
+    }
+
+    /// The same rule the other way round: a note that ends without a newline
+    /// is a note knapper leaves without one. The last byte follows the note,
+    /// not the tool (#94).
+    #[test]
+    fn a_note_that_ends_without_a_newline_is_given_none() {
+        let doc = "# Note\n\n## Spells\n\nFireball\n\n## Rank\n\nS";
+        let out = apply_section_edit(doc, "Rank", "A", EditMode::Replace).unwrap();
+        assert!(!out.ends_with('\n'), "{out:?}");
+        assert!(out.ends_with("## Rank\n\nA"), "{out:?}");
+    }
+
+    /// The call that surfaced #94: one line appended to a list section is one
+    /// line of diff, and the note's last line is untouched.
+    #[test]
+    fn a_section_append_adds_the_line_it_names_and_no_other() {
+        let note =
+            "---\ntags: [a]\n---\n\n## Contains\n\n- [[One]]\n- [[Two]]\n\n## Notes\n\nEnd.\n";
+        let edits = vec![NoteEdit {
+            target: EditTarget::Section("Contains".into()),
+            mode: EditMode::Append,
+            content: Some(EditContent::Text("- [[Three]]".into())),
+        }];
+        assert_eq!(
+            apply_note_edits(note, &edits).unwrap(),
+            "---\ntags: [a]\n---\n\n## Contains\n\n- [[One]]\n- [[Two]]\n- [[Three]]\n\n## Notes\n\nEnd.\n"
         );
     }
 }
