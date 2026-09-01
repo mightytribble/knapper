@@ -48,21 +48,6 @@ pub struct EditResult {
     pub mode: String,
 }
 
-/// One change to a note's frontmatter. `AddTo` and `RemoveFrom` name the
-/// property they change, so an edit to `status` cannot reach the `tags` list.
-/// The four variants that wrote the key into their own name — `AddTag`,
-/// `RemoveTag`, `AddAlias`, `RemoveAlias` — were exact aliases of these two
-/// with `tags` or `aliases` inlined, and a routing table that falls back to
-/// one of them writes to the wrong property whenever the key is a third one
-/// (#62).
-#[derive(Debug, Clone)]
-pub enum FrontmatterOp {
-    Set(String, String),
-    Remove(String),
-    AddTo(String, String),
-    RemoveFrom(String, String),
-}
-
 /// What one edit addresses. A note has three addressable things: its body,
 /// a section of its body, and a frontmatter property. One edit names one of
 /// them, so two targets are unrepresentable rather than rejected (#62).
@@ -868,95 +853,6 @@ pub fn apply_body_edit(
     }
 }
 
-/// Apply a list of frontmatter operations to a note's text. The transform is
-/// separate from the I/O so that `update_note` can apply a list of them to
-/// one string and write once (#62).
-///
-/// Uses `crate::markdown::split_frontmatter()` to extract raw YAML, then applies
-/// operations sequentially using `serde_yaml`.
-pub fn apply_frontmatter_ops(content: &str, ops: &[FrontmatterOp]) -> Result<String> {
-    // Split frontmatter using crate::markdown::split_frontmatter (returns raw YAML without delimiters)
-    let (maybe_fm, body) = crate::markdown::split_frontmatter(content);
-
-    // Parse YAML into a Mapping (create empty mapping if no frontmatter)
-    let mut mapping: serde_yaml::Mapping = if let Some(ref fm) = maybe_fm {
-        let val: serde_yaml::Value = serde_yaml::from_str(fm)
-            .unwrap_or(serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
-        match val {
-            serde_yaml::Value::Mapping(m) => m,
-            _ => serde_yaml::Mapping::new(),
-        }
-    } else {
-        serde_yaml::Mapping::new()
-    };
-
-    // Apply operations sequentially
-    for op in ops {
-        match op {
-            FrontmatterOp::Set(key, value) => {
-                mapping.insert(
-                    serde_yaml::Value::String(key.clone()),
-                    serde_yaml::Value::String(value.clone()),
-                );
-            }
-            FrontmatterOp::Remove(key) => {
-                mapping.remove(serde_yaml::Value::String(key.clone()));
-            }
-            FrontmatterOp::AddTo(key, value) => {
-                apply_add_to_sequence(&mut mapping, key, value);
-            }
-            FrontmatterOp::RemoveFrom(key, value) => {
-                apply_remove_from_sequence(&mut mapping, key, value);
-            }
-        }
-    }
-
-    // Serialize back to YAML
-    let yaml_str = serde_yaml::to_string(&serde_yaml::Value::Mapping(mapping))?;
-
-    // Reassemble: ---\n{yaml}---\n\n{body}
-    // serde_yaml::to_string adds a trailing newline, so we don't need an extra one before ---.
-    // `split_frontmatter`'s found-delimiter branch rejoins the body with `lines().join("\n")`,
-    // which drops the body's own final line break — restore it here so the file keeps ending
-    // in one, matching every other write path in this module. The same rejoin also leaves the
-    // body carrying the break after the closing `---` (the defect `apply_body_edit` fixes the
-    // same way for its own reassembly, #62); the line below writes its own `\n\n` separator, so
-    // that leading break has to go, or it pushes the body one line further down on every call.
-    let body = body.trim_start_matches('\n');
-    let body = if body.is_empty() || body.ends_with('\n') {
-        body.to_string()
-    } else {
-        format!("{}\n", body)
-    };
-    Ok(format!("---\n{}---\n\n{}", yaml_str, body))
-}
-
-/// Helper: add a value to a YAML sequence field (create if missing, skip duplicates).
-fn apply_add_to_sequence(mapping: &mut serde_yaml::Mapping, key: &str, value: &str) {
-    let key_val = serde_yaml::Value::String(key.to_string());
-    let new_item = serde_yaml::Value::String(value.to_string());
-
-    let seq = mapping
-        .entry(key_val)
-        .or_insert_with(|| serde_yaml::Value::Sequence(vec![]));
-
-    if let serde_yaml::Value::Sequence(items) = seq
-        && !items.contains(&new_item)
-    {
-        items.push(new_item);
-    }
-}
-
-/// Helper: remove a value from a YAML sequence field.
-fn apply_remove_from_sequence(mapping: &mut serde_yaml::Mapping, key: &str, value: &str) {
-    let key_val = serde_yaml::Value::String(key.to_string());
-    let remove_item = serde_yaml::Value::String(value.to_string());
-
-    if let Some(serde_yaml::Value::Sequence(items)) = mapping.get_mut(&key_val) {
-        items.retain(|item| item != &remove_item);
-    }
-}
-
 /// The text one edit writes. A body and a section take one string, so a list
 /// is content for a property alone (#62).
 fn text_of(edit: &NoteEdit) -> Result<String> {
@@ -972,52 +868,35 @@ fn text_of(edit: &NoteEdit) -> Result<String> {
     }
 }
 
-/// The frontmatter operations one property edit means. Every key routes
-/// through `AddTo` and `RemoveFrom`, which carry the key, so an append to
-/// `status` cannot reach the `tags` list (#62).
-fn property_ops(
+/// Apply one property edit to `block`. Every mode names one operation on
+/// one key, so an append to `status` cannot reach the `tags` list (#62).
+fn apply_property_edit(
+    block: &mut crate::frontmatter::Block,
     key: &str,
     mode: EditMode,
     content: Option<&EditContent>,
-) -> Result<Vec<FrontmatterOp>> {
-    Ok(match (mode, content) {
-        (EditMode::Replace, Some(EditContent::Text(v))) => {
-            vec![FrontmatterOp::Set(key.to_string(), v.clone())]
-        }
-        // `Set` carries a scalar, so a whole sequence is a remove and then
-        // one add per item.
-        (EditMode::Replace, Some(EditContent::List(vs))) => {
-            let mut ops = vec![FrontmatterOp::Remove(key.to_string())];
-            ops.extend(
-                vs.iter()
-                    .map(|v| FrontmatterOp::AddTo(key.to_string(), v.clone())),
-            );
-            ops
-        }
-        (EditMode::Append, Some(EditContent::Text(v))) => {
-            vec![FrontmatterOp::AddTo(key.to_string(), v.clone())]
-        }
-        (EditMode::Remove, None) => vec![FrontmatterOp::Remove(key.to_string())],
-        (EditMode::Remove, Some(EditContent::Text(v))) => {
-            vec![FrontmatterOp::RemoveFrom(key.to_string(), v.clone())]
-        }
+) -> Result<()> {
+    match (mode, content) {
+        (EditMode::Replace, Some(EditContent::Text(v))) => block.set_scalar(key, v),
+        (EditMode::Replace, Some(EditContent::List(vs))) => block.set_list(key, vs),
+        (EditMode::Append, Some(EditContent::Text(v))) => block.add_to_list(key, v),
+        (EditMode::Remove, None) => block.remove(key),
+        (EditMode::Remove, Some(EditContent::Text(v))) => block.remove_from_list(key, v),
         (mode, content) => anyhow::bail!(
             "a {} on property '{key}' with {} content has no meaning",
             edit_mode_name(&mode),
             if content.is_some() { "this" } else { "no" }
         ),
-    })
+    }
 }
 
 /// Apply every edit to a note's text, in order. Pure, so `update_note` can
 /// write the result once — one file write, one conflict check and one
 /// re-index for a whole batch (#62).
 ///
-/// A run of property edits becomes one `apply_frontmatter_ops` call. The ops
-/// already apply in order over one YAML mapping, so the result is the same,
-/// but each call reassembles the note and each reassembly adds a line break
-/// between the frontmatter and the body. One call per edit therefore pushes
-/// the body one line down for every property edit in the list.
+/// A run of property edits becomes one pass over one `Block`, so the run is
+/// one parse and one render. The block splices onto the note's own body, so
+/// no number of property edits moves the body a line.
 pub fn apply_note_edits(content: &str, edits: &[NoteEdit]) -> Result<String> {
     let mut text = content.to_string();
     let mut rest = edits;
@@ -1029,14 +908,14 @@ pub fn apply_note_edits(content: &str, edits: &[NoteEdit]) -> Result<String> {
                     .position(|e| !matches!(e.target, EditTarget::Property(_)))
                     .unwrap_or(rest.len());
                 let (properties, tail) = rest.split_at(run);
-                let mut ops = Vec::new();
+                let mut block = crate::frontmatter::Block::parse_or_open(&text)?;
                 for property in properties {
                     let EditTarget::Property(key) = &property.target else {
                         bail!("a run of property edits holds property edits alone");
                     };
-                    ops.extend(property_ops(key, property.mode, property.content.as_ref())?);
+                    apply_property_edit(&mut block, key, property.mode, property.content.as_ref())?;
                 }
-                text = apply_frontmatter_ops(&text, &ops)?;
+                text = block.render();
                 rest = tail;
             }
             EditTarget::Body => {
@@ -1612,20 +1491,93 @@ mod tests {
     }
 
     #[test]
-    fn frontmatter_ops_are_a_pure_transform_of_the_text() {
-        let doc = "---\ntags:\n  - a\n---\n\nbody\n";
-        let out = apply_frontmatter_ops(
-            doc,
-            &[
-                FrontmatterOp::AddTo("tags".into(), "b".into()),
-                FrontmatterOp::Set("status".into(), "done".into()),
-            ],
-        )
-        .unwrap();
-        assert!(out.contains("- a"));
-        assert!(out.contains("- b"));
-        assert!(out.contains("status: done"));
-        assert!(out.ends_with("body\n"));
+    fn a_property_edit_keeps_the_key_in_place_and_in_its_style() {
+        let note = "---\nname: Probe\naliases: []\ntags: [type/lore, realm/rudd]\n---\n\nBody.\n";
+        let edits = vec![NoteEdit {
+            target: EditTarget::Property("tags".into()),
+            mode: EditMode::Replace,
+            content: Some(EditContent::List(vec![
+                "type/lore".into(),
+                "realm/skaldi".into(),
+            ])),
+        }];
+        assert_eq!(
+            apply_note_edits(note, &edits).unwrap(),
+            "---\nname: Probe\naliases: []\ntags: [type/lore, realm/skaldi]\n---\n\nBody.\n"
+        );
+    }
+
+    #[test]
+    fn a_property_replaced_with_an_empty_list_keeps_the_key() {
+        let note = "---\nname: Probe\naliases: [Old]\n---\n\nBody.\n";
+        let edits = vec![NoteEdit {
+            target: EditTarget::Property("aliases".into()),
+            mode: EditMode::Replace,
+            content: Some(EditContent::List(vec![])),
+        }];
+        assert_eq!(
+            apply_note_edits(note, &edits).unwrap(),
+            "---\nname: Probe\naliases: []\n---\n\nBody.\n"
+        );
+    }
+
+    #[test]
+    fn a_run_of_property_edits_is_one_pass_and_does_not_move_the_body() {
+        let note = "---\nname: Probe\ntags: [a]\n---\n\nBody.\n";
+        let edits = vec![
+            NoteEdit {
+                target: EditTarget::Property("tags".into()),
+                mode: EditMode::Append,
+                content: Some(EditContent::Text("b".into())),
+            },
+            NoteEdit {
+                target: EditTarget::Property("status".into()),
+                mode: EditMode::Replace,
+                content: Some(EditContent::Text("draft".into())),
+            },
+            NoteEdit {
+                target: EditTarget::Property("name".into()),
+                mode: EditMode::Remove,
+                content: None,
+            },
+        ];
+        assert_eq!(
+            apply_note_edits(note, &edits).unwrap(),
+            "---\ntags: [a, b]\nstatus: draft\n---\n\nBody.\n"
+        );
+    }
+
+    #[test]
+    fn a_body_edit_after_a_property_edit_still_sees_the_frontmatter() {
+        let note = "---\nname: Probe\n---\n\nOld body.\n";
+        let edits = vec![
+            NoteEdit {
+                target: EditTarget::Property("name".into()),
+                mode: EditMode::Replace,
+                content: Some(EditContent::Text("Renamed".into())),
+            },
+            NoteEdit {
+                target: EditTarget::Body,
+                mode: EditMode::Replace,
+                content: Some(EditContent::Text("New body.".into())),
+            },
+        ];
+        let out = apply_note_edits(note, &edits).unwrap();
+        assert!(out.starts_with("---\nname: Renamed\n---\n"), "{out}");
+        assert!(out.contains("New body."), "{out}");
+        assert!(!out.contains("Old body."), "{out}");
+    }
+
+    #[test]
+    fn a_property_edit_on_a_value_it_cannot_address_writes_nothing() {
+        let note = "---\nname: Probe\nnested:\n  inner: 1\n---\n\nBody.\n";
+        let edits = vec![NoteEdit {
+            target: EditTarget::Property("nested".into()),
+            mode: EditMode::Replace,
+            content: Some(EditContent::Text("flat".into())),
+        }];
+        let err = apply_note_edits(note, &edits).unwrap_err();
+        assert!(err.to_string().contains("nested mapping"), "{err}");
     }
 
     /// `split_frontmatter` rejoins the body as `lines[i+1..].join("\n")`, so
@@ -2835,7 +2787,7 @@ mod tests {
                     mode: EditMode::Append,
                     content: Some(EditContent::Text("wip".into())),
                 },
-                "status:\n- wip",
+                "status:\n  - wip",
                 true,
             ),
             (
@@ -2858,10 +2810,10 @@ mod tests {
 
     #[test]
     fn a_list_of_property_edits_reassembles_the_note_once() {
-        // A run of property edits becomes one `apply_frontmatter_ops` call
-        // (#62), so a two-edit call must give the same bytes as a one-edit
-        // call gives, plus the tag. A `contains` assertion cannot see this,
-        // so pin the bytes.
+        // A run of property edits becomes one pass over one `Block` (#62), so
+        // a two-edit call must give the same bytes as a one-edit call gives,
+        // plus the tag, with the block's own two-space list style kept. A
+        // `contains` assertion cannot see this, so pin the bytes.
         let doc = "---\ntags:\n  - a\n---\n\n## Spells\n\nold\n";
 
         let one = apply_note_edits(
@@ -2873,7 +2825,7 @@ mod tests {
             }],
         )
         .unwrap();
-        assert_eq!(one, "---\ntags:\n- a\n- b\n---\n\n## Spells\n\nold\n");
+        assert_eq!(one, "---\ntags:\n  - a\n  - b\n---\n\n## Spells\n\nold\n");
 
         let two = apply_note_edits(
             doc,
@@ -2893,12 +2845,12 @@ mod tests {
         .unwrap();
         assert_eq!(
             two,
-            "---\ntags:\n- a\n- b\nstatus: done\n---\n\n## Spells\n\nold\n"
+            "---\ntags:\n  - a\n  - b\nstatus: done\n---\n\n## Spells\n\nold\n"
         );
     }
 
     /// The Task 12 fix trimmed the leading break `split_frontmatter` leaves
-    /// on a body edit; `apply_frontmatter_ops` reassembles the same way and
+    /// on a body edit; the frontmatter block reassembles the same way and
     /// carried the same defect (#62). `update` is the only frontmatter write
     /// path, so it accumulates one blank line per call across successive
     /// `update`s on the same note — pin the bytes across two of them.
