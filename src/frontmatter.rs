@@ -547,7 +547,10 @@ fn classify(text: &str) -> Value {
     match v {
         serde_yaml::Value::Sequence(items) if items.iter().all(is_scalar) => {
             if head.starts_with('[') {
-                Value::List(ListStyle::Inline)
+                match inline_list_addressable(text) {
+                    Ok(()) => Value::List(ListStyle::Inline),
+                    Err(found) => Value::Opaque(found),
+                }
             } else {
                 Value::List(ListStyle::Block {
                     indent: first_item_indent(text),
@@ -559,6 +562,45 @@ fn classify(text: &str) -> Value {
         serde_yaml::Value::Tagged(_) => Value::Opaque("a tagged value"),
         _ => Value::Scalar,
     }
+}
+
+/// Whether a flow list's raw text is one `key: [items]` line with nothing
+/// after the `]` that closes it. `render_list` writes exactly that shape and
+/// has nowhere to put a second line or trailing text, so a flow list that
+/// does not already look like that is refused rather than silently
+/// collapsed when it is edited.
+fn inline_list_addressable(text: &str) -> Result<(), &'static str> {
+    if text.lines().count() > 1 {
+        return Err("a flow list that spans more than one line");
+    }
+    let head = value_text(text).trim_start();
+    match closing_bracket(head) {
+        Some(end) if head[end + 1..].trim().is_empty() => Ok(()),
+        _ => Err("a flow list with text after its closing `]`"),
+    }
+}
+
+/// The index in `head` of the `]` that closes the `[` at its start, skipping
+/// a bracket inside a quoted scalar. `None` when there is none. `head` is
+/// assumed to start with `[`.
+fn closing_bracket(head: &str) -> Option<usize> {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (i, c) in head.char_indices().skip(1) {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Some('"') if c == '\\' => escaped = true,
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == '\'' || c == '"' => quote = Some(c),
+            None if c == ']' => return Some(i),
+            None => {}
+        }
+    }
+    None
 }
 
 /// One scalar as YAML, quoted when it has to be.
@@ -597,9 +639,20 @@ fn scalar_source(text: &str) -> String {
 /// The items a list entry holds, each keeping the source text that
 /// reproduces it.
 fn list_items(text: &str, style: ListStyle) -> Vec<ListItem> {
-    list_values(text)
+    let values = list_values(text);
+    let sources = list_sources(text, style);
+    // A shortfall here means the source scan found a different number of
+    // items than the YAML parse did — some shape the scan does not handle,
+    // slipping past whatever guards classify already applies. Zipping the
+    // two short would silently drop whichever items ran out first, which is
+    // data loss; falling back to fresh values re-serialises every item
+    // through yaml_scalar instead, which only loses formatting.
+    if values.len() != sources.len() {
+        return values.into_iter().map(ListItem::fresh).collect();
+    }
+    values
         .into_iter()
-        .zip(list_sources(text, style))
+        .zip(sources)
         .map(|(value, source)| ListItem::existing(value, source))
         .collect()
 }
@@ -622,10 +675,14 @@ fn list_sources(text: &str, style: ListStyle) -> Vec<String> {
     match style {
         ListStyle::Inline => {
             let head = value_text(text).trim();
-            let inner = head
-                .strip_prefix('[')
-                .and_then(|s| s.strip_suffix(']'))
-                .unwrap_or_default();
+            let inner = if head.starts_with('[') {
+                match closing_bracket(head) {
+                    Some(end) => &head[1..end],
+                    None => "",
+                }
+            } else {
+                ""
+            };
             split_flow_items(inner)
         }
         ListStyle::Block { .. } => text
@@ -637,18 +694,31 @@ fn list_sources(text: &str, style: ListStyle) -> Vec<String> {
 }
 
 /// Split a flow sequence's inner text on commas that are not inside a `'` or
-/// `"` quoted scalar, each piece trimmed of surrounding spaces. `classify`
-/// already guarantees every item is a scalar, so this has only to respect
-/// quotes and never has to handle nesting.
+/// `"` quoted scalar, each piece trimmed of surrounding spaces. Inside a `"`
+/// scalar a `\` escapes the next character, so an escaped quote does not
+/// close it; a `'` scalar has no such escape and only the doubled-quote
+/// convention closes and reopens it, which a plain toggle already handles.
+/// `classify` already guarantees every item is a scalar, so this never has
+/// to handle nesting.
 fn split_flow_items(inner: &str) -> Vec<String> {
     if inner.trim().is_empty() {
         return Vec::new();
     }
     let mut items = Vec::new();
     let mut current = String::new();
-    let mut quote = None;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
     for c in inner.chars() {
+        if escaped {
+            current.push(c);
+            escaped = false;
+            continue;
+        }
         match quote {
+            Some('"') if c == '\\' => {
+                current.push(c);
+                escaped = true;
+            }
             Some(q) if c == q => {
                 quote = None;
                 current.push(c);
@@ -952,6 +1022,52 @@ mod tests {
             edited(text, |b| b.remove_from_list("tags", "a")),
             "---\ntags: ['b c', plain]\n---\n"
         );
+    }
+
+    #[test]
+    fn an_item_holding_a_comma_inside_quotes_is_one_item_not_two() {
+        let text = "---\ntags: [a, \"b, c\", d]\n---\n";
+        assert_eq!(
+            edited(text, |b| b.add_to_list("tags", "e")),
+            "---\ntags: [a, \"b, c\", d, e]\n---\n"
+        );
+    }
+
+    #[test]
+    fn an_item_holding_an_escaped_quote_survives_an_edit_to_a_neighbour() {
+        let text = "---\ntags: [\"a\\\"b\", c]\n---\n";
+        assert_eq!(
+            edited(text, |b| b.remove_from_list("tags", "c")),
+            "---\ntags: [\"a\\\"b\"]\n---\n"
+        );
+    }
+
+    #[test]
+    fn an_inline_list_with_a_trailing_comment_refuses_the_write_and_leaves_the_block_unchanged() {
+        let text = "---\ntags: [a, b]  # trailing comment\n---\n";
+        let mut block = Block::parse(text).unwrap().unwrap();
+        let err = block.add_to_list("tags", "c").unwrap_err();
+        assert!(err.to_string().contains("flow list"), "{err}");
+        assert!(err.to_string().contains("`tags`"), "{err}");
+        assert_eq!(block.render(), text);
+    }
+
+    #[test]
+    fn the_count_guard_keeps_every_item_when_sources_and_values_disagree() {
+        // (a)-(c) close every public-API path that could produce a
+        // source/value count mismatch, so this drives the internal
+        // `list_items` directly: an inline entry's text paired with the
+        // block style's source extraction finds no `- ` lines, so sources
+        // come back empty against three parsed values, and the guard must
+        // fall back to re-serialising every item rather than lose the two
+        // the zip would otherwise drop.
+        let items = list_items("tags: [a, b, c]\n", ListStyle::Block { indent: 2 });
+        assert_eq!(items.len(), 3);
+        assert_eq!(
+            items.iter().map(|i| i.value.as_str()).collect::<Vec<_>>(),
+            ["a", "b", "c"]
+        );
+        assert!(items.iter().all(|i| i.source.is_none()));
     }
 
     #[test]
