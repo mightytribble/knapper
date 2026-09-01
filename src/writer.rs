@@ -677,12 +677,18 @@ fn edit_mode_name(mode: &EditMode) -> &'static str {
 /// so that `update_note` can apply a list of them to one string and write once
 /// (#62).
 ///
-/// With `preserve_frontmatter`, the note is parsed through
-/// [`crate::frontmatter::Block`], `mode` is applied to the block's own body
-/// alone, and only the body is replaced before the block renders itself
-/// back — the frontmatter is never split into a string and rejoined, so it
-/// cannot pick up a rebuilt fence, a normalised line ending or a shifted
-/// blank line the way `markdown::split_frontmatter` did (#92, I5). Without
+/// With `preserve_frontmatter`, [`crate::frontmatter::split_body`] finds the
+/// block's own byte span — the opening fence through the separator after the
+/// closing one — with no property edit's worth of parsing, `mode` is applied
+/// to whatever follows that span, and the two are joined back verbatim. The
+/// frontmatter is never split into a string and rejoined, so it cannot pick
+/// up a rebuilt fence, a normalised line ending or a shifted blank line the
+/// way `markdown::split_frontmatter` did (#92, I5). A body edit does not
+/// read or write a single frontmatter byte, so it does not need the block's
+/// entries to parse either: a non-mapping block or one holding a duplicate
+/// key still has a byte span `split_body` can find, and carries that block
+/// through untouched, however malformed, rather than refusing an edit to
+/// content the malformed part is not even in (#92, R2 regression). Without
 /// `preserve_frontmatter`, `Replace` returns `new` and `Append`/`Prepend`
 /// join the whole text.
 ///
@@ -691,10 +697,9 @@ fn edit_mode_name(mode: &EditMode) -> &'static str {
 /// and no other caller passes it, so the arm exists to keep a mode a body
 /// cannot express from deleting one (#62).
 ///
-/// Errors only when the note opens a frontmatter block knapper cannot even
-/// read the shape of — the same refusal `Block::parse` gives a property
-/// edit — because a body edit that cannot see the block's true span cannot
-/// promise to leave it untouched.
+/// Errors only when the block's own span is unknowable — an opening `---`
+/// with no closing one — because a body edit that cannot find where the
+/// block ends cannot promise to leave it untouched.
 pub fn apply_body_edit(
     content: &str,
     new: &str,
@@ -704,16 +709,16 @@ pub fn apply_body_edit(
     if mode == EditMode::Remove {
         return Ok(content.to_string());
     }
-    if preserve_frontmatter && let Some(mut block) = crate::frontmatter::Block::parse(content)? {
-        let old_body = block.body();
+    if preserve_frontmatter
+        && let Some((block, old_body)) = crate::frontmatter::split_body(content)?
+    {
         let new_body = match mode {
             EditMode::Replace => new.to_string(),
             EditMode::Append => format!("{}\n{}", old_body.trim_end(), new),
             EditMode::Prepend => format!("{}\n{}", new.trim_end(), old_body),
-            EditMode::Remove => old_body.to_string(),
+            EditMode::Remove => old_body,
         };
-        block.set_body(new_body);
-        return Ok(block.render());
+        return Ok(format!("{block}{new_body}"));
     }
     // No existing frontmatter to preserve — or `preserve_frontmatter` is
     // false — so join the whole text; `Append` and `Prepend` still keep the
@@ -1519,6 +1524,56 @@ mod tests {
         let doc = "---\nname: X\n---\nBody.\n";
         let out = apply_body_edit(doc, "New body.\n", EditMode::Replace, true).unwrap();
         assert_eq!(out, "---\nname: X\n---\nNew body.\n");
+    }
+
+    /// R2: a body edit does not touch the frontmatter at all, so a block
+    /// that is not a mapping — a top-level sequence here — must not stop
+    /// one. Before the fix, `apply_body_edit` routed through `Block::parse`,
+    /// which itemizes the block's entries and refuses this shape, blocking
+    /// an edit to content the malformed part is not even in.
+    #[test]
+    fn a_body_edit_succeeds_on_a_block_that_is_not_a_mapping() {
+        let doc = "---\n- one\n- two\n---\n\nOriginal body.\n";
+        let out = apply_body_edit(doc, "New body.\n", EditMode::Replace, true).unwrap();
+        assert_eq!(out, "---\n- one\n- two\n---\n\nNew body.\n");
+    }
+
+    /// The same, for a block holding one key twice: `Block::parse` also
+    /// refuses this because it cannot tell which of the two the note means,
+    /// which matters to a property edit and not at all to a body edit.
+    #[test]
+    fn a_body_edit_succeeds_on_a_block_holding_one_key_twice() {
+        let doc = "---\ntags: [a]\nname: X\ntags: [b]\n---\n\nOriginal body.\n";
+        let out = apply_body_edit(doc, "New body.\n", EditMode::Replace, true).unwrap();
+        assert_eq!(
+            out,
+            "---\ntags: [a]\nname: X\ntags: [b]\n---\n\nNew body.\n"
+        );
+    }
+
+    /// The boundary the fix must not move: a block with one opaque entry —
+    /// a nested mapping under one key, everything else fine — already
+    /// itemizes successfully, so it must keep succeeding exactly as before.
+    /// Only a block `parse_items` cannot itemize at all is what this fix
+    /// changes.
+    #[test]
+    fn a_body_edit_succeeds_on_a_block_holding_one_opaque_entry() {
+        let doc = "---\nname: Probe\nnested:\n  inner: 1\n---\n\nOriginal body.\n";
+        let out = apply_body_edit(doc, "New body.\n", EditMode::Replace, true).unwrap();
+        assert_eq!(
+            out,
+            "---\nname: Probe\nnested:\n  inner: 1\n---\n\nNew body.\n"
+        );
+    }
+
+    /// The one case that stays refused: an opening `---` with no closing
+    /// one, where the block's own span — not just its entries — is unknown,
+    /// so no caller can promise to leave it untouched.
+    #[test]
+    fn a_body_edit_is_still_refused_when_the_block_never_closes() {
+        let doc = "---\nname: Probe\n\nOriginal body.\n";
+        let err = apply_body_edit(doc, "New body.\n", EditMode::Replace, true).unwrap_err();
+        assert!(err.to_string().contains("never closes"), "{err}");
     }
 
     #[test]

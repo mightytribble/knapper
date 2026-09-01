@@ -581,6 +581,35 @@ fn split_separator(after: &str) -> (&str, &str) {
     }
 }
 
+/// Split `text` into its frontmatter block's own bytes — the opening fence
+/// through the separator that follows the closing one, unparsed — and the
+/// body below it. `Ok(None)` means the note has no block.
+///
+/// This finds the block's span the way [`Block::parse`] does, but does not
+/// call [`parse_items`], so it does not need the block's entries to parse:
+/// a non-mapping block or one holding a duplicate key still has a byte span
+/// this can find, because both are refusals `parse_items` raises, not ones
+/// [`split_fences`] does. A body edit never reads or writes a frontmatter
+/// byte, so it does not need to itemize the block to leave it alone — only
+/// to know where it ends, which is what [`crate::writer::apply_body_edit`]
+/// uses this for (#92, R2).
+///
+/// An error means even the span is unknowable: an opening `---` with no
+/// closing one, [`split_fences`]'s own refusal, which no caller can work
+/// around because there is no boundary between block and body to trust.
+pub fn split_body(text: &str) -> Result<Option<(String, String)>> {
+    let Some((open, inner, close, after)) = split_fences(text)? else {
+        return Ok(None);
+    };
+    let (separator, body) = split_separator(after);
+    let mut block = String::with_capacity(open.len() + inner.len() + close.len() + separator.len());
+    block.push_str(open);
+    block.push_str(inner);
+    block.push_str(close);
+    block.push_str(separator);
+    Ok(Some((block, body.to_string())))
+}
+
 /// Cut the text between the fences into items. An entry runs from its key
 /// line to the line before the next key line or column-0 comment; a run of
 /// blank lines at its tail belongs between the entries instead, so a blank
