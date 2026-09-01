@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Changed
+
+- A config file records what the user chose, not what the binary shipped with (#90). `Config::save` serialized the whole struct, so the first `knapper configure` after an upgrade materialized every section — `[calibrated]`, `[fts]`, `[ranking]`, `[lane_weights]` — into `~/.knapper/config.toml` with that build's values, and a later release that moved a default never reached that user. A save now edits the file instead of rewriting it: it writes a key whose value differs from its default, and a key the file already holds, because an explicit setting is the user's and is kept even where it equals today's default. Comments, key order, spacing and a key this build does not know are all left as they stand. A data directory with no config file yet is given the whole catalogue commented out under live `[section]` headers, so the file shows what there is to set without setting any of it.
+
 ### Fixed
 
 - Frontmatter writes preserve the note (#92). `create` writes the caller's frontmatter as given, and no longer adds `created`, `created_by` or placement keys. A property edit keeps the key's position and the note's list style, and an empty list writes an empty list instead of deleting the key. `archive` and `unarchive` edit the block instead of rebuilding it, so an archive round trip keeps the note's other keys, its comments and its blank lines byte for byte. `archive` refuses a note that already holds `archived`, `archived_at` or `archived_from`, naming the key it found, rather than lose the note's own value or drop it silently on unarchive. `unarchive` drops a leftover `archived` tag from a note archived by an earlier version of knapper, so the tag does not return to the vocabulary. A value knapper cannot address as a line — a nested mapping, an anchor, a block scalar — refuses the write and names what it found. The placement-correction learning loop no longer fires for a newly created note, because `create` no longer writes the `suggested_folder` and `created_by` keys the loop reads.

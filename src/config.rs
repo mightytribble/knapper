@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use toml_edit::{DocumentMut, Item, Table};
 
 use crate::llm::EmbeddingPromptConfig;
 use crate::prefix::PrefixConfig;
@@ -1166,9 +1167,47 @@ impl Config {
     }
 
     /// Save config to a specific path.
+    ///
+    /// The file is edited, not rewritten. A serialized `Config` holds every key
+    /// the binary ships with, so writing one over the file pinned each of those
+    /// values into the user's config: a later release that moved a default
+    /// never reached them, and nothing told either party (#90). Two rules
+    /// decide what a save writes:
+    ///
+    /// - a key whose value differs from its default, because that value is the
+    ///   user's or a `configure` call's and the file is where it lives;
+    /// - a key the file already holds, because the user wrote it there and an
+    ///   explicit setting is not knapper's to remove — even where it happens to
+    ///   equal today's default.
+    ///
+    /// Everything else stays out, so an unset key follows the binary. The rest
+    /// of the file — its comments, its key order, its blank lines, and any key
+    /// this build does not know — is left exactly as it stands. A key the
+    /// config no longer holds at all is left too: nothing clears one today, and
+    /// deleting on that rule would take a user's typo with it.
+    ///
+    /// A path with no file yet is given [`commented_defaults`], so the file on
+    /// disk always shows what there is to set.
     pub fn save_to(&self, path: &Path) -> Result<()> {
-        let content = toml::to_string_pretty(self).context("serializing config")?;
-        std::fs::write(path, content).with_context(|| format!("writing {}", path.display()))?;
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => commented_defaults()?,
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        let mut doc = text
+            .parse::<DocumentMut>()
+            .with_context(|| format!("parsing {}", path.display()))?;
+        let full = as_document(self)?;
+        let defaults = as_document(&Config::default())?;
+        let mut position = next_position(doc.as_table());
+        write_changed(
+            full.as_table(),
+            defaults.as_table(),
+            doc.as_table_mut(),
+            &mut position,
+        );
+        std::fs::write(path, doc.to_string())
+            .with_context(|| format!("writing {}", path.display()))?;
         Ok(())
     }
 
@@ -1187,6 +1226,154 @@ impl Config {
         let path = Self::data_dir()?.join("config.toml");
         std::fs::create_dir_all(path.parent().unwrap())?;
         self.save_to(&path)
+    }
+}
+
+/// The banner that introduces the commented catalogue.
+///
+/// It sits above the commented keys rather than at the top of the file: TOML
+/// puts a table's own keys before any `[section]`, so a root key knapper writes
+/// lands above whatever leads the file, and a banner that called itself the
+/// header would be wrong the first time one did.
+const CONFIG_BANNER: &str = "\
+# Everything commented out below carries the value this build defaults to.
+# Uncomment a line to set it. A key left commented follows the binary, so a
+# release that moves a default moves it here too, and a key written here is
+# yours and is kept. Section headers are live: uncommenting one key is enough.
+
+";
+
+/// A config file holding every default, commented out.
+///
+/// The section headers stay live and only the key lines are commented, so
+/// uncommenting one line sets that key in the table it sits under. Commenting
+/// the headers too would put an uncommented key in whichever table precedes it
+/// — valid TOML, silently the wrong setting.
+fn commented_defaults() -> Result<String> {
+    let body = toml::to_string_pretty(&Config::default()).context("serializing defaults")?;
+    let mut out = String::with_capacity(CONFIG_BANNER.len() + body.len() * 2);
+    out.push_str(CONFIG_BANNER);
+    let mut emitted: Vec<String> = Vec::new();
+    for line in body.lines() {
+        if let Some(path) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            // `to_string_pretty` writes `[models.embed_api]` and no `[models]`,
+            // because `models` holds no key of its own. Write the parent too:
+            // a table the file already names is one no save has to create, and
+            // creating one moves the comments that sat where it lands.
+            let mut prefix = String::new();
+            for segment in path.split('.') {
+                if !prefix.is_empty() {
+                    prefix.push('.');
+                }
+                prefix.push_str(segment);
+                if prefix != path && !emitted.iter().any(|e| e == &prefix) {
+                    out.push_str(&format!("[{prefix}]\n\n"));
+                    emitted.push(prefix.clone());
+                }
+            }
+            emitted.push(path.to_string());
+            out.push_str(line);
+        } else {
+            if !line.is_empty() {
+                out.push_str("# ");
+            }
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+/// One config as a document of `[section]` tables.
+///
+/// Through `to_string_pretty` rather than `toml_edit::ser::to_document`, which
+/// renders a nested struct as an inline table — `ranking = { mode = "sorted",
+/// … }` — and would leave [`write_changed`] no table to descend into.
+fn as_document<T: Serialize>(value: &T) -> Result<DocumentMut> {
+    toml::to_string_pretty(value)
+        .context("serializing config")?
+        .parse::<DocumentMut>()
+        .context("re-reading serialized config")
+}
+
+/// Write into `doc` every key of `full` that differs from `defaults`, and every
+/// key `doc` already holds, leaving the rest of the document alone (#90).
+///
+/// `full` and `defaults` come from one serializer through [`as_document`], so
+/// two equal values render to one string and `to_string` compares them.
+fn write_changed(full: &Table, defaults: &Table, doc: &mut Table, next_position: &mut usize) {
+    for (key, item) in full.iter() {
+        let default_item = defaults.get(key);
+        let Some(full_child) = item.as_table() else {
+            let differs = default_item.is_none_or(|d| d.to_string() != item.to_string());
+            if differs || doc.contains_key(key) {
+                set_value(doc, key, item);
+            }
+            continue;
+        };
+        let empty = Table::new();
+        let default_child = default_item.and_then(Item::as_table).unwrap_or(&empty);
+        match doc.get_mut(key).map(Item::as_table_mut) {
+            // The document holds the table: descend and leave its own text be.
+            Some(Some(doc_child)) => {
+                write_changed(full_child, default_child, doc_child, next_position)
+            }
+            // The document holds something else under this key. `load` reads
+            // the file before any save, so it has already refused anything the
+            // config cannot parse; leave it rather than overwrite it.
+            Some(None) => {}
+            // No table yet — add one only if a key inside it has to be written,
+            // and put it past every table the document already places. Without
+            // a position of its own a new table renders in key order, which can
+            // put it between a block of comments and the table they introduce.
+            None => {
+                let mut fresh = Table::new();
+                write_changed(full_child, default_child, &mut fresh, next_position);
+                if !fresh.is_empty() {
+                    fresh.set_implicit(false);
+                    fresh.set_position(*next_position);
+                    *next_position += 1;
+                    doc.insert(key, Item::Table(fresh));
+                }
+            }
+        }
+    }
+}
+
+/// One past the last document position any table in `table` claims.
+fn next_position(table: &Table) -> usize {
+    table
+        .iter()
+        .filter_map(|(_, item)| item.as_table())
+        .map(|t| t.position().map_or(0, |p| p + 1).max(next_position(t)))
+        .max()
+        .unwrap_or(0)
+}
+
+/// Set one key, keeping the formatting the document already gave it.
+///
+/// A key the document holds is written through the item that is already there,
+/// so the key itself is never replaced. Replacing it drops the key's decor —
+/// which is where the parser puts the comment lines above it, and the spacing
+/// its author chose — and a save would quietly eat the note the user wrote to
+/// explain their own setting.
+fn set_value(doc: &mut Table, key: &str, item: &Item) {
+    let Some(existing) = doc.get_mut(key) else {
+        let mut item = item.clone();
+        if let Some(value) = item.as_value_mut() {
+            value.decor_mut().set_prefix(" ");
+            value.decor_mut().set_suffix("");
+        }
+        doc.insert(key, item);
+        return;
+    };
+    match (item.as_value(), existing.as_value()) {
+        (Some(new_value), Some(old_value)) => {
+            let mut new_value = new_value.clone();
+            *new_value.decor_mut() = old_value.decor().clone();
+            *existing = Item::Value(new_value);
+        }
+        _ => *existing = item.clone(),
     }
 }
 
@@ -1867,6 +2054,163 @@ vault_purpose = "notes"
         assert!(
             omitted.calibrated.enabled,
             "a config with no [calibrated] table ships enabled"
+        );
+    }
+
+    /// Whether `table` names a value anywhere. A live `[section]` header with
+    /// nothing under it sets nothing, and the catalogue is made of those.
+    fn sets_any_value(table: &toml::Table) -> bool {
+        table.values().any(|v| match v {
+            toml::Value::Table(t) => sets_any_value(t),
+            _ => true,
+        })
+    }
+
+    /// A serialized `Config` holds every key the binary ships with. Writing one
+    /// over the file pinned each of those values into the user's config, so a
+    /// later release that moved a default never reached them (#90). A value
+    /// equal to its default is not the user's, and is not written.
+    #[test]
+    fn a_value_at_its_default_is_not_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        Config::default().save_to(&path).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let live: toml::Table = toml::from_str(&text).unwrap();
+        assert!(
+            !sets_any_value(&live),
+            "a default config sets nothing, so the file names no value: {live:?}"
+        );
+        assert_eq!(
+            Config::load_from(&path).unwrap().top_n,
+            Config::default().top_n
+        );
+    }
+
+    /// The other half of the rule: a key the file already holds is the user's,
+    /// and stays theirs even where it happens to equal today's default (#90).
+    #[test]
+    fn a_key_the_file_holds_is_kept_at_its_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "top_n = {}\n\n[calibrated]\nfloor = {}\n",
+                Config::default().top_n,
+                Config::default().calibrated.floor
+            ),
+        )
+        .unwrap();
+
+        let mut cfg = Config::load_from(&path).unwrap();
+        cfg.intelligence = Some(true);
+        cfg.save_to(&path).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("top_n = 5"), "{text}");
+        assert!(text.contains("floor = 0.75"), "{text}");
+        assert!(text.contains("intelligence = true"), "{text}");
+    }
+
+    /// The file is edited, not rewritten, so everything the save does not name
+    /// survives: the user's comments, their key order and spacing, and a key
+    /// this build does not know — deleting that last one would take a typo with
+    /// it, and a typo is better left where its author can see it (#90).
+    #[test]
+    fn a_save_keeps_the_text_it_did_not_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = "\
+# my vault, my rules
+top_n    =    30
+some_key_from_a_later_build = 7
+
+[ranking]
+# tuned against my own pool
+answer_floor = 0.5
+";
+        std::fs::write(&path, original).unwrap();
+
+        let mut cfg = Config::load_from(&path).unwrap();
+        cfg.models.embed = Some("hf:custom/e.gguf".into());
+        cfg.save_to(&path).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# my vault, my rules"), "{text}");
+        assert!(text.contains("# tuned against my own pool"), "{text}");
+        assert!(
+            text.contains("top_n    =    30"),
+            "spacing is the user's: {text}"
+        );
+        assert!(text.contains("some_key_from_a_later_build = 7"), "{text}");
+        assert!(text.contains("answer_floor = 0.5"), "{text}");
+
+        let back = Config::load_from(&path).unwrap();
+        assert_eq!(back.top_n, 30);
+        assert_eq!(back.ranking.answer_floor, 0.5);
+        assert_eq!(back.models.embed.as_deref(), Some("hf:custom/e.gguf"));
+    }
+
+    /// A path with no file is given the commented catalogue, so the file on
+    /// disk shows what there is to set without setting any of it (#90).
+    #[test]
+    fn a_generated_file_comments_every_default_under_a_live_header() {
+        let text = commented_defaults().unwrap();
+
+        let live: toml::Table = toml::from_str(&text).unwrap();
+        assert!(
+            !sets_any_value(&live),
+            "nothing in the catalogue is set: {live:?}"
+        );
+
+        let mut headers: Vec<&str> = Vec::new();
+        for line in text.lines() {
+            if let Some(path) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+                // A table whose parent the file never names is one a save has
+                // to create, and creating it moves the comments where it lands.
+                if let Some((parent, _)) = path.rsplit_once('.') {
+                    assert!(headers.contains(&parent), "no header for {parent}: {text}");
+                }
+                headers.push(path);
+            } else {
+                assert!(
+                    line.is_empty() || line.starts_with('#'),
+                    "an uncommented key line: {line}"
+                );
+            }
+        }
+        assert!(headers.contains(&"models"), "{text}");
+        assert!(headers.contains(&"calibrated"), "{text}");
+    }
+
+    /// An array of tables is one value, so `http.api_keys` survives the round
+    /// trip whole and a second save writes the same file as the first.
+    #[test]
+    fn a_save_is_stable_over_an_array_of_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        let mut cfg = Config::default();
+        cfg.http.api_keys.push(ApiKeyConfig {
+            key: "kn_x".into(),
+            name: "chatgpt".into(),
+            permissions: "read".into(),
+        });
+        cfg.save_to(&path).unwrap();
+        let once = std::fs::read_to_string(&path).unwrap();
+
+        let back = Config::load_from(&path).unwrap();
+        assert_eq!(back.http.api_keys.len(), 1);
+        assert_eq!(back.http.api_keys[0].name, "chatgpt");
+
+        back.save_to(&path).unwrap();
+        assert_eq!(
+            once,
+            std::fs::read_to_string(&path).unwrap(),
+            "a save of what was loaded rewrites nothing"
         );
     }
 }

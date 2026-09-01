@@ -16,6 +16,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 toml = "0.8"
+# Already in the graph under `toml`; declared directly so `config.rs` can edit
+# a config file in place rather than re-serializing it over the user's text.
+toml_edit = "0.22"
 dirs = "5"
 anyhow = "1"
 rusqlite = { version = "0.32", features = ["bundled", "array"] }
