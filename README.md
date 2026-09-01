@@ -263,7 +263,7 @@ One bare path per line, in path order, so a folder's notes arrive together and `
 knapper create --content "# Meeting Notes\n\nDiscussed auth timeline with Sarah." --tags meeting,auth
 ```
 
-knapper resolves tags against the registry (fuzzy matching), discovers potential wikilinks (`[[Sarah Chen]]`), suggests the best folder based on semantic similarity to existing notes, and writes atomically.
+knapper resolves tags against the registry (fuzzy matching), discovers potential wikilinks (`[[Sarah Chen]]`), suggests the best folder based on semantic similarity to existing notes, and writes atomically. The frontmatter in `--content` is written as given; `tags` is the only key `create` adds, and only the tags it resolved.
 
 **Edit a specific section:**
 
@@ -288,6 +288,8 @@ knapper update "Meeting Notes" --property tags --mode append --content "actionab
 ```
 
 A property takes `--mode replace`, `append` or `remove`; a body or a section takes `replace`, `prepend` or `append`. Repeat `--content` to write a list-valued property such as tags or aliases.
+
+A write changes only the keys it names. A property edit keeps the key's place and the note's own list style, and a list with no items writes `[]` instead of deleting the key. A value knapper cannot edit as a line — a nested mapping, an anchor, a block scalar — refuses the write and names what it found, rather than re-styling the block.
 
 **Delete a note:**
 

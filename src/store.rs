@@ -817,7 +817,7 @@ impl Store {
                 mtime        = excluded.mtime,
                 indexed_at   = excluded.indexed_at,
                 docid        = excluded.docid,
-                created_by   = excluded.created_by,
+                created_by   = COALESCE(excluded.created_by, files.created_by),
                 note_date    = excluded.note_date",
             params![path, hash, mtime, now, docid, created_by, note_date],
         )?;
@@ -4406,6 +4406,140 @@ mod tests {
             .unwrap();
         let rec = store.get_file("notes/test.md").unwrap().unwrap();
         assert_eq!(rec.created_by, None);
+    }
+
+    // ── `created_by` survives a reindex (#92 follow-up) ───────────
+    //
+    // `created_by` is provenance set once at creation. A reindex re-derives
+    // it from the note's frontmatter, which is `None` for a note the write
+    // pipeline made on this branch — `create` stamps no key of its own beyond
+    // its resolved tags. The upsert must not let that `None` clear a value
+    // the row already holds.
+
+    /// The bug: a row that holds `created_by` keeps it when a later
+    /// `insert_file` for the same path — a reindex reading no key from the
+    /// note's frontmatter — passes `None`.
+    #[test]
+    fn a_stored_created_by_survives_a_later_insert_with_no_value() {
+        let store = Store::open_memory().unwrap();
+        let docid = generate_docid("notes/test.md");
+        store
+            .insert_file("notes/test.md", "hash1", 100, &docid, Some("cli"), None)
+            .unwrap();
+
+        // A reindex: same path, no `created_by` read from the frontmatter.
+        store
+            .insert_file("notes/test.md", "hash2", 200, &docid, None, None)
+            .unwrap();
+
+        let rec = store.get_file("notes/test.md").unwrap().unwrap();
+        assert_eq!(rec.created_by, Some("cli".to_string()));
+    }
+
+    /// A later `insert_file` that does carry a value still overwrites the
+    /// stored one, so a genuine change of agent is recorded rather than
+    /// pinned forever by the fix above.
+    #[test]
+    fn a_later_insert_with_a_value_still_overwrites_the_stored_created_by() {
+        let store = Store::open_memory().unwrap();
+        let docid = generate_docid("notes/test.md");
+        store
+            .insert_file("notes/test.md", "hash1", 100, &docid, Some("cli"), None)
+            .unwrap();
+
+        store
+            .insert_file(
+                "notes/test.md",
+                "hash2",
+                200,
+                &docid,
+                Some("mcp-server"),
+                None,
+            )
+            .unwrap();
+
+        let rec = store.get_file("notes/test.md").unwrap().unwrap();
+        assert_eq!(rec.created_by, Some("mcp-server".to_string()));
+    }
+
+    /// The `COALESCE` on `created_by` must not spread to the other upserted
+    /// columns: `content_hash` and `mtime` still follow the second insert
+    /// exactly, the way they did before this fix.
+    #[test]
+    fn the_other_upserted_columns_still_follow_a_later_insert() {
+        let store = Store::open_memory().unwrap();
+        let docid = generate_docid("notes/test.md");
+        store
+            .insert_file("notes/test.md", "hash1", 100, &docid, Some("cli"), None)
+            .unwrap();
+
+        store
+            .insert_file("notes/test.md", "hash2", 200, &docid, None, None)
+            .unwrap();
+
+        let rec = store.get_file("notes/test.md").unwrap().unwrap();
+        assert_eq!(rec.content_hash, "hash2");
+        assert_eq!(rec.mtime, 200);
+    }
+
+    /// End to end: a note made through the write pipeline carries
+    /// `created_by` immediately, and a later reindex — a watcher event or
+    /// `knapper index` finding the file unchanged-but-rescanned — must not
+    /// clear it. The note still answers a `list_files` query filtered on
+    /// that `created_by`, which is the user-facing symptom (#92 follow-up).
+    #[test]
+    fn a_reindexed_note_still_matches_its_created_by_filter() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let store = Store::open_memory().unwrap();
+        let mut embedder = crate::llm::MockLlm::new(32);
+        let config = crate::config::Config::default();
+
+        let written = crate::writer::create_note(
+            crate::writer::CreateNoteInput {
+                content: "Some content.\n".to_string(),
+                filename: "provenance-check".into(),
+                type_hint: None,
+                tags: vec![],
+                folder: Some("notes".into()),
+                created_by: "cli".into(),
+                auto_link: Some(false),
+            },
+            &store,
+            &mut embedder,
+            crate::prefix::EmbedComposition::from_config(&config),
+            config.chunk_options(),
+            root,
+            None,
+        )
+        .unwrap();
+
+        let path = written.path.clone();
+        let on_disk = std::fs::read_to_string(root.join(&path)).unwrap();
+
+        // The note carries no `created_by:` key of its own (#92), so a
+        // reindex over it — the watcher, or `knapper index` — extracts
+        // `None` from its frontmatter.
+        crate::indexer::index_file(
+            &path,
+            &on_disk,
+            "a-different-hash",
+            &store,
+            &mut embedder,
+            root,
+            &config,
+        )
+        .unwrap();
+
+        let rec = store.get_file(&path).unwrap().unwrap();
+        assert_eq!(rec.created_by, Some("cli".to_string()));
+
+        let scope = crate::tags::Scope::default();
+        let filtered = store.list_files(&scope, Some("cli"), None).unwrap();
+        assert!(
+            filtered.iter().any(|f| f.path == path),
+            "the created_by filter dropped the reindexed note: {filtered:#?}"
+        );
     }
 
     #[test]

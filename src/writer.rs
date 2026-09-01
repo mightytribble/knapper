@@ -48,21 +48,6 @@ pub struct EditResult {
     pub mode: String,
 }
 
-/// One change to a note's frontmatter. `AddTo` and `RemoveFrom` name the
-/// property they change, so an edit to `status` cannot reach the `tags` list.
-/// The four variants that wrote the key into their own name — `AddTag`,
-/// `RemoveTag`, `AddAlias`, `RemoveAlias` — were exact aliases of these two
-/// with `tags` or `aliases` inlined, and a routing table that falls back to
-/// one of them writes to the wrong property whenever the key is a third one
-/// (#62).
-#[derive(Debug, Clone)]
-pub enum FrontmatterOp {
-    Set(String, String),
-    Remove(String),
-    AddTo(String, String),
-    RemoveFrom(String, String),
-}
-
 /// What one edit addresses. A note has three addressable things: its body,
 /// a section of its body, and a frontmatter property. One edit names one of
 /// them, so two targets are unrepresentable rather than rejected (#62).
@@ -109,6 +94,10 @@ pub struct WriteResult {
     pub folder: String,
     pub confidence: f64,
     pub strategy: String,
+    /// Why the note landed where it did. `create` fills it from placement;
+    /// a write with no placement to explain leaves it empty.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub reason: String,
 }
 
 // ── Helper functions ────────────────────────────────────────────
@@ -132,55 +121,6 @@ pub fn normalize_filename(name: &str) -> String {
     } else {
         format!("{cleaned}.md")
     }
-}
-
-/// Optional placement suggestion metadata for inbox notes.
-pub struct PlacementSuggestion {
-    pub suggested_folder: String,
-    pub confidence: f64,
-    pub reason: String,
-}
-
-/// Build YAML frontmatter string.
-pub fn build_frontmatter(
-    tags: &[String],
-    created_by: Option<&str>,
-    aliases: Option<&[String]>,
-    suggestion: Option<&PlacementSuggestion>,
-) -> String {
-    let mut fm = String::from("---\n");
-
-    if !tags.is_empty() {
-        fm.push_str("tags:\n");
-        for tag in tags {
-            fm.push_str(&format!("  - {}\n", tag));
-        }
-    }
-
-    if let Some(aliases) = aliases
-        && !aliases.is_empty()
-    {
-        fm.push_str("aliases:\n");
-        for alias in aliases {
-            fm.push_str(&format!("  - {}\n", alias));
-        }
-    }
-
-    fm.push_str(&format!("created: {}\n", today_date()));
-
-    if let Some(by) = created_by {
-        fm.push_str(&format!("created_by: {}\n", by));
-    }
-
-    // Placement suggestion for inbox notes — user sees why it landed here
-    if let Some(s) = suggestion {
-        fm.push_str(&format!("suggested_folder: {}\n", s.suggested_folder));
-        fm.push_str(&format!("confidence: {:.2}\n", s.confidence));
-        fm.push_str(&format!("reason: \"{}\"\n", s.reason));
-    }
-
-    fm.push_str("---\n\n");
-    fm
 }
 
 /// Split content into (frontmatter_string, body_string).
@@ -307,72 +247,6 @@ pub(crate) fn parse_frontmatter_fields(
     }
 
     (scalars, tags, aliases)
-}
-
-/// Build a merged frontmatter block from auto-generated fields + user-provided fields.
-///
-/// - `tags` and `aliases` are merged (deduplicated), user values included
-/// - `created` and `created_by` always use auto-generated values
-/// - All other user fields are passed through
-fn build_merged_frontmatter(
-    auto_tags: &[String],
-    created_by: Option<&str>,
-    suggestion: Option<&PlacementSuggestion>,
-    user_scalars: &BTreeMap<String, String>,
-    user_tags: &[String],
-    user_aliases: &[String],
-) -> String {
-    // Merge tags: auto first, then user, deduplicated
-    let mut merged_tags: Vec<String> = auto_tags.to_vec();
-    for t in user_tags {
-        if !merged_tags.iter().any(|existing| existing == t) {
-            merged_tags.push(t.clone());
-        }
-    }
-
-    // Merge aliases: just user aliases (auto has none by default from create_note)
-    let merged_aliases: Vec<String> = user_aliases.to_vec();
-
-    let mut fm = String::from("---\n");
-
-    if !merged_tags.is_empty() {
-        fm.push_str("tags:\n");
-        for tag in &merged_tags {
-            fm.push_str(&format!("  - {}\n", tag));
-        }
-    }
-
-    if !merged_aliases.is_empty() {
-        fm.push_str("aliases:\n");
-        for alias in &merged_aliases {
-            fm.push_str(&format!("  - {}\n", alias));
-        }
-    }
-
-    // Always auto-generated
-    fm.push_str(&format!("created: {}\n", today_date()));
-
-    if let Some(by) = created_by {
-        fm.push_str(&format!("created_by: {}\n", by));
-    }
-
-    // User scalar fields (skip created/created_by — always auto-generated)
-    for (key, val) in user_scalars {
-        match key.as_str() {
-            "created" | "created_by" => continue,
-            _ => fm.push_str(&format!("{}: {}\n", key, val)),
-        }
-    }
-
-    // Placement suggestion for inbox notes
-    if let Some(s) = suggestion {
-        fm.push_str(&format!("suggested_folder: {}\n", s.suggested_folder));
-        fm.push_str(&format!("confidence: {:.2}\n", s.confidence));
-        fm.push_str(&format!("reason: \"{}\"\n", s.reason));
-    }
-
-    fm.push_str("---\n\n");
-    fm
 }
 
 /// Returns today's date as "YYYY-MM-DD".
@@ -600,37 +474,17 @@ pub fn create_note(
         placement::place_note(&content_with_links, &hints, profile, store, Some(embedder))?
     };
 
-    // Step 5: Build frontmatter and assemble content
-    // Split user frontmatter from body so we can merge instead of duplicate
-    let (user_fm, body) = split_frontmatter(&content_with_links);
-    let (user_scalars, user_tags, user_aliases) = if !user_fm.is_empty() {
-        parse_frontmatter_fields(&user_fm)
+    // Step 5: The caller's frontmatter is the note's frontmatter. The only
+    // key create writes is `tags`, and only what `--tags` resolved to (#92).
+    let mut block = crate::frontmatter::Block::parse_or_open(&content_with_links)?;
+    for tag in &resolved_tags {
+        block.add_to_list("tags", tag)?;
+    }
+    let full_content = if block.is_empty() {
+        content_with_links.clone()
     } else {
-        (BTreeMap::new(), Vec::new(), Vec::new())
+        block.render()
     };
-
-    // If placement fell back to inbox with a suggestion, inject suggested_folder metadata
-    let suggestion = if placement_result.strategy == placement::PlacementStrategy::InboxFallback {
-        placement_result
-            .suggestion
-            .as_ref()
-            .map(|(folder, conf)| PlacementSuggestion {
-                suggested_folder: folder.clone(),
-                confidence: *conf,
-                reason: format!("semantic similarity: {conf:.3}"),
-            })
-    } else {
-        None
-    };
-    let frontmatter = build_merged_frontmatter(
-        &resolved_tags,
-        Some(&input.created_by),
-        suggestion.as_ref(),
-        &user_scalars,
-        &user_tags,
-        &user_aliases,
-    );
-    let full_content = format!("{}{}", frontmatter, body);
 
     let rel_path = format!("{}/{}", placement_result.folder, filename);
     let final_path = vault_path.join(&rel_path);
@@ -743,6 +597,7 @@ pub fn create_note(
         folder: placement_result.folder,
         confidence: placement_result.confidence,
         strategy: strategy_name,
+        reason: placement_result.reason.clone(),
     })
 }
 
@@ -822,139 +677,58 @@ fn edit_mode_name(mode: &EditMode) -> &'static str {
 /// so that `update_note` can apply a list of them to one string and write once
 /// (#62).
 ///
-/// With `preserve_frontmatter`, the frontmatter is split off, `mode` is
-/// applied to the body alone, and the two are reassembled. Without it,
-/// `Replace` returns `new` and `Append`/`Prepend` join the whole text.
+/// With `preserve_frontmatter`, [`crate::frontmatter::split_body`] finds the
+/// block's own byte span — the opening fence through the separator after the
+/// closing one — with no property edit's worth of parsing, `mode` is applied
+/// to whatever follows that span, and the two are joined back verbatim. The
+/// frontmatter is never split into a string and rejoined, so it cannot pick
+/// up a rebuilt fence, a normalised line ending or a shifted blank line the
+/// way `markdown::split_frontmatter` did (#92, I5). A body edit does not
+/// read or write a single frontmatter byte, so it does not need the block's
+/// entries to parse either: a non-mapping block or one holding a duplicate
+/// key still has a byte span `split_body` can find, and carries that block
+/// through untouched, however malformed, rather than refusing an edit to
+/// content the malformed part is not even in (#92, R2 regression). Without
+/// `preserve_frontmatter`, `Replace` returns `new` and `Append`/`Prepend`
+/// join the whole text.
 ///
 /// `Remove` is a property mode and has no meaning for a body, so it returns
 /// the text unchanged. `apply_note_edits` rejects it before it reaches here
 /// and no other caller passes it, so the arm exists to keep a mode a body
 /// cannot express from deleting one (#62).
+///
+/// Errors only when the block's own span is unknowable — an opening `---`
+/// with no closing one — because a body edit that cannot find where the
+/// block ends cannot promise to leave it untouched.
 pub fn apply_body_edit(
     content: &str,
     new: &str,
     mode: EditMode,
     preserve_frontmatter: bool,
-) -> String {
+) -> Result<String> {
     if mode == EditMode::Remove {
-        return content.to_string();
+        return Ok(content.to_string());
     }
-    if preserve_frontmatter {
-        let (maybe_frontmatter, old_body) = crate::markdown::split_frontmatter(content);
-        if let Some(frontmatter) = maybe_frontmatter {
-            // `split_frontmatter` rejoins the body as `lines[i+1..].join("\n")`,
-            // so a note written `---\nfm\n---\n\nbody` hands back a body that
-            // still carries the break after the closing `---`. The reassembly
-            // below writes its own `\n\n`, so this break has to go: keeping it
-            // added one blank line to the note on every append, and they
-            // accumulated call after call (#62).
-            let old_body = old_body.trim_start_matches('\n');
-            let new_body = match mode {
-                EditMode::Replace => new.to_string(),
-                EditMode::Append => format!("{}\n{}", old_body.trim_end(), new),
-                EditMode::Prepend => format!("{}\n{}", new.trim_end(), old_body),
-                EditMode::Remove => old_body.to_string(),
-            };
-            return format!("---\n{}\n---\n\n{}", frontmatter, new_body);
-        }
-        // No existing frontmatter to preserve — fall through to the whole-text
-        // join below, so Append and Prepend still keep the note's own body.
+    if preserve_frontmatter
+        && let Some((block, old_body)) = crate::frontmatter::split_body(content)?
+    {
+        let new_body = match mode {
+            EditMode::Replace => new.to_string(),
+            EditMode::Append => format!("{}\n{}", old_body.trim_end(), new),
+            EditMode::Prepend => format!("{}\n{}", new.trim_end(), old_body),
+            EditMode::Remove => old_body,
+        };
+        return Ok(format!("{block}{new_body}"));
     }
-    match mode {
+    // No existing frontmatter to preserve — or `preserve_frontmatter` is
+    // false — so join the whole text; `Append` and `Prepend` still keep the
+    // note's own content either way.
+    Ok(match mode {
         EditMode::Replace => new.to_string(),
         EditMode::Append => format!("{}\n{}", content.trim_end(), new),
         EditMode::Prepend => format!("{}\n{}", new.trim_end(), content),
         EditMode::Remove => content.to_string(),
-    }
-}
-
-/// Apply a list of frontmatter operations to a note's text. The transform is
-/// separate from the I/O so that `update_note` can apply a list of them to
-/// one string and write once (#62).
-///
-/// Uses `crate::markdown::split_frontmatter()` to extract raw YAML, then applies
-/// operations sequentially using `serde_yaml`.
-pub fn apply_frontmatter_ops(content: &str, ops: &[FrontmatterOp]) -> Result<String> {
-    // Split frontmatter using crate::markdown::split_frontmatter (returns raw YAML without delimiters)
-    let (maybe_fm, body) = crate::markdown::split_frontmatter(content);
-
-    // Parse YAML into a Mapping (create empty mapping if no frontmatter)
-    let mut mapping: serde_yaml::Mapping = if let Some(ref fm) = maybe_fm {
-        let val: serde_yaml::Value = serde_yaml::from_str(fm)
-            .unwrap_or(serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
-        match val {
-            serde_yaml::Value::Mapping(m) => m,
-            _ => serde_yaml::Mapping::new(),
-        }
-    } else {
-        serde_yaml::Mapping::new()
-    };
-
-    // Apply operations sequentially
-    for op in ops {
-        match op {
-            FrontmatterOp::Set(key, value) => {
-                mapping.insert(
-                    serde_yaml::Value::String(key.clone()),
-                    serde_yaml::Value::String(value.clone()),
-                );
-            }
-            FrontmatterOp::Remove(key) => {
-                mapping.remove(serde_yaml::Value::String(key.clone()));
-            }
-            FrontmatterOp::AddTo(key, value) => {
-                apply_add_to_sequence(&mut mapping, key, value);
-            }
-            FrontmatterOp::RemoveFrom(key, value) => {
-                apply_remove_from_sequence(&mut mapping, key, value);
-            }
-        }
-    }
-
-    // Serialize back to YAML
-    let yaml_str = serde_yaml::to_string(&serde_yaml::Value::Mapping(mapping))?;
-
-    // Reassemble: ---\n{yaml}---\n\n{body}
-    // serde_yaml::to_string adds a trailing newline, so we don't need an extra one before ---.
-    // `split_frontmatter`'s found-delimiter branch rejoins the body with `lines().join("\n")`,
-    // which drops the body's own final line break — restore it here so the file keeps ending
-    // in one, matching every other write path in this module. The same rejoin also leaves the
-    // body carrying the break after the closing `---` (the defect `apply_body_edit` fixes the
-    // same way for its own reassembly, #62); the line below writes its own `\n\n` separator, so
-    // that leading break has to go, or it pushes the body one line further down on every call.
-    let body = body.trim_start_matches('\n');
-    let body = if body.is_empty() || body.ends_with('\n') {
-        body.to_string()
-    } else {
-        format!("{}\n", body)
-    };
-    Ok(format!("---\n{}---\n\n{}", yaml_str, body))
-}
-
-/// Helper: add a value to a YAML sequence field (create if missing, skip duplicates).
-fn apply_add_to_sequence(mapping: &mut serde_yaml::Mapping, key: &str, value: &str) {
-    let key_val = serde_yaml::Value::String(key.to_string());
-    let new_item = serde_yaml::Value::String(value.to_string());
-
-    let seq = mapping
-        .entry(key_val)
-        .or_insert_with(|| serde_yaml::Value::Sequence(vec![]));
-
-    if let serde_yaml::Value::Sequence(items) = seq
-        && !items.contains(&new_item)
-    {
-        items.push(new_item);
-    }
-}
-
-/// Helper: remove a value from a YAML sequence field.
-fn apply_remove_from_sequence(mapping: &mut serde_yaml::Mapping, key: &str, value: &str) {
-    let key_val = serde_yaml::Value::String(key.to_string());
-    let remove_item = serde_yaml::Value::String(value.to_string());
-
-    if let Some(serde_yaml::Value::Sequence(items)) = mapping.get_mut(&key_val) {
-        items.retain(|item| item != &remove_item);
-    }
+    })
 }
 
 /// The text one edit writes. A body and a section take one string, so a list
@@ -972,52 +746,35 @@ fn text_of(edit: &NoteEdit) -> Result<String> {
     }
 }
 
-/// The frontmatter operations one property edit means. Every key routes
-/// through `AddTo` and `RemoveFrom`, which carry the key, so an append to
-/// `status` cannot reach the `tags` list (#62).
-fn property_ops(
+/// Apply one property edit to `block`. Every mode names one operation on
+/// one key, so an append to `status` cannot reach the `tags` list (#62).
+fn apply_property_edit(
+    block: &mut crate::frontmatter::Block,
     key: &str,
     mode: EditMode,
     content: Option<&EditContent>,
-) -> Result<Vec<FrontmatterOp>> {
-    Ok(match (mode, content) {
-        (EditMode::Replace, Some(EditContent::Text(v))) => {
-            vec![FrontmatterOp::Set(key.to_string(), v.clone())]
-        }
-        // `Set` carries a scalar, so a whole sequence is a remove and then
-        // one add per item.
-        (EditMode::Replace, Some(EditContent::List(vs))) => {
-            let mut ops = vec![FrontmatterOp::Remove(key.to_string())];
-            ops.extend(
-                vs.iter()
-                    .map(|v| FrontmatterOp::AddTo(key.to_string(), v.clone())),
-            );
-            ops
-        }
-        (EditMode::Append, Some(EditContent::Text(v))) => {
-            vec![FrontmatterOp::AddTo(key.to_string(), v.clone())]
-        }
-        (EditMode::Remove, None) => vec![FrontmatterOp::Remove(key.to_string())],
-        (EditMode::Remove, Some(EditContent::Text(v))) => {
-            vec![FrontmatterOp::RemoveFrom(key.to_string(), v.clone())]
-        }
+) -> Result<()> {
+    match (mode, content) {
+        (EditMode::Replace, Some(EditContent::Text(v))) => block.set_scalar(key, v),
+        (EditMode::Replace, Some(EditContent::List(vs))) => block.set_list(key, vs),
+        (EditMode::Append, Some(EditContent::Text(v))) => block.add_to_list(key, v),
+        (EditMode::Remove, None) => block.remove(key),
+        (EditMode::Remove, Some(EditContent::Text(v))) => block.remove_from_list(key, v),
         (mode, content) => anyhow::bail!(
             "a {} on property '{key}' with {} content has no meaning",
             edit_mode_name(&mode),
             if content.is_some() { "this" } else { "no" }
         ),
-    })
+    }
 }
 
 /// Apply every edit to a note's text, in order. Pure, so `update_note` can
 /// write the result once — one file write, one conflict check and one
 /// re-index for a whole batch (#62).
 ///
-/// A run of property edits becomes one `apply_frontmatter_ops` call. The ops
-/// already apply in order over one YAML mapping, so the result is the same,
-/// but each call reassembles the note and each reassembly adds a line break
-/// between the frontmatter and the body. One call per edit therefore pushes
-/// the body one line down for every property edit in the list.
+/// A run of property edits becomes one pass over one `Block`, so the run is
+/// one parse and one render. The block splices onto the note's own body, so
+/// no number of property edits moves the body a line.
 pub fn apply_note_edits(content: &str, edits: &[NoteEdit]) -> Result<String> {
     let mut text = content.to_string();
     let mut rest = edits;
@@ -1029,14 +786,14 @@ pub fn apply_note_edits(content: &str, edits: &[NoteEdit]) -> Result<String> {
                     .position(|e| !matches!(e.target, EditTarget::Property(_)))
                     .unwrap_or(rest.len());
                 let (properties, tail) = rest.split_at(run);
-                let mut ops = Vec::new();
+                let mut block = crate::frontmatter::Block::parse_or_open(&text)?;
                 for property in properties {
                     let EditTarget::Property(key) = &property.target else {
                         bail!("a run of property edits holds property edits alone");
                     };
-                    ops.extend(property_ops(key, property.mode, property.content.as_ref())?);
+                    apply_property_edit(&mut block, key, property.mode, property.content.as_ref())?;
                 }
-                text = apply_frontmatter_ops(&text, &ops)?;
+                text = block.render();
                 rest = tail;
             }
             EditTarget::Body => {
@@ -1044,7 +801,7 @@ pub fn apply_note_edits(content: &str, edits: &[NoteEdit]) -> Result<String> {
                     bail!("Remove has no meaning for a body");
                 }
                 let new = text_of(edit)?;
-                text = apply_body_edit(&text, &new, edit.mode, true);
+                text = apply_body_edit(&text, &new, edit.mode, true)?;
                 rest = &rest[1..];
             }
             EditTarget::Section(heading) => {
@@ -1194,6 +951,7 @@ pub fn move_note(
         folder: new_folder.to_string(),
         confidence: 1.0,
         strategy: "Move".to_string(),
+        reason: String::new(),
     })
 }
 
@@ -1313,32 +1071,27 @@ pub fn archive_note(
     let new_rel_path = format!("{}/{}", archive_folder, file_record.path);
     let new_full_path = vault_path.join(&new_rel_path);
 
-    // Read content and inject archive frontmatter
+    // Archive's three keys go into the block the note already has, so every
+    // key the note carried is still there when it comes back (#92).
     let content = std::fs::read_to_string(&old_path)?;
-    let (old_fm, body) = split_frontmatter(&content);
-
-    // Keep the note's own `tags:` property and add the archive tag. The source
-    // is the property, not `FileRecord.tags`: the junction also holds the body
-    // hashtags (#60), which stay in the body.
-    let (_, mut tags, _) = parse_frontmatter_fields(&old_fm);
-    if !tags.contains(&"archived".to_string()) {
-        tags.push("archived".to_string());
+    let mut block = crate::frontmatter::Block::parse_or_open(&content)?;
+    // A note that already holds one of these three keys cannot be archived
+    // without losing something: overwriting the note's own value, or —
+    // since `unarchive` removes exactly these three — leaving no way to
+    // tell the note's own key from the one this write adds. Refusing is
+    // the honest answer; the file is not touched (#92, I7).
+    for key in ["archived", "archived_at", "archived_from"] {
+        if block.value(key).is_some() {
+            bail!(
+                "note already holds `{key}`; knapper cannot archive it without losing that note's own value"
+            );
+        }
     }
-
-    let archive_fm = format!(
-        "---\n\
-         archived: true\n\
-         archived_at: {}\n\
-         archived_from: {}\n\
-         tags:\n{}\
-         ---\n\n",
-        today_date(),
-        file_record.path,
-        tags.iter()
-            .map(|t| format!("  - {}\n", t))
-            .collect::<String>(),
-    );
-    let new_content = format!("{}{}", archive_fm, body);
+    let tags = block.list("tags");
+    block.set_bool("archived", true)?;
+    block.set_scalar("archived_at", &today_date())?;
+    block.set_scalar("archived_from", &file_record.path)?;
+    let new_content = block.render();
 
     // Ensure target directory
     if let Some(parent) = new_full_path.parent() {
@@ -1372,6 +1125,7 @@ pub fn archive_note(
         folder: archive_folder.to_string(),
         confidence: 1.0,
         strategy: "Archive".to_string(),
+        reason: String::new(),
     })
 }
 
@@ -1392,17 +1146,12 @@ pub fn unarchive_note(
     }
 
     let content = std::fs::read_to_string(&archive_path)?;
-    let (fm_str, body) = split_frontmatter(&content);
-
-    // Extract archived_from from frontmatter
-    let original_path = fm_str
-        .lines()
-        .find(|l| l.starts_with("archived_from:"))
-        .and_then(|l| l.strip_prefix("archived_from:"))
-        .map(|s| s.trim().to_string())
-        .ok_or_else(|| {
-            anyhow::anyhow!("no archived_from in frontmatter — cannot determine original location")
-        })?;
+    let mut block = crate::frontmatter::Block::parse(&content)?.ok_or_else(|| {
+        anyhow::anyhow!("no archived_from in frontmatter — cannot determine original location")
+    })?;
+    let original_path = block.scalar("archived_from").ok_or_else(|| {
+        anyhow::anyhow!("no archived_from in frontmatter — cannot determine original location")
+    })?;
 
     let restore_full_path = vault_path.join(&original_path);
 
@@ -1413,32 +1162,25 @@ pub fn unarchive_note(
         );
     }
 
-    // Rebuild frontmatter without archive fields
-    let mut tags: Vec<String> = fm_str
-        .lines()
-        .skip_while(|l| !l.starts_with("tags:"))
-        .skip(1)
-        .take_while(|l| l.starts_with("  - "))
-        .filter_map(|l| l.strip_prefix("  - "))
-        .map(|s| s.trim().to_string())
-        .filter(|t| t != "archived")
-        .collect();
-    if tags.is_empty() {
-        // Try inline tags format
-        if let Some(line) = fm_str.lines().find(|l| l.starts_with("tags:"))
-            && let Some(rest) = line.strip_prefix("tags:")
-        {
-            let rest = rest.trim().trim_start_matches('[').trim_end_matches(']');
-            tags = rest
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty() && s != "archived")
-                .collect();
-        }
-    }
-
-    let new_fm = build_frontmatter(&tags, None, None, None);
-    let restored_content = format!("{}{}", new_fm, body);
+    block.remove("archived")?;
+    block.remove("archived_at")?;
+    block.remove("archived_from")?;
+    // A note archived by a version of knapper before #92 got `archived`
+    // written into its own `tags` list, alongside the three keys above.
+    // This build's `archive` no longer does that, but an old note still
+    // carries the tag, and it must not come back into the vocabulary just
+    // because the note is unarchived.
+    block.remove_from_list("tags", "archived")?;
+    let tags = block.list("tags");
+    // A note that had no block before it was archived gets none back.
+    // `is_empty` counts keys only, so a block holding just a comment or a
+    // blank line still reports empty; checking `is_blank` instead keeps
+    // those bytes rather than discarding the fences around them (#92, I2).
+    let restored_content = if block.is_blank() {
+        block.body().to_string()
+    } else {
+        block.render()
+    };
 
     // Ensure target directory
     if let Some(parent) = restore_full_path.parent() {
@@ -1511,6 +1253,7 @@ pub fn unarchive_note(
         folder,
         confidence: 1.0,
         strategy: "Unarchive".to_string(),
+        reason: String::new(),
     })
 }
 
@@ -1612,37 +1355,107 @@ mod tests {
     }
 
     #[test]
-    fn frontmatter_ops_are_a_pure_transform_of_the_text() {
-        let doc = "---\ntags:\n  - a\n---\n\nbody\n";
-        let out = apply_frontmatter_ops(
-            doc,
-            &[
-                FrontmatterOp::AddTo("tags".into(), "b".into()),
-                FrontmatterOp::Set("status".into(), "done".into()),
-            ],
-        )
-        .unwrap();
-        assert!(out.contains("- a"));
-        assert!(out.contains("- b"));
-        assert!(out.contains("status: done"));
-        assert!(out.ends_with("body\n"));
+    fn a_property_edit_keeps_the_key_in_place_and_in_its_style() {
+        let note = "---\nname: Probe\naliases: []\ntags: [type/lore, realm/rudd]\n---\n\nBody.\n";
+        let edits = vec![NoteEdit {
+            target: EditTarget::Property("tags".into()),
+            mode: EditMode::Replace,
+            content: Some(EditContent::List(vec![
+                "type/lore".into(),
+                "realm/skaldi".into(),
+            ])),
+        }];
+        assert_eq!(
+            apply_note_edits(note, &edits).unwrap(),
+            "---\nname: Probe\naliases: []\ntags: [type/lore, realm/skaldi]\n---\n\nBody.\n"
+        );
     }
 
-    /// `split_frontmatter` rejoins the body as `lines[i+1..].join("\n")`, so
-    /// the usual `---\nfm\n---\n\nbody` layout hands back a body that still
-    /// carries the line break after the closing `---`. The reassembly below
-    /// supplies its own `\n\n`, so adding both put one blank line into the
-    /// note per append and they accumulated. The `write append` call this
-    /// replaced added none, and `update`'s body append is byte-identical to it
-    /// (#62).
+    #[test]
+    fn a_property_replaced_with_an_empty_list_keeps_the_key() {
+        let note = "---\nname: Probe\naliases: [Old]\n---\n\nBody.\n";
+        let edits = vec![NoteEdit {
+            target: EditTarget::Property("aliases".into()),
+            mode: EditMode::Replace,
+            content: Some(EditContent::List(vec![])),
+        }];
+        assert_eq!(
+            apply_note_edits(note, &edits).unwrap(),
+            "---\nname: Probe\naliases: []\n---\n\nBody.\n"
+        );
+    }
+
+    #[test]
+    fn a_run_of_property_edits_is_one_pass_and_does_not_move_the_body() {
+        let note = "---\nname: Probe\ntags: [a]\n---\n\nBody.\n";
+        let edits = vec![
+            NoteEdit {
+                target: EditTarget::Property("tags".into()),
+                mode: EditMode::Append,
+                content: Some(EditContent::Text("b".into())),
+            },
+            NoteEdit {
+                target: EditTarget::Property("status".into()),
+                mode: EditMode::Replace,
+                content: Some(EditContent::Text("draft".into())),
+            },
+            NoteEdit {
+                target: EditTarget::Property("name".into()),
+                mode: EditMode::Remove,
+                content: None,
+            },
+        ];
+        assert_eq!(
+            apply_note_edits(note, &edits).unwrap(),
+            "---\ntags: [a, b]\nstatus: draft\n---\n\nBody.\n"
+        );
+    }
+
+    #[test]
+    fn a_body_edit_after_a_property_edit_still_sees_the_frontmatter() {
+        let note = "---\nname: Probe\n---\n\nOld body.\n";
+        let edits = vec![
+            NoteEdit {
+                target: EditTarget::Property("name".into()),
+                mode: EditMode::Replace,
+                content: Some(EditContent::Text("Renamed".into())),
+            },
+            NoteEdit {
+                target: EditTarget::Body,
+                mode: EditMode::Replace,
+                content: Some(EditContent::Text("New body.".into())),
+            },
+        ];
+        let out = apply_note_edits(note, &edits).unwrap();
+        assert!(out.starts_with("---\nname: Renamed\n---\n"), "{out}");
+        assert!(out.contains("New body."), "{out}");
+        assert!(!out.contains("Old body."), "{out}");
+    }
+
+    #[test]
+    fn a_property_edit_on_a_value_it_cannot_address_writes_nothing() {
+        let note = "---\nname: Probe\nnested:\n  inner: 1\n---\n\nBody.\n";
+        let edits = vec![NoteEdit {
+            target: EditTarget::Property("nested".into()),
+            mode: EditMode::Replace,
+            content: Some(EditContent::Text("flat".into())),
+        }];
+        let err = apply_note_edits(note, &edits).unwrap_err();
+        assert!(err.to_string().contains("nested mapping"), "{err}");
+    }
+
+    /// `Block::body()` is the text past the blank line that separates it
+    /// from the block, so nothing here has to trim or re-add that break —
+    /// `block.render()` supplies it once, from the block's own `separator`
+    /// field, however many times a body is appended to (#62, #92 I5).
     #[test]
     fn successive_body_appends_add_no_blank_line_of_their_own() {
         let doc = "---\ntags:\n  - a\n---\n\nbody line\n";
 
-        let once = apply_body_edit(doc, "first", EditMode::Append, true);
+        let once = apply_body_edit(doc, "first", EditMode::Append, true).unwrap();
         assert_eq!(once, "---\ntags:\n  - a\n---\n\nbody line\nfirst");
 
-        let twice = apply_body_edit(&once, "second", EditMode::Append, true);
+        let twice = apply_body_edit(&once, "second", EditMode::Append, true).unwrap();
         assert_eq!(twice, "---\ntags:\n  - a\n---\n\nbody line\nfirst\nsecond");
     }
 
@@ -1653,15 +1466,15 @@ mod tests {
     fn a_body_append_matches_the_call_it_replaces() {
         let doc = "---\ntags:\n  - a\n---\n\nbody line\n";
         assert_eq!(
-            apply_body_edit(doc, "first", EditMode::Append, true),
-            apply_body_edit(doc, "first", EditMode::Append, false),
+            apply_body_edit(doc, "first", EditMode::Append, true).unwrap(),
+            apply_body_edit(doc, "first", EditMode::Append, false).unwrap(),
         );
     }
 
     #[test]
     fn appending_with_preserve_frontmatter_on_a_note_with_none_keeps_the_body() {
         let doc = "old body\n";
-        let out = apply_body_edit(doc, "new stuff", EditMode::Append, true);
+        let out = apply_body_edit(doc, "new stuff", EditMode::Append, true).unwrap();
         assert!(out.contains("old body"), "the existing body must survive");
         assert!(out.contains("new stuff"));
     }
@@ -1669,9 +1482,98 @@ mod tests {
     #[test]
     fn prepending_with_preserve_frontmatter_on_a_note_with_none_keeps_the_body() {
         let doc = "old body\n";
-        let out = apply_body_edit(doc, "new stuff", EditMode::Prepend, true);
+        let out = apply_body_edit(doc, "new stuff", EditMode::Prepend, true).unwrap();
         assert!(out.contains("old body"), "the existing body must survive");
         assert!(out.contains("new stuff"));
+    }
+
+    /// `markdown::split_frontmatter` rebuilds its output with
+    /// `lines().join("\n")`, which reads a CRLF file apart on `\n` alone and
+    /// glues it back with `\n`, converting the whole note to LF. Routing
+    /// through `Block` instead never turns the frontmatter or the fences
+    /// into a `String` split on lines, so a CRLF note stays CRLF (#92, I5).
+    #[test]
+    fn a_body_edit_on_a_crlf_note_keeps_crlf_throughout() {
+        let doc = "---\r\nname: X\r\ntags: [a]\r\n---\r\n\r\nBody.\r\n";
+        let out = apply_body_edit(doc, "New body.\r\n", EditMode::Replace, true).unwrap();
+        assert_eq!(
+            out,
+            "---\r\nname: X\r\ntags: [a]\r\n---\r\n\r\nNew body.\r\n"
+        );
+    }
+
+    /// `markdown::split_frontmatter` compares `line.trim() == "---"`, so it
+    /// reads a fence with trailing whitespace as frontmatter but rebuilds
+    /// its output with a bare `"---"`, silently trimming that whitespace
+    /// away. `Block` keeps the fence line verbatim (#92, I1, I5).
+    #[test]
+    fn a_body_edit_keeps_a_fence_with_trailing_whitespace() {
+        let doc = "--- \nname: X\n--- \n\nBody.\n";
+        let out = apply_body_edit(doc, "New body.\n", EditMode::Replace, true).unwrap();
+        assert_eq!(out, "--- \nname: X\n--- \n\nNew body.\n");
+    }
+
+    /// A note whose body starts right after the closing fence, with no
+    /// blank line between them, is legal input `markdown::split_frontmatter`
+    /// accepts. The reassembly this replaced always wrote its own `\n\n`
+    /// after the fence, so a note with none gained a blank line it never
+    /// had. `Block` keeps whatever separator — empty or one blank line — it
+    /// actually parsed (#92, I5).
+    #[test]
+    fn a_body_edit_does_not_insert_a_blank_line_the_note_never_had() {
+        let doc = "---\nname: X\n---\nBody.\n";
+        let out = apply_body_edit(doc, "New body.\n", EditMode::Replace, true).unwrap();
+        assert_eq!(out, "---\nname: X\n---\nNew body.\n");
+    }
+
+    /// R2: a body edit does not touch the frontmatter at all, so a block
+    /// that is not a mapping — a top-level sequence here — must not stop
+    /// one. Before the fix, `apply_body_edit` routed through `Block::parse`,
+    /// which itemizes the block's entries and refuses this shape, blocking
+    /// an edit to content the malformed part is not even in.
+    #[test]
+    fn a_body_edit_succeeds_on_a_block_that_is_not_a_mapping() {
+        let doc = "---\n- one\n- two\n---\n\nOriginal body.\n";
+        let out = apply_body_edit(doc, "New body.\n", EditMode::Replace, true).unwrap();
+        assert_eq!(out, "---\n- one\n- two\n---\n\nNew body.\n");
+    }
+
+    /// The same, for a block holding one key twice: `Block::parse` also
+    /// refuses this because it cannot tell which of the two the note means,
+    /// which matters to a property edit and not at all to a body edit.
+    #[test]
+    fn a_body_edit_succeeds_on_a_block_holding_one_key_twice() {
+        let doc = "---\ntags: [a]\nname: X\ntags: [b]\n---\n\nOriginal body.\n";
+        let out = apply_body_edit(doc, "New body.\n", EditMode::Replace, true).unwrap();
+        assert_eq!(
+            out,
+            "---\ntags: [a]\nname: X\ntags: [b]\n---\n\nNew body.\n"
+        );
+    }
+
+    /// The boundary the fix must not move: a block with one opaque entry —
+    /// a nested mapping under one key, everything else fine — already
+    /// itemizes successfully, so it must keep succeeding exactly as before.
+    /// Only a block `parse_items` cannot itemize at all is what this fix
+    /// changes.
+    #[test]
+    fn a_body_edit_succeeds_on_a_block_holding_one_opaque_entry() {
+        let doc = "---\nname: Probe\nnested:\n  inner: 1\n---\n\nOriginal body.\n";
+        let out = apply_body_edit(doc, "New body.\n", EditMode::Replace, true).unwrap();
+        assert_eq!(
+            out,
+            "---\nname: Probe\nnested:\n  inner: 1\n---\n\nNew body.\n"
+        );
+    }
+
+    /// The one case that stays refused: an opening `---` with no closing
+    /// one, where the block's own span — not just its entries — is unknown,
+    /// so no caller can promise to leave it untouched.
+    #[test]
+    fn a_body_edit_is_still_refused_when_the_block_never_closes() {
+        let doc = "---\nname: Probe\n\nOriginal body.\n";
+        let err = apply_body_edit(doc, "New body.\n", EditMode::Replace, true).unwrap_err();
+        assert!(err.to_string().contains("never closes"), "{err}");
     }
 
     #[test]
@@ -1693,33 +1595,6 @@ mod tests {
         let out = normalize_filename("../etc/passwd");
         assert!(!out.contains('/'), "a slash survived: {out}");
         assert_eq!(out, "..etcpasswd.md");
-    }
-
-    #[test]
-    fn test_build_frontmatter() {
-        let fm = build_frontmatter(
-            &["work".to_string(), "knapper".to_string()],
-            Some("claude-code"),
-            None,
-            None,
-        );
-        assert!(fm.starts_with("---\n"));
-        assert!(fm.ends_with("---\n\n"));
-        assert!(fm.contains("work"));
-        assert!(fm.contains("created_by: claude-code"));
-    }
-
-    #[test]
-    fn test_build_frontmatter_with_aliases() {
-        let fm = build_frontmatter(
-            &["test".to_string()],
-            Some("writer"),
-            Some(&["alias1".to_string(), "alias2".to_string()]),
-            None,
-        );
-        assert!(fm.contains("aliases:"));
-        assert!(fm.contains("  - alias1"));
-        assert!(fm.contains("  - alias2"));
     }
 
     #[test]
@@ -1758,24 +1633,6 @@ mod tests {
         assert_eq!(date.len(), 10);
         assert_eq!(&date[4..5], "-");
         assert_eq!(&date[7..8], "-");
-    }
-
-    #[test]
-    fn test_build_frontmatter_with_suggestion() {
-        let suggestion = PlacementSuggestion {
-            suggested_folder: "02-Areas/Development".to_string(),
-            confidence: 0.58,
-            reason: "semantic similarity: 0.580".to_string(),
-        };
-        let fm = build_frontmatter(
-            &["work".to_string()],
-            Some("claude-code"),
-            None,
-            Some(&suggestion),
-        );
-        assert!(fm.contains("suggested_folder: 02-Areas/Development"));
-        assert!(fm.contains("confidence: 0.58"));
-        assert!(fm.contains("reason: \"semantic similarity: 0.580\""));
     }
 
     #[test]
@@ -1989,165 +1846,6 @@ mod tests {
         drop(tmp);
     }
 
-    // ── Frontmatter merge tests ────────────────────────────────────
-
-    #[test]
-    fn test_merge_user_frontmatter_produces_single_block() {
-        let user_content =
-            "---\ntitle: My Note\ntags:\n  - project\n  - work\n---\n\n# My Note content\n";
-        let (user_fm, body) = split_frontmatter(user_content);
-        assert!(!user_fm.is_empty());
-
-        let (user_scalars, user_tags, user_aliases) = parse_frontmatter_fields(&user_fm);
-        let auto_tags = vec!["project".to_string()];
-
-        let merged = build_merged_frontmatter(
-            &auto_tags,
-            Some("mcp"),
-            None,
-            &user_scalars,
-            &user_tags,
-            &user_aliases,
-        );
-        let full = format!("{}{}", merged, body);
-
-        // Count frontmatter blocks: should be exactly one
-        let fm_count = full.matches("\n---\n").count();
-        // The opening ---\n at the start + the closing \n---\n = pattern appears once for closing
-        assert!(full.starts_with("---\n"));
-        assert_eq!(fm_count, 1, "Should have exactly one closing --- delimiter");
-        assert!(full.contains("# My Note content"));
-    }
-
-    #[test]
-    fn test_merge_tags_deduplicated() {
-        let user_fm = "---\ntags:\n  - project\n  - work\n  - rust\n---\n";
-        let (user_scalars, user_tags, user_aliases) = parse_frontmatter_fields(user_fm);
-        let auto_tags = vec!["project".to_string(), "knapper".to_string()];
-
-        let merged = build_merged_frontmatter(
-            &auto_tags,
-            Some("mcp"),
-            None,
-            &user_scalars,
-            &user_tags,
-            &user_aliases,
-        );
-
-        // "project" should appear once, "knapper" from auto, "work" and "rust" from user
-        let tag_lines: Vec<&str> = merged.lines().filter(|l| l.starts_with("  - ")).collect();
-        assert_eq!(tag_lines.len(), 4);
-        assert!(merged.contains("  - project\n"));
-        assert!(merged.contains("  - knapper\n"));
-        assert!(merged.contains("  - work\n"));
-        assert!(merged.contains("  - rust\n"));
-
-        // "project" tag line should appear only once
-        let project_count = merged.matches("  - project\n").count();
-        assert_eq!(
-            project_count, 1,
-            "Duplicate tag 'project' should be deduplicated"
-        );
-    }
-
-    #[test]
-    fn test_merge_preserves_user_custom_fields() {
-        let user_fm =
-            "---\ntitle: My Project\nstatus: active\npriority: high\ntags:\n  - work\n---\n";
-        let (user_scalars, user_tags, user_aliases) = parse_frontmatter_fields(user_fm);
-        let auto_tags = vec!["project".to_string()];
-
-        let merged = build_merged_frontmatter(
-            &auto_tags,
-            Some("mcp"),
-            None,
-            &user_scalars,
-            &user_tags,
-            &user_aliases,
-        );
-
-        assert!(merged.contains("title: My Project"));
-        assert!(merged.contains("status: active"));
-        assert!(merged.contains("priority: high"));
-        assert!(merged.contains("  - work"));
-        assert!(merged.contains("  - project"));
-    }
-
-    #[test]
-    fn test_merge_created_always_auto_generated() {
-        let user_fm = "---\ncreated: 2020-01-01\ncreated_by: user\ntitle: Test\n---\n";
-        let (user_scalars, user_tags, user_aliases) = parse_frontmatter_fields(user_fm);
-        let auto_tags = vec![];
-
-        let merged = build_merged_frontmatter(
-            &auto_tags,
-            Some("mcp"),
-            None,
-            &user_scalars,
-            &user_tags,
-            &user_aliases,
-        );
-
-        // created should be today's date, not 2020-01-01
-        assert!(!merged.contains("2020-01-01"));
-        assert!(merged.contains(&format!("created: {}", today_date())));
-        // created_by should be "mcp", not "user"
-        assert!(merged.contains("created_by: mcp"));
-        assert!(!merged.contains("created_by: user"));
-        // But title should still be preserved
-        assert!(merged.contains("title: Test"));
-    }
-
-    #[test]
-    fn test_merge_content_without_frontmatter_unchanged() {
-        let content = "# Just a heading\n\nSome body text.\n";
-        let (user_fm, body) = split_frontmatter(content);
-        assert!(user_fm.is_empty());
-
-        let (user_scalars, user_tags, user_aliases) = parse_frontmatter_fields(&user_fm);
-        let auto_tags = vec!["inbox".to_string()];
-
-        let merged = build_merged_frontmatter(
-            &auto_tags,
-            Some("mcp"),
-            None,
-            &user_scalars,
-            &user_tags,
-            &user_aliases,
-        );
-        let full = format!("{}{}", merged, body);
-
-        // Should have frontmatter from auto-gen only
-        assert!(full.starts_with("---\n"));
-        assert!(full.contains("  - inbox"));
-        assert!(full.contains("created_by: mcp"));
-        // Body should be intact
-        assert!(full.contains("# Just a heading"));
-        assert!(full.contains("Some body text."));
-    }
-
-    #[test]
-    fn test_merge_user_aliases_preserved() {
-        let user_fm = "---\naliases:\n  - My Alias\n  - Another Name\ntags:\n  - test\n---\n";
-        let (user_scalars, user_tags, user_aliases) = parse_frontmatter_fields(user_fm);
-        let auto_tags = vec!["auto".to_string()];
-
-        let merged = build_merged_frontmatter(
-            &auto_tags,
-            Some("mcp"),
-            None,
-            &user_scalars,
-            &user_tags,
-            &user_aliases,
-        );
-
-        assert!(merged.contains("aliases:"));
-        assert!(merged.contains("  - My Alias"));
-        assert!(merged.contains("  - Another Name"));
-        assert!(merged.contains("  - test"));
-        assert!(merged.contains("  - auto"));
-    }
-
     #[test]
     fn test_parse_frontmatter_fields_empty() {
         let (scalars, tags, aliases) = parse_frontmatter_fields("");
@@ -2277,6 +1975,74 @@ mod tests {
         );
     }
 
+    /// Create one note and hand back what landed on disk.
+    fn created_text(content: &str, tags: Vec<String>, filename: &str) -> String {
+        use crate::llm::MockLlm;
+
+        let (_tmp, store, root) = setup_vault();
+        let mut embedder = MockLlm::new(256);
+        let result = create_note(
+            CreateNoteInput {
+                content: content.to_string(),
+                filename: filename.to_string(),
+                type_hint: None,
+                tags,
+                folder: Some("lore".to_string()),
+                created_by: "test".to_string(),
+                auto_link: Some(false),
+            },
+            &store,
+            &mut embedder,
+            EmbedComposition::default(),
+            test_chunk_opts(),
+            &root,
+            None,
+        )
+        .unwrap();
+        std::fs::read_to_string(root.join(&result.path)).unwrap()
+    }
+
+    #[test]
+    fn create_writes_the_callers_frontmatter_as_it_was_given() {
+        let content = "---\nname: Tidewatch Tower\naliases: []\ntags: [type/location]\n---\n\nPart of the coast.\n";
+        assert_eq!(created_text(content, vec![], "Tidewatch Tower.md"), content);
+    }
+
+    #[test]
+    fn create_adds_the_resolved_tags_to_the_notes_own_list() {
+        let written = created_text(
+            "---\nname: X\ntags: [type/lore]\n---\n\nBody.\n",
+            vec!["realm/rudd".to_string()],
+            "X.md",
+        );
+        assert_eq!(
+            written,
+            "---\nname: X\ntags: [type/lore, realm/rudd]\n---\n\nBody.\n"
+        );
+    }
+
+    #[test]
+    fn create_writes_no_block_when_it_has_nothing_to_put_in_one() {
+        assert_eq!(
+            created_text("Just a body.\n", vec![], "Bare.md"),
+            "Just a body.\n"
+        );
+    }
+
+    #[test]
+    fn create_writes_no_created_stamp_and_no_placement_keys() {
+        let written = created_text("---\nname: X\n---\n\nBody.\n", vec![], "X.md");
+        for key in [
+            "created:",
+            "created_by:",
+            "suggested_folder:",
+            "confidence:",
+            "reason:",
+        ] {
+            assert!(!written.contains(key), "{key} is in the note:\n{written}");
+        }
+    }
+
     #[test]
     fn create_refuses_a_colliding_name_and_points_at_update() {
         use crate::llm::MockLlm;
@@ -2318,6 +2084,28 @@ mod tests {
         assert!(
             msg.contains("update"),
             "the error must point the caller at update: {msg}"
+        );
+    }
+
+    /// `archive` overwrites the note's own value and `unarchive` then
+    /// removes the key, so a note that already holds `archived_at` loses
+    /// it in the round trip. Refusing is the only choice that neither
+    /// loses the note's own value nor leaves a key behind (#92, I7).
+    #[test]
+    fn archiving_a_note_that_already_holds_archived_at_is_refused() {
+        let (_tmp, store, root) = setup_vault();
+        let content = "---\nname: X\narchived_at: 1999-01-01\n---\n\nBody\n";
+        std::fs::write(root.join("n.md"), content).unwrap();
+        store
+            .insert_file("n.md", "hash", 100, "refuse1", None, None)
+            .unwrap();
+
+        let err = archive_note("n.md", &store, &root, None).unwrap_err();
+        assert!(err.to_string().contains("archived_at"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("n.md")).unwrap(),
+            content,
+            "a refused archive must not touch the file"
         );
     }
 
@@ -2376,7 +2164,9 @@ mod tests {
         let written = std::fs::read_to_string(root.join("04-Archive/n.md")).unwrap();
         let (fm, _) = split_frontmatter(&written);
         let (_, property_tags, _) = parse_frontmatter_fields(&fm);
-        assert_eq!(property_tags, vec!["work", "archived"]);
+        // archive no longer writes an `archived` tag (#92): `archived: true`
+        // and the note's place under the archive folder already say it.
+        assert_eq!(property_tags, vec!["work"]);
         assert!(written.contains("#todo"), "the body tag stays in the body");
     }
 
@@ -2419,6 +2209,203 @@ mod tests {
         .unwrap();
         assert!(vault.join("Projects/n.md").exists());
         assert!(!archived.exists());
+        assert_eq!(
+            std::fs::read_to_string(vault.join("Projects/n.md")).unwrap(),
+            "# N\n\nbody\n"
+        );
+    }
+
+    /// A vault holding one note at `rel`, indexed and ready to archive.
+    fn vault_with(
+        rel: &str,
+        text: &str,
+    ) -> (
+        tempfile::TempDir,
+        Store,
+        std::path::PathBuf,
+        crate::llm::MockLlm,
+    ) {
+        use crate::llm::MockLlm;
+
+        let (tmp, store, vault) = setup_vault();
+        if let Some(parent) = std::path::Path::new(rel).parent() {
+            std::fs::create_dir_all(vault.join(parent)).unwrap();
+        }
+        std::fs::write(vault.join(rel), text).unwrap();
+        let mut embedder = MockLlm::new(256);
+        let config = crate::config::Config::default();
+        crate::indexer::run_index_shared(
+            &vault,
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
+        (tmp, store, vault, embedder)
+    }
+
+    #[test]
+    fn archiving_keeps_every_key_the_note_already_carried() {
+        let note = "---\nname: Probe\naliases: []\ntags: [type/lore]\n---\n\nBody.\n";
+        let (_tmp, store, vault, _embedder) = vault_with("lore/Probe.md", note);
+
+        archive_note("lore/Probe.md", &store, &vault, None).unwrap();
+
+        let archived = std::fs::read_to_string(vault.join("04-Archive/lore/Probe.md")).unwrap();
+        assert!(
+            archived.starts_with("---\nname: Probe\naliases: []\ntags: [type/lore]\n"),
+            "{archived}"
+        );
+        assert!(archived.contains("archived: true"), "{archived}");
+        assert!(
+            archived.contains("archived_from: lore/Probe.md"),
+            "{archived}"
+        );
+        assert!(archived.ends_with("---\n\nBody.\n"), "{archived}");
+    }
+
+    #[test]
+    fn an_archive_round_trip_returns_the_file_byte_for_byte() {
+        let note = "---\nname: Probe\naliases: []\ntags: [type/lore]\n---\n\nBody.\n";
+        let (_tmp, store, vault, mut embedder) = vault_with("lore/Probe.md", note);
+
+        archive_note("lore/Probe.md", &store, &vault, None).unwrap();
+        unarchive_note(
+            "04-Archive/lore/Probe.md",
+            &store,
+            &mut embedder,
+            EmbedComposition::default(),
+            test_chunk_opts(),
+            &vault,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(vault.join("lore/Probe.md")).unwrap(),
+            note
+        );
+    }
+
+    /// A note with no frontmatter block at all takes `Block::parse_or_open`
+    /// down the `open` path on archive and back through `parse` on
+    /// unarchive — the two paths must agree on where the block ends and the
+    /// body begins, or the round trip gains or loses the blank line between
+    /// them (#92).
+    #[test]
+    fn an_archive_round_trip_on_a_note_with_no_frontmatter_returns_the_file_byte_for_byte() {
+        let note = "# N\n\nbody\n";
+        let (_tmp, store, vault, mut embedder) = vault_with("n.md", note);
+
+        archive_note("n.md", &store, &vault, None).unwrap();
+        unarchive_note(
+            "04-Archive/n.md",
+            &store,
+            &mut embedder,
+            EmbedComposition::default(),
+            test_chunk_opts(),
+            &vault,
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read_to_string(vault.join("n.md")).unwrap(), note);
+    }
+
+    /// `Block::is_empty` counts keys only, so a block holding just a
+    /// comment reported empty the same way a note with no block at all
+    /// does. `unarchive_note` used to fall back to `block.body()` for both,
+    /// discarding the fences and the comment along with them (#92, I2).
+    #[test]
+    fn an_archive_round_trip_on_a_note_with_a_comment_only_block_returns_the_file_byte_for_byte() {
+        let note = "---\n# why this note exists\n---\n\nBody\n";
+        let (_tmp, store, vault, mut embedder) = vault_with("n.md", note);
+
+        archive_note("n.md", &store, &vault, None).unwrap();
+        unarchive_note(
+            "04-Archive/n.md",
+            &store,
+            &mut embedder,
+            EmbedComposition::default(),
+            test_chunk_opts(),
+            &vault,
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read_to_string(vault.join("n.md")).unwrap(), note);
+    }
+
+    /// A block that is present but holds no key at all — `---\n---\n` — and
+    /// a note with no block are indistinguishable once archived: both
+    /// leave the archived block holding exactly the three archive keys and
+    /// nothing else, so `unarchive_note`'s only honest choice between them
+    /// is the one that does not regress the no-block round trip above.
+    /// This does not restore the original `---\n---\n` fences — a known
+    /// limit of a fix confined to `unarchive_note` (#92, I2 — see the final
+    /// fix report for why `archive_note` would have to change too).
+    #[test]
+    fn a_truly_empty_block_and_no_block_restore_the_same_way() {
+        let note = "---\n---\n\nBody\n";
+        let (_tmp, store, vault, mut embedder) = vault_with("n.md", note);
+
+        archive_note("n.md", &store, &vault, None).unwrap();
+        unarchive_note(
+            "04-Archive/n.md",
+            &store,
+            &mut embedder,
+            EmbedComposition::default(),
+            test_chunk_opts(),
+            &vault,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(vault.join("n.md")).unwrap(),
+            "Body\n",
+            "an empty block cannot be told apart from no block at unarchive time"
+        );
+    }
+
+    /// A note archived by a version of knapper before #92 wrote `archived`
+    /// into its own `tags` list, on top of the `archived: true` key this
+    /// build reads (see `git show 9bae927:src/writer.rs`, the
+    /// `.filter(|t| t != "archived")` this restores). Unarchiving it must
+    /// not let the leftover tag back into the vocabulary (#92, I6).
+    #[test]
+    fn unarchiving_a_legacy_note_strips_the_archived_tag_it_carried() {
+        use crate::llm::MockLlm;
+
+        let (_tmp, store, vault) = setup_vault();
+        std::fs::create_dir_all(vault.join("04-Archive")).unwrap();
+        std::fs::write(
+            vault.join("04-Archive/n.md"),
+            "---\ntags: [work, archived]\narchived: true\narchived_at: 2020-01-01\narchived_from: n.md\n---\n\nBody.\n",
+        )
+        .unwrap();
+        let mut embedder = MockLlm::new(256);
+
+        let result = unarchive_note(
+            "04-Archive/n.md",
+            &store,
+            &mut embedder,
+            EmbedComposition::default(),
+            test_chunk_opts(),
+            &vault,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.tags,
+            vec!["work"],
+            "the leftover archived tag must not report back"
+        );
+        let written = std::fs::read_to_string(vault.join("n.md")).unwrap();
+        assert_eq!(
+            written, "---\ntags: [work]\n---\n\nBody.\n",
+            "got {written}"
+        );
+        assert_eq!(stored_tags(&store, "n.md"), vec!["work"]);
     }
 
     /// A vault of one note, indexed, ready for `update_note`.
@@ -2835,7 +2822,7 @@ mod tests {
                     mode: EditMode::Append,
                     content: Some(EditContent::Text("wip".into())),
                 },
-                "status:\n- wip",
+                "status:\n  - wip",
                 true,
             ),
             (
@@ -2858,10 +2845,10 @@ mod tests {
 
     #[test]
     fn a_list_of_property_edits_reassembles_the_note_once() {
-        // A run of property edits becomes one `apply_frontmatter_ops` call
-        // (#62), so a two-edit call must give the same bytes as a one-edit
-        // call gives, plus the tag. A `contains` assertion cannot see this,
-        // so pin the bytes.
+        // A run of property edits becomes one pass over one `Block` (#62), so
+        // a two-edit call must give the same bytes as a one-edit call gives,
+        // plus the tag, with the block's own two-space list style kept. A
+        // `contains` assertion cannot see this, so pin the bytes.
         let doc = "---\ntags:\n  - a\n---\n\n## Spells\n\nold\n";
 
         let one = apply_note_edits(
@@ -2873,7 +2860,7 @@ mod tests {
             }],
         )
         .unwrap();
-        assert_eq!(one, "---\ntags:\n- a\n- b\n---\n\n## Spells\n\nold\n");
+        assert_eq!(one, "---\ntags:\n  - a\n  - b\n---\n\n## Spells\n\nold\n");
 
         let two = apply_note_edits(
             doc,
@@ -2893,12 +2880,12 @@ mod tests {
         .unwrap();
         assert_eq!(
             two,
-            "---\ntags:\n- a\n- b\nstatus: done\n---\n\n## Spells\n\nold\n"
+            "---\ntags:\n  - a\n  - b\nstatus: done\n---\n\n## Spells\n\nold\n"
         );
     }
 
     /// The Task 12 fix trimmed the leading break `split_frontmatter` leaves
-    /// on a body edit; `apply_frontmatter_ops` reassembles the same way and
+    /// on a body edit; the frontmatter block reassembles the same way and
     /// carried the same defect (#62). `update` is the only frontmatter write
     /// path, so it accumulates one blank line per call across successive
     /// `update`s on the same note — pin the bytes across two of them.

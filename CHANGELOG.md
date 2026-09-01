@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Frontmatter writes preserve the note (#92). `create` writes the caller's frontmatter as given, and no longer adds `created`, `created_by` or placement keys. A property edit keeps the key's position and the note's list style, and an empty list writes an empty list instead of deleting the key. `archive` and `unarchive` edit the block instead of rebuilding it, so an archive round trip keeps the note's other keys, its comments and its blank lines byte for byte. `archive` refuses a note that already holds `archived`, `archived_at` or `archived_from`, naming the key it found, rather than lose the note's own value or drop it silently on unarchive. `unarchive` drops a leftover `archived` tag from a note archived by an earlier version of knapper, so the tag does not return to the vocabulary. A value knapper cannot address as a line — a nested mapping, an anchor, a block scalar — refuses the write and names what it found. The placement-correction learning loop no longer fires for a newly created note, because `create` no longer writes the `suggested_folder` and `created_by` keys the loop reads.
+
 ## 0.9.1 (2026-08-30)
 
 ### Calibrated score fusion: the model-free default ranks and abstains
