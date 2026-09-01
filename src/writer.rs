@@ -94,6 +94,10 @@ pub struct WriteResult {
     pub folder: String,
     pub confidence: f64,
     pub strategy: String,
+    /// Why the note landed where it did. `create` fills it from placement;
+    /// a write with no placement to explain leaves it empty.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub reason: String,
 }
 
 // ── Helper functions ────────────────────────────────────────────
@@ -292,72 +296,6 @@ pub(crate) fn parse_frontmatter_fields(
     }
 
     (scalars, tags, aliases)
-}
-
-/// Build a merged frontmatter block from auto-generated fields + user-provided fields.
-///
-/// - `tags` and `aliases` are merged (deduplicated), user values included
-/// - `created` and `created_by` always use auto-generated values
-/// - All other user fields are passed through
-fn build_merged_frontmatter(
-    auto_tags: &[String],
-    created_by: Option<&str>,
-    suggestion: Option<&PlacementSuggestion>,
-    user_scalars: &BTreeMap<String, String>,
-    user_tags: &[String],
-    user_aliases: &[String],
-) -> String {
-    // Merge tags: auto first, then user, deduplicated
-    let mut merged_tags: Vec<String> = auto_tags.to_vec();
-    for t in user_tags {
-        if !merged_tags.iter().any(|existing| existing == t) {
-            merged_tags.push(t.clone());
-        }
-    }
-
-    // Merge aliases: just user aliases (auto has none by default from create_note)
-    let merged_aliases: Vec<String> = user_aliases.to_vec();
-
-    let mut fm = String::from("---\n");
-
-    if !merged_tags.is_empty() {
-        fm.push_str("tags:\n");
-        for tag in &merged_tags {
-            fm.push_str(&format!("  - {}\n", tag));
-        }
-    }
-
-    if !merged_aliases.is_empty() {
-        fm.push_str("aliases:\n");
-        for alias in &merged_aliases {
-            fm.push_str(&format!("  - {}\n", alias));
-        }
-    }
-
-    // Always auto-generated
-    fm.push_str(&format!("created: {}\n", today_date()));
-
-    if let Some(by) = created_by {
-        fm.push_str(&format!("created_by: {}\n", by));
-    }
-
-    // User scalar fields (skip created/created_by — always auto-generated)
-    for (key, val) in user_scalars {
-        match key.as_str() {
-            "created" | "created_by" => continue,
-            _ => fm.push_str(&format!("{}: {}\n", key, val)),
-        }
-    }
-
-    // Placement suggestion for inbox notes
-    if let Some(s) = suggestion {
-        fm.push_str(&format!("suggested_folder: {}\n", s.suggested_folder));
-        fm.push_str(&format!("confidence: {:.2}\n", s.confidence));
-        fm.push_str(&format!("reason: \"{}\"\n", s.reason));
-    }
-
-    fm.push_str("---\n\n");
-    fm
 }
 
 /// Returns today's date as "YYYY-MM-DD".
@@ -585,37 +523,17 @@ pub fn create_note(
         placement::place_note(&content_with_links, &hints, profile, store, Some(embedder))?
     };
 
-    // Step 5: Build frontmatter and assemble content
-    // Split user frontmatter from body so we can merge instead of duplicate
-    let (user_fm, body) = split_frontmatter(&content_with_links);
-    let (user_scalars, user_tags, user_aliases) = if !user_fm.is_empty() {
-        parse_frontmatter_fields(&user_fm)
+    // Step 5: The caller's frontmatter is the note's frontmatter. The only
+    // key create writes is `tags`, and only what `--tags` resolved to (#92).
+    let mut block = crate::frontmatter::Block::parse_or_open(&content_with_links)?;
+    for tag in &resolved_tags {
+        block.add_to_list("tags", tag)?;
+    }
+    let full_content = if block.is_empty() {
+        content_with_links.clone()
     } else {
-        (BTreeMap::new(), Vec::new(), Vec::new())
+        block.render()
     };
-
-    // If placement fell back to inbox with a suggestion, inject suggested_folder metadata
-    let suggestion = if placement_result.strategy == placement::PlacementStrategy::InboxFallback {
-        placement_result
-            .suggestion
-            .as_ref()
-            .map(|(folder, conf)| PlacementSuggestion {
-                suggested_folder: folder.clone(),
-                confidence: *conf,
-                reason: format!("semantic similarity: {conf:.3}"),
-            })
-    } else {
-        None
-    };
-    let frontmatter = build_merged_frontmatter(
-        &resolved_tags,
-        Some(&input.created_by),
-        suggestion.as_ref(),
-        &user_scalars,
-        &user_tags,
-        &user_aliases,
-    );
-    let full_content = format!("{}{}", frontmatter, body);
 
     let rel_path = format!("{}/{}", placement_result.folder, filename);
     let final_path = vault_path.join(&rel_path);
@@ -728,6 +646,7 @@ pub fn create_note(
         folder: placement_result.folder,
         confidence: placement_result.confidence,
         strategy: strategy_name,
+        reason: placement_result.reason.clone(),
     })
 }
 
@@ -1073,6 +992,7 @@ pub fn move_note(
         folder: new_folder.to_string(),
         confidence: 1.0,
         strategy: "Move".to_string(),
+        reason: String::new(),
     })
 }
 
@@ -1251,6 +1171,7 @@ pub fn archive_note(
         folder: archive_folder.to_string(),
         confidence: 1.0,
         strategy: "Archive".to_string(),
+        reason: String::new(),
     })
 }
 
@@ -1390,6 +1311,7 @@ pub fn unarchive_note(
         folder,
         confidence: 1.0,
         strategy: "Unarchive".to_string(),
+        reason: String::new(),
     })
 }
 
@@ -1941,165 +1863,6 @@ mod tests {
         drop(tmp);
     }
 
-    // ── Frontmatter merge tests ────────────────────────────────────
-
-    #[test]
-    fn test_merge_user_frontmatter_produces_single_block() {
-        let user_content =
-            "---\ntitle: My Note\ntags:\n  - project\n  - work\n---\n\n# My Note content\n";
-        let (user_fm, body) = split_frontmatter(user_content);
-        assert!(!user_fm.is_empty());
-
-        let (user_scalars, user_tags, user_aliases) = parse_frontmatter_fields(&user_fm);
-        let auto_tags = vec!["project".to_string()];
-
-        let merged = build_merged_frontmatter(
-            &auto_tags,
-            Some("mcp"),
-            None,
-            &user_scalars,
-            &user_tags,
-            &user_aliases,
-        );
-        let full = format!("{}{}", merged, body);
-
-        // Count frontmatter blocks: should be exactly one
-        let fm_count = full.matches("\n---\n").count();
-        // The opening ---\n at the start + the closing \n---\n = pattern appears once for closing
-        assert!(full.starts_with("---\n"));
-        assert_eq!(fm_count, 1, "Should have exactly one closing --- delimiter");
-        assert!(full.contains("# My Note content"));
-    }
-
-    #[test]
-    fn test_merge_tags_deduplicated() {
-        let user_fm = "---\ntags:\n  - project\n  - work\n  - rust\n---\n";
-        let (user_scalars, user_tags, user_aliases) = parse_frontmatter_fields(user_fm);
-        let auto_tags = vec!["project".to_string(), "knapper".to_string()];
-
-        let merged = build_merged_frontmatter(
-            &auto_tags,
-            Some("mcp"),
-            None,
-            &user_scalars,
-            &user_tags,
-            &user_aliases,
-        );
-
-        // "project" should appear once, "knapper" from auto, "work" and "rust" from user
-        let tag_lines: Vec<&str> = merged.lines().filter(|l| l.starts_with("  - ")).collect();
-        assert_eq!(tag_lines.len(), 4);
-        assert!(merged.contains("  - project\n"));
-        assert!(merged.contains("  - knapper\n"));
-        assert!(merged.contains("  - work\n"));
-        assert!(merged.contains("  - rust\n"));
-
-        // "project" tag line should appear only once
-        let project_count = merged.matches("  - project\n").count();
-        assert_eq!(
-            project_count, 1,
-            "Duplicate tag 'project' should be deduplicated"
-        );
-    }
-
-    #[test]
-    fn test_merge_preserves_user_custom_fields() {
-        let user_fm =
-            "---\ntitle: My Project\nstatus: active\npriority: high\ntags:\n  - work\n---\n";
-        let (user_scalars, user_tags, user_aliases) = parse_frontmatter_fields(user_fm);
-        let auto_tags = vec!["project".to_string()];
-
-        let merged = build_merged_frontmatter(
-            &auto_tags,
-            Some("mcp"),
-            None,
-            &user_scalars,
-            &user_tags,
-            &user_aliases,
-        );
-
-        assert!(merged.contains("title: My Project"));
-        assert!(merged.contains("status: active"));
-        assert!(merged.contains("priority: high"));
-        assert!(merged.contains("  - work"));
-        assert!(merged.contains("  - project"));
-    }
-
-    #[test]
-    fn test_merge_created_always_auto_generated() {
-        let user_fm = "---\ncreated: 2020-01-01\ncreated_by: user\ntitle: Test\n---\n";
-        let (user_scalars, user_tags, user_aliases) = parse_frontmatter_fields(user_fm);
-        let auto_tags = vec![];
-
-        let merged = build_merged_frontmatter(
-            &auto_tags,
-            Some("mcp"),
-            None,
-            &user_scalars,
-            &user_tags,
-            &user_aliases,
-        );
-
-        // created should be today's date, not 2020-01-01
-        assert!(!merged.contains("2020-01-01"));
-        assert!(merged.contains(&format!("created: {}", today_date())));
-        // created_by should be "mcp", not "user"
-        assert!(merged.contains("created_by: mcp"));
-        assert!(!merged.contains("created_by: user"));
-        // But title should still be preserved
-        assert!(merged.contains("title: Test"));
-    }
-
-    #[test]
-    fn test_merge_content_without_frontmatter_unchanged() {
-        let content = "# Just a heading\n\nSome body text.\n";
-        let (user_fm, body) = split_frontmatter(content);
-        assert!(user_fm.is_empty());
-
-        let (user_scalars, user_tags, user_aliases) = parse_frontmatter_fields(&user_fm);
-        let auto_tags = vec!["inbox".to_string()];
-
-        let merged = build_merged_frontmatter(
-            &auto_tags,
-            Some("mcp"),
-            None,
-            &user_scalars,
-            &user_tags,
-            &user_aliases,
-        );
-        let full = format!("{}{}", merged, body);
-
-        // Should have frontmatter from auto-gen only
-        assert!(full.starts_with("---\n"));
-        assert!(full.contains("  - inbox"));
-        assert!(full.contains("created_by: mcp"));
-        // Body should be intact
-        assert!(full.contains("# Just a heading"));
-        assert!(full.contains("Some body text."));
-    }
-
-    #[test]
-    fn test_merge_user_aliases_preserved() {
-        let user_fm = "---\naliases:\n  - My Alias\n  - Another Name\ntags:\n  - test\n---\n";
-        let (user_scalars, user_tags, user_aliases) = parse_frontmatter_fields(user_fm);
-        let auto_tags = vec!["auto".to_string()];
-
-        let merged = build_merged_frontmatter(
-            &auto_tags,
-            Some("mcp"),
-            None,
-            &user_scalars,
-            &user_tags,
-            &user_aliases,
-        );
-
-        assert!(merged.contains("aliases:"));
-        assert!(merged.contains("  - My Alias"));
-        assert!(merged.contains("  - Another Name"));
-        assert!(merged.contains("  - test"));
-        assert!(merged.contains("  - auto"));
-    }
-
     #[test]
     fn test_parse_frontmatter_fields_empty() {
         let (scalars, tags, aliases) = parse_frontmatter_fields("");
@@ -2227,6 +1990,74 @@ mod tests {
             vec!["habitat/swamp", "type/undead"],
             "the property and the body are peers"
         );
+    }
+
+    /// Create one note and hand back what landed on disk.
+    fn created_text(content: &str, tags: Vec<String>, filename: &str) -> String {
+        use crate::llm::MockLlm;
+
+        let (_tmp, store, root) = setup_vault();
+        let mut embedder = MockLlm::new(256);
+        let result = create_note(
+            CreateNoteInput {
+                content: content.to_string(),
+                filename: filename.to_string(),
+                type_hint: None,
+                tags,
+                folder: Some("lore".to_string()),
+                created_by: "test".to_string(),
+                auto_link: Some(false),
+            },
+            &store,
+            &mut embedder,
+            EmbedComposition::default(),
+            test_chunk_opts(),
+            &root,
+            None,
+        )
+        .unwrap();
+        std::fs::read_to_string(root.join(&result.path)).unwrap()
+    }
+
+    #[test]
+    fn create_writes_the_callers_frontmatter_as_it_was_given() {
+        let content = "---\nname: Tidewatch Tower\naliases: []\ntags: [type/location]\n---\n\nPart of the coast.\n";
+        assert_eq!(created_text(content, vec![], "Tidewatch Tower.md"), content);
+    }
+
+    #[test]
+    fn create_adds_the_resolved_tags_to_the_notes_own_list() {
+        let written = created_text(
+            "---\nname: X\ntags: [type/lore]\n---\n\nBody.\n",
+            vec!["realm/rudd".to_string()],
+            "X.md",
+        );
+        assert_eq!(
+            written,
+            "---\nname: X\ntags: [type/lore, realm/rudd]\n---\n\nBody.\n"
+        );
+    }
+
+    #[test]
+    fn create_writes_no_block_when_it_has_nothing_to_put_in_one() {
+        assert_eq!(
+            created_text("Just a body.\n", vec![], "Bare.md"),
+            "Just a body.\n"
+        );
+    }
+
+    #[test]
+    fn create_writes_no_created_stamp_and_no_placement_keys() {
+        let written = created_text("---\nname: X\n---\n\nBody.\n", vec![], "X.md");
+        for key in [
+            "created:",
+            "created_by:",
+            "suggested_folder:",
+            "confidence:",
+            "reason:",
+        ] {
+            assert!(!written.contains(key), "{key} is in the note:\n{written}");
+        }
     }
 
     #[test]
