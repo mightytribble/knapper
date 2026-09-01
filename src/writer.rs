@@ -677,50 +677,53 @@ fn edit_mode_name(mode: &EditMode) -> &'static str {
 /// so that `update_note` can apply a list of them to one string and write once
 /// (#62).
 ///
-/// With `preserve_frontmatter`, the frontmatter is split off, `mode` is
-/// applied to the body alone, and the two are reassembled. Without it,
-/// `Replace` returns `new` and `Append`/`Prepend` join the whole text.
+/// With `preserve_frontmatter`, the note is parsed through
+/// [`crate::frontmatter::Block`], `mode` is applied to the block's own body
+/// alone, and only the body is replaced before the block renders itself
+/// back — the frontmatter is never split into a string and rejoined, so it
+/// cannot pick up a rebuilt fence, a normalised line ending or a shifted
+/// blank line the way `markdown::split_frontmatter` did (#92, I5). Without
+/// `preserve_frontmatter`, `Replace` returns `new` and `Append`/`Prepend`
+/// join the whole text.
 ///
 /// `Remove` is a property mode and has no meaning for a body, so it returns
 /// the text unchanged. `apply_note_edits` rejects it before it reaches here
 /// and no other caller passes it, so the arm exists to keep a mode a body
 /// cannot express from deleting one (#62).
+///
+/// Errors only when the note opens a frontmatter block knapper cannot even
+/// read the shape of — the same refusal `Block::parse` gives a property
+/// edit — because a body edit that cannot see the block's true span cannot
+/// promise to leave it untouched.
 pub fn apply_body_edit(
     content: &str,
     new: &str,
     mode: EditMode,
     preserve_frontmatter: bool,
-) -> String {
+) -> Result<String> {
     if mode == EditMode::Remove {
-        return content.to_string();
+        return Ok(content.to_string());
     }
-    if preserve_frontmatter {
-        let (maybe_frontmatter, old_body) = crate::markdown::split_frontmatter(content);
-        if let Some(frontmatter) = maybe_frontmatter {
-            // `split_frontmatter` rejoins the body as `lines[i+1..].join("\n")`,
-            // so a note written `---\nfm\n---\n\nbody` hands back a body that
-            // still carries the break after the closing `---`. The reassembly
-            // below writes its own `\n\n`, so this break has to go: keeping it
-            // added one blank line to the note on every append, and they
-            // accumulated call after call (#62).
-            let old_body = old_body.trim_start_matches('\n');
-            let new_body = match mode {
-                EditMode::Replace => new.to_string(),
-                EditMode::Append => format!("{}\n{}", old_body.trim_end(), new),
-                EditMode::Prepend => format!("{}\n{}", new.trim_end(), old_body),
-                EditMode::Remove => old_body.to_string(),
-            };
-            return format!("---\n{}\n---\n\n{}", frontmatter, new_body);
-        }
-        // No existing frontmatter to preserve — fall through to the whole-text
-        // join below, so Append and Prepend still keep the note's own body.
+    if preserve_frontmatter && let Some(mut block) = crate::frontmatter::Block::parse(content)? {
+        let old_body = block.body();
+        let new_body = match mode {
+            EditMode::Replace => new.to_string(),
+            EditMode::Append => format!("{}\n{}", old_body.trim_end(), new),
+            EditMode::Prepend => format!("{}\n{}", new.trim_end(), old_body),
+            EditMode::Remove => old_body.to_string(),
+        };
+        block.set_body(new_body);
+        return Ok(block.render());
     }
-    match mode {
+    // No existing frontmatter to preserve — or `preserve_frontmatter` is
+    // false — so join the whole text; `Append` and `Prepend` still keep the
+    // note's own content either way.
+    Ok(match mode {
         EditMode::Replace => new.to_string(),
         EditMode::Append => format!("{}\n{}", content.trim_end(), new),
         EditMode::Prepend => format!("{}\n{}", new.trim_end(), content),
         EditMode::Remove => content.to_string(),
-    }
+    })
 }
 
 /// The text one edit writes. A body and a section take one string, so a list
@@ -793,7 +796,7 @@ pub fn apply_note_edits(content: &str, edits: &[NoteEdit]) -> Result<String> {
                     bail!("Remove has no meaning for a body");
                 }
                 let new = text_of(edit)?;
-                text = apply_body_edit(&text, &new, edit.mode, true);
+                text = apply_body_edit(&text, &new, edit.mode, true)?;
                 rest = &rest[1..];
             }
             EditTarget::Section(heading) => {
@@ -1436,21 +1439,18 @@ mod tests {
         assert!(err.to_string().contains("nested mapping"), "{err}");
     }
 
-    /// `split_frontmatter` rejoins the body as `lines[i+1..].join("\n")`, so
-    /// the usual `---\nfm\n---\n\nbody` layout hands back a body that still
-    /// carries the line break after the closing `---`. The reassembly below
-    /// supplies its own `\n\n`, so adding both put one blank line into the
-    /// note per append and they accumulated. The `write append` call this
-    /// replaced added none, and `update`'s body append is byte-identical to it
-    /// (#62).
+    /// `Block::body()` is the text past the blank line that separates it
+    /// from the block, so nothing here has to trim or re-add that break —
+    /// `block.render()` supplies it once, from the block's own `separator`
+    /// field, however many times a body is appended to (#62, #92 I5).
     #[test]
     fn successive_body_appends_add_no_blank_line_of_their_own() {
         let doc = "---\ntags:\n  - a\n---\n\nbody line\n";
 
-        let once = apply_body_edit(doc, "first", EditMode::Append, true);
+        let once = apply_body_edit(doc, "first", EditMode::Append, true).unwrap();
         assert_eq!(once, "---\ntags:\n  - a\n---\n\nbody line\nfirst");
 
-        let twice = apply_body_edit(&once, "second", EditMode::Append, true);
+        let twice = apply_body_edit(&once, "second", EditMode::Append, true).unwrap();
         assert_eq!(twice, "---\ntags:\n  - a\n---\n\nbody line\nfirst\nsecond");
     }
 
@@ -1461,15 +1461,15 @@ mod tests {
     fn a_body_append_matches_the_call_it_replaces() {
         let doc = "---\ntags:\n  - a\n---\n\nbody line\n";
         assert_eq!(
-            apply_body_edit(doc, "first", EditMode::Append, true),
-            apply_body_edit(doc, "first", EditMode::Append, false),
+            apply_body_edit(doc, "first", EditMode::Append, true).unwrap(),
+            apply_body_edit(doc, "first", EditMode::Append, false).unwrap(),
         );
     }
 
     #[test]
     fn appending_with_preserve_frontmatter_on_a_note_with_none_keeps_the_body() {
         let doc = "old body\n";
-        let out = apply_body_edit(doc, "new stuff", EditMode::Append, true);
+        let out = apply_body_edit(doc, "new stuff", EditMode::Append, true).unwrap();
         assert!(out.contains("old body"), "the existing body must survive");
         assert!(out.contains("new stuff"));
     }
@@ -1477,9 +1477,48 @@ mod tests {
     #[test]
     fn prepending_with_preserve_frontmatter_on_a_note_with_none_keeps_the_body() {
         let doc = "old body\n";
-        let out = apply_body_edit(doc, "new stuff", EditMode::Prepend, true);
+        let out = apply_body_edit(doc, "new stuff", EditMode::Prepend, true).unwrap();
         assert!(out.contains("old body"), "the existing body must survive");
         assert!(out.contains("new stuff"));
+    }
+
+    /// `markdown::split_frontmatter` rebuilds its output with
+    /// `lines().join("\n")`, which reads a CRLF file apart on `\n` alone and
+    /// glues it back with `\n`, converting the whole note to LF. Routing
+    /// through `Block` instead never turns the frontmatter or the fences
+    /// into a `String` split on lines, so a CRLF note stays CRLF (#92, I5).
+    #[test]
+    fn a_body_edit_on_a_crlf_note_keeps_crlf_throughout() {
+        let doc = "---\r\nname: X\r\ntags: [a]\r\n---\r\n\r\nBody.\r\n";
+        let out = apply_body_edit(doc, "New body.\r\n", EditMode::Replace, true).unwrap();
+        assert_eq!(
+            out,
+            "---\r\nname: X\r\ntags: [a]\r\n---\r\n\r\nNew body.\r\n"
+        );
+    }
+
+    /// `markdown::split_frontmatter` compares `line.trim() == "---"`, so it
+    /// reads a fence with trailing whitespace as frontmatter but rebuilds
+    /// its output with a bare `"---"`, silently trimming that whitespace
+    /// away. `Block` keeps the fence line verbatim (#92, I1, I5).
+    #[test]
+    fn a_body_edit_keeps_a_fence_with_trailing_whitespace() {
+        let doc = "--- \nname: X\n--- \n\nBody.\n";
+        let out = apply_body_edit(doc, "New body.\n", EditMode::Replace, true).unwrap();
+        assert_eq!(out, "--- \nname: X\n--- \n\nNew body.\n");
+    }
+
+    /// A note whose body starts right after the closing fence, with no
+    /// blank line between them, is legal input `markdown::split_frontmatter`
+    /// accepts. The reassembly this replaced always wrote its own `\n\n`
+    /// after the fence, so a note with none gained a blank line it never
+    /// had. `Block` keeps whatever separator — empty or one blank line — it
+    /// actually parsed (#92, I5).
+    #[test]
+    fn a_body_edit_does_not_insert_a_blank_line_the_note_never_had() {
+        let doc = "---\nname: X\n---\nBody.\n";
+        let out = apply_body_edit(doc, "New body.\n", EditMode::Replace, true).unwrap();
+        assert_eq!(out, "---\nname: X\n---\nNew body.\n");
     }
 
     #[test]

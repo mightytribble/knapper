@@ -227,6 +227,14 @@ impl Block {
         &self.body
     }
 
+    /// Replace the note's content below the block. The block itself — its
+    /// fences, its items, the separator between it and the body — is
+    /// untouched, so a body edit routed through `render()` cannot move or
+    /// re-render a single frontmatter byte (#92, I5).
+    pub fn set_body(&mut self, body: String) {
+        self.body = body;
+    }
+
     /// The value `key` holds, when it holds a scalar.
     pub fn scalar(&self, key: &str) -> Option<String> {
         let idx = self.find(key)?;
