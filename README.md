@@ -96,7 +96,7 @@ cargo install --git https://github.com/mightytribble/knapper
 # hosts — Windows on ARM is not supported. The CUDA image carries its own
 # toolkit: the host needs Docker and the NVIDIA Container Toolkit, never nvcc.
 docker pull ghcr.io/mightytribble/knapper:cuda    # or :cpu, or :latest for cpu
-docker pull ghcr.io/mightytribble/knapper:0.9.1-cuda      # version-pinned
+docker pull ghcr.io/mightytribble/knapper:0.9.2-cuda      # version-pinned
 ```
 
 [deployment.md](deployment.md) has the full container flow — data volume, `--gpus all`, and wiring the MCP stdio server through `docker run -i`.

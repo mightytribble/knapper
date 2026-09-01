@@ -1,10 +1,17 @@
 # Changelog
 
-## Unreleased
+## 0.9.2 (2026-08-31)
+
+A patch release over 0.9.1. A note written through knapper keeps the rest of
+itself byte for byte, an edited note stays in the index, and a config save
+records the user's own settings rather than the defaults this build shipped
+with. No fingerprint moves, so no store re-indexes on the upgrade.
 
 ### Changed
 
 - A config file records what the user chose, not what the binary shipped with (#90). `Config::save` serialized the whole struct, so the first `knapper configure` after an upgrade materialized every section — `[calibrated]`, `[fts]`, `[ranking]`, `[lane_weights]` — into `~/.knapper/config.toml` with that build's values, and a later release that moved a default never reached that user. A save now edits the file instead of rewriting it: it writes a key whose value differs from its default, and a key the file already holds, because an explicit setting is the user's and is kept even where it equals today's default. Comments, key order, spacing and a key this build does not know are all left as they stand. A data directory with no config file yet is given the whole catalogue commented out under live `[section]` headers, so the file shows what there is to set without setting any of it.
+
+- **Test count: 1035 → 1116.**
 
 ### Fixed
 

@@ -133,7 +133,7 @@ docker pull ghcr.io/mightytribble/knapper:cuda
 docker tag ghcr.io/mightytribble/knapper:cuda knapper:cuda
 ```
 
-`:cuda` tracks the latest release and `:0.9.1-cuda` pins one. The second
+`:cuda` tracks the latest release and `:0.9.2-cuda` pins one. The second
 line retags it locally, so every command below can read `knapper:cuda`
 whichever way you got the image. To run something newer than the last
 release, build from a checkout instead:
@@ -272,7 +272,7 @@ docker pull ghcr.io/mightytribble/knapper:cpu
 docker tag ghcr.io/mightytribble/knapper:cpu knapper:cpu
 ```
 
-`:cpu` tracks the latest release, `:0.9.1-cpu` pins one, and `:latest` is
+`:cpu` tracks the latest release, `:0.9.2-cpu` pins one, and `:latest` is
 an alias for `:cpu`. The second line retags it locally, so every command
 below can read `knapper:cpu` whichever way you got the image. To run
 something newer than the last release, build from a checkout instead:
