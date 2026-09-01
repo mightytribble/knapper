@@ -1,6 +1,11 @@
 # Changelog
 
-## 0.9.3 (unreleased)
+## 0.9.3 (2026-09-01)
+
+A patch release over 0.9.2. What `read` returns can be written straight back
+through `update`, a section can be renamed, and a note that has been removed
+stops reporting broken links. No fingerprint moves, so no store re-indexes on
+the upgrade.
 
 ### Added
 
@@ -13,6 +18,8 @@
 - `delete --mode soft` leaves the note searchable (#98). A soft delete relocates a note and keeps it indexed, but it moved the note by deleting its `files` row and inserting a fresh one — and the cascade off the old row took the note's chunks, its vectors, its keyword rows and its edges, with nothing to put them back. The note stayed in `files` and in `list`, and left every search: the same failure `move_note` was fixed for in #27, still live in this path. It now moves the row with `update_file_path`, which keeps the file's id, and everything keyed on that id follows. The docid is recomputed, because it is a hash of the path.
 
 - `read`'s output can be written straight back through `update` (#96). The two disagreed about where content begins, in two places, and both round trips corrupted the note silently. A section read carried its heading line, and a section `replace` writes the body under the heading already on disk, so feeding a read straight back wrote the heading twice — and again on every repeat. A whole-note read counted the blank line under the frontmatter as the body's first, and a body `replace` counts it as the block's last, so each round trip gained a blank line. A section read now returns the body alone and names the section's `heading` and `level` beside it, which is what a caller reassembles the markdown from; a note's body starts where `frontmatter::split_body` says it does, which is the splitter the body edit already used. Content for a section that opens with a heading at or above the section's own level — what a caller holding an older read would send — is now refused rather than written, since such a line ends the section instead of filling it. On the CLI, `read --section` names the section beside the note on its first line, in the markup `list --detailed` uses.
+
+- **Test count: 1116 → 1136.**
 
 ## 0.9.2 (2026-08-31)
 
