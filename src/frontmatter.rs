@@ -139,6 +139,32 @@ impl Block {
         }))
     }
 
+    /// A new, empty block above `text`. The separator is the blank line
+    /// knapper puts between a block and a body, and there is none when the
+    /// note is empty.
+    pub fn open(text: &str) -> Block {
+        let newline = newline_of(text);
+        Block {
+            open_fence: format!("---{newline}"),
+            items: Vec::new(),
+            close_fence: format!("---{newline}"),
+            separator: if text.is_empty() {
+                String::new()
+            } else {
+                newline.to_string()
+            },
+            body: text.to_string(),
+            newline: newline.to_string(),
+        }
+    }
+
+    /// Open `text` for editing, creating a block when the note has none. The
+    /// refusals of [`Block::parse`] still apply: a block that is there and
+    /// cannot be edited is an error, not a second block.
+    pub fn parse_or_open(text: &str) -> Result<Block> {
+        Ok(Block::parse(text)?.unwrap_or_else(|| Block::open(text)))
+    }
+
     /// The block's text, spliced back onto the note's own body.
     pub fn render(&self) -> String {
         let mut out = String::with_capacity(self.body.len() + 128);
@@ -1081,5 +1107,47 @@ mod tests {
             block.remove_from_list("tags", "zz").unwrap();
             assert_eq!(block.render(), text);
         }
+    }
+
+    #[test]
+    fn a_note_with_no_block_gets_one_above_its_body() {
+        let mut block = Block::parse_or_open("# Title\n\nBody.\n").unwrap();
+        block.add_to_list("tags", "type/lore").unwrap();
+        assert_eq!(
+            block.render(),
+            "---\ntags:\n  - type/lore\n---\n\n# Title\n\nBody.\n"
+        );
+    }
+
+    #[test]
+    fn an_opened_block_that_gains_nothing_is_empty_and_keeps_the_body() {
+        let block = Block::parse_or_open("# Title\n").unwrap();
+        assert!(block.is_empty());
+        assert_eq!(block.body(), "# Title\n");
+    }
+
+    #[test]
+    fn a_note_with_a_block_is_parsed_rather_than_opened() {
+        let block = Block::parse_or_open("---\nname: X\n---\n\nBody.\n").unwrap();
+        assert_eq!(block.render(), "---\nname: X\n---\n\nBody.\n");
+    }
+
+    #[test]
+    fn opening_a_block_on_an_empty_note_writes_no_separator() {
+        let mut block = Block::parse_or_open("").unwrap();
+        block.set_scalar("name", "X").unwrap();
+        assert_eq!(block.render(), "---\nname: X\n---\n");
+    }
+
+    #[test]
+    fn opening_a_block_on_a_crlf_note_writes_crlf() {
+        let mut block = Block::parse_or_open("# Title\r\n").unwrap();
+        block.set_scalar("name", "X").unwrap();
+        assert_eq!(block.render(), "---\r\nname: X\r\n---\r\n\r\n# Title\r\n");
+    }
+
+    #[test]
+    fn parse_or_open_still_refuses_a_block_it_cannot_edit() {
+        assert!(Block::parse_or_open("---\nname: X\n\nBody.\n").is_err());
     }
 }
