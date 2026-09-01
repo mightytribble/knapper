@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Frontmatter writes preserve the note (#92). `create` writes the caller's frontmatter as given, and no longer adds `created`, `created_by` or placement keys. A property edit keeps the key's position and the note's list style, and an empty list writes an empty list instead of deleting the key. `archive` and `unarchive` edit the block instead of rebuilding it, so an archive round trip returns the file byte for byte. A value knapper cannot address as a line — a nested mapping, an anchor, a block scalar — refuses the write and names what it found.
+
 ## 0.9.1 (2026-08-30)
 
 ### Calibrated score fusion: the model-free default ranks and abstains

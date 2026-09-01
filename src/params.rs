@@ -222,6 +222,8 @@ where
     deserializer.deserialize_any(TagListVisitor)
 }
 
+/// The frontmatter in `content` is written as given. `tags` are added to
+/// the note's own `tags` list; no other key is written.
 #[derive(Debug, Args, Deserialize, JsonSchema)]
 pub struct Create {
     /// Note content. The CLI reads stdin when this is omitted.
@@ -284,7 +286,9 @@ pub struct Edit {
     /// The section to edit: a heading's own text, or its full path from the
     /// note's top heading down, joined with ` > ` (#69).
     pub section: Option<String>,
-    /// The frontmatter property to edit.
+    /// The frontmatter property to edit. A property edit keeps the key
+    /// where it is and in the list style the note already uses, and a list
+    /// with no items writes an empty list.
     pub property: Option<String>,
     /// `replace`, `append`, `prepend` or `remove`.
     pub mode: EditMode,
