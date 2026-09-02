@@ -613,6 +613,15 @@ pub fn create_note(
 /// - Replace: replace the entire section body with new content
 /// - Append: add new content at the end of the section body
 /// - Prepend: add new content at the start of the section body
+///
+/// The blank line under the heading and the one before the next section are
+/// the note's, not the content's: blank lines at the edges of `content` are
+/// dropped, so a body that opens with a newline lands under the heading once.
+/// The exception is the edge an edit joins on. An append writes the new text
+/// on the line after the old body, and leading blank lines in the content ask
+/// for a paragraph break there; a prepend reads trailing blank lines the same
+/// way. Empty content empties a replaced section and is a no-op for the other
+/// two modes (#104).
 pub fn apply_section_edit(
     content: &str,
     heading: &str,
@@ -646,26 +655,35 @@ pub fn apply_section_edit(
     let body = &lines[section.body_start..section.body_end];
     let after = &lines[section.body_end..];
 
-    let new_body = match mode {
-        EditMode::Replace => {
-            format!("\n{}\n", new.trim_end())
+    let (leading, text, trailing) = content_edges(new);
+    let existing = body.join("\n");
+    // A body on its own under the heading: one blank line above it, and the
+    // join below supplies the one before the next section. An empty body is
+    // nothing at all, so the heading meets the next one across one blank line.
+    let alone = |text: &str| {
+        if text.is_empty() {
+            String::new()
+        } else {
+            format!("\n{text}\n")
         }
+    };
+    let new_body = match mode {
+        EditMode::Replace => alone(text),
+        EditMode::Append | EditMode::Prepend if text.is_empty() => existing,
         EditMode::Append => {
-            let existing = body.join("\n");
-            let trimmed_existing = existing.trim_end();
-            if trimmed_existing.is_empty() {
-                format!("\n{}\n", new.trim_end())
+            let old = existing.trim_end();
+            if old.is_empty() {
+                alone(text)
             } else {
-                format!("{}\n{}\n", trimmed_existing, new.trim_end())
+                format!("{old}\n{}{text}\n", "\n".repeat(leading))
             }
         }
         EditMode::Prepend => {
-            let existing = body.join("\n");
-            let trimmed_existing = existing.trim_start();
-            if trimmed_existing.is_empty() {
-                format!("\n{}\n", new.trim_end())
+            let old = from_first_text_line(&existing);
+            if old.is_empty() {
+                alone(text)
             } else {
-                format!("\n{}\n{}", new.trim_end(), trimmed_existing)
+                format!("\n{text}\n{}{old}", "\n".repeat(trailing))
             }
         }
         EditMode::Remove => bail!("Remove has no meaning for a section"),
@@ -682,6 +700,36 @@ pub fn apply_section_edit(
     }
     // Join with newlines, ensuring we don't double up
     Ok(keep_final_newline(content, result_parts.join("\n")))
+}
+
+/// The text of a section edit's `content`, with the blank lines on either
+/// side of it counted rather than kept.
+///
+/// `apply_section_edit` supplies the newline after the heading and the one
+/// before the next section itself, so blank lines at the edges of the content
+/// are not body text. They carry one meaning, and only at the edge an edit
+/// joins on: an append reads leading blank lines as the paragraph break
+/// between the old body and the new text, a prepend reads trailing ones the
+/// same way round. A single trailing newline is a line ending, not a blank
+/// line. Indentation on the first line is content and stays (#104).
+fn content_edges(new: &str) -> (usize, &str, usize) {
+    let from_text = from_first_text_line(new);
+    let text = from_text.trim_end();
+    if text.is_empty() {
+        return (0, "", 0);
+    }
+    let head = &new[..new.len() - from_text.len()];
+    let tail = &new[head.len() + text.len()..];
+    let leading = head.matches('\n').count();
+    let trailing = tail.matches('\n').count() - usize::from(tail.ends_with('\n'));
+    (leading, text, trailing)
+}
+
+/// The text from the start of its first non-blank line, so that line keeps
+/// its indentation where `trim_start` would take it (#104).
+fn from_first_text_line(s: &str) -> &str {
+    let blank = &s[..s.len() - s.trim_start().len()];
+    &s[blank.rfind('\n').map_or(0, |i| i + 1)..]
 }
 
 /// Rewrite one section's heading line, and nothing else in the note (#97).
@@ -3297,6 +3345,135 @@ mod tests {
             apply_note_edits(note, &edits).unwrap(),
             "---\ntags: [a]\n---\n\n## Contains\n\n- [[One]]\n- [[Two]]\n- [[Three]]\n\n## Notes\n\nEnd.\n"
         );
+    }
+
+    /// Content that opens with a newline is hand-authored content of the
+    /// right shape: a section's body does begin on the line after its
+    /// heading. The format string already supplies that newline, so the
+    /// content's own used to double the blank line under the heading in
+    /// every branch that writes there (#104).
+    #[test]
+    fn a_leading_newline_in_section_content_does_not_double_the_blank_line() {
+        let doc = "# Note\n\n## Section\n\nOriginal body.\n\n## Next\n\nOther.\n";
+        let empty = "# Note\n\n## Section\n\n## Next\n\nOther.\n";
+        let filled = "# Note\n\n## Section\n\nNew body.\n\n## Next\n\nOther.\n";
+        for (label, doc, mode, expected) in [
+            ("replace", doc, EditMode::Replace, filled),
+            (
+                "append into a bodyless section",
+                empty,
+                EditMode::Append,
+                filled,
+            ),
+            (
+                "prepend into a bodyless section",
+                empty,
+                EditMode::Prepend,
+                filled,
+            ),
+            (
+                "prepend",
+                doc,
+                EditMode::Prepend,
+                "# Note\n\n## Section\n\nNew body.\nOriginal body.\n\n## Next\n\nOther.\n",
+            ),
+        ] {
+            let out = apply_section_edit(doc, "Section", "\nNew body.\n", mode).unwrap();
+            assert_eq!(out, expected, "{label}");
+        }
+    }
+
+    /// A CRLF at the front is the same newline (#104).
+    #[test]
+    fn a_leading_crlf_in_section_content_is_dropped_too() {
+        let doc = "# Note\n\n## Section\n\nOriginal body.\n\n## Next\n\nOther.\n";
+        let out =
+            apply_section_edit(doc, "Section", "\r\nNew body.\r\n", EditMode::Replace).unwrap();
+        assert_eq!(
+            out,
+            "# Note\n\n## Section\n\nNew body.\n\n## Next\n\nOther.\n"
+        );
+    }
+
+    /// Indentation on the first line is content, not part of the newline
+    /// before it (#104).
+    #[test]
+    fn a_leading_newline_is_dropped_but_the_first_lines_indentation_is_kept() {
+        let doc = "# Note\n\n## Section\n\nOriginal body.\n\n## Next\n\nOther.\n";
+        let out = apply_section_edit(doc, "Section", "\n    code\n", EditMode::Replace).unwrap();
+        assert_eq!(
+            out,
+            "# Note\n\n## Section\n\n    code\n\n## Next\n\nOther.\n"
+        );
+    }
+
+    /// An append joins the new text onto the line after the old body. A blank
+    /// line at the front of the content asks for a paragraph break instead,
+    /// and that is the one place a leading newline means something, so it is
+    /// kept (#104).
+    #[test]
+    fn an_append_keeps_the_paragraph_break_a_leading_blank_line_asks_for() {
+        let doc = "# Note\n\n## Section\n\nOriginal body.\n\n## Next\n\nOther.\n";
+        let out = apply_section_edit(doc, "Section", "\nNew body.\n", EditMode::Append).unwrap();
+        assert_eq!(
+            out,
+            "# Note\n\n## Section\n\nOriginal body.\n\nNew body.\n\n## Next\n\nOther.\n"
+        );
+    }
+
+    /// The same rule the other way round: a prepend joins the old body onto
+    /// the line after the new text, and a blank line at the end of the
+    /// content asks for a paragraph break. A single trailing newline is a
+    /// line ending, as it is everywhere else (#104).
+    #[test]
+    fn a_prepend_keeps_the_paragraph_break_a_trailing_blank_line_asks_for() {
+        let doc = "# Note\n\n## Section\n\nOriginal body.\n\n## Next\n\nOther.\n";
+        let joined = apply_section_edit(doc, "Section", "New body.\n", EditMode::Prepend).unwrap();
+        assert_eq!(
+            joined,
+            "# Note\n\n## Section\n\nNew body.\nOriginal body.\n\n## Next\n\nOther.\n"
+        );
+        let broken =
+            apply_section_edit(doc, "Section", "New body.\n\n", EditMode::Prepend).unwrap();
+        assert_eq!(
+            broken,
+            "# Note\n\n## Section\n\nNew body.\n\nOriginal body.\n\n## Next\n\nOther.\n"
+        );
+    }
+
+    /// A prepend used to trim the old body's leading whitespace, which took
+    /// the indentation off its first line (#104).
+    #[test]
+    fn a_prepend_keeps_the_indentation_of_the_old_bodys_first_line() {
+        let doc = "# Note\n\n## Section\n\n    code\n\n## Next\n\nOther.\n";
+        let out = apply_section_edit(doc, "Section", "Intro", EditMode::Prepend).unwrap();
+        assert_eq!(
+            out,
+            "# Note\n\n## Section\n\nIntro\n    code\n\n## Next\n\nOther.\n"
+        );
+    }
+
+    /// Replacing a section's body with nothing empties the section: the
+    /// heading, one blank line, the next heading. It used to leave three
+    /// blank lines (#104).
+    #[test]
+    fn a_replace_with_empty_content_leaves_a_bodyless_section() {
+        let doc = "# Note\n\n## Section\n\nOriginal body.\n\n## Next\n\nOther.\n";
+        let out = apply_section_edit(doc, "Section", "", EditMode::Replace).unwrap();
+        assert_eq!(out, "# Note\n\n## Section\n\n## Next\n\nOther.\n");
+        let last = "# Note\n\n## Section\n\nOriginal body.\n";
+        let out = apply_section_edit(last, "Section", "\n", EditMode::Replace).unwrap();
+        assert_eq!(out, "# Note\n\n## Section\n");
+    }
+
+    /// Appending or prepending nothing changes nothing (#104).
+    #[test]
+    fn an_append_or_prepend_of_empty_content_is_a_no_op() {
+        let doc = "# Note\n\n## Section\n\nOriginal body.\n\n## Next\n\nOther.\n";
+        for mode in [EditMode::Append, EditMode::Prepend] {
+            let out = apply_section_edit(doc, "Section", "\n", mode).unwrap();
+            assert_eq!(out, doc, "{mode:?}");
+        }
     }
 
     /// A hard delete takes the note off disk and out of the index, so the
