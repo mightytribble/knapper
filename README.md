@@ -135,7 +135,7 @@ Every request hit the sessions table, and the table was the single point of fail
 The web app keeps the session token in an HTTP-only, SameSite=Strict cookie. Nothing auth-related is stored in localStorage. Mobile clients use the platform keychain. The legacy server-side session table is gone; see [[2024 Legacy Session Auth]] for what it replaced.
 ```
 
-A result is one section of a note, with its full text. Adjacent sections of one note arrive as one block: the first result is the note's head and its `## Overview`, presented together at the stronger section's score. `6e1b70#0` is the note's docid and the section's ordinal, and `matched:` names the lanes that found it. The percentage is whichever scorer sorted the result's probability — the cross-encoder's when one is configured, otherwise a calibrated probability fused from the semantic and keyword lanes' own scores — and `--scores` prints it either way; a result below its scorer's own floor (`answer_floor`, 30% by default, for the cross-encoder; `[calibrated] floor`, 75% by default, for the calibrated logistic) is dropped, so a query the vault cannot answer prints `No relevant content found for this query in the vault.` rather than its nearest miss. `--explain` adds each result's per-lane ranks and scores.
+A result is one section of a note, with its full text. Abutting chunks of one section — and of the subsections below it — arrive as one block: the first result is the note's head and its `## Overview`, presented together at the stronger member's score. The merge stops at a sibling section, so two neighbouring topics stay two results. `6e1b70#0` is the note's docid and the section's ordinal, and `matched:` names the lanes that found it. The percentage is whichever scorer sorted the result's probability — the cross-encoder's when one is configured, otherwise a calibrated probability fused from the semantic and keyword lanes' own scores — and `--scores` prints it either way; a result below its scorer's own floor (`answer_floor`, 30% by default, for the cross-encoder; `[calibrated] floor`, 75% by default, for the calibrated logistic) is dropped, so a query the vault cannot answer prints `No relevant content found for this query in the vault.` rather than its nearest miss. `--explain` adds each result's per-lane ranks and scores.
 
 **Claude Code** — Install the plugin (recommended), which registers the MCP server and the skills:
 
@@ -574,7 +574,7 @@ STYLE:
 
 **Developer second brain** — Index architecture docs, decision records, meeting notes, and code snippets. Search by concept across all of them.
 
-**Research and writing** — Ask a question in prose and get the sections that answer it, each scored by the cross-encoder, with a note's adjacent sections merged into one block; `read --metadata` then follows a note's wikilinks in both directions.
+**Research and writing** — Ask a question in prose and get the sections that answer it, each scored by the cross-encoder, with a note's abutting chunks of one section merged into one block; `read --metadata` then follows a note's wikilinks in both directions.
 
 **Team knowledge graphs** — Index a shared docs vault. AI agents can answer "who knows about X?" and "what decisions were made about Y?" by traversing the note graph.
 
@@ -654,8 +654,9 @@ intelligence = true
 # rerank = 1.0
 # temporal = 0.0
 
-# Adjacent sections of one document are returned as a single block. Default
-# on; set to false for per-section results.
+# Abutting chunks of one section — and of the subsections below it — are
+# returned as a single block, stopping at a sibling section. Default on; set
+# to false for per-chunk results.
 [ranking]
 # coalesce_adjacent = true
 

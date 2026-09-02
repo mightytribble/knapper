@@ -2115,11 +2115,52 @@ mod tests {
         assert!(hits.iter().all(|r| r.heading.is_some()));
     }
 
+    /// A vault whose one file is a section and its subsections, which is the
+    /// unit coalescing merges since #101: the sibling sections of
+    /// `indexed_vault` are separate topics and no longer form one block.
+    /// Every body clears `chunk_min_chars`, so each section is its own chunk.
+    fn nested_vault() -> (tempfile::TempDir, Store, crate::llm::MockLlm) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("rules")).unwrap();
+        std::fs::write(
+            root.join("rules/warding-school.md"),
+            "## Warding School
+
+The school of warding covers every effect that blocks,              ends or pins magic, and the entries below inherit their rules from this              section rather than restating them each time.
+
+             ### Counterspell
+
+A warding effect that stops a spell mid-cast.              It interrupts the casting itself and does nothing to a spell already in effect,              which is what separates it from the entry below.
+
+             ### Dispel Magic
+
+A warding effect that ends an ongoing spell.              It reaches an effect already in place and cannot interrupt one              that is still being cast, which is the whole of the difference.
+",
+        )
+        .unwrap();
+
+        let store = Store::open_memory().unwrap();
+        let mut embedder = crate::llm::MockLlm::new(256);
+        let config = crate::config::Config::default();
+        crate::indexer::run_index_shared(
+            root,
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
+        (tmp, store, embedder)
+    }
+
     #[test]
     fn coalescing_runs_with_no_cross_encoder() {
-        // The three adjacent sections of the abjuration file are one block, and the
-        // pass ran with reranker: None — so it does not depend on the model.
-        let (_tmp, store, mut embedder) = indexed_vault();
+        // A section and its two subsections are one block, and the pass ran
+        // with reranker: None — so it does not depend on the model.
+        let (_tmp, store, mut embedder) = nested_vault();
         let mut config = SearchConfig {
             fts: crate::config::FtsConfig::default(),
             scope: crate::tags::Scope::default(),
@@ -2140,20 +2181,24 @@ mod tests {
             },
         };
         let out = search_with_intelligence("warding", 10, &mut embedder, &mut config).unwrap();
-        let abjuration: Vec<&InternalSearchResult> = out
+        let warding: Vec<&InternalSearchResult> = out
             .results
             .iter()
-            .filter(|r| r.file_path == "rules/abjuration-spells.md")
+            .filter(|r| r.file_path == "rules/warding-school.md")
             .collect();
         assert_eq!(
-            abjuration.len(),
+            warding.len(),
             1,
-            "the adjacent sections are one block: {:#?}",
+            "a section and its subsections are one block: {:#?}",
             out.results
         );
-        assert!(abjuration[0].text.contains("Counterspell"));
-        assert!(abjuration[0].text.contains("Dispel Magic"));
-        assert!(abjuration[0].text.contains("Dimensional Anchor"));
+        assert_eq!(
+            warding[0].heading_path, "rules/warding-school.md > Warding School",
+            "headed by the section that contains the rest"
+        );
+        assert!(warding[0].text.contains("school of warding"));
+        assert!(warding[0].text.contains("Counterspell"));
+        assert!(warding[0].text.contains("Dispel Magic"));
     }
 
     #[test]
@@ -2291,9 +2336,9 @@ mod tests {
         // `per_note_cap` limits how many sections of one file reach the
         // result, above coalescing. So it also limits how many sections a
         // coalesced block can span (design doc, "Composition and control").
-        let (_tmp, store, mut embedder) = indexed_vault();
+        let (_tmp, store, mut embedder) = nested_vault();
 
-        let abjuration_text = |per_note_cap, embedder: &mut llm::MockLlm| {
+        let warding_text = |per_note_cap, embedder: &mut llm::MockLlm| {
             let mut reranker = llm::MockLlm::new(8);
             let mut config = SearchConfig {
                 fts: crate::config::FtsConfig::default(),
@@ -2318,15 +2363,15 @@ mod tests {
             let out = search_with_intelligence("warding", 20, embedder, &mut config).unwrap();
             out.results
                 .into_iter()
-                .find(|r| r.file_path == "rules/abjuration-spells.md")
+                .find(|r| r.file_path == "rules/warding-school.md")
                 .map(|r| r.text)
                 .unwrap_or_default()
         };
 
-        let markers = ["Counterspell", "Dispel Magic", "Dimensional Anchor"];
+        let markers = ["school of warding", "Counterspell", "Dispel Magic"];
 
         // Control: unbounded, the block spans all three sections.
-        let unbounded = abjuration_text(0, &mut embedder);
+        let unbounded = warding_text(0, &mut embedder);
         let unbounded_count = markers.iter().filter(|m| unbounded.contains(**m)).count();
         assert_eq!(
             unbounded_count, 3,
@@ -2335,7 +2380,7 @@ mod tests {
 
         // `per_note_cap: 2` bounds the sections available to merge to two, so
         // the block must span strictly fewer sections than the control.
-        let bounded = abjuration_text(2, &mut embedder);
+        let bounded = warding_text(2, &mut embedder);
         let bounded_count = markers.iter().filter(|m| bounded.contains(**m)).count();
         assert!(
             bounded_count < unbounded_count,
