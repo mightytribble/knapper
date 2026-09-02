@@ -27,7 +27,7 @@ pub fn idf(n_rows: u64, doc_freq: u64) -> f64 {
 /// `aFreq[ip] += w`, then `idf · tf·(k1+1) / (tf + k1·(…))`), so the ceiling is
 /// `idf · (k1 + 1)` whatever the weights are. A heavier weight moves a row's
 /// score toward that same ceiling instead of raising it. This is also the
-/// formula `eval/calibrated-fusion-eval.py` fits the coefficients with, so the
+/// formula `scripts/calibrated-fusion-eval.py` fits the coefficients with, so the
 /// binary and the refit tool must agree here (spec 2026-08-30).
 pub fn upper_bound(idfs: &[f64]) -> f64 {
     (K1 + 1.0) * idfs.iter().sum::<f64>()

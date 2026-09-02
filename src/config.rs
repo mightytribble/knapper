@@ -384,16 +384,20 @@ impl Default for RerankConfig {
 /// configured; with one configured the whole section is inert. Every key is
 /// query-time and reaches no fingerprint, so a sweep is a config edit.
 ///
-/// **The coefficients and the floor are fit against the default local
-/// embedder.** `bm25n` normalizes itself per query and per corpus, but raw
-/// cosine is one model's similarity scale: at `bm25n = 0` the shipped floor
-/// asks for `cos >= 0.5006`, a threshold read off that model's distribution.
-/// A non-default `models.embed` — an API embedder or another `hf:` GGUF —
-/// moves the scale in an unknown direction, and the failure is silent: the
-/// path abstains on every query, or on none. Set `floor = 0.0` on a
-/// non-default embedder, or refit the four numbers with
-/// `eval/calibrated-fusion-eval.py`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// **The four numbers below are EmbeddingGemma's fit, not a global default.**
+/// `bm25n` normalizes itself per query and per corpus, but raw cosine is one
+/// model's similarity scale: at `bm25n = 0` the shipped floor asks for
+/// `cos >= 0.5006`, a threshold read off that model's distribution. A
+/// different `models.embed` — an API embedder or another `hf:` GGUF — moves
+/// the scale in an unknown direction, and the failure is silent: the path
+/// abstains on every query, or on none (#103).
+///
+/// The coefficients and the floor are **one fit** and do not move
+/// independently. Scaling the weights down without moving the floor tightens
+/// the threshold — at `semantic = 11` it becomes `cos >= 0.6315`, above almost
+/// every positive the pin fit was built from, whose top cosines run 0.446 to
+/// 0.633. Refit all four together with `scripts/calibrated-fusion-eval.py`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CalibratedConfig {
     /// The calibrated sort itself. `false` restores the pre-change routing —
@@ -416,7 +420,7 @@ impl Default for CalibratedConfig {
         // The pin fit: 33 tier-1 positives against 1228 labeled negatives,
         // leave-one-query-out validated. Provenance in
         // eval/calibrated-fusion-report-2026-08-30.txt; the fit's tool is
-        // eval/calibrated-fusion-eval.py.
+        // scripts/calibrated-fusion-eval.py.
         Self {
             enabled: true,
             semantic: 13.878,
@@ -1172,6 +1176,36 @@ impl Config {
         self.intelligence.unwrap_or(false)
     }
 
+    /// Whether `[calibrated]` holds the shipped fit while `models.embed` names
+    /// an embedder that fit does not cover (#103).
+    ///
+    /// Three conditions, and all three have to hold before there is anything
+    /// to say. The path has to run at all: with a cross-encoder configured, or
+    /// with `enabled = false`, the section is inert and its numbers decide
+    /// nothing. The embedder has to be one the fit does not cover, since
+    /// cosine is one model's scale and the shipped coefficients read
+    /// EmbeddingGemma's. And the numbers have to still be the shipped ones —
+    /// a user who refit set their own, and telling them their own fit is stale
+    /// would be false.
+    ///
+    /// `None` resolves through [`crate::llm::ModelDefaults`], the same value
+    /// `load_embedder` resolves it through, so the unset case cannot drift
+    /// from what actually loads.
+    pub fn calibration_needs_refit(&self) -> bool {
+        if self.intelligence_enabled() || !self.calibrated.enabled {
+            return false;
+        }
+        if self.calibrated != CalibratedConfig::default() {
+            return false;
+        }
+        let uri = self
+            .models
+            .embed
+            .clone()
+            .unwrap_or_else(|| crate::llm::ModelDefaults::default().embed_uri);
+        !uri.to_lowercase().contains("embeddinggemma")
+    }
+
     /// Save config to a specific path.
     ///
     /// The file is edited, not rewritten. A serialized `Config` holds every key
@@ -1249,6 +1283,32 @@ const CONFIG_BANNER: &str = "\
 
 ";
 
+/// The prose a generated config carries above one section.
+///
+/// The banner says what a commented key means; this says what a section's
+/// values are *tied to*, which the values themselves cannot. Only a section
+/// whose defaults stop being right when something outside them changes needs
+/// one, so the map holds what it holds and no more.
+fn section_note(path: &str) -> Option<&'static str> {
+    match path {
+        // The numbers are one embedder's fit, and nothing in the file says so
+        // (#103). A user who changes `models.embed` keeps a floor read off a
+        // scale that is gone, and the failure is quiet.
+        "calibrated" => Some(
+            "These coefficients and this floor are fit against EmbeddingGemma,\n\
+             the embedder this build installs. They are one fit: cosine is one\n\
+             model's similarity scale, and the floor is a threshold read off\n\
+             that scale.\n\
+             \n\
+             Point models.embed at a different embedder and it is yours to\n\
+             refit all four numbers against it. Until you do, the floor cuts in\n\
+             the wrong place, and it fails quietly: the path abstains on every\n\
+             query, or on none.",
+        ),
+        _ => None,
+    }
+}
+
 /// A config file holding every default, commented out.
 ///
 /// The section headers stay live and only the key lines are commented, so
@@ -1278,6 +1338,16 @@ fn commented_defaults() -> Result<String> {
                 }
             }
             emitted.push(path.to_string());
+            if let Some(note) = section_note(path) {
+                for note_line in note.lines() {
+                    // A bare `#` for a blank line: a trailing space is
+                    // invisible in the file and visible in every diff of it.
+                    match note_line.trim_start() {
+                        "" => out.push_str("#\n"),
+                        text => out.push_str(&format!("# {text}\n")),
+                    }
+                }
+            }
             out.push_str(line);
         } else {
             if !line.is_empty() {
@@ -2190,6 +2260,97 @@ answer_floor = 0.5
         }
         assert!(headers.contains(&"models"), "{text}");
         assert!(headers.contains(&"calibrated"), "{text}");
+    }
+
+    /// The shipped `[calibrated]` numbers are EmbeddingGemma's fit, so an
+    /// index that now embeds with something else puts a different cosine scale
+    /// under a floor read off that one (#103). Three things have to be true at
+    /// once before there is anything to tell the user, and each of them alone
+    /// is a reason to stay quiet.
+    #[test]
+    fn a_refit_is_needed_only_where_the_shipped_fit_decides_something() {
+        let mut cfg = Config::default();
+        assert!(
+            !cfg.calibration_needs_refit(),
+            "the default install runs the embedder the fit covers"
+        );
+
+        cfg.models.embed = Some("gemini:gemini-embedding-2".into());
+        assert!(
+            cfg.calibration_needs_refit(),
+            "a hosted embedder is not the one the numbers were fit against"
+        );
+
+        // A cross-encoder sorts instead, so the section is inert.
+        cfg.intelligence = Some(true);
+        assert!(!cfg.calibration_needs_refit());
+        cfg.intelligence = Some(false);
+        assert!(cfg.calibration_needs_refit());
+
+        // The legacy stage runs instead, so the numbers decide nothing.
+        cfg.calibrated.enabled = false;
+        assert!(!cfg.calibration_needs_refit());
+        cfg.calibrated.enabled = true;
+        assert!(cfg.calibration_needs_refit());
+
+        // Their own fit is not stale, whatever it says.
+        cfg.calibrated.semantic = 8.0;
+        assert!(
+            !cfg.calibration_needs_refit(),
+            "a user who refit set these; calling their numbers stale is false"
+        );
+        cfg.calibrated = CalibratedConfig::default();
+        assert!(cfg.calibration_needs_refit());
+
+        // Naming the shipped model explicitly is the same as leaving it unset.
+        cfg.models.embed =
+            Some("hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf".into());
+        assert!(!cfg.calibration_needs_refit());
+
+        cfg.models.embed = Some("hf:someone/other-model/other-Q8_0.gguf".into());
+        assert!(
+            cfg.calibration_needs_refit(),
+            "another local GGUF is another cosine scale"
+        );
+    }
+
+    /// The unset case resolves through the same default the loader reads, so
+    /// the two cannot drift apart.
+    #[test]
+    fn the_unset_embedder_is_the_one_the_fit_covers() {
+        assert!(
+            crate::llm::ModelDefaults::default()
+                .embed_uri
+                .to_lowercase()
+                .contains("embeddinggemma")
+        );
+    }
+
+    /// The `[calibrated]` numbers are one embedder's fit, and the file that
+    /// carries them says so above the header they sit under (#103). Without it
+    /// a user who changes `models.embed` keeps a floor fit to a scale that is
+    /// gone, and nothing in their config tells them.
+    #[test]
+    fn the_calibrated_section_carries_the_embedder_its_fit_belongs_to() {
+        let text = commented_defaults().unwrap();
+        let (before, _) = text.split_once("[calibrated]").expect("a header: {text}");
+        let note = before
+            .rsplit("\n\n")
+            .next()
+            .expect("text before the header");
+
+        assert!(
+            note.contains("EmbeddingGemma"),
+            "the note names the embedder: {note}"
+        );
+        assert!(
+            note.contains("refit"),
+            "the note says what a different embedder costs: {note}"
+        );
+        assert!(
+            note.lines().all(|l| l.starts_with('#')),
+            "every note line is a comment: {note}"
+        );
     }
 
     /// An array of tables is one value, so `http.api_keys` survives the round

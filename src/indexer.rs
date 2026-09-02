@@ -714,6 +714,21 @@ fn run_index_inner(
             mismatch.key,
             mismatch.action.describe()
         );
+        // The vectors below are rebuilt; the numbers that read them are not
+        // (#103). `[calibrated]` is EmbeddingGemma's fit, so a re-index onto
+        // another embedder puts a different cosine scale under a floor read
+        // off that one, and the failure is quiet — the path abstains on every
+        // query, or on none. The fingerprint's own action cannot say this: it
+        // is `Reindex`, and the re-index is not what is missing.
+        if mismatch.key == crate::fingerprint::EMBEDDING.name && config.calibration_needs_refit() {
+            eprintln!(
+                "  Note: [calibrated] is fit against EmbeddingGemma, and this \
+                 vault now embeds with something else. Its floor cuts in the \
+                 wrong place until you refit the four numbers \
+                 (scripts/calibrated-fusion-eval.py) or set [calibrated] \
+                 floor = 0.0."
+            );
+        }
     }
     if actions.contains(&crate::fingerprint::Action::Reindex) {
         rebuild = true;
