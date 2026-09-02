@@ -585,26 +585,21 @@ pub fn search_with_intelligence(
             GroupBy::Chunk => fusion::cap_per_file(final_fused, config.ranking.per_note_cap),
         };
 
-        let results: Vec<InternalSearchResult> = final_fused
-            .iter()
-            .take(top_n)
-            .map(|f| {
-                // Whichever scorer sorted the pool — the cross-encoder or
-                // the calibrated logistic — its own number, not a fused one.
-                // This is the absolute score layer 2 thresholds on for
-                // abstention.
-                let score = model_score(f).unwrap_or(f.rrf_score);
-                build_result(config.store, f, config.rerank, score)
-            })
-            .collect();
-
         return Ok(finalize_search_output(
-            results,
+            Presentation {
+                store: config.store,
+                rerank: config.rerank,
+                top_n,
+                coalesce: config.ranking.coalesce_adjacent,
+                // Whichever scorer sorted the pool — the cross-encoder or the
+                // calibrated logistic — its own number, not a fused one. This
+                // is the absolute score layer 2 thresholds on for abstention.
+                score: |f: &FusedResult| model_score(f).unwrap_or(f.rrf_score),
+            },
             final_fused,
             degraded,
             trace,
             config.fts.columns(),
-            config.ranking.coalesce_adjacent,
         ));
     }
 
@@ -746,20 +741,18 @@ pub fn search_with_intelligence(
         },
     );
 
-    // Convert fused results to InternalSearchResult, taking top_n.
-    let results: Vec<InternalSearchResult> = final_fused
-        .iter()
-        .take(top_n)
-        .map(|f| build_result(config.store, f, config.rerank, f.rrf_score))
-        .collect();
-
     Ok(finalize_search_output(
-        results,
+        Presentation {
+            store: config.store,
+            rerank: config.rerank,
+            top_n,
+            coalesce: config.ranking.coalesce_adjacent,
+            score: |f: &FusedResult| f.rrf_score,
+        },
         final_fused,
         false,
         trace,
         config.fts.columns(),
-        config.ranking.coalesce_adjacent,
     ))
 }
 
@@ -790,18 +783,21 @@ fn model_score(result: &FusedResult) -> Option<f64> {
 /// It is the `--explain` record of the fusion step. It is not the presented
 /// result.
 fn finalize_search_output(
-    results: Vec<InternalSearchResult>,
+    present: Presentation<'_, impl Fn(&FusedResult) -> f64>,
     fused: Vec<FusedResult>,
     degraded: bool,
     trace: RetrievalTrace,
     fts_columns: Vec<(&'static str, f64)>,
-    coalesce: bool,
 ) -> SearchOutput {
-    let results = if coalesce {
-        crate::coalesce::coalesce_adjacent(results)
+    let top_n = present.top_n;
+    let coalesce = present.coalesce;
+    let built = admit_for_top_n(&present, &fused);
+    let mut results = if coalesce {
+        crate::coalesce::coalesce_adjacent(built)
     } else {
-        results
+        built
     };
+    results.truncate(top_n);
     SearchOutput {
         results,
         fused,
@@ -809,6 +805,62 @@ fn finalize_search_output(
         retrieval: trace,
         fts_columns,
     }
+}
+
+/// Build candidates in rank order until the merged output holds `top_n`
+/// blocks (#102).
+///
+/// `top_n` is the number of results a caller is shown, and the merge
+/// collapses rows, so cutting the candidates at `top_n` and merging after
+/// returned `top_n` minus however many merges fired — a shortfall that
+/// moved with the data, so no value returned a known number of results.
+/// Each candidate is built once; `coalesce::blocks` counts what the merge
+/// would make, so the count and the merge read one rule.
+///
+/// The candidates are the pool the answer floor already filtered, so the
+/// top-up admits no row that was not an answer, and it stops when they run
+/// out — `[ranking] candidates` is the ceiling, and no `top_n` reaches past
+/// it. With `coalesce` off a block is a chunk, so this is `take(top_n)`.
+///
+/// Admitting a candidate can also *lower* the count, when it is the section
+/// that gathers rows already admitted. The scan stops at the first prefix
+/// that reaches `top_n`, so it takes the fewest candidates that answer the
+/// request; past that point the merge is what bounds the result, and asking
+/// for more than the vault can present as distinct blocks returns the
+/// blocks there are.
+fn admit_for_top_n<F: Fn(&FusedResult) -> f64>(
+    present: &Presentation<'_, F>,
+    fused: &[FusedResult],
+) -> Vec<InternalSearchResult> {
+    let mut built: Vec<InternalSearchResult> = Vec::new();
+    if present.top_n == 0 {
+        return built;
+    }
+    for f in fused {
+        let score = (present.score)(f);
+        built.push(build_result(present.store, f, present.rerank, score));
+        let blocks = if present.coalesce {
+            crate::coalesce::blocks(&built).len()
+        } else {
+            built.len()
+        };
+        if blocks >= present.top_n {
+            break;
+        }
+    }
+    built
+}
+
+/// What turns the ranked candidates into the results a caller is shown: the
+/// store each row is read from, the rerank window settings, how many blocks
+/// were asked for, whether the merge runs, and which score the stage that
+/// produced the candidates reports.
+struct Presentation<'a, F: Fn(&FusedResult) -> f64> {
+    store: &'a Store,
+    rerank: crate::config::RerankConfig,
+    top_n: usize,
+    coalesce: bool,
+    score: F,
 }
 
 /// Build the contract row for one fused result (#35).
@@ -2115,11 +2167,204 @@ mod tests {
         assert!(hits.iter().all(|r| r.heading.is_some()));
     }
 
+    /// A vault whose one file is a section and its subsections, which is the
+    /// unit coalescing merges since #101: the sibling sections of
+    /// `indexed_vault` are separate topics and no longer form one block.
+    /// Every body clears `chunk_min_chars`, so each section is its own chunk.
+    fn nested_vault() -> (tempfile::TempDir, Store, crate::llm::MockLlm) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("rules")).unwrap();
+        std::fs::write(
+            root.join("rules/warding-school.md"),
+            "## Warding School
+
+The school of warding covers every effect that blocks,              ends or pins magic, and the entries below inherit their rules from this              section rather than restating them each time.
+
+             ### Counterspell
+
+A warding effect that stops a spell mid-cast.              It interrupts the casting itself and does nothing to a spell already in effect,              which is what separates it from the entry below.
+
+             ### Dispel Magic
+
+A warding effect that ends an ongoing spell.              It reaches an effect already in place and cannot interrupt one              that is still being cast, which is the whole of the difference.
+",
+        )
+        .unwrap();
+
+        let store = Store::open_memory().unwrap();
+        let mut embedder = crate::llm::MockLlm::new(256);
+        let config = crate::config::Config::default();
+        crate::indexer::run_index_shared(
+            root,
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
+        (tmp, store, embedder)
+    }
+
+    /// Five files, each a section and its two subsections, so every file
+    /// contributes three chunks that merge into one block. `warding-00` is
+    /// the terse one, and `MockLlm`'s reranker scores by 4-gram overlap, so
+    /// a short chunk outranks a long one: that file's three chunks take the
+    /// top of the sorted stage's order and merge inside any small prefix.
+    fn topup_vault() -> (tempfile::TempDir, Store, crate::llm::MockLlm) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("warding-00.md"),
+            "## Warding School 0\n\nWarding covers every effect that blocks, ends or \
+             pins magic, and the entries below inherit their rules from here.\n\n\
+             ### Counterspell 0\n\nA warding effect that stops a spell mid-cast, and \
+             does nothing at all to a spell that is already in effect.\n\n\
+             ### Dispel Magic 0\n\nA warding effect that ends a spell already in \
+             place, and cannot reach one that is still being cast.\n",
+        )
+        .unwrap();
+        for i in 1..5 {
+            std::fs::write(
+                root.join(format!("warding-{i:02}.md")),
+                format!(
+                    "## Warding School {i}\n\nThe school of warding covers every effect that \
+                     blocks, ends or pins magic, and each of the entries set out below \
+                     inherits its rules from this section rather than restating any of \
+                     them a second time in its own words.\n\n\
+                     ### Counterspell {i}\n\nA warding effect that stops a spell mid-cast. \
+                     It interrupts the casting itself and does nothing whatever to a spell \
+                     that is already in effect, which is what separates it from the entry \
+                     set out immediately below this one.\n\n\
+                     ### Dispel Magic {i}\n\nA warding effect that ends an ongoing spell. \
+                     It reaches an effect already in place and cannot interrupt one that is \
+                     still being cast, which is the whole of the difference between this \
+                     entry and the one immediately above it.\n"
+                ),
+            )
+            .unwrap();
+        }
+
+        let store = Store::open_memory().unwrap();
+        let mut embedder = crate::llm::MockLlm::new(256);
+        let config = crate::config::Config::default();
+        crate::indexer::run_index_shared(
+            root,
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
+        (tmp, store, embedder)
+    }
+
+    /// Whether any result is a block of more than one chunk. The count
+    /// assertions prove nothing about the top-up unless a merge fired.
+    fn a_merge_fired(out: &SearchOutput) -> bool {
+        out.results
+            .iter()
+            .any(|r| r.text.contains("Counterspell") && r.text.contains("Dispel Magic"))
+    }
+
+    #[test]
+    fn top_n_counts_blocks_and_not_pre_merge_chunks() {
+        // #102. `top_n` bounded the candidate set before the merge, so every
+        // merge that fired cost the caller a row and no value of `top_n`
+        // returned a known number of results.
+        let (_tmp, store, mut embedder) = topup_vault();
+        let mut merged = false;
+        for top_n in 1..=4 {
+            let out = search_at(
+                "warding",
+                top_n,
+                crate::config::default_retrieval_width(),
+                &store,
+                &mut embedder,
+            );
+            assert_eq!(out.results.len(), top_n, "asked for {top_n}");
+            merged |= a_merge_fired(&out);
+        }
+        assert!(merged, "no merge fired, so the counts prove nothing");
+    }
+
+    #[test]
+    fn the_sorted_stage_honours_top_n_and_stops_at_the_blocks_there_are() {
+        // The top-up lives where both stages converge, so it must hold with a
+        // cross-encoder sorting the pool. Past the number of distinct blocks
+        // the corpus can present, the merge is what bounds the result, and
+        // every row is then a whole three-chunk block.
+        let (_tmp, store, mut embedder) = topup_vault();
+        let mut search = |top_n: usize| {
+            let mut reranker = llm::MockLlm::new(8);
+            let mut config = SearchConfig {
+                fts: crate::config::FtsConfig::default(),
+                scope: crate::tags::Scope::default(),
+                reranker: Some(&mut reranker),
+                store: &store,
+                rerank_candidates: 30,
+                lane_weights: crate::config::LaneWeights::default(),
+                rerank: crate::config::RerankConfig::default(),
+                max_chunks_per_file: crate::config::default_max_chunks_per_file(),
+                group_by: GroupBy::Chunk,
+                ranking: sorted_config(crate::config::RankingConfig::default()),
+                calibrated: crate::config::CalibratedConfig::default(),
+            };
+            search_with_intelligence("warding", top_n, &mut embedder, &mut config).unwrap()
+        };
+
+        // Five files, so five whole blocks: asking for more than the corpus
+        // can present as distinct sections is the ceiling, not a shortfall.
+        let mut merged = false;
+        for top_n in 1..=5 {
+            let out = search(top_n);
+            assert_eq!(out.results.len(), top_n, "asked for {top_n}");
+            merged |= a_merge_fired(&out);
+        }
+        assert!(
+            merged,
+            "no merge fired inside the admitted prefix, so the counts prove nothing"
+        );
+
+        let exhausted = search(40);
+        assert_eq!(
+            exhausted.results.len(),
+            5,
+            "five files, each one block once its sections are all admitted"
+        );
+        assert!(
+            exhausted
+                .results
+                .iter()
+                .all(|r| r.text.contains("Counterspell") && r.text.contains("Dispel Magic")),
+            "each block holds its whole section run"
+        );
+    }
+
+    #[test]
+    fn a_top_n_beyond_the_candidates_returns_what_there_is() {
+        // The top-up draws on the pool the floor already filtered, so it stops
+        // when the candidates run out rather than inventing a row.
+        let (_tmp, store, mut embedder) = topup_vault();
+        let out = search_at(
+            "warding",
+            50,
+            crate::config::default_retrieval_width(),
+            &store,
+            &mut embedder,
+        );
+        assert_eq!(out.results.len(), 5, "the vault holds five blocks");
+    }
+
     #[test]
     fn coalescing_runs_with_no_cross_encoder() {
-        // The three adjacent sections of the abjuration file are one block, and the
-        // pass ran with reranker: None — so it does not depend on the model.
-        let (_tmp, store, mut embedder) = indexed_vault();
+        // A section and its two subsections are one block, and the pass ran
+        // with reranker: None — so it does not depend on the model.
+        let (_tmp, store, mut embedder) = nested_vault();
         let mut config = SearchConfig {
             fts: crate::config::FtsConfig::default(),
             scope: crate::tags::Scope::default(),
@@ -2140,20 +2385,24 @@ mod tests {
             },
         };
         let out = search_with_intelligence("warding", 10, &mut embedder, &mut config).unwrap();
-        let abjuration: Vec<&InternalSearchResult> = out
+        let warding: Vec<&InternalSearchResult> = out
             .results
             .iter()
-            .filter(|r| r.file_path == "rules/abjuration-spells.md")
+            .filter(|r| r.file_path == "rules/warding-school.md")
             .collect();
         assert_eq!(
-            abjuration.len(),
+            warding.len(),
             1,
-            "the adjacent sections are one block: {:#?}",
+            "a section and its subsections are one block: {:#?}",
             out.results
         );
-        assert!(abjuration[0].text.contains("Counterspell"));
-        assert!(abjuration[0].text.contains("Dispel Magic"));
-        assert!(abjuration[0].text.contains("Dimensional Anchor"));
+        assert_eq!(
+            warding[0].heading_path, "rules/warding-school.md > Warding School",
+            "headed by the section that contains the rest"
+        );
+        assert!(warding[0].text.contains("school of warding"));
+        assert!(warding[0].text.contains("Counterspell"));
+        assert!(warding[0].text.contains("Dispel Magic"));
     }
 
     #[test]
@@ -2291,9 +2540,9 @@ mod tests {
         // `per_note_cap` limits how many sections of one file reach the
         // result, above coalescing. So it also limits how many sections a
         // coalesced block can span (design doc, "Composition and control").
-        let (_tmp, store, mut embedder) = indexed_vault();
+        let (_tmp, store, mut embedder) = nested_vault();
 
-        let abjuration_text = |per_note_cap, embedder: &mut llm::MockLlm| {
+        let warding_text = |per_note_cap, embedder: &mut llm::MockLlm| {
             let mut reranker = llm::MockLlm::new(8);
             let mut config = SearchConfig {
                 fts: crate::config::FtsConfig::default(),
@@ -2318,15 +2567,15 @@ mod tests {
             let out = search_with_intelligence("warding", 20, embedder, &mut config).unwrap();
             out.results
                 .into_iter()
-                .find(|r| r.file_path == "rules/abjuration-spells.md")
+                .find(|r| r.file_path == "rules/warding-school.md")
                 .map(|r| r.text)
                 .unwrap_or_default()
         };
 
-        let markers = ["Counterspell", "Dispel Magic", "Dimensional Anchor"];
+        let markers = ["school of warding", "Counterspell", "Dispel Magic"];
 
         // Control: unbounded, the block spans all three sections.
-        let unbounded = abjuration_text(0, &mut embedder);
+        let unbounded = warding_text(0, &mut embedder);
         let unbounded_count = markers.iter().filter(|m| unbounded.contains(**m)).count();
         assert_eq!(
             unbounded_count, 3,
@@ -2335,7 +2584,7 @@ mod tests {
 
         // `per_note_cap: 2` bounds the sections available to merge to two, so
         // the block must span strictly fewer sections than the control.
-        let bounded = abjuration_text(2, &mut embedder);
+        let bounded = warding_text(2, &mut embedder);
         let bounded_count = markers.iter().filter(|m| bounded.contains(**m)).count();
         assert!(
             bounded_count < unbounded_count,

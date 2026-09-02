@@ -193,10 +193,27 @@ pub fn assemble(results: &[InternalSearchResult], p: AssembleParams) -> SearchEn
         }
     }
 
+    // Say that the budget is what shortened the answer (#102). `overflow`
+    // names each held-back result, but a caller reading `blocks` alone sees a
+    // short list and no reason for it — and the reason is a number they can
+    // raise. It names no flag, because the CLI spells the budget `--tokens`
+    // and MCP and HTTP spell it `budget_tokens`. The `summaries` return above
+    // carries no warning, because there the empty `blocks` is what was asked
+    // for.
+    let mut warnings = Vec::new();
+    if !overflow.is_empty() {
+        let n = overflow.len();
+        let s = if n == 1 { "result" } else { "results" };
+        warnings.push(format!(
+            "{n} {s} held back by the token budget; raise it to see {}",
+            if n == 1 { "it" } else { "them" }
+        ));
+    }
+
     SearchEnvelope {
         status: SearchStatus::Ok,
         degraded: p.degraded,
-        warnings: Vec::new(),
+        warnings,
         blocks,
         overflow,
     }
@@ -264,6 +281,12 @@ pub fn render_text(env: &SearchEnvelope, scores: bool) -> String {
         out.push_str(&b.text);
         out.push_str("\n\n");
     }
+    // The reason, above the list it explains: "lower relevance" is the rank
+    // order and not why these were cut, and the budget is a number the caller
+    // can raise (#102).
+    for w in &env.warnings {
+        out.push_str(&format!("({w})\n"));
+    }
     for s in &env.overflow {
         let pct = match (scores, s.score) {
             (true, Some(v)) => format!(" [{v:.0}%]"),
@@ -324,6 +347,34 @@ mod assemble_tests {
         assert_eq!(env.blocks.len(), 2);
         assert_eq!(env.overflow.len(), 1);
         assert_eq!(env.overflow[0].id, "000003#3");
+    }
+
+    #[test]
+    fn the_budget_says_so_when_it_holds_results_back() {
+        let rs = vec![result(1, 80), result(2, 80), result(3, 80)];
+        let env = assemble(&rs, params(260));
+        assert_eq!(
+            env.warnings,
+            vec!["1 result held back by the token budget; raise it to see it".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_budget_that_holds_nothing_back_warns_about_nothing() {
+        let rs = vec![result(1, 80), result(2, 80)];
+        let env = assemble(&rs, params(100_000));
+        assert!(env.warnings.is_empty());
+        assert!(env.overflow.is_empty());
+    }
+
+    #[test]
+    fn summaries_overflow_is_not_a_budget_warning() {
+        // `summaries` puts every rank in overflow by request, not because the
+        // budget stopped anything.
+        let rs = vec![result(1, 80), result(2, 80)];
+        let mut p = params(100_000);
+        p.summaries = true;
+        assert!(assemble(&rs, p).warnings.is_empty());
     }
 
     #[test]
@@ -526,6 +577,36 @@ mod render_tests {
         assert!(out.contains("[abc#0]"));
         assert!(out.contains("semantic+keyword"));
         assert!(!out.contains('%'));
+    }
+
+    #[test]
+    fn text_render_gives_the_reason_above_the_excluded_list() {
+        let env = SearchEnvelope {
+            status: SearchStatus::Ok,
+            degraded: false,
+            warnings: vec!["1 result held back by the token budget".to_string()],
+            blocks: vec![],
+            overflow: vec![Summary {
+                id: "000002#2".into(),
+                path: "b.md".into(),
+                heading_path: "b.md > B".into(),
+                provenance: Provenance {
+                    keyword: true,
+                    semantic: false,
+                    graph: false,
+                    linked_from: vec![],
+                },
+                score: None,
+            }],
+        };
+        let text = render_text(&env, false);
+        let reason = text
+            .find("1 result held back")
+            .expect("the warning renders");
+        let listed = text
+            .find("Not included")
+            .expect("the excluded list renders");
+        assert!(reason < listed, "the reason comes before the list: {text}");
     }
 
     #[test]

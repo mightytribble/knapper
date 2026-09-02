@@ -746,10 +746,16 @@ pub struct RankingConfig {
     /// Probe 4 is the candidate: `archdragon.md` holds ranks 1, 3 and 5, and all
     /// 20 of its results are above the floor.
     pub per_note_cap: usize,
-    /// Present adjacent sections of one document as one result block, after
-    /// ranking (#39). Query-time: it reaches no fingerprint and re-indexes
-    /// nothing. The block takes its strongest section's score, so abstention
-    /// is unchanged. `false` reproduces the per-section output byte for byte.
+    /// Present a section and its subsections, where they abut in one
+    /// document, as one result block, after ranking (#39). Query-time: it
+    /// reaches no fingerprint and re-indexes nothing. The block takes its
+    /// strongest member's score, so abstention is unchanged. `false`
+    /// reproduces the per-chunk output byte for byte.
+    ///
+    /// The merge stops at a sibling section (#101). It exists because a
+    /// section is one topic, so a weaker follow-on chunk still carries that
+    /// topic's context; a subsection subdivides the same topic and keeps the
+    /// premise, while a sibling starts a new one and breaks it.
     pub coalesce_adjacent: bool,
 }
 

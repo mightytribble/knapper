@@ -22,6 +22,12 @@ pub struct Search {
     /// Number of results to return. Omit it for the configured default,
     /// which is `top_n` in `config.toml` and is the same number on every
     /// surface (#62).
+    ///
+    /// It counts the results a caller is shown, so a merged block is one
+    /// (#102). Fewer come back only when the vault holds fewer: the
+    /// candidates are capped at `[ranking] candidates` and the answer floor
+    /// removes what is not an answer, so a large `top_n` reaches that
+    /// ceiling rather than the number asked for.
     #[arg(short = 'n', long)]
     pub top_n: Option<usize>,
     /// Show the per-lane score breakdown for each result.
