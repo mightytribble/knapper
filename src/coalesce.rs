@@ -28,8 +28,28 @@ use crate::search::InternalSearchResult;
 /// heading and then labelled the block with a section that had not
 /// matched.
 pub fn coalesce_adjacent(results: Vec<InternalSearchResult>) -> Vec<InternalSearchResult> {
+    blocks(&results)
+        .into_iter()
+        .map(|members| {
+            if members.len() == 1 {
+                results[members[0]].clone()
+            } else {
+                merge_block(&results, &members)
+            }
+        })
+        .collect()
+}
+
+/// The groups `coalesce_adjacent` folds into blocks, as member indices into
+/// `results`, in output order. A group of one is a result that merges with
+/// nothing.
+///
+/// It is public because `search.rs` counts blocks to honour `top_n` (#102),
+/// and counting them any other way would be a second copy of the run rule
+/// that could drift from this one.
+pub fn blocks(results: &[InternalSearchResult]) -> Vec<Vec<usize>> {
     let mut taken = vec![false; results.len()];
-    let mut out: Vec<InternalSearchResult> = Vec::with_capacity(results.len());
+    let mut out: Vec<Vec<usize>> = Vec::with_capacity(results.len());
 
     for i in 0..results.len() {
         if taken[i] {
@@ -72,11 +92,7 @@ pub fn coalesce_adjacent(results: Vec<InternalSearchResult>) -> Vec<InternalSear
             }
         }
 
-        if members.len() == 1 {
-            out.push(results[i].clone());
-        } else {
-            out.push(merge_block(&results, &members));
-        }
+        out.push(members);
     }
 
     out
@@ -199,6 +215,15 @@ mod tests {
         result.heading = None;
         result.heading_path = format!("f{file_id}.md");
         result
+    }
+
+    #[test]
+    fn blocks_names_the_groups_the_merge_makes() {
+        // The counter and the merge read one rule, so what `blocks` groups is
+        // exactly what `coalesce_adjacent` folds.
+        let rows = vec![r(1, 3, 90.0, "A"), r(2, 0, 80.0, "B"), r(1, 4, 70.0, "C")];
+        assert_eq!(blocks(&rows), vec![vec![0, 2], vec![1]]);
+        assert_eq!(coalesce_adjacent(rows).len(), 2);
     }
 
     #[test]

@@ -630,6 +630,9 @@ Optional config at `~/.knapper/config.toml`:
 
 ```toml
 vault_path = "~/Documents/MyVault"
+# How many results a search returns, counting a merged block as one. Fewer
+# come back only when the vault holds fewer: `[ranking] candidates` caps the
+# pool and the answer floor drops what is not an answer.
 top_n = 10
 exclude = [".obsidian/", "node_modules/", ".git/", "*-index.md", "templates/"]
 
