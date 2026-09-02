@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.9.4 (2026-09-02)
+
+A patch release over 0.9.3. `top_n` returns the number of results it says it
+will, a merged block is presented under a heading that actually matched, and
+`[calibrated]`'s numbers say which embedder they were fit against. No
+fingerprint moves, so no store re-indexes on the upgrade.
+
+### Fixed
+
+- `top_n` counts results, not pre-merge chunks (#102). The candidate list was cut at `top_n` and the merge ran afterwards, so a caller received `top_n` minus however many merges fired. The shortfall moved with the data — one row when one merge fired, two once a second section joined the candidate set — so no value returned a known number of results, while the MCP schema called it "Number of results to return". Candidates are now admitted in rank order until the merge counts `top_n` blocks, through one path both ranking stages reach. They are the pool the answer floor already filtered, so the top-up admits no row that was not an answer, and it stops when they run out: `[ranking] candidates` is the ceiling no `top_n` reaches past. Admitting a candidate can also lower the count, when it is the section that gathers rows already admitted, so the scan stops at the first prefix that reaches `top_n` and takes the fewest candidates that answer the request. With `coalesce_adjacent = false` a block is a chunk and the scan reduces to the old truncation exactly.
+
+- A search says when the token budget is what shortened it (#102). `overflow` named each held-back result, but a caller reading `blocks` alone saw a short list and no reason for it — and the reason is a number they can raise. The envelope now carries that reason, and the text rendering prints it above the excluded list, whose "lower relevance" label is the rank order rather than why those rows were cut. It names no flag, because the CLI spells the budget `--tokens` and MCP and HTTP spell it `budget_tokens`.
+
+- A merged block stays inside one section (#101). The run that decides which abutting chunks present as one block was a contiguous span of a file, which let it cross a heading: the block then took its score from its strongest member and its identity from its leading one, so it was presented under a heading that had not matched, and a caller following that `heading_path` with a section read landed in the wrong section. The label also moved with `top_n` — the same query reported one heading at 13 and another at 8, at one score to fourteen decimals. A run now carries a root heading path and admits an abutting chunk whose path is the root or descends from it; a chunk the root descends from widens the root instead, and the loop runs to a fixed point, so which member ranked highest cannot decide the block. Paths are compared by segment and never by characters, so `Foo` does not swallow the sibling `Foo Bar`. The rule follows the reason the merge exists: a section is one topic, a subsection subdivides it and keeps the premise, a sibling section starts a new one and breaks it.
+
+- `[calibrated]` says which embedder its numbers were fit against (#103). The four numbers are EmbeddingGemma's fit, not a global default: `bm25n` normalizes itself per query, but raw cosine is one model's similarity scale and the floor is a threshold read off it. Point `models.embed` at another embedder and `embedding_fingerprint` correctly prescribes a re-index, the re-index produces correct vectors, and the numbers that interpret them are still fit to the model that is going away — so the floor cuts in the wrong place, and it fails quietly: the path abstains on every query, or on none. `knapper index` now says so on an `embedding_fingerprint` mismatch, and a generated `config.toml` carries the same note above the section. The warning needs all three of: the calibrated path actually running, an embedder the shipped fit does not cover, and the shipped numbers still in place — a user who refit set their own, and calling their fit stale would be false. The numbers themselves do not move, so this changes nothing for anyone on the default embedder. Note that the coefficients and the floor are one fit and do not move apart: scaling the weights while holding the floor moves the decision boundary rather than rescaling it.
+
+- **Test count: 1136 → 1154.**
+
+### Changed
+
+- The refit tool ships. `calibrated-fusion-eval.py` moves into `scripts/`, since telling a user that refitting `[calibrated]` is theirs to do while the tool sat in a directory they never receive was half an answer. Its documentation now names all four inputs and which two are labels only they can write — the queries, and which chunks of their vault answer each one. The labels come from your corpus, but the corpus is not what makes the numbers stale: both lane scores self-normalize per query, so refit when you change the embedder, not when the vault grows.
+
 ## 0.9.3 (2026-09-01)
 
 A patch release over 0.9.2. What `read` returns can be written straight back
