@@ -23,13 +23,18 @@ So you write two files, the last two. The shipped numbers were fit on 33 tier-1
 positives against 1228 labeled negatives. A fit is worth what its labels are
 worth.
 
-## Refit when the embedder changes, not when the corpus does
+## What a fit is tied to
 
-The labels come from your corpus, but the corpus is not what makes the shipped
-numbers wrong. Both features are self-normalized per query — BM25 against that
-query's own upper bound, cosine against the model's scale — so a new corpus
-changes what the features say and not what the coefficients mean. What the
-coefficients are tied to is the embedder. Refit when you change `models.embed`.
+Two things. Only the keyword half is self-normalized: BM25 is measured against
+each query's own upper bound, so it travels. The semantic half is a raw cosine,
+and where that sits depends on the embedder that produced the vectors and on
+how long the notes being scored are. Either can move the floor out from under a
+fit — a change of `models.embed`, or a corpus whose notes are much shorter or
+longer than the ones the numbers were fit on.
+
+The symptom is an abstention on a query that retrieved everything: `--explain`
+shows the lanes hitting and nothing coming back, because the floor is sitting
+inside the band the correct answers score in.
 
 Tests whether per-query self-calibrated lane scores — anchored cosine and
 upper-bound-normalized BM25, fused by a logistic fit on the ground-truth pool —
