@@ -299,7 +299,7 @@ Replaces the entire body while keeping existing frontmatter (tags, dates, metada
 knapper update "Meeting Notes" --property tags --mode append --content "actionable"
 ```
 
-A property takes `--mode replace`, `append` or `remove`; a body or a section takes `replace`, `prepend` or `append`. Repeat `--content` to write a list-valued property such as tags or aliases.
+A property takes `--mode replace`, `append` or `remove`; a body or a section takes `replace`, `prepend` or `append`. Repeat `--content` to write a list-valued property such as tags or aliases. A section append writes its content on the line after the old body and a prepend on the line before it. A blank line at that joining edge of the content asks for a paragraph break; blank lines at the content's other edges are dropped, so the section keeps one blank line under its heading.
 
 A write changes only the keys it names. A property edit keeps the key's place and the note's own list style, and a list with no items writes `[]` instead of deleting the key. A value knapper cannot edit as a line — a nested mapping, an anchor, a block scalar — refuses the write and names what it found, rather than re-styling the block.
 
