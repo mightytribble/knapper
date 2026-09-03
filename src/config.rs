@@ -1294,6 +1294,19 @@ fn section_note(path: &str) -> Option<&'static str> {
         // The numbers are one embedder's fit, and nothing in the file says so
         // (#103). A user who changes `models.embed` keeps a floor read off a
         // scale that is gone, and the failure is quiet.
+        // Both templates and the field they fill are one family's, and nothing
+        // in the file says so (#8). Point `models.embed` at another family and
+        // every key here stops doing anything, quietly.
+        "embedding_prompt" => Some(
+            "These templates are EmbeddingGemma's, the embedder this build\n\
+             installs. The query and document templates are the two halves of\n\
+             its documented pair, and document_title fills a title: field that\n\
+             only its document template has.\n\
+             \n\
+             Point models.embed at another family and every key here stops\n\
+             doing anything. Qwen3-Embedding, for one, takes its instruct on\n\
+             the query alone and embeds a document as itself.",
+        ),
         "calibrated" => Some(
             "These coefficients and this floor are fit against EmbeddingGemma,\n\
              the embedder this build installs. They are one fit: cosine is one\n\
@@ -2346,6 +2359,32 @@ answer_floor = 0.5
         assert!(
             note.contains("refit"),
             "the note says what a different embedder costs: {note}"
+        );
+        assert!(
+            note.lines().all(|l| l.starts_with('#')),
+            "every note line is a comment: {note}"
+        );
+    }
+
+    /// `[embedding_prompt]` is one family's templates, and the file has to say
+    /// so (#8). Both templates and the `title:` field they fill are
+    /// EmbeddingGemma's; point `models.embed` at Qwen3-Embedding and every key
+    /// in the section stops doing anything, with nothing in the output to show
+    /// it.
+    #[test]
+    fn the_embedding_prompt_section_names_the_family_it_belongs_to() {
+        let text = commented_defaults().unwrap();
+        let (before, _) = text
+            .split_once("[embedding_prompt]")
+            .expect("a header: {text}");
+        let note = before
+            .rsplit("\n\n")
+            .next()
+            .expect("text before the header");
+
+        assert!(
+            note.contains("EmbeddingGemma"),
+            "the note names the family: {note}"
         );
         assert!(
             note.lines().all(|l| l.starts_with('#')),
