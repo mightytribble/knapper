@@ -7,6 +7,7 @@ pub fn build_openapi_spec(server_url: &str) -> serde_json::Value {
     // Read endpoints
     paths.insert("/api/health-check".into(), build_health_check());
     paths.insert("/api/search".into(), build_search());
+    paths.insert("/api/match".into(), build_match());
     paths.insert("/api/read".into(), build_read());
     paths.insert("/api/list".into(), build_list());
     paths.insert("/api/tags".into(), build_tags());
@@ -93,6 +94,32 @@ fn build_search() -> serde_json::Value {
                 }}}
             },
             "responses": { "200": { "description": "An envelope: status ('ok' or 'no_results'); degraded (bool, true when no cross-encoder ranked the results); warnings (array of strings); blocks, the results that fit the token budget, each {id, path, heading_path, provenance: {keyword, semantic, graph, linked_from}, text, untrusted_content, truncated, and score when scores was requested}; and overflow, the results the budget excluded, each {id, path, heading_path, provenance, and score when requested} with no text. explain, the per-lane breakdown, rides beside the envelope when the request asked for it" } }
+        }
+    })
+}
+
+fn build_match() -> serde_json::Value {
+    serde_json::json!({
+        "post": {
+            "operationId": "matchLiteral",
+            "summary": "Confirm whether a literal string still appears in the vault's note text, and count the notes holding it.",
+            "requestBody": {
+                "required": true,
+                "content": { "application/json": { "schema": {
+                    "type": "object",
+                    "required": ["pattern"],
+                    "properties": {
+                        "pattern": { "type": "string", "description": "The literal string to look for. Text and not a regex: . * and [ are themselves. An empty pattern is a 400" },
+                        "case_sensitive": { "type": "boolean", "description": "Compare exactly. The default folds case, which is what the keyword index does" },
+                        "scope": { "type": "array", "items": { "type": "string" }, "description": "Tag terms; a trailing / matches the tag and its descendants. A term starting with / is a directory path from the vault root instead, case-sensitive, with a trailing / its subtree. Alias of all" },
+                        "all": { "type": "array", "items": { "type": "string" }, "description": "Tag terms a note carries every one of, or directory terms (starting with /, case-sensitive, a trailing / its subtree) it lies under" },
+                        "any": { "type": "array", "items": { "type": "string" }, "description": "Tag terms a note carries at least one of, or directory terms (starting with /, case-sensitive, a trailing / its subtree) it lies under" },
+                        "none": { "type": "array", "items": { "type": "string" }, "description": "Tag terms a note carries none of, or directory terms (starting with /, case-sensitive, a trailing / its subtree) it does not lie under" },
+                        "limit": { "type": "integer", "description": "Maximum matched lines to report. Absent, every one comes back; 0 reports none. The notes and lines counts are whole whatever this says" }
+                    }
+                }}}
+            },
+            "responses": { "200": { "description": "{pattern, notes (how many notes hold it — 0 means nothing in scope says it), lines (distinct matched lines across every note), hits (the matched lines, capped by limit, each {file, heading_path, line})}. The scan is exhaustive and unranked over the indexed note bodies, so it does not read frontmatter." } }
         }
     })
 }
@@ -596,6 +623,7 @@ mod tests {
         let expected: BTreeSet<String> = [
             "healthCheck",
             "searchVault",
+            "matchLiteral",
             "readNote",
             "listNotes",
             "listTags",

@@ -164,6 +164,55 @@ pub struct List {
 }
 
 #[derive(Debug, Args, Deserialize, JsonSchema)]
+pub struct Match {
+    /// The literal string to look for. It is text and not a pattern: `.`,
+    /// `*` and `[` are themselves.
+    pub pattern: String,
+    /// Compare the pattern exactly. The default folds case, which is what
+    /// the keyword index does.
+    #[arg(long)]
+    #[serde(default)]
+    pub case_sensitive: bool,
+    /// An alias of `all`. A term starting with `/` is a directory path from
+    /// the vault root instead of a tag, case-sensitive; a trailing `/`
+    /// scopes to its subtree.
+    #[arg(long, value_delimiter = ',')]
+    #[serde(default, deserialize_with = "deserialize_tag_list")]
+    pub scope: Vec<String>,
+    /// Look only in notes carrying every term. A term is a tag path; a
+    /// trailing `/` or `/*` matches the tag and its descendants. A term
+    /// starting with `/` is a directory path from the vault root instead,
+    /// case-sensitive, with a trailing `/` scoping to its subtree.
+    #[arg(long, value_delimiter = ',')]
+    #[serde(default, deserialize_with = "deserialize_tag_list")]
+    pub all: Vec<String>,
+    /// Look only in notes carrying at least one of these terms.
+    #[arg(long, value_delimiter = ',')]
+    #[serde(default, deserialize_with = "deserialize_tag_list")]
+    pub any: Vec<String>,
+    /// Skip notes carrying any of these terms.
+    #[arg(long, value_delimiter = ',')]
+    #[serde(default, deserialize_with = "deserialize_tag_list")]
+    pub none: Vec<String>,
+    /// Maximum matched lines to report. Absent, every one comes back — a
+    /// caller that wants less names a scope or a limit, which is `list`'s
+    /// rule for the same field (#68). `0` reports none. The note and line
+    /// counts are whole whatever this says, because the count is the answer
+    /// to the absence question.
+    #[arg(long)]
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+impl Match {
+    /// The notes to look in, with `scope` folded into `all`.
+    pub fn scope(&self) -> anyhow::Result<crate::tags::Scope> {
+        let all = crate::tags::merge_scope_alias(self.scope.clone(), self.all.clone());
+        crate::tags::Scope::parse(&all, &self.any, &self.none)
+    }
+}
+
+#[derive(Debug, Args, Deserialize, JsonSchema)]
 pub struct Tags {
     /// Limit to one tag and its descendants, as `type/` or `type/*`. Omit
     /// for the whole vocabulary.

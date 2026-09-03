@@ -285,6 +285,20 @@ async fn main() -> Result<()> {
             )?;
         }
 
+        Command::Match(args) => {
+            if !index_exists(&data_dir) {
+                eprintln!("No index found. Run 'knapper index <path>' first.");
+                std::process::exit(1);
+            }
+            let store = store::Store::open(&config::db_path(&data_dir))?;
+            let report = knapper::matching::run(&store, &args)?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", knapper::matching::render_text(&report));
+            }
+        }
+
         Command::Status(_) => {
             if !index_exists(&data_dir) {
                 eprintln!("No index found. Run 'knapper index <path>' first.");

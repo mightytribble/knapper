@@ -236,6 +236,35 @@ knapper search "how does authentication work" --explain
 
 The reranker scored each result for relevance as the 4th RRF lane.
 
+**Confirm an edit took, across the whole vault:**
+
+`search` is ranked and cut to `top_n`, so it answers something whatever you
+ask it — which makes it useless for proving a string is gone. `match` is the
+other contract: one literal string, every note in scope, no ranking.
+
+```bash
+knapper match "years old at the start of the story"
+```
+```
+No note holds "years old at the start of the story".
+```
+
+```bash
+knapper match "Royal Academy" --scope /characters/ --limit 2
+```
+```
+40 notes, 44 lines hold "Royal Academy".
+  characters/Barnaby Finch.md [characters/Barnaby Finch.md > Biography]
+    A noble student at the Royal Academy, age 17.
+  characters/Callum Reeves.md [characters/Callum Reeves.md > Biography]
+    A commoner student at the Royal Academy, age 20.
+  (42 more not shown; raise --limit to see them)
+```
+
+The counts are the answer and `--limit` never truncates them. It reads the
+indexed note bodies, so it does not see frontmatter, and it will not tell you
+what a note is about — that is what `search` is for.
+
 **Vault structure overview:**
 
 ```bash
@@ -322,7 +351,7 @@ Returns orphan notes (no links in or out), broken wikilinks, stale headings, sta
 
 `knapper serve --http` adds a full REST API alongside the MCP server, exposing the same capabilities over HTTP for web agents, scripts, and integrations.
 
-**19 endpoints:**
+**20 endpoints:**
 
 Every capability is one route, and the route is the CLI command's name under `/api/`. `surfaces.md` is the generated table of all three surfaces.
 
@@ -330,6 +359,7 @@ Every capability is one route, and the route is the CLI command's name under `/a
 |--------|----------|------------|-------------|
 | GET | `/api/health-check` | read | Server health check |
 | POST | `/api/search` | read | Hybrid search (semantic + FTS5 + graph + reranker + temporal), scoped by tag or directory terms — a leading `/` reads a term as a directory path (`scope`/`all`, `any`, `none`) |
+| POST | `/api/match` | read | Find every note whose text holds a literal string, and count them — scoped the same way. For verification, not discovery: `notes: 0` means nothing in scope says it |
 | GET | `/api/read` | read | Read a note (`file`), or one of its sections (`section`) |
 | GET | `/api/list` | read | List notes by tag or directory terms — a leading `/` reads a term as a directory path (`scope`/`all`, `any`, `none`), creator, limit, and `detailed=true` for each note's heading outline |
 | GET | `/api/tags` | read | The tag vocabulary, whole or under one term (`under`) |
@@ -609,8 +639,9 @@ Similarly, Gemini Embedding 2 gives superior results to EmbeddingGemma, at the c
 - Confidence % display: search results show normalized 0-100% confidence instead of raw RRF scores
 - llama.cpp inference via Rust bindings (GGUF models, Metal GPU on macOS, CUDA on Linux)
 - Intelligence opt-in: the cross-encoder lane is off unless enabled
-- MCP server with 18 tools (5 read, 5 write, 6 index and diagnostic, 1 setup, 1 migrate) via stdio
-- HTTP REST API with 19 endpoints, API key auth (`kn_` prefix), rate limiting, CORS — enabled via `knapper serve --http`
+- Literal matching: `match` answers whether a string still appears anywhere in scope, exhaustively and unranked, with a count that survives the reported-line cap — the question `search` cannot answer, because it is ranked and always returns something
+- MCP server with 19 tools (6 read, 5 write, 6 index and diagnostic, 1 setup, 1 migrate) via stdio
+- HTTP REST API with 20 endpoints, API key auth (`kn_` prefix), rate limiting, CORS — enabled via `knapper serve --http`
 - User identity with L0/L1 tiered context for AI agent session starts
 - Section-level reading and editing: target specific headings with replace/prepend/append modes
 - Full note rewriting with automatic frontmatter preservation

@@ -19,6 +19,7 @@ pub mod indexer;
 pub mod links;
 pub mod llm;
 pub mod markdown;
+pub mod matching;
 pub mod migrate;
 pub mod onboarding;
 pub mod openapi;
