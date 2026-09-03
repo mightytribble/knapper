@@ -556,6 +556,10 @@ pub fn create_note(
         }
 
         build_edges_for_file(store, file_id, &full_content)?;
+        // Other notes may have named this one before it existed. Their own
+        // content did not change, so nothing else ever revisits the links they
+        // wrote (#108).
+        crate::indexer::reconcile_links(store, vault_path, &[])?;
 
         // The writer is not an author of the vocabulary (#60). It writes the
         // file; the reconciler owns the rows, and reads the tags back out of
@@ -1200,6 +1204,11 @@ pub fn move_note(
     // and only the path-derived docid needs recomputing.
     let new_docid = generate_docid(&new_rel_path);
 
+    // A wikilink resolves by basename, so most links survive a move. One
+    // written as `[[folder/note]]` does not, and one written that way against
+    // the *new* folder starts to resolve — both are re-derived below (#108).
+    let linking = crate::indexer::sources_linking_to(store, file_record.id)?;
+
     // Ensure target directory exists
     if let Some(parent) = new_full_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -1227,6 +1236,7 @@ pub fn move_note(
             store.commit()?;
             // Step 3: Rename file on disk
             std::fs::rename(&old_path, &new_full_path)?;
+            crate::indexer::reconcile_links(store, vault_path, &linking)?;
         }
         Err(e) => {
             let _ = store.rollback();
@@ -1276,6 +1286,10 @@ pub fn delete_note(
         .ok_or_else(|| anyhow::anyhow!("file not found: {}", file))?;
 
     let old_path = vault_path.join(&file_record.path);
+    // The notes that link to this one, read before the row moves or goes: the
+    // edges go with it, and only a re-derivation of those notes records what
+    // their links now name (#108).
+    let linking = crate::indexer::sources_linking_to(store, file_record.id)?;
 
     match mode {
         DeleteMode::Soft => {
@@ -1316,6 +1330,7 @@ pub fn delete_note(
             // rename leaves the note where the store says it is.
             std::fs::rename(&old_path, &new_full_path)?;
 
+            crate::indexer::reconcile_links(store, vault_path, &linking)?;
             Ok(())
         }
         DeleteMode::Hard => {
@@ -1324,6 +1339,7 @@ pub fn delete_note(
             std::fs::remove_file(&old_path)?;
             store.delete_file_hard(&file_record.path)?;
             store.prune_unused_tags(&released_tags)?;
+            crate::indexer::reconcile_links(store, vault_path, &linking)?;
             Ok(())
         }
     }
@@ -1387,6 +1403,11 @@ pub fn archive_note(
     atomic_write(&new_full_path, &new_content, false)?;
 
     // Remove from index (note disappears from search)
+    //
+    // The notes that link to this one are read before the cascade takes their
+    // edges: an archived note is out of the index, so those links now name
+    // nothing and only a re-derivation of those notes records that (#108).
+    let linking = crate::indexer::sources_linking_to(store, file_record.id)?;
     let old_vids = store.get_vector_ids_for_file(file_record.id)?;
     for vid in &old_vids {
         store.delete_vec(*vid)?;
@@ -1398,6 +1419,8 @@ pub fn archive_note(
 
     // Remove original file
     std::fs::remove_file(&old_path)?;
+
+    crate::indexer::reconcile_links(store, vault_path, &linking)?;
 
     let docid = file_record.docid.unwrap_or_default();
 
@@ -1506,6 +1529,9 @@ pub fn unarchive_note(
         }
 
         build_edges_for_file(store, file_id, &restored_content)?;
+        // The note is back in the index, so the links other notes wrote to it
+        // resolve again (#108).
+        crate::indexer::reconcile_links(store, vault_path, &[])?;
 
         store.reconcile_file_tags(file_id, &crate::tags::extract(&restored_content))?;
 
@@ -1550,9 +1576,14 @@ pub fn unarchive_note(
 pub fn verify_index_integrity(store: &Store, vault_path: &Path) -> Result<usize> {
     let all_files = store.get_all_files()?;
     let mut orphans = 0;
+    // The notes that link to each orphan, read before the cascade takes their
+    // edges. They write a link to a note the vault does not have, and only a
+    // re-derivation of those notes records that (#108).
+    let mut linking: Vec<i64> = Vec::new();
     for file in &all_files {
         let full_path = vault_path.join(&file.path);
         if !full_path.exists() {
+            linking.extend(crate::indexer::sources_linking_to(store, file.id)?);
             // Clean up orphan: vectors, edges, file record. The chunks and
             // their keyword index go with the `files` row (issue #37), and
             // so do the file's `file_tags` rows. The tag ids are read
@@ -1569,6 +1600,9 @@ pub fn verify_index_integrity(store: &Store, vault_path: &Path) -> Result<usize>
             store.prune_unused_tags(&released)?;
             orphans += 1;
         }
+    }
+    if orphans > 0 {
+        crate::indexer::reconcile_links(store, vault_path, &linking)?;
     }
     Ok(orphans)
 }
@@ -4026,6 +4060,174 @@ mod tests {
             store.get_unresolved_links().unwrap(),
             vec![("04-Archive/Saltmere.md".to_string(), "Nowhere".to_string())],
             "and so do the broken links it reports"
+        );
+    }
+
+    // ── Links across notes (#108) ────────────────────────────────
+
+    /// Index a vault that already holds files, and hand back the pieces.
+    fn vault_with_files(files: &[(&str, &str)]) -> (tempfile::TempDir, Store, std::path::PathBuf) {
+        let (tmp, store, vault) = setup_vault();
+        for (rel, text) in files {
+            if let Some(parent) = std::path::Path::new(rel).parent() {
+                std::fs::create_dir_all(vault.join(parent)).unwrap();
+            }
+            std::fs::write(vault.join(rel), text).unwrap();
+        }
+        let mut embedder = crate::llm::MockLlm::new(256);
+        let config = crate::config::Config::default();
+        crate::indexer::run_index_shared(
+            &vault,
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
+        (tmp, store, vault)
+    }
+
+    fn outgoing_paths(store: &Store, from: &str) -> Vec<String> {
+        let file = store.get_file(from).unwrap().unwrap();
+        store
+            .get_outgoing(file.id, Some("wikilink"))
+            .unwrap()
+            .into_iter()
+            .map(|(to, _)| store.get_file_by_id(to).unwrap().unwrap().path)
+            .collect()
+    }
+
+    /// `create` resolves the links other notes wrote before the note existed.
+    ///
+    /// This is the shape a batch of cross-referencing notes takes — a parent
+    /// that names its children, written before them. Every forward reference in
+    /// the batch was recorded broken and stayed broken (#108).
+    #[test]
+    fn creating_a_note_resolves_the_links_that_were_waiting_for_it() {
+        use crate::llm::MockLlm;
+
+        let (_tmp, store, vault) = vault_with_files(&[("a.md", "# A\n\nSee [[b]].\n")]);
+        assert_eq!(store.get_unresolved_links().unwrap().len(), 1);
+
+        let mut embedder = MockLlm::new(256);
+        create_note(
+            CreateNoteInput {
+                content: "# B\n\nBody.\n".to_string(),
+                filename: "b.md".to_string(),
+                type_hint: None,
+                tags: vec![],
+                folder: None,
+                created_by: "test".to_string(),
+                auto_link: Some(false),
+            },
+            &store,
+            &mut embedder,
+            EmbedComposition::default(),
+            test_chunk_opts(),
+            &vault,
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            store.get_unresolved_links().unwrap().is_empty(),
+            "the link A wrote resolves now: {:?}",
+            store.get_unresolved_links().unwrap()
+        );
+        assert_eq!(
+            outgoing_paths(&store, "a.md").len(),
+            1,
+            "and the graph holds the edge it earned"
+        );
+    }
+
+    /// A hard delete records the links it leaves naming nothing (#108).
+    #[test]
+    fn a_hard_delete_records_the_links_it_breaks() {
+        let (_tmp, store, vault) =
+            vault_with_files(&[("a.md", "# A\n\nSee [[b]].\n"), ("b.md", "# B\n\nBody.\n")]);
+        assert!(store.get_unresolved_links().unwrap().is_empty());
+        assert_eq!(outgoing_paths(&store, "a.md"), vec!["b.md".to_string()]);
+
+        delete_note(&store, &vault, "b.md", DeleteMode::Hard, "04-Archive/").unwrap();
+
+        assert_eq!(
+            store.get_unresolved_links().unwrap(),
+            vec![("a.md".to_string(), "b".to_string())],
+            "A still writes the link, and it now names nothing"
+        );
+    }
+
+    /// Archiving takes the note out of the index, so the links to it break the
+    /// same way a hard delete breaks them (#108).
+    #[test]
+    fn archiving_a_note_records_the_links_it_breaks() {
+        let (_tmp, store, vault) =
+            vault_with_files(&[("a.md", "# A\n\nSee [[b]].\n"), ("b.md", "# B\n\nBody.\n")]);
+
+        archive_note("b.md", &store, &vault, None).unwrap();
+
+        assert_eq!(
+            store.get_unresolved_links().unwrap(),
+            vec![("a.md".to_string(), "b".to_string())],
+            "an archived note is out of the index, so links to it name nothing"
+        );
+    }
+
+    /// Unarchiving puts the note back, and the links to it resolve again (#108).
+    #[test]
+    fn unarchiving_a_note_resolves_the_links_that_named_it() {
+        use crate::llm::MockLlm;
+
+        let (_tmp, store, vault) =
+            vault_with_files(&[("a.md", "# A\n\nSee [[b]].\n"), ("b.md", "# B\n\nBody.\n")]);
+        archive_note("b.md", &store, &vault, None).unwrap();
+        assert_eq!(store.get_unresolved_links().unwrap().len(), 1);
+
+        let mut embedder = MockLlm::new(256);
+        unarchive_note(
+            "04-Archive/b.md",
+            &store,
+            &mut embedder,
+            EmbedComposition::default(),
+            test_chunk_opts(),
+            &vault,
+        )
+        .unwrap();
+
+        assert!(
+            store.get_unresolved_links().unwrap().is_empty(),
+            "the note is back, so the link to it resolves: {:?}",
+            store.get_unresolved_links().unwrap()
+        );
+        assert_eq!(outgoing_paths(&store, "a.md"), vec!["b.md".to_string()]);
+    }
+
+    /// A move breaks the links written as a path, and records them (#108).
+    ///
+    /// A wikilink resolves by basename, so most links survive a move. One
+    /// written as `[[folder/note]]` does not: it names a path the vault no
+    /// longer has.
+    #[test]
+    fn a_move_records_the_path_shaped_links_it_breaks() {
+        let (_tmp, store, vault) = vault_with_files(&[
+            ("a.md", "# A\n\nSee [[inbox/n]].\n"),
+            ("inbox/n.md", "# N\n\nBody.\n"),
+        ]);
+        assert_eq!(
+            outgoing_paths(&store, "a.md"),
+            vec!["inbox/n.md".to_string()]
+        );
+
+        std::fs::create_dir_all(vault.join("lore")).unwrap();
+        move_note("inbox/n.md", "lore", &store, &vault).unwrap();
+
+        assert_eq!(
+            store.get_unresolved_links().unwrap(),
+            vec![("a.md".to_string(), "inbox/n".to_string())],
+            "the link names the path the note has left"
         );
     }
 }

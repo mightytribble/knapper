@@ -600,7 +600,7 @@ pub async fn run_consumer(
                             Some((mean, folder))
                         });
 
-                    match indexer::remove_file(&rel, &store_guard) {
+                    match indexer::remove_file(&rel, &store_guard, &vault_path) {
                         Ok(()) => {
                             tracing::info!(path = %rel, "removed deleted file from index");
 
@@ -638,7 +638,7 @@ pub async fn run_consumer(
                     // Phase 1: Store operations under lock
                     let needs_frontmatter_strip = {
                         let store_guard = store.lock().await;
-                        match indexer::rename_file(&old_rel, &new_rel, &store_guard) {
+                        match indexer::rename_file(&old_rel, &new_rel, &store_guard, &vault_path) {
                             Ok(()) => {
                                 tracing::info!(from = %old_rel, to = %new_rel, "renamed file in index");
                                 // Track the file_id for edge rebuild
@@ -803,35 +803,21 @@ pub async fn run_consumer(
         }
 
         // Pass 2: edge rebuild for affected files (skip if full rescan already rebuilt everything)
+        //
+        // The files this batch touched, and the notes whose broken links those
+        // files now satisfy: a note that arrives resolves the links other notes
+        // wrote before it existed, and those notes did not change, so nothing
+        // else revisits them (#108). A deletion repairs itself inside
+        // `indexer::remove_file`.
         if !had_full_rescan && !affected_file_ids.is_empty() {
             tracing::info!(
                 count = affected_file_ids.len(),
                 "rebuilding edges for affected files"
             );
             let store_guard = store.lock().await;
-            for file_id in &affected_file_ids {
-                // Delete old edges first
-                // Outgoing only: backlinks into this file belong to other
-                // files' content, and re-indexing this one must not touch them
-                // (issue #27).
-                if let Err(e) = store_guard.delete_outgoing_edges_for_file(*file_id) {
-                    tracing::warn!(file_id, error = %e, "failed to delete old edges");
-                    continue;
-                }
-
-                if let Ok(Some(file)) = store_guard.get_file_by_id(*file_id) {
-                    let content =
-                        std::fs::read_to_string(vault_path.join(&file.path)).unwrap_or_default();
-                    if let Err(e) = indexer::build_edges_for_file(&store_guard, *file_id, &content)
-                    {
-                        tracing::warn!(
-                            file_id,
-                            path = %file.path,
-                            error = %e,
-                            "failed to rebuild edges"
-                        );
-                    }
-                }
+            if let Err(e) = indexer::reconcile_links(&store_guard, &vault_path, &affected_file_ids)
+            {
+                tracing::warn!(error = %e, "failed to rebuild edges");
             }
             drop(store_guard);
         }
@@ -846,6 +832,144 @@ pub async fn run_consumer(
 mod tests {
     use super::{ResolvedWatcher, fs_magic_needs_poll, requested_backend, resolve_watcher};
     use crate::config::WatcherBackend;
+
+    /// A note the watcher indexes resolves the links other notes wrote before
+    /// it existed (#108).
+    ///
+    /// The watcher rebuilds the edges of the files it touched. The note that
+    /// wrote the link is not one of them — it did not change — so its broken
+    /// link outlived the condition it described.
+    #[tokio::test]
+    async fn a_file_the_watcher_indexes_resolves_the_links_that_waited_for_it() {
+        use super::{WatchEvent, run_consumer};
+        use crate::config::Config;
+        use crate::llm::{EmbedModel, MockLlm};
+        use crate::store::Store;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use tokio::sync::{Mutex, mpsc};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let vault = tmp.path().to_path_buf();
+        std::fs::write(vault.join("a.md"), "# A\n\nSee [[b]].\n").unwrap();
+
+        let store = Store::open_memory().unwrap();
+        let config = Config::default();
+        crate::indexer::run_index_shared(
+            &vault,
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut MockLlm::new(256),
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(store.get_unresolved_links().unwrap().len(), 1);
+
+        std::fs::write(vault.join("b.md"), "# B\n\nBody.\n").unwrap();
+
+        let store = Arc::new(Mutex::new(store));
+        let embedder: Arc<Mutex<Box<dyn EmbedModel + Send>>> =
+            Arc::new(Mutex::new(Box::new(MockLlm::new(256))));
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(vec![WatchEvent::Changed(vault.join("b.md"))])
+            .await
+            .unwrap();
+        drop(tx);
+
+        run_consumer(
+            rx,
+            store.clone(),
+            embedder,
+            Arc::new(vault.clone()),
+            Arc::new(None),
+            config,
+            Arc::new(Mutex::new(HashMap::new())),
+        )
+        .await;
+
+        let store = store.lock().await;
+        assert!(
+            store.get_unresolved_links().unwrap().is_empty(),
+            "the link A wrote resolves now that B is indexed: {:?}",
+            store.get_unresolved_links().unwrap()
+        );
+        let f_a = store.get_file("a.md").unwrap().unwrap();
+        let f_b = store.get_file("b.md").unwrap().unwrap();
+        let out = store.get_outgoing(f_a.id, Some("wikilink")).unwrap();
+        assert_eq!(out.len(), 1, "and the graph holds the edge");
+        assert_eq!(out[0].0, f_b.id);
+    }
+
+    /// A note the watcher sees move records the path-shaped links it breaks
+    /// (#108).
+    ///
+    /// A wikilink resolves by basename, so most links survive a move. One
+    /// written as `[[folder/note]]` names a path the vault no longer has.
+    #[tokio::test]
+    async fn a_move_the_watcher_sees_records_the_path_shaped_links_it_breaks() {
+        use super::{WatchEvent, run_consumer};
+        use crate::config::Config;
+        use crate::llm::{EmbedModel, MockLlm};
+        use crate::store::Store;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use tokio::sync::{Mutex, mpsc};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let vault = tmp.path().to_path_buf();
+        std::fs::create_dir_all(vault.join("inbox")).unwrap();
+        std::fs::create_dir_all(vault.join("lore")).unwrap();
+        std::fs::write(vault.join("a.md"), "# A\n\nSee [[inbox/n]].\n").unwrap();
+        std::fs::write(vault.join("inbox/n.md"), "# N\n\nBody.\n").unwrap();
+
+        let store = Store::open_memory().unwrap();
+        let config = Config::default();
+        crate::indexer::run_index_shared(
+            &vault,
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut MockLlm::new(256),
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(store.get_unresolved_links().unwrap().is_empty());
+
+        std::fs::rename(vault.join("inbox/n.md"), vault.join("lore/n.md")).unwrap();
+
+        let store = Arc::new(Mutex::new(store));
+        let embedder: Arc<Mutex<Box<dyn EmbedModel + Send>>> =
+            Arc::new(Mutex::new(Box::new(MockLlm::new(256))));
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(vec![WatchEvent::Moved {
+            from: vault.join("inbox/n.md"),
+            to: vault.join("lore/n.md"),
+        }])
+        .await
+        .unwrap();
+        drop(tx);
+
+        run_consumer(
+            rx,
+            store.clone(),
+            embedder,
+            Arc::new(vault.clone()),
+            Arc::new(None),
+            config,
+            Arc::new(Mutex::new(HashMap::new())),
+        )
+        .await;
+
+        let store = store.lock().await;
+        assert_eq!(
+            store.get_unresolved_links().unwrap(),
+            vec![("a.md".to_string(), "inbox/n".to_string())],
+            "the link names the path the note has left"
+        );
+    }
 
     #[test]
     fn the_env_override_wins_over_config() {

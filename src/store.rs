@@ -2926,6 +2926,27 @@ impl Store {
         Ok(results)
     }
 
+    /// Every unresolved link as (source file id, target).
+    ///
+    /// The re-resolution form of the rows [`get_unresolved_links`] reports
+    /// (#108). The caller re-derives the source's links, which is keyed on the
+    /// id, and it resolves the target itself rather than reading a path.
+    ///
+    /// [`get_unresolved_links`]: Self::get_unresolved_links
+    pub fn unresolved_link_sources(&self) -> Result<Vec<(i64, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT file_id, target FROM unresolved_links ORDER BY file_id, target")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
     // ── Health Queries ───────────────────────────────────────────
 
     /// Find files that have no edges (neither incoming nor outgoing).
