@@ -264,6 +264,53 @@ pub fn split_frontmatter(content: &str) -> (Option<String>, String) {
     (None, content.to_string())
 }
 
+// ── Line endings ────────────────────────────────────────────────
+
+/// The line ending a text uses: CRLF when its first break is one.
+///
+/// A note has one ending, and every line an edit writes takes it. A text with
+/// no break has none of its own and answers LF (#92, #105).
+pub(crate) fn newline_of(text: &str) -> &'static str {
+    match text.find('\n') {
+        Some(i) if i > 0 && text.as_bytes()[i - 1] == b'\r' => "\r\n",
+        _ => "\n",
+    }
+}
+
+/// Split `text` into lines, each keeping its own line ending.
+///
+/// The counterpart to [`str::lines`], which drops the `\r` of a CRLF ending
+/// and so cannot rebuild what it read. A transform that keeps the lines it was
+/// not asked to touch splits with this one and joins by concatenation (#105).
+pub(crate) fn lines_with_endings(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for (i, b) in text.bytes().enumerate() {
+        if b == b'\n' {
+            out.push(&text[start..=i]);
+            start = i + 1;
+        }
+    }
+    if start < text.len() {
+        out.push(&text[start..]);
+    }
+    out
+}
+
+/// `text` with every line ending rewritten to `newline`.
+///
+/// Content arrives with whatever ending the caller's own tools wrote, and a
+/// note that takes it verbatim ends up holding both. The note's ending is the
+/// one that wins (#105).
+pub(crate) fn with_newline(text: &str, newline: &str) -> String {
+    let lf = text.replace("\r\n", "\n");
+    if newline == "\r\n" {
+        lf.replace('\n', "\r\n")
+    } else {
+        lf
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

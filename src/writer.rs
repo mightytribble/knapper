@@ -649,57 +649,72 @@ pub fn apply_section_edit(
         );
     }
 
-    // Apply the edit based on mode
-    let lines: Vec<&str> = content.lines().collect();
+    // Apply the edit based on mode.
+    //
+    // The split keeps each line's own ending and the parts join by
+    // concatenation, so every line the edit does not name comes through byte
+    // for byte — a CRLF note stays CRLF, and one that arrives mixed leaves
+    // mixed outside the section named. The lines the edit writes take the
+    // note's own ending, the content included, so content written with LF
+    // does not leave a CRLF note holding both (#105).
+    let nl = crate::markdown::newline_of(content);
+    let lines = crate::markdown::lines_with_endings(content);
     let before = &lines[..section.body_start];
     let body = &lines[section.body_start..section.body_end];
     let after = &lines[section.body_end..];
 
-    let (leading, text, trailing) = content_edges(new);
-    let existing = body.join("\n");
+    let (leading, raw, trailing) = content_edges(new);
+    let owned = crate::markdown::with_newline(raw, nl);
+    let text = owned.as_str();
+    // The body without the ending its last line carries, so the formats below
+    // supply that ending themselves and every arm reads the same way.
+    let joined = body.concat();
+    let existing = without_final_ending(&joined);
     // A body on its own under the heading: one blank line above it, and the
-    // join below supplies the one before the next section. An empty body is
+    // tail below supplies the one before the next section. An empty body is
     // nothing at all, so the heading meets the next one across one blank line.
     let alone = |text: &str| {
         if text.is_empty() {
             String::new()
         } else {
-            format!("\n{text}\n")
+            format!("{nl}{text}{nl}")
         }
     };
     let new_body = match mode {
         EditMode::Replace => alone(text),
-        EditMode::Append | EditMode::Prepend if text.is_empty() => existing,
+        EditMode::Append | EditMode::Prepend if text.is_empty() => existing.to_string(),
         EditMode::Append => {
             let old = existing.trim_end();
             if old.is_empty() {
                 alone(text)
             } else {
-                format!("{old}\n{}{text}\n", "\n".repeat(leading))
+                format!("{old}{nl}{}{text}{nl}", nl.repeat(leading))
             }
         }
         EditMode::Prepend => {
-            let old = from_first_text_line(&existing);
+            let old = from_first_text_line(existing);
             if old.is_empty() {
                 alone(text)
             } else {
-                format!("\n{text}\n{}{old}", "\n".repeat(trailing))
+                format!("{nl}{text}{nl}{}{old}", nl.repeat(trailing))
             }
         }
         EditMode::Remove => bail!("Remove has no meaning for a section"),
     };
 
     // Reconstruct the file
-    let mut result_parts: Vec<String> = Vec::new();
-    if !before.is_empty() {
-        result_parts.push(before.join("\n"));
+    let mut result = before.concat();
+    // A section at the end of a note that ends mid-line leaves `before`
+    // ending mid-line too, and the body still opens on the next one.
+    if !result.is_empty() && !result.ends_with('\n') {
+        result.push_str(nl);
     }
-    result_parts.push(new_body);
+    result.push_str(&new_body);
     if !after.is_empty() {
-        result_parts.push(after.join("\n"));
+        result.push_str(nl);
+        result.push_str(&after.concat());
     }
-    // Join with newlines, ensuring we don't double up
-    Ok(keep_final_newline(content, result_parts.join("\n")))
+    Ok(keep_final_newline(content, result))
 }
 
 /// The text of a section edit's `content`, with the blank lines on either
@@ -770,10 +785,24 @@ pub fn rename_section(content: &str, heading: &str, new_heading: &str) -> Result
         );
     }
 
-    let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
-    lines[section.heading.line] =
-        renamed_heading_line(&lines[section.heading.line], &section.heading, text);
-    Ok(keep_final_newline(content, lines.join("\n")))
+    // One line is rewritten and the rest are spliced back as they came, its
+    // own ending included: a rename of a CRLF note leaves it CRLF, and one of
+    // a mixed note touches no line's ending at all (#105).
+    let lines = crate::markdown::lines_with_endings(content);
+    let old = lines[section.heading.line];
+    let bare = without_final_ending(old);
+    let renamed = format!(
+        "{}{}",
+        renamed_heading_line(bare, &section.heading, text),
+        &old[bare.len()..]
+    );
+    let edited = [
+        lines[..section.heading.line].concat(),
+        renamed,
+        lines[section.heading.line + 1..].concat(),
+    ]
+    .concat();
+    Ok(keep_final_newline(content, edited))
 }
 
 /// The heading line `old` becomes when its text is `text`.
@@ -816,15 +845,22 @@ fn opening_heading(text: &str) -> Option<crate::markdown::HeadingInfo> {
 fn keep_final_newline(original: &str, edited: String) -> String {
     let mut edited = edited;
     match (original.ends_with('\n'), edited.ends_with('\n')) {
-        (true, false) => edited.push('\n'),
+        // The note's own ending, so a CRLF note is not given back an LF one.
+        (true, false) => edited.push_str(crate::markdown::newline_of(original)),
         // One newline, not every trailing one: the rest of the tail is the
-        // caller's content and this is not the call that trims it.
-        (false, true) => {
-            edited.pop();
-        }
+        // caller's content and this is not the call that trims it. Both of a
+        // CRLF ending's bytes go, or the note keeps a lone `\r` (#105).
+        (false, true) => edited.truncate(without_final_ending(&edited).len()),
         _ => {}
     }
     edited
+}
+
+/// `s` without the line ending its last line carries, if it carries one.
+fn without_final_ending(s: &str) -> &str {
+    s.strip_suffix('\n')
+        .map(|s| s.strip_suffix('\r').unwrap_or(s))
+        .unwrap_or(s)
 }
 
 /// The display name of an edit mode, for `EditResult::mode`.
@@ -873,13 +909,21 @@ pub fn apply_body_edit(
     if mode == EditMode::Remove {
         return Ok(content.to_string());
     }
+    // The note's ending is the one it keeps: the separator an append or a
+    // prepend writes takes it, and so does the content, which arrives with
+    // whatever the caller's own tools wrote and used to be spliced in
+    // verbatim. The note's own lines are never split apart, so they carry
+    // their endings through untouched (#105).
+    let nl = crate::markdown::newline_of(content);
+    let owned = crate::markdown::with_newline(new, nl);
+    let new = owned.as_str();
     if preserve_frontmatter
         && let Some((block, old_body)) = crate::frontmatter::split_body(content)?
     {
         let new_body = match mode {
             EditMode::Replace => new.to_string(),
-            EditMode::Append => format!("{}\n{}", old_body.trim_end(), new),
-            EditMode::Prepend => format!("{}\n{}", new.trim_end(), old_body),
+            EditMode::Append => format!("{}{nl}{}", old_body.trim_end(), new),
+            EditMode::Prepend => format!("{}{nl}{}", new.trim_end(), old_body),
             EditMode::Remove => old_body,
         };
         return Ok(keep_final_newline(content, format!("{block}{new_body}")));
@@ -889,8 +933,8 @@ pub fn apply_body_edit(
     // note's own content either way.
     let edited = match mode {
         EditMode::Replace => new.to_string(),
-        EditMode::Append => format!("{}\n{}", content.trim_end(), new),
-        EditMode::Prepend => format!("{}\n{}", new.trim_end(), content),
+        EditMode::Append => format!("{}{nl}{}", content.trim_end(), new),
+        EditMode::Prepend => format!("{}{nl}{}", new.trim_end(), content),
         EditMode::Remove => content.to_string(),
     };
     Ok(keep_final_newline(content, edited))
@@ -1850,6 +1894,44 @@ mod tests {
             out,
             "---\r\nname: X\r\ntags: [a]\r\n---\r\n\r\nNew body.\r\n"
         );
+    }
+
+    /// The content's own endings do not survive a note that uses another one.
+    /// A body replace spliced `new` in verbatim, so LF content written to a
+    /// CRLF note left the note holding both (#105).
+    #[test]
+    fn a_body_replace_with_lf_content_on_a_crlf_note_writes_crlf() {
+        let doc = "---\r\nname: X\r\n---\r\n\r\nBody.\r\n";
+        let out =
+            apply_body_edit(doc, "New body.\nSecond line.\n", EditMode::Replace, true).unwrap();
+        assert_eq!(
+            out,
+            "---\r\nname: X\r\n---\r\n\r\nNew body.\r\nSecond line.\r\n"
+        );
+    }
+
+    /// An append writes a separator of its own, and that takes the note's
+    /// ending as well as the content does (#105).
+    #[test]
+    fn a_body_append_with_lf_content_on_a_crlf_note_writes_crlf() {
+        let doc = "---\r\nname: X\r\n---\r\n\r\nBody.\r\n";
+        let out = apply_body_edit(doc, "More.\n", EditMode::Append, true).unwrap();
+        assert_eq!(out, "---\r\nname: X\r\n---\r\n\r\nBody.\r\nMore.\r\n");
+    }
+
+    /// The rule runs both ways round: CRLF content written to an LF note
+    /// lands as LF (#105).
+    #[test]
+    fn a_body_replace_with_crlf_content_on_an_lf_note_writes_lf() {
+        let doc = "---\nname: X\n---\n\nBody.\n";
+        let out = apply_body_edit(
+            doc,
+            "New body.\r\nSecond line.\r\n",
+            EditMode::Replace,
+            true,
+        )
+        .unwrap();
+        assert_eq!(out, "---\nname: X\n---\n\nNew body.\nSecond line.\n");
     }
 
     /// `markdown::split_frontmatter` compares `line.trim() == "---"`, so it
@@ -3073,6 +3155,62 @@ mod tests {
         );
     }
 
+    /// The whole write path, not the transforms alone: a CRLF note read off
+    /// disk, edited in every way one call can edit it, and written back keeps
+    /// CRLF on every line. The bug this guards showed as a whole-file diff on
+    /// a one-section edit (#105).
+    #[test]
+    fn a_run_of_edits_on_a_crlf_note_writes_the_note_back_as_crlf() {
+        use crate::llm::MockLlm;
+
+        let (_tmp, store, vault) = setup_vault();
+        std::fs::write(
+            vault.join("note.md"),
+            "---\r\nname: X\r\n---\r\n\r\n## Spells\r\n\r\nold\r\n",
+        )
+        .unwrap();
+        let mut embedder = MockLlm::new(256);
+        let config = crate::config::Config::default();
+        crate::indexer::run_index_shared(
+            &vault,
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
+
+        update_note(
+            &store,
+            &vault,
+            &UpdateInput {
+                file: "note.md".into(),
+                edits: vec![
+                    NoteEdit {
+                        target: EditTarget::Section("Spells".into()),
+                        heading: Some("Cantrips".into()),
+                        mode: EditMode::Replace,
+                        content: Some(EditContent::Text("new".into())),
+                    },
+                    NoteEdit {
+                        target: EditTarget::Property("name".into()),
+                        heading: None,
+                        mode: EditMode::Replace,
+                        content: Some(EditContent::Text("Y".into())),
+                    },
+                ],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(vault.join("note.md")).unwrap(),
+            "---\r\nname: Y\r\n---\r\n\r\n## Cantrips\r\n\r\nnew\r\n"
+        );
+    }
+
     #[test]
     fn one_call_applies_a_section_edit_and_a_property_edit_in_one_write() {
         use crate::llm::MockLlm;
@@ -3383,6 +3521,25 @@ mod tests {
         }
     }
 
+    /// A note that ended mid-line still ends mid-line, and the pop that takes
+    /// the ending back takes both of its bytes rather than leaving a lone
+    /// `\r` behind (#94, #105).
+    #[test]
+    fn a_section_edit_leaves_a_crlf_note_that_ended_mid_line_ending_mid_line() {
+        let doc = "# Note\r\n\r\n## Section\r\n\r\nOld.";
+        let out = apply_section_edit(doc, "Section", "New.", EditMode::Replace).unwrap();
+        assert_eq!(out, "# Note\r\n\r\n## Section\r\n\r\nNew.");
+    }
+
+    /// And the ending given back to a note the edit left mid-line is the
+    /// note's own, not a bare `\n` (#94, #105).
+    #[test]
+    fn a_section_edit_gives_back_the_crlf_the_note_ended_on() {
+        let doc = "# Note\r\n\r\n## Section\r\n\r\nOld body.\r\n";
+        let out = apply_section_edit(doc, "Section", "New.\n", EditMode::Prepend).unwrap();
+        assert_eq!(out, "# Note\r\n\r\n## Section\r\n\r\nNew.\r\nOld body.\r\n");
+    }
+
     /// A CRLF at the front is the same newline (#104).
     #[test]
     fn a_leading_crlf_in_section_content_is_dropped_too() {
@@ -3392,6 +3549,98 @@ mod tests {
         assert_eq!(
             out,
             "# Note\n\n## Section\n\nNew body.\n\n## Next\n\nOther.\n"
+        );
+    }
+
+    /// A CRLF note keeps CRLF through a section replace. The rebuild read the
+    /// note apart with `lines()`, which drops the `\r` of a CRLF ending, and
+    /// glued it back with `\n`, so an edit to one section rewrote the line
+    /// ending of every line in the note (#105).
+    #[test]
+    fn a_section_replace_on_a_crlf_note_keeps_crlf() {
+        let doc = "# Note\r\n\r\n## Section\r\n\r\nOriginal body.\r\n\r\n## Next\r\n\r\nOther.\r\n";
+        let out = apply_section_edit(doc, "Section", "New body.", EditMode::Replace).unwrap();
+        assert_eq!(
+            out,
+            "# Note\r\n\r\n## Section\r\n\r\nNew body.\r\n\r\n## Next\r\n\r\nOther.\r\n"
+        );
+    }
+
+    /// The separators an append writes take the note's ending too (#105).
+    #[test]
+    fn a_section_append_on_a_crlf_note_keeps_crlf() {
+        let doc = "# Note\r\n\r\n## Section\r\n\r\nOriginal body.\r\n\r\n## Next\r\n\r\nOther.\r\n";
+        let out = apply_section_edit(doc, "Section", "\nMore.\n", EditMode::Append).unwrap();
+        assert_eq!(
+            out,
+            "# Note\r\n\r\n## Section\r\n\r\nOriginal body.\r\n\r\nMore.\r\n\r\n## Next\r\n\r\nOther.\r\n"
+        );
+    }
+
+    /// And the ones a prepend writes (#105).
+    #[test]
+    fn a_section_prepend_on_a_crlf_note_keeps_crlf() {
+        let doc = "# Note\r\n\r\n## Section\r\n\r\nOriginal body.\r\n\r\n## Next\r\n\r\nOther.\r\n";
+        let out = apply_section_edit(doc, "Section", "More.\n", EditMode::Prepend).unwrap();
+        assert_eq!(
+            out,
+            "# Note\r\n\r\n## Section\r\n\r\nMore.\r\nOriginal body.\r\n\r\n## Next\r\n\r\nOther.\r\n"
+        );
+    }
+
+    /// The note's ending wins over the content's, so LF content written to a
+    /// CRLF note lands as CRLF rather than leaving the note mixed. It is the
+    /// same rule `a_leading_crlf_in_section_content_is_dropped_too` applies at
+    /// the edges, carried to the breaks inside the content (#105).
+    #[test]
+    fn lf_section_content_takes_the_notes_crlf() {
+        let doc = "# Note\r\n\r\n## Section\r\n\r\nOriginal body.\r\n\r\n## Next\r\n\r\nOther.\r\n";
+        let out = apply_section_edit(
+            doc,
+            "Section",
+            "First line.\nSecond line.\n",
+            EditMode::Replace,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "# Note\r\n\r\n## Section\r\n\r\nFirst line.\r\nSecond line.\r\n\r\n## Next\r\n\r\nOther.\r\n"
+        );
+    }
+
+    /// A rename rebuilt the note the same way, so renaming one heading of a
+    /// CRLF note converted the whole file (#105).
+    #[test]
+    fn a_rename_on_a_crlf_note_keeps_crlf() {
+        let doc = "# Note\r\n\r\n## Section\r\n\r\nOriginal body.\r\n\r\n## Next\r\n\r\nOther.\r\n";
+        let out = rename_section(doc, "Section", "Renamed").unwrap();
+        assert_eq!(
+            out,
+            "# Note\r\n\r\n## Renamed\r\n\r\nOriginal body.\r\n\r\n## Next\r\n\r\nOther.\r\n"
+        );
+    }
+
+    /// A note that arrives mixed leaves mixed. Every line the edit does not
+    /// name keeps the ending it came in with, so a rename is the heading's
+    /// text and nothing else — the promise #94 makes about the note's last
+    /// line, applied to every line the caller did not address (#105).
+    #[test]
+    fn a_rename_keeps_the_endings_of_the_lines_it_does_not_name() {
+        let doc = "# Note\r\n\n## Section\n\nBody.\r\n";
+        let out = rename_section(doc, "Section", "Renamed").unwrap();
+        assert_eq!(out, "# Note\r\n\n## Renamed\n\nBody.\r\n");
+    }
+
+    /// The same for a section edit: the lines above the heading and below the
+    /// section keep their own endings, and only the body the edit writes takes
+    /// the note's (#105).
+    #[test]
+    fn a_section_edit_keeps_the_endings_of_the_lines_it_does_not_name() {
+        let doc = "# Note\r\n\r\n## Section\r\n\r\nOriginal.\r\n\r\n## Next\n\nOther.\n";
+        let out = apply_section_edit(doc, "Section", "New.", EditMode::Replace).unwrap();
+        assert_eq!(
+            out,
+            "# Note\r\n\r\n## Section\r\n\r\nNew.\r\n\r\n## Next\n\nOther.\n"
         );
     }
 
