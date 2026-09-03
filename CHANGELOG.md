@@ -3,7 +3,7 @@
 Every entry below the upstream-lineage line names the commit it describes.
 Links resolve against https://github.com/mightytribble/knapper.
 
-## Unreleased
+## 0.9.6 (2026-09-03)
 
 Qwen3-Embedding becomes a local embedder you can point `models.embed` at.
 EmbeddingGemma stays the default and its stored vectors are unchanged, so no
