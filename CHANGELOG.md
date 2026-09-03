@@ -8,11 +8,15 @@ existing store re-indexes on the upgrade.
 
 ### Added
 
-- Qwen3-Embedding 0.6B and 4B are supported local embedders (#8). They are options, not defaults: `models.embed` takes the GGUF and the output width, the input context and the prompt template all come from the model itself. The 0.6B is 1024-wide over a 32768-token context and runs on CPU; the 4B is 2560-wide over 40960 and wants a GPU. Taking either re-indexes the vault at the new width, because the embedder is a fingerprint component and the vector table is declared at the model's dimension. `[calibrated]`'s four numbers stay EmbeddingGemma's fit and are the user's to refit, which is what `config::section_note` and the indexer's fingerprint warning already say. `[embedding_prompt]` is EmbeddingGemma's pair of templates and does nothing under another family; the generated config now says so above the header, because every key in it was silently inert.
+- Qwen3-Embedding 0.6B and 4B are supported local embedders (#8). They are options, not defaults: `models.embed` takes the GGUF and the output width, the input context and the prompt template all come from the model itself. The 0.6B is 1024-wide over a 32768-token context and runs on CPU; the 4B is 2560-wide over 40960 and wants a GPU. Taking either re-indexes the vault at the new width, because the embedder is a fingerprint component and the vector table is declared at the model's dimension. `[calibrated]`'s shipped four numbers stay EmbeddingGemma's fit, and the generated config carries a measured fit for each Qwen model beside them. `[embedding_prompt]` is EmbeddingGemma's pair of templates and does nothing under another family; the generated config now says so above the header, because every key in it was silently inert.
+
+- The generated config carries a `[calibrated]` fit for every embedder `models list` names, commented out under the header (#8). Uncommenting a block's four lines is the refit for that model: Qwen3-Embedding-0.6B at `semantic 17.197`, `keyword 12.181`, `intercept -9.057`, `floor 0.78`, and the 4B at `11.618`, `11.298`, `-6.419`, `0.76`. Each is fit on the corpus, the pool and the label set the shipped numbers were fit on, and each floor silences the same eight of the pool's eleven negatives, and the nonsense control, that the default floor does. A trailer sits below a section's keys where a note sits above its header, because a key uncommented above a header sets that key in the table before it.
 
 - `knapper models list` names the embedders that are known to work, with each one's width, context and download size, and marks the one in use (#8). It was a one-row stub that knew only the default. `models info` reports the same beside the width the store was actually built at. The catalogue decides nothing: any other `hf:<repo>/<file>.gguf` is still accepted.
 
 ### Fixed
+
+- `[calibrated]`'s coefficients were fit against a feature the engine does not compute (#8). `scripts/calibrated-fusion-eval.py` fits four semantic features and reports the coefficients of one of them, `fused-median` — an anchored cosine, `(cos - background) / (self-similarity - background)`. `calibrate::probability` multiplies the candidate's **raw** cosine, so the shipped weights described a quantity the engine never forms. The three are now the tool's `fused-raw` fit over the same corpus, pool and labels: `semantic 20.777`, `keyword 13.377`, `intercept -8.762`. `floor` stays 0.75. On the calibration pool the model-free path silences the same eight of eleven negatives and the control, holds 22 of 33 tier-1 members against 21, and carries 10 noise rows in the window against 14. Every key is query-time and reaches no fingerprint, so no store re-indexes.
 
 - Pointing `models.embed` at a Qwen3 embedding model segfaulted (#8). Which llama.cpp forward pass runs the graph was a constant, `encode`, and `llama_context::encode` runs the graph with a **null** memory context because an encoder needs no KV cache. `llm_build_qwen3` opens with `build_attn_inp_kv()` and dereferences that null. EmbeddingGemma survives it because its graph uses `build_attn_inp_no_cache()`, which is why the constant held for the shipped default and for nothing else. The pass is now the model family's, `decode` for Qwen3 and `encode` for EmbeddingGemma. llama.cpp's own `llama_model_has_encoder` cannot be the predicate — it is true for T5 alone, so it would move the default's path too.
 
@@ -20,7 +24,7 @@ existing store re-indexes on the upgrade.
 
 - The Qwen3 templates were not the model card's (#8). The query prefix was an invented `Instruct: Retrieve relevant passages\nQuery: {query}`, and a document was written as `{title}\n{text}` — a format the card does not have, and at the shipped `document_title = none` a bare leading newline. The query is now the card's own `Instruct: {task}\nQuery:{query}` and a document is its text alone, which is what the card gives. The Qwen arm's `template_id` moves with it, so a store built under the old document template re-indexes and an EmbeddingGemma store does not.
 
-- **Test count: 1208 -> 1223.**
+- **Test count: 1208 -> 1224.**
 
 ## 0.9.5 (2026-09-02)
 
