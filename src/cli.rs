@@ -57,6 +57,14 @@ pub enum Command {
     /// Search the indexed vault.
     Search(crate::params::Search),
 
+    /// Find every note whose text holds a literal string, and count them.
+    ///
+    /// For verification and maintenance — confirming a phrase is gone after
+    /// an edit, or finding what still carries an old form. `search` is the
+    /// command for finding what a note is about.
+    #[command(name = "match")]
+    Match(crate::params::Match),
+
     /// Read a note's content, one of its sections with `--section`, or its
     /// metadata with `--metadata`.
     Read(crate::params::Read),

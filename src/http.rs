@@ -286,6 +286,7 @@ pub fn routes() -> Vec<(&'static str, MethodRouter<ApiState>)> {
     vec![
         ("/api/health-check", get(health_check)),
         ("/api/search", post(handle_search)),
+        ("/api/match", post(handle_match)),
         ("/api/read", get(handle_read)),
         ("/api/list", get(handle_list)),
         ("/api/tags", get(handle_tags)),
@@ -366,6 +367,20 @@ async fn handle_plugin_manifest(State(state): State<ApiState>) -> impl IntoRespo
 /// from where the error is built (#60, #65).
 fn is_scope_typo(message: &str) -> bool {
     message.starts_with("no such tag") || message.starts_with("no such folder")
+}
+
+async fn handle_match(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(body): Json<crate::params::Match>,
+) -> Result<impl IntoResponse, ApiError> {
+    authorize(&headers, &state, false)?;
+    let store = state.store.lock().await;
+    // An empty pattern and an unknown scope term are both the caller's own
+    // text naming nothing, so both are 400 rather than 500 (#65).
+    let report = crate::matching::run(&store, &body)
+        .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
+    Ok(Json(report))
 }
 
 async fn handle_search(

@@ -85,6 +85,18 @@ pub const CAPABILITIES: &[Capability] = &[
         cli_only_args: &[],
         server_only_args: &[],
     },
+    // Literal matching, not ranked retrieval (#106). `search` answers what a
+    // note is about; this answers whether a note still says a given string,
+    // and its POST body carries the scope operators as arrays the way
+    // `search`'s does.
+    Capability {
+        name: "match",
+        cli: Presence::On,
+        mcp: Presence::On,
+        http: Http::Post,
+        cli_only_args: &[],
+        server_only_args: &[],
+    },
     Capability {
         name: "read",
         cli: Presence::On,
@@ -654,8 +666,8 @@ mod tests {
     }
 
     #[test]
-    fn there_are_eighteen_capabilities() {
-        assert_eq!(CAPABILITIES.len(), 18);
+    fn there_are_nineteen_capabilities() {
+        assert_eq!(CAPABILITIES.len(), 19);
     }
 
     #[test]

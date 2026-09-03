@@ -1882,6 +1882,44 @@ impl Store {
         Ok(results)
     }
 
+    /// Stream every chunk a scope admits, in path and then chunk order (#106).
+    ///
+    /// A visitor rather than a returned list: the literal scan behind `match`
+    /// is exhaustive by contract, so it reads every row in scope whatever its
+    /// limit, and materializing the vault's text to do that would be waste.
+    ///
+    /// `none` is not checked, for the reason `list_files` does not check it:
+    /// excluding a tag no note carries is a no-op.
+    pub fn for_each_chunk_in_scope(
+        &self,
+        scope: &crate::tags::Scope,
+        mut visit: impl FnMut(crate::matching::ChunkRow),
+    ) -> Result<()> {
+        let checked: Vec<&crate::tags::ScopeTerm> =
+            scope.all.iter().chain(scope.any.iter()).collect();
+        crate::tags::check_terms(&self.conn, &checked)?;
+
+        let (scope_sql, args) = scope_clauses(scope);
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT f.path, c.heading_path, c.text
+               FROM chunks c JOIN files f ON f.id = c.file_id
+              WHERE 1=1{scope_sql}
+              ORDER BY f.path, c.seq"
+        ))?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(args.iter()))?;
+        while let Some(row) = rows.next()? {
+            let heading_path: String = row.get(1)?;
+            visit(crate::matching::ChunkRow {
+                file: row.get(0)?,
+                // NOT NULL with an empty default: no breadcrumb, rather than a
+                // breadcrumb of no characters.
+                heading_path: (!heading_path.is_empty()).then_some(heading_path),
+                text: row.get(2)?,
+            });
+        }
+        Ok(())
+    }
+
     /// The ids of the notes a tag filter admits (#60).
     ///
     /// The scope a search runs under, resolved once so that all three lanes
@@ -5818,6 +5856,76 @@ mod tests {
             &none.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
         )
         .unwrap()
+    }
+
+    /// A file with two chunks, so a scan has an order to answer in.
+    fn chunk_fixture() -> Store {
+        let store = Store::open_memory().unwrap();
+        for (i, path) in ["People/marcus.md", "Places/varenholt.md"]
+            .iter()
+            .enumerate()
+        {
+            let file_id = store
+                .insert_file(path, "h", i as i64, &format!("d00000{i}"), None, None)
+                .unwrap();
+            for seq in 0..2 {
+                store
+                    .insert_chunk(&NewChunk {
+                        file_id,
+                        seq,
+                        heading: "Biography",
+                        heading_path: if seq == 0 { "" } else { "Marcus > Biography" },
+                        tags_text: "",
+                        text: &format!("{path} chunk {seq}"),
+                        vector_id: (i * 2 + seq as usize) as u64,
+                        token_count: 4,
+                    })
+                    .unwrap();
+            }
+        }
+        store
+    }
+
+    fn scanned(store: &Store, scope: &crate::tags::Scope) -> Vec<crate::matching::ChunkRow> {
+        let mut rows = Vec::new();
+        store
+            .for_each_chunk_in_scope(scope, |row| rows.push(row))
+            .unwrap();
+        rows
+    }
+
+    #[test]
+    fn a_chunk_scan_answers_every_chunk_in_path_then_chunk_order() {
+        let rows = scanned(&chunk_fixture(), &crate::tags::Scope::default());
+        assert_eq!(
+            rows.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(),
+            vec![
+                "People/marcus.md chunk 0",
+                "People/marcus.md chunk 1",
+                "Places/varenholt.md chunk 0",
+                "Places/varenholt.md chunk 1",
+            ]
+        );
+        assert_eq!(rows[0].file, "People/marcus.md");
+    }
+
+    #[test]
+    fn a_chunk_scan_answers_only_what_the_scope_admits() {
+        let rows = scanned(&chunk_fixture(), &folder_scope(&["/Places/"], &[], &[]));
+        assert_eq!(
+            rows.iter().map(|r| r.file.as_str()).collect::<Vec<_>>(),
+            vec!["Places/varenholt.md", "Places/varenholt.md"]
+        );
+    }
+
+    #[test]
+    fn a_chunk_with_no_breadcrumb_scans_as_no_heading_path() {
+        // `chunks.heading_path` is NOT NULL and defaults to the empty string,
+        // which is the absence of a breadcrumb rather than a breadcrumb of no
+        // characters.
+        let rows = scanned(&chunk_fixture(), &crate::tags::Scope::default());
+        assert_eq!(rows[0].heading_path, None);
+        assert_eq!(rows[1].heading_path.as_deref(), Some("Marcus > Biography"));
     }
 
     #[test]
