@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.9.5 (2026-09-02)
+
+A feature release over 0.9.4. New capability `match`, stale-heading reporting
+on `update` and `health`, and two write-path fixes to line endings and blank
+lines. No fingerprint moves, so no store re-indexes on the upgrade.
+
+### Added
+
+- `match`, a surface that can report the absence (or presence) of an arbitrary string in indexed content (#106). One capability on all three surfaces. The pattern is a literal, never a regex, and `case_sensitive` turns off the default case folding. It takes the same four scope operators as `search` and `list`, and a `limit` on the reported lines whose absent case is all of them and whose `0` is none, which is `list`'s rule for the same field. It answers `notes`, `lines`, and the matched lines with each one's path and breadcrumb. `limit` caps the reported lines and neither count. It reads the indexed note bodies, so it does not see frontmatter — the chunker strips the YAML block, and each surface says so. A line is reported once per section, so a chunk split that repeats text across rows does not report it twice.
+
+- Stale heading links are reported (#99). A section rename leaves a `[[Note#Heading]]` in another note naming a heading that is gone. The file resolves, so this is not a broken link and the broken-link report never saw it; on the linking note's next re-index the edge degrades from the passage to the document. `update` now returns `stale_links`, the notes holding such a link to the heading it renamed, read before the write. `health` gains `stale_headings`, the same fact over every note, on by default. Both read the links back out of the chunk text, which keeps the heading as the source note spelled it, so a heading renamed outside knapper is reported too. The linking notes are not rewritten; that is #107. Both reports can name a note whose `[[Note#Heading]]` is only an example inside a code block: the link extractor scans the raw text and does not track code fences.
+
+### Fixed
+
+- An edit writes the note's own line ending (#105). A section edit or rename read the note apart with `lines()` and joined it with `\n`, so a CRLF note came back LF on every line, not only the lines the edit named. A body edit wrote a bare `\n` for its append and prepend separator and spliced the caller's content in verbatim, leaving a CRLF note mixed. Every line an edit does not name now keeps the ending it came in with; the lines it writes, and the content, take the note's own ending, which is the first line break's. `keep_final_newline` no longer pushes a bare `\n` onto a CRLF note or leaves a lone `\r` behind when it pops one.
+
+- A section edit keeps the content's blank lines only where they join (#104). The content was trimmed at its end and not its start, and the heading's newline is written separately, so content opening with a newline added a second blank line under the heading — in replace, in prepend, and in append to a bodyless section. Blank lines at the content's edges are now counted rather than kept, and only the edge the edit joins on carries them: an append reads leading blank lines as a paragraph break, a prepend reads trailing ones. A single trailing newline is a line ending. First-line indentation is kept, on the content and on the old body under a prepend. Empty content empties a replaced section rather than leaving three blank lines, and is a no-op for append and prepend.
+
+- **Test count: 1154 -> 1208.**
+
+### Changed
+
+- The calibration guidance names note length beside the embedder. The README and the refit tool said to refit `[calibrated]` on an embedder change and not on a corpus change. Only BM25 self-normalizes per query; the semantic half is a raw cosine, and note length moves that distribution with no embedder changing. A vault of much shorter notes than the fit was built on can put the floor inside the band its own correct answers score in, and the symptom is an abstention on a query whose lanes retrieved everything. The numbers and the code are untouched.
+
 ## 0.9.4 (2026-09-02)
 
 A patch release over 0.9.3. `top_n` returns the number of results it says it
