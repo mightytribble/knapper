@@ -12,7 +12,7 @@ use crate::chunker::{chunk_markdown, split_oversized_chunks};
 use crate::config::{Config, db_path};
 use crate::docid::generate_docid;
 use crate::exclude::ExcludeMatcher;
-use crate::graph::{Wikilink, extract_wikilinks};
+use crate::graph::{Wikilink, extract_wikilinks, resolve_link_target};
 use crate::llm::EmbedModel;
 use crate::profile::VaultProfile;
 use crate::store::{DOC_LEVEL, FileRecord, Store};
@@ -209,34 +209,6 @@ fn rebuild_all_edges(store: &Store, vault_path: &Path, files: &[PathBuf]) -> Res
         rebuilt += 1;
     }
     Ok(rebuilt)
-}
-
-/// Resolve a wikilink target name to a file ID in the store.
-fn resolve_link_target(store: &Store, target: &str) -> Result<Option<i64>> {
-    let with_ext = if target.ends_with(".md") {
-        target.to_string()
-    } else {
-        format!("{}.md", target)
-    };
-
-    // Try exact path match
-    if let Some(f) = store.get_file(&with_ext)? {
-        return Ok(Some(f.id));
-    }
-
-    // Try basename match (case-insensitive)
-    let all_files = store.get_all_files()?;
-    let target_lower = with_ext.to_lowercase();
-    let mut matches: Vec<&FileRecord> = all_files
-        .iter()
-        .filter(|f| {
-            let path_lower = f.path.to_lowercase();
-            path_lower == target_lower || path_lower.ends_with(&format!("/{}", target_lower))
-        })
-        .collect();
-
-    matches.sort_by_key(|f| f.path.len());
-    Ok(matches.first().map(|f| f.id))
 }
 
 /// Build wikilink edges for a single file, at chunk granularity on both ends.

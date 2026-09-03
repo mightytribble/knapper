@@ -46,6 +46,27 @@ pub struct EditResult {
     pub path: String,
     pub heading: String,
     pub mode: String,
+    /// The notes this write left holding a link to a heading it renamed away.
+    /// Empty for every edit that renames nothing (#99).
+    pub stale_links: Vec<StaleLink>,
+}
+
+/// A note whose `[[This Note#Old Heading]]` link a rename left stale (#99).
+///
+/// A heading is an identifier: `read` addresses a section by it and the
+/// breadcrumbs `search` returns are keyed on it. A rename is the one edit that
+/// can invalidate another note's reference to the note being edited, and
+/// nothing else reports it — the linked file still resolves, so the link is
+/// not unresolved and `health`'s broken-link report does not see it.
+///
+/// The rename is not undone and the other note is not written. Knowing is the
+/// whole of it; rewriting the link is a separate ask (#107).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct StaleLink {
+    /// The linking note's path.
+    pub source: String,
+    /// The heading it named — the name this note no longer has.
+    pub heading: String,
 }
 
 /// What one edit addresses. A note has three addressable things: its body,
@@ -1045,6 +1066,45 @@ pub fn apply_note_edits(content: &str, edits: &[NoteEdit]) -> Result<String> {
     Ok(text)
 }
 
+/// The links a run of edits is about to leave naming a heading that is gone.
+///
+/// Read **before** the write: the lookup asks the store which notes link here
+/// and what heading each one wrote, and the re-index that follows a write
+/// replaces exactly those rows.
+///
+/// `get_incoming` narrows the vault to the notes that link to this one at all,
+/// which cannot miss a candidate — a note writing `[[This#Anything]]` always
+/// holds a wikilink edge to this note, deep or degraded. The headings are then
+/// matched on the text those notes actually wrote, because the edge itself
+/// does not keep it (#99).
+fn stale_links_for(store: &Store, file_id: i64, edits: &[NoteEdit]) -> Result<Vec<StaleLink>> {
+    let renamed: Vec<String> = edits
+        .iter()
+        .filter(|e| e.heading.is_some())
+        .filter_map(|e| match &e.target {
+            EditTarget::Section(old) => Some(crate::store::normalise_heading(old)),
+            _ => None,
+        })
+        .collect();
+    if renamed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sources: Vec<i64> = store
+        .get_incoming(file_id, Some("wikilink"))?
+        .into_iter()
+        .map(|(from_file, _)| from_file)
+        .collect();
+    Ok(crate::graph::deep_links_from(store, &sources)?
+        .into_iter()
+        .filter(|link| link.target_id == file_id)
+        .filter(|link| renamed.contains(&crate::store::normalise_heading(&link.heading)))
+        .map(|link| StaleLink {
+            source: link.source,
+            heading: link.heading,
+        })
+        .collect())
+}
+
 /// Apply a list of edits to one note in one write.
 ///
 /// The list is one write however long it is: one conflict check, one
@@ -1074,15 +1134,18 @@ pub fn update_note(store: &Store, vault_path: &Path, input: &UpdateInput) -> Res
         );
     }
 
-    // Step 3: Apply every edit to the text the file holds
+    // Step 3: What a rename is about to leave stale, read before the write
+    let stale_links = stale_links_for(store, file_record.id, &input.edits)?;
+
+    // Step 4: Apply every edit to the text the file holds
     let content = std::fs::read_to_string(&full_path)?;
     let new_content = apply_note_edits(&content, &input.edits)
         .map_err(|e| anyhow::anyhow!("{e} in {}", input.file))?;
 
-    // Step 4: Write atomically — once
+    // Step 5: Write atomically — once
     atomic_write(&full_path, &new_content, true)?;
 
-    // Step 5: Update the store's content hash, mtime and tag rows
+    // Step 6: Update the store's content hash, mtime and tag rows
     let content_hash = compute_content_hash(&new_content);
     let mtime = file_mtime(&full_path)?;
     let docid = file_record
@@ -1104,6 +1167,7 @@ pub fn update_note(store: &Store, vault_path: &Path, input: &UpdateInput) -> Res
         path: file_record.path,
         heading: String::new(),
         mode: "Update".to_string(),
+        stale_links,
     })
 }
 
@@ -3159,6 +3223,135 @@ mod tests {
     /// disk, edited in every way one call can edit it, and written back keeps
     /// CRLF on every line. The bug this guards showed as a whole-file diff on
     /// a one-section edit (#105).
+    /// Index every note in `vault`, so the store holds the chunk headings and
+    /// the wikilink edges a stale-link lookup reads.
+    fn index_vault(store: &Store, vault: &std::path::Path) {
+        let config = crate::config::Config::default();
+        crate::indexer::run_index_shared(
+            vault,
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            store,
+            &mut crate::llm::MockLlm::new(256),
+            false,
+            None,
+        )
+        .unwrap();
+    }
+
+    /// A rename is the one edit that can invalidate another note's reference
+    /// to the note being edited, and nothing reported it: the stale link is
+    /// not unresolved — the file is there — so `health`'s broken-link report
+    /// never saw it, and the edge quietly degraded to the document (#99).
+    #[test]
+    fn a_rename_names_the_notes_whose_links_it_left_stale() {
+        let (_tmp, store, vault) = setup_vault();
+        std::fs::write(
+            vault.join("Roads.md"),
+            "# Roads\n\n## Norlund to Westport via Bend\n\nThe northern leg.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            vault.join("Trade.md"),
+            "# Trade\n\n## Legs\n\nSee [[Roads#Norlund to Westport via Bend]].\n",
+        )
+        .unwrap();
+        index_vault(&store, &vault);
+
+        let result = update_note(
+            &store,
+            &vault,
+            &UpdateInput {
+                file: "Roads.md".into(),
+                edits: vec![NoteEdit {
+                    target: EditTarget::Section("Norlund to Westport via Bend".into()),
+                    heading: Some("Norlund to Westport".into()),
+                    mode: EditMode::Replace,
+                    content: None,
+                }],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.stale_links,
+            vec![StaleLink {
+                source: "Trade.md".into(),
+                heading: "Norlund to Westport via Bend".into(),
+            }]
+        );
+    }
+
+    /// Nothing linked at the heading, so the rename broke nothing and says so
+    /// rather than naming the note that linked at the document (#99).
+    #[test]
+    fn a_rename_nothing_linked_at_reports_no_stale_links() {
+        let (_tmp, store, vault) = setup_vault();
+        std::fs::write(
+            vault.join("Roads.md"),
+            "# Roads\n\n## Norlund to Westport via Bend\n\nThe northern leg.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            vault.join("Trade.md"),
+            "# Trade\n\n## Legs\n\nSee [[Roads]] and [[Roads#Other Leg]].\n",
+        )
+        .unwrap();
+        index_vault(&store, &vault);
+
+        let result = update_note(
+            &store,
+            &vault,
+            &UpdateInput {
+                file: "Roads.md".into(),
+                edits: vec![NoteEdit {
+                    target: EditTarget::Section("Norlund to Westport via Bend".into()),
+                    heading: Some("Norlund to Westport".into()),
+                    mode: EditMode::Replace,
+                    content: None,
+                }],
+            },
+        )
+        .unwrap();
+
+        assert!(result.stale_links.is_empty());
+    }
+
+    /// An edit that renames nothing reports nothing, and does not pay for the
+    /// lookup either (#99).
+    #[test]
+    fn an_edit_that_renames_nothing_reports_no_stale_links() {
+        let (_tmp, store, vault) = setup_vault();
+        std::fs::write(
+            vault.join("Roads.md"),
+            "# Roads\n\n## Norlund to Westport via Bend\n\nThe northern leg.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            vault.join("Trade.md"),
+            "# Trade\n\n## Legs\n\nSee [[Roads#Norlund to Westport via Bend]].\n",
+        )
+        .unwrap();
+        index_vault(&store, &vault);
+
+        let result = update_note(
+            &store,
+            &vault,
+            &UpdateInput {
+                file: "Roads.md".into(),
+                edits: vec![NoteEdit {
+                    target: EditTarget::Section("Norlund to Westport via Bend".into()),
+                    heading: None,
+                    mode: EditMode::Replace,
+                    content: Some(EditContent::Text("The northern leg, rewritten.".into())),
+                }],
+            },
+        )
+        .unwrap();
+
+        assert!(result.stale_links.is_empty());
+    }
+
     #[test]
     fn a_run_of_edits_on_a_crlf_note_writes_the_note_back_as_crlf() {
         use crate::llm::MockLlm;
