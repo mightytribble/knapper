@@ -152,7 +152,7 @@ CREATE INDEX IF NOT EXISTS idx_unresolved_file ON unresolved_links(file_id);";
 /// Strips the leading `#`s a stored heading carries and a link's does not,
 /// case-folds, and drops the `(cont.)` suffix the chunker appends when it splits
 /// an oversized section — a `[[Note#Events]]` means `## Events (cont.)` too.
-fn normalise_heading(heading: &str) -> String {
+pub(crate) fn normalise_heading(heading: &str) -> String {
     heading
         .trim_start_matches('#')
         .trim()

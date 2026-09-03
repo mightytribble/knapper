@@ -20,7 +20,7 @@ Knapper solves this by providing your LLM with effective search, realtime indexi
 - **MCP server for AI agents** — `knapper serve` exposes 18 tools (search, read, list, tags, vault_map, create, update, delete, move, archive, index, reindex_file, status, health, validate, identity, init, migrate) that Claude, Cursor, or any MCP client can call directly.
 - **HTTP REST API** — `knapper serve --http` adds an axum-based HTTP server alongside MCP with 19 REST endpoints, API key authentication, rate limiting, and CORS. Web-based agents and scripts can query your vault with simple `curl` calls.
 - **Section-level editing** — AI agents can read, replace, prepend, append to or rename a section by heading, edit the note's body, or edit a frontmatter property — every change is one `update` call carrying a list of edits, and what `read` returns is what `update` takes back.
-- **Vault health diagnostics** — detect orphan notes, broken wikilinks, stale content, and tag hygiene issues. Available as MCP tool and CLI command.
+- **Vault health diagnostics** — detect orphan notes, broken wikilinks, links naming a heading that no longer exists, stale content, and tag hygiene issues. Available as MCP tool and CLI command.
 - **Real-time sync** — file watcher keeps the index fresh as you edit in Obsidian. No manual re-indexing needed.
 - **Smart write pipeline** — AI agents can create, edit, rewrite, and delete notes with automatic tag resolution, wikilink discovery, and folder placement based on semantic similarity.
 - **Fully local** — [llama.cpp](https://github.com/ggml-org/llama.cpp) inference with GGUF models (~300MB mandatory, ~650MB optional for the cross-encoder). Metal GPU-accelerated on macOS, CUDA build available for local GPU. No API keys, no cloud required, but Google Gemini Embeddings supported if you want them.
@@ -283,7 +283,7 @@ A section's content is the body **below** the heading, which is what `knapper re
 knapper update "The Roads of New Visland" --section "Norlund to Westport via Bend" --heading "Norlund to Bend"
 ```
 
-Renames the section and leaves its body alone; add `--content` to rewrite the body in the same write. The note keeps the heading's own markup, so a `###` stays a `###` and a promoted bold line keeps its markers — `--heading` carries the text. A name another section of the note already holds is refused, since two sections of one name leave both unaddressable by name.
+Renames the section and leaves its body alone; add `--content` to rewrite the body in the same write. The note keeps the heading's own markup, so a `###` stays a `###` and a promoted bold line keeps its markers — `--heading` carries the text. A name another section of the note already holds is refused, since two sections of one name leave both unaddressable by name. A rename also names any note whose `[[This Note#Old Heading]]` link it left naming a heading the note no longer has; the other notes are not written.
 
 **Rewrite a note (preserves frontmatter):**
 
@@ -316,7 +316,7 @@ knapper delete "Old Draft" --mode hard   # permanent removal
 knapper health
 ```
 
-Returns orphan notes (no links in or out), broken wikilinks, stale notes, and tag hygiene issues.
+Returns orphan notes (no links in or out), broken wikilinks, stale headings, stale notes, and tag hygiene issues. A stale heading is a `[[Note#Heading]]` whose note exists but whose heading does not — a heading renamed in knapper or in Obsidian — which is not a broken link and so goes unreported otherwise.
 
 ## HTTP REST API
 
@@ -589,7 +589,7 @@ STYLE:
 | Understands note links | Yes (wikilink graph traversal) | No | Limited (backlinks panel) |
 | AI agent access | MCP server (18 tools) + HTTP REST API (19 endpoints) | Custom API needed | No |
 | Write capability | Create/edit/rewrite/delete with smart filing | No | Manual |
-| Vault health | Orphans, broken links, stale notes, tag hygiene | No | Limited |
+| Vault health | Orphans, broken links, stale headings, stale notes, tag hygiene | No | Limited |
 | Real-time sync | File watcher, 2s debounce | Manual re-index | N/A |
 | Runs locally | Yes, llama.cpp + Metal GPU | Depends | Yes |
 | Setup | One binary, one command | Framework + code | Built-in |
@@ -616,7 +616,7 @@ Similarly, Gemini Embedding 2 gives superior results to EmbeddingGemma, at the c
 - Full note rewriting with automatic frontmatter preservation
 - Frontmatter property edits: replace, append to or remove a property, scalar or list-valued
 - Soft delete (archive) and hard delete (permanent) with audit logging
-- Vault health diagnostics: orphan notes, broken wikilinks, stale content, tag hygiene
+- Vault health diagnostics: orphan notes, broken wikilinks, stale headings, stale content, tag hygiene
 - Real-time file watching with 2s debounce, startup reconciliation, and watcher coordination to prevent double re-indexing
 - Write pipeline: tag resolution, fuzzy link discovery, semantic folder placement
 - Vault graph: directional wikilink edges, traversed both ways (outgoing links + backlinks); single-hop personalized-PageRank expansion over the chunk graph

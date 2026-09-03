@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use anyhow::Result;
 
 use crate::fusion::RankedResult;
-use crate::store::{DOC_LEVEL, Store};
+use crate::store::{DOC_LEVEL, FileRecord, Store};
 
 /// A wikilink as written, with the heading it named still attached.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -71,6 +71,102 @@ pub fn extract_wikilink_targets(text: &str) -> Vec<String> {
         .map(|l| l.target)
         .filter(|t| seen.insert(t.clone()))
         .collect()
+}
+
+/// Resolve a wikilink target name to a file ID in the store.
+///
+/// Lives beside the link vocabulary rather than in the indexer, because
+/// resolving what a link names is what every reader of a link has to do —
+/// `build_edges_for_file` writes edges from it and [`deep_links_from`] reports
+/// on it (#99).
+pub(crate) fn resolve_link_target(store: &Store, target: &str) -> Result<Option<i64>> {
+    let with_ext = if target.ends_with(".md") {
+        target.to_string()
+    } else {
+        format!("{}.md", target)
+    };
+
+    // Try exact path match
+    if let Some(f) = store.get_file(&with_ext)? {
+        return Ok(Some(f.id));
+    }
+
+    // Try basename match (case-insensitive)
+    let all_files = store.get_all_files()?;
+    let target_lower = with_ext.to_lowercase();
+    let mut matches: Vec<&FileRecord> = all_files
+        .iter()
+        .filter(|f| {
+            let path_lower = f.path.to_lowercase();
+            path_lower == target_lower || path_lower.ends_with(&format!("/{}", target_lower))
+        })
+        .collect();
+
+    matches.sort_by_key(|f| f.path.len());
+    Ok(matches.first().map(|f| f.id))
+}
+
+/// A deep wikilink as one note wrote it, resolved to the note it names.
+///
+/// The heading is the **source note's** text and not the target's. That is
+/// what a report quotes and what a rewrite would have to edit, and the edge
+/// table keeps neither: an edge names a `to_chunk_seq`, and a heading that no
+/// longer resolves is already flattened to [`DOC_LEVEL`] there (#99).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DeepLink {
+    /// The linking note's path.
+    pub source: String,
+    /// The note the link resolves to.
+    pub target_id: i64,
+    /// The `#Heading` the link named, as written.
+    pub heading: String,
+}
+
+/// Every deep wikilink written in `sources`, resolved to the note it names.
+///
+/// Reads `chunks.text` and never the vault, so the answer is what each note
+/// held at its last index. A link whose note does not resolve is left out:
+/// that is the `unresolved_links` table's fact, and repeating it here would
+/// report one broken link twice.
+///
+/// Two callers, one enumeration (#99). A rename passes the notes that link to
+/// the note being renamed — `get_incoming` gives them, since a note writing
+/// `[[Target#Anything]]` always holds a wikilink edge to `Target` — and keeps
+/// the headings that match the old name. `health` passes every note and keeps
+/// the headings the target no longer holds.
+///
+/// A link inside a code fence counts, because [`extract_wikilinks`] does not
+/// track fences. A note that documents the syntax therefore reports a link it
+/// does not really hold. That costs a reader one glance, which is the reason
+/// both callers report and neither writes.
+pub fn deep_links_from(store: &Store, sources: &[i64]) -> Result<Vec<DeepLink>> {
+    let mut out = Vec::new();
+    for &source_id in sources {
+        let Some(source) = store.get_file_by_id(source_id)? else {
+            continue; // the file went away mid-read
+        };
+        // One note naming one heading is one link however many passages of the
+        // note write it; `extract_wikilinks` dedups within a passage only.
+        let mut seen = HashSet::new();
+        for chunk in store.get_chunks_by_file(source_id)? {
+            for link in extract_wikilinks(&chunk.text) {
+                let Some(heading) = link.heading else {
+                    continue; // a plain link names the document and cannot go stale
+                };
+                if !seen.insert((link.target.clone(), heading.clone())) {
+                    continue;
+                }
+                if let Some(target_id) = resolve_link_target(store, &link.target)? {
+                    out.push(DeepLink {
+                        source: source.path.clone(),
+                        target_id,
+                        heading,
+                    });
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// How much of its weight an edge keeps when the seed *passage* did not contain
@@ -461,6 +557,119 @@ mod tests {
             vec![Wikilink {
                 target: "Language".into(),
                 heading: None
+            }]
+        );
+    }
+
+    // ── Deep links (#99) ─────────────────────────────────────────
+
+    /// A note whose passages are `(heading, text)`, so a link one note wrote
+    /// can be found in the text the store holds.
+    fn note(store: &Store, path: &str, passages: &[(&str, &str)]) -> i64 {
+        let id = store
+            .insert_file(path, "h", 100, &generate_docid(path), None, None)
+            .unwrap();
+        for (seq, (heading, text)) in passages.iter().enumerate() {
+            store
+                .insert_chunk(&NewChunk {
+                    file_id: id,
+                    seq: seq as i64,
+                    heading,
+                    text,
+                    vector_id: (id * 100 + seq as i64) as u64,
+                    token_count: 20,
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        id
+    }
+
+    /// The heading is kept as the source note wrote it, not as the target
+    /// holds it: it is the text a report quotes and a rewrite would edit, and
+    /// the edge table throws it away (#99).
+    #[test]
+    fn a_deep_link_carries_the_heading_the_source_note_wrote() {
+        let store = Store::open_memory().unwrap();
+        let target = note(&store, "Roads.md", &[("## Norlund to Westport", "body")]);
+        let source = note(
+            &store,
+            "Trade.md",
+            &[("## Legs", "See [[Roads#Norlund to Westport]].")],
+        );
+        assert_eq!(
+            deep_links_from(&store, &[source]).unwrap(),
+            vec![DeepLink {
+                source: "Trade.md".into(),
+                target_id: target,
+                heading: "Norlund to Westport".into(),
+            }]
+        );
+    }
+
+    /// A plain `[[Note]]` names the document and cannot go stale (#99).
+    #[test]
+    fn a_plain_wikilink_is_not_a_deep_link() {
+        let store = Store::open_memory().unwrap();
+        note(&store, "Roads.md", &[("## Norlund to Westport", "body")]);
+        let source = note(&store, "Trade.md", &[("## Legs", "See [[Roads]].")]);
+        assert!(deep_links_from(&store, &[source]).unwrap().is_empty());
+    }
+
+    /// The alias is display text; the heading behind it is what resolves (#99).
+    #[test]
+    fn an_aliased_deep_link_keeps_its_heading() {
+        let store = Store::open_memory().unwrap();
+        let target = note(&store, "Roads.md", &[("## Norlund to Westport", "body")]);
+        let source = note(
+            &store,
+            "Trade.md",
+            &[(
+                "## Legs",
+                "See [[Roads#Norlund to Westport|the north leg]].",
+            )],
+        );
+        assert_eq!(
+            deep_links_from(&store, &[source]).unwrap(),
+            vec![DeepLink {
+                source: "Trade.md".into(),
+                target_id: target,
+                heading: "Norlund to Westport".into(),
+            }]
+        );
+    }
+
+    /// A link to a note that does not exist is the `unresolved_links` table's
+    /// fact, and reporting it here would name it twice (#99).
+    #[test]
+    fn a_deep_link_whose_note_does_not_resolve_is_not_one() {
+        let store = Store::open_memory().unwrap();
+        let source = note(&store, "Trade.md", &[("## Legs", "See [[Nowhere#Bend]].")]);
+        assert!(deep_links_from(&store, &[source]).unwrap().is_empty());
+    }
+
+    /// A link names its note the way a link may: by basename, folded, without
+    /// the folder it sits in — the rule `build_edges_for_file` already
+    /// resolves by (#99).
+    #[test]
+    fn a_deep_link_resolves_its_note_by_basename() {
+        let store = Store::open_memory().unwrap();
+        let target = note(
+            &store,
+            "01-Places/Roads.md",
+            &[("## Norlund to Westport", "body")],
+        );
+        let source = note(
+            &store,
+            "Trade.md",
+            &[("## Legs", "See [[roads#Norlund to Westport]].")],
+        );
+        assert_eq!(
+            deep_links_from(&store, &[source]).unwrap(),
+            vec![DeepLink {
+                source: "Trade.md".into(),
+                target_id: target,
+                heading: "Norlund to Westport".into(),
             }]
         );
     }

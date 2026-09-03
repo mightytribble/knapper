@@ -466,15 +466,22 @@ async fn main() -> Result<()> {
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
-                println!("Files:        {}", report.total_files);
-                println!("Orphans:      {}", report.orphans.len());
-                println!("Broken links: {}", report.broken_links.len());
-                println!("Stale notes:  {}", report.stale_notes.len());
-                println!("Inbox:        {} pending", report.inbox_pending.len());
-                println!("Tag issues:   {}", report.tag_issues.len());
-                println!("Index age:    {}s", report.index_age_seconds);
+                println!("Files:          {}", report.total_files);
+                println!("Orphans:        {}", report.orphans.len());
+                println!("Broken links:   {}", report.broken_links.len());
+                println!("Stale headings: {}", report.stale_headings.len());
+                println!("Stale notes:    {}", report.stale_notes.len());
+                println!("Inbox:          {} pending", report.inbox_pending.len());
+                println!("Tag issues:     {}", report.tag_issues.len());
+                println!("Index age:      {}s", report.index_age_seconds);
                 for link in &report.broken_links {
                     println!("  broken: {} -> {}", link.source, link.target);
+                }
+                for link in &report.stale_headings {
+                    println!(
+                        "  stale:  {} -> {}#{}",
+                        link.source, link.target, link.heading
+                    );
                 }
                 for issue in &report.tag_issues {
                     println!("  tag: {} — {}", issue.file, issue.issue);
@@ -936,6 +943,12 @@ async fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
                 println!("Updated: {}", result.path);
+                for link in &result.stale_links {
+                    println!(
+                        "  stale link: {} still names \"{}\"",
+                        link.source, link.heading
+                    );
+                }
             }
         }
 

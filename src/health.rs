@@ -7,6 +7,7 @@ use crate::store::Store;
 pub struct HealthReport {
     pub orphans: Vec<String>,
     pub broken_links: Vec<BrokenLink>,
+    pub stale_headings: Vec<StaleHeading>,
     pub stale_notes: Vec<String>,
     pub inbox_pending: Vec<String>,
     pub tag_issues: Vec<TagIssue>,
@@ -19,6 +20,24 @@ pub struct HealthReport {
 pub struct BrokenLink {
     pub source: String,
     pub target: String,
+}
+
+/// A wikilink whose note resolves but whose `#Heading` the note no longer
+/// holds (#99).
+///
+/// Not a [`BrokenLink`]: the file is there, so nothing is unresolved and the
+/// `unresolved_links` table never sees it. What breaks is quieter — the edge
+/// degrades from the passage to the document on the linking note's next
+/// re-index, so the graph lane expands a whole note where it used to expand
+/// one section, and the link in the vault names a heading that is not there.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct StaleHeading {
+    /// The linking note's path.
+    pub source: String,
+    /// The linked note's path. It exists; only the heading does not.
+    pub target: String,
+    /// The `#Heading` the link named, as written.
+    pub heading: String,
 }
 
 /// A tag-related problem in a file.
@@ -61,6 +80,40 @@ pub fn find_broken_links(store: &Store) -> Result<Vec<BrokenLink>> {
         .collect())
 }
 
+/// Find wikilinks whose note resolves but whose `#Heading` it no longer holds.
+///
+/// The other end of #99's fact. A rename tells its caller what it broke, but
+/// only for the rename knapper itself made; this finds the same thing from the
+/// vault side, so a heading renamed in Obsidian is reported too, and no rename
+/// has to have happened for it to be true.
+///
+/// Reads `chunks.text` for every note, which is a pass the vault-wide edge
+/// backfill already makes in well under a second on a few hundred notes. A
+/// link inside a code fence is counted — see [`crate::graph::deep_links_from`]
+/// — so a note that documents the wikilink syntax reports one finding that is
+/// not real.
+pub fn find_stale_headings(store: &Store) -> Result<Vec<StaleHeading>> {
+    let sources: Vec<i64> = store.get_all_files()?.into_iter().map(|f| f.id).collect();
+    let mut out = Vec::new();
+    for link in crate::graph::deep_links_from(store, &sources)? {
+        if !store
+            .chunk_seqs_with_heading(link.target_id, &link.heading)?
+            .is_empty()
+        {
+            continue;
+        }
+        let Some(target) = store.get_file_by_id(link.target_id)? else {
+            continue; // the note went away mid-read
+        };
+        out.push(StaleHeading {
+            source: link.source,
+            target: target.path,
+            heading: link.heading,
+        });
+    }
+    Ok(out)
+}
+
 /// Find notes that haven't been updated in the given number of days.
 ///
 /// Stub — returns an empty vec for now. A full implementation would check
@@ -73,6 +126,7 @@ pub fn find_stale_notes(_store: &Store, _days: u32) -> Result<Vec<String>> {
 pub fn generate_health_report(store: &Store, config: &HealthConfig) -> Result<HealthReport> {
     let orphans = find_orphans(store, config)?;
     let broken_links = find_broken_links(store)?;
+    let stale_headings = find_stale_headings(store)?;
     let stale_notes = find_stale_notes(store, 90)?;
 
     // Inbox pending: files in the inbox folder.
@@ -122,6 +176,7 @@ pub fn generate_health_report(store: &Store, config: &HealthConfig) -> Result<He
     Ok(HealthReport {
         orphans,
         broken_links,
+        stale_headings,
         stale_notes,
         inbox_pending,
         tag_issues,
@@ -134,6 +189,113 @@ pub fn generate_health_report(store: &Store, config: &HealthConfig) -> Result<He
 mod tests {
     use super::*;
     use crate::store::{DOC_LEVEL, Store};
+
+    /// A note whose passages are `(heading, text)`, so a link one note wrote
+    /// can be resolved against the headings another note holds.
+    fn note(store: &Store, path: &str, passages: &[(&str, &str)]) -> i64 {
+        let id = store
+            .insert_file(
+                path,
+                "h",
+                100,
+                &crate::docid::generate_docid(path),
+                None,
+                None,
+            )
+            .unwrap();
+        for (seq, (heading, text)) in passages.iter().enumerate() {
+            store
+                .insert_chunk(&crate::store::NewChunk {
+                    file_id: id,
+                    seq: seq as i64,
+                    heading,
+                    text,
+                    vector_id: (id * 100 + seq as i64) as u64,
+                    token_count: 20,
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        id
+    }
+
+    /// The fact #99 names: the note resolves, the heading does not, and
+    /// nothing reported it. `build_edges_for_file` degrades the edge to
+    /// `DOC_LEVEL` instead, which is indistinguishable from a plain link.
+    #[test]
+    fn a_link_to_a_heading_the_note_no_longer_holds_is_stale() {
+        let store = Store::open_memory().unwrap();
+        note(&store, "Roads.md", &[("## Norlund to Westport", "body")]);
+        note(
+            &store,
+            "Trade.md",
+            &[("## Legs", "See [[Roads#Norlund to Westport via Bend]].")],
+        );
+        assert_eq!(
+            find_stale_headings(&store).unwrap(),
+            vec![StaleHeading {
+                source: "Trade.md".into(),
+                target: "Roads.md".into(),
+                heading: "Norlund to Westport via Bend".into(),
+            }]
+        );
+    }
+
+    /// A link that still names a heading the note holds is not a finding (#99).
+    #[test]
+    fn a_link_to_a_heading_the_note_still_holds_is_not_stale() {
+        let store = Store::open_memory().unwrap();
+        note(&store, "Roads.md", &[("## Norlund to Westport", "body")]);
+        note(
+            &store,
+            "Trade.md",
+            &[("## Legs", "See [[Roads#Norlund to Westport]].")],
+        );
+        assert!(find_stale_headings(&store).unwrap().is_empty());
+    }
+
+    /// An oversized section becomes `## Events` and `## Events (cont.)`, and a
+    /// link to `#Events` means both. `normalise_heading` is what says so, and
+    /// this check reads headings through it (#99).
+    #[test]
+    fn a_heading_split_across_two_passages_still_resolves() {
+        let store = Store::open_memory().unwrap();
+        note(
+            &store,
+            "Session.md",
+            &[("## Events", "first"), ("## Events (cont.)", "second")],
+        );
+        note(
+            &store,
+            "Trade.md",
+            &[("## Legs", "See [[Session#Events]].")],
+        );
+        assert!(find_stale_headings(&store).unwrap().is_empty());
+    }
+
+    /// Heading matching folds case, so a link that spells the heading
+    /// differently is not a finding (#99).
+    #[test]
+    fn a_heading_named_in_another_case_is_not_stale() {
+        let store = Store::open_memory().unwrap();
+        note(&store, "Roads.md", &[("## Norlund to Westport", "body")]);
+        note(
+            &store,
+            "Trade.md",
+            &[("## Legs", "See [[roads#norlund TO westport]].")],
+        );
+        assert!(find_stale_headings(&store).unwrap().is_empty());
+    }
+
+    /// A link to a note that does not exist is `broken_links`' finding. This
+    /// check would name the same link a second time under another heading, so
+    /// it leaves it alone (#99).
+    #[test]
+    fn a_link_whose_note_does_not_resolve_is_left_to_broken_links() {
+        let store = Store::open_memory().unwrap();
+        note(&store, "Trade.md", &[("## Legs", "See [[Nowhere#Bend]].")]);
+        assert!(find_stale_headings(&store).unwrap().is_empty());
+    }
 
     fn setup_health_store() -> Store {
         let store = Store::open_memory().unwrap();
