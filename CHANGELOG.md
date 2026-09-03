@@ -3,6 +3,16 @@
 Every entry below the upstream-lineage line names the commit it describes.
 Links resolve against https://github.com/mightytribble/knapper.
 
+## Unreleased
+
+### Fixed
+
+- A wikilink written before its target exists resolves once the target is there (#108). Such a link was recorded broken and stayed broken after the target was created and indexed: `health` named it, the graph did not hold it, and both notes counted as orphans. `index` did not repair it. Creating, indexing, restoring or moving a note now re-resolves the links that name it. ([`4ffeaea`](https://github.com/mightytribble/knapper/commit/4ffeaea))
+
+- `health` reports a link whose target has been removed (#108). It reported nothing. Deleting, archiving or moving a note now records the links it leaves naming nothing. ([`4ffeaea`](https://github.com/mightytribble/knapper/commit/4ffeaea))
+
+Nothing re-indexes on the upgrade.
+
 ## 0.9.6 (2026-09-03)
 
 Qwen3-Embedding becomes a local embedder you can point `models.embed` at.
