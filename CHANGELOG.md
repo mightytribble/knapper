@@ -1,221 +1,209 @@
 # Changelog
 
+Every entry below the upstream-lineage line names the commit it describes.
+Links resolve against https://github.com/mightytribble/knapper.
+
 ## Unreleased
 
-Qwen3-Embedding becomes a local embedder `models.embed` can be pointed at (#8).
+Qwen3-Embedding becomes a local embedder you can point `models.embed` at.
 EmbeddingGemma stays the default and its stored vectors are unchanged, so no
 existing store re-indexes on the upgrade.
 
 ### Added
 
-- Qwen3-Embedding 0.6B and 4B are supported local embedders (#8). They are options, not defaults: `models.embed` takes the GGUF and the output width, the input context and the prompt template all come from the model itself. The 0.6B is 1024-wide over a 32768-token context and runs on CPU; the 4B is 2560-wide over 40960 and wants a GPU. Taking either re-indexes the vault at the new width, because the embedder is a fingerprint component and the vector table is declared at the model's dimension. `[calibrated]`'s shipped four numbers stay EmbeddingGemma's fit, and the generated config carries a measured fit for each Qwen model beside them. `[embedding_prompt]` is EmbeddingGemma's pair of templates and does nothing under another family; the generated config now says so above the header, because every key in it was silently inert.
+- Added support for Qwen3-Embedding 0.6B and 4B. `knapper models list` now names embedders that are known to work. ([`6e84edc`](https://github.com/mightytribble/knapper/commit/6e84edc))
 
-- The generated config carries a `[calibrated]` fit for every embedder `models list` names, commented out under the header (#8). Uncommenting a block's four lines is the refit for that model: Qwen3-Embedding-0.6B at `semantic 17.197`, `keyword 12.181`, `intercept -9.057`, `floor 0.78`, and the 4B at `11.618`, `11.298`, `-6.419`, `0.76`. Each is fit on the corpus, the pool and the label set the shipped numbers were fit on, and each floor silences the same eight of the pool's eleven negatives, and the nonsense control, that the default floor does. A trailer sits below a section's keys where a note sits above its header, because a key uncommented above a header sets that key in the table before it.
-
-- `knapper models list` names the embedders that are known to work, with each one's width, context and download size, and marks the one in use (#8). It was a one-row stub that knew only the default. `models info` reports the same beside the width the store was actually built at. The catalogue decides nothing: any other `hf:<repo>/<file>.gguf` is still accepted.
+- Added default values for Gemma, Qwen3 0.6B, and Qwen 4B embedders to config. Uncomment to activate, adjust to your own corpus. ([`06b95f2`](https://github.com/mightytribble/knapper/commit/06b95f2))
 
 ### Fixed
 
-- `[calibrated]`'s coefficients were fit against a feature the engine does not compute (#8). `scripts/calibrated-fusion-eval.py` fits four semantic features and reports the coefficients of one of them, `fused-median` — an anchored cosine, `(cos - background) / (self-similarity - background)`. `calibrate::probability` multiplies the candidate's **raw** cosine, so the shipped weights described a quantity the engine never forms. The three are now the tool's `fused-raw` fit over the same corpus, pool and labels: `semantic 20.777`, `keyword 13.377`, `intercept -8.762`. `floor` stays 0.75. On the calibration pool the model-free path silences the same eight of eleven negatives and the control, holds 22 of 33 tier-1 members against 21, and carries 10 noise rows in the window against 14. Every key is query-time and reaches no fingerprint, so no store re-indexes.
+- The default `[calibrated]` coefficients were fit against a value the search path never computes. Refitted against the right one: with no cross-encoder configured, search keeps more correct results and fewer irrelevant ones, and abstains on the same queries as before. Nothing re-indexes. ([`06b95f2`](https://github.com/mightytribble/knapper/commit/06b95f2))
 
-- Pointing `models.embed` at a Qwen3 embedding model segfaulted (#8). Which llama.cpp forward pass runs the graph was a constant, `encode`, and `llama_context::encode` runs the graph with a **null** memory context because an encoder needs no KV cache. `llm_build_qwen3` opens with `build_attn_inp_kv()` and dereferences that null. EmbeddingGemma survives it because its graph uses `build_attn_inp_no_cache()`, which is why the constant held for the shipped default and for nothing else. The pass is now the model family's, `decode` for Qwen3 and `encode` for EmbeddingGemma. llama.cpp's own `llama_model_has_encoder` cannot be the predicate — it is true for T5 alone, so it would move the default's path too.
+- Pointing `models.embed` at a Qwen3 embedding model crashed the process. ([`6e84edc`](https://github.com/mightytribble/knapper/commit/6e84edc))
 
-- A Qwen3 embedding model pooled the wrong token (#8). It pools the **last** token and its GGUF declares `add_eos_token = true`, but `str_to_token` was called with `AddBos::Never`, which is llama.cpp's `add_special` and suppresses the trailing EOS along with the leading BOS — so llama.cpp pooled the last token of the *content*. Which special tokens a family asks for is now its own decision. EmbeddingGemma keeps `Never`, since it writes its own `<bos>` into the template and a second one would change every stored vector. Measured on the 0.6B: the cosine between one note indexed twice, once with a literal `<|endoftext|>`, moves from 0.844 to 0.996 across the fix, on the CPU and the CUDA build alike.
+- A Qwen3 embedder pooled the last token of the note text instead of the model's end-of-text token, which weakened every stored vector. ([`6e84edc`](https://github.com/mightytribble/knapper/commit/6e84edc))
 
-- The Qwen3 templates were not the model card's (#8). The query prefix was an invented `Instruct: Retrieve relevant passages\nQuery: {query}`, and a document was written as `{title}\n{text}` — a format the card does not have, and at the shipped `document_title = none` a bare leading newline. The query is now the card's own `Instruct: {task}\nQuery:{query}` and a document is its text alone, which is what the card gives. The Qwen arm's `template_id` moves with it, so a store built under the old document template re-indexes and an EmbeddingGemma store does not.
+- The Qwen3 prompt templates did not match the model card. They do now. ([`6e84edc`](https://github.com/mightytribble/knapper/commit/6e84edc))
 
-- **Test count: 1208 -> 1224.**
+- **Test count: 1208 → 1224.**
 
 ## 0.9.5 (2026-09-02)
 
-A feature release over 0.9.4. New capability `match`, stale-heading reporting
-on `update` and `health`, and two write-path fixes to line endings and blank
-lines. No fingerprint moves, so no store re-indexes on the upgrade.
+A feature release over 0.9.4. Nothing re-indexes on the upgrade.
 
 ### Added
 
-- `match`, a surface that can report the absence (or presence) of an arbitrary string in indexed content (#106). One capability on all three surfaces. The pattern is a literal, never a regex, and `case_sensitive` turns off the default case folding. It takes the same four scope operators as `search` and `list`, and a `limit` on the reported lines whose absent case is all of them and whose `0` is none, which is `list`'s rule for the same field. It answers `notes`, `lines`, and the matched lines with each one's path and breadcrumb. `limit` caps the reported lines and neither count. It reads the indexed note bodies, so it does not see frontmatter — the chunker strips the YAML block, and each surface says so. A line is reported once per section, so a chunk split that repeats text across rows does not report it twice.
+- `match` reports whether a literal string is present in your notes, and where. Available on the CLI, MCP and HTTP. It takes the same scope operators as `search`, and reads note bodies only — not frontmatter. ([`6116e2e`](https://github.com/mightytribble/knapper/commit/6116e2e))
 
-- Stale heading links are reported (#99). A section rename leaves a `[[Note#Heading]]` in another note naming a heading that is gone. The file resolves, so this is not a broken link and the broken-link report never saw it; on the linking note's next re-index the edge degrades from the passage to the document. `update` now returns `stale_links`, the notes holding such a link to the heading it renamed, read before the write. `health` gains `stale_headings`, the same fact over every note, on by default. Both read the links back out of the chunk text, which keeps the heading as the source note spelled it, so a heading renamed outside knapper is reported too. The linking notes are not rewritten; that is #107. Both reports can name a note whose `[[Note#Heading]]` is only an example inside a code block: the link extractor scans the raw text and does not track code fences.
+- `update` and `health` report stale heading links: a `[[Note#Heading]]` naming a heading that has been renamed or removed. The note still resolves, so these never appeared as broken links. The linking notes are not rewritten for you. ([`6588773`](https://github.com/mightytribble/knapper/commit/6588773))
 
 ### Fixed
 
-- An edit writes the note's own line ending (#105). A section edit or rename read the note apart with `lines()` and joined it with `\n`, so a CRLF note came back LF on every line, not only the lines the edit named. A body edit wrote a bare `\n` for its append and prepend separator and spliced the caller's content in verbatim, leaving a CRLF note mixed. Every line an edit does not name now keeps the ending it came in with; the lines it writes, and the content, take the note's own ending, which is the first line break's. `keep_final_newline` no longer pushes a bare `\n` onto a CRLF note or leaves a lone `\r` behind when it pops one.
+- An edit no longer rewrites a CRLF note's line endings. Every line an edit does not name keeps the ending it came in with. ([`07d9d4f`](https://github.com/mightytribble/knapper/commit/07d9d4f))
 
-- A section edit keeps the content's blank lines only where they join (#104). The content was trimmed at its end and not its start, and the heading's newline is written separately, so content opening with a newline added a second blank line under the heading — in replace, in prepend, and in append to a bodyless section. Blank lines at the content's edges are now counted rather than kept, and only the edge the edit joins on carries them: an append reads leading blank lines as a paragraph break, a prepend reads trailing ones. A single trailing newline is a line ending. First-line indentation is kept, on the content and on the old body under a prepend. Empty content empties a replaced section rather than leaving three blank lines, and is a no-op for append and prepend.
+- A section edit no longer adds a stray blank line under the heading. Blank lines at the edges of your content are kept only on the edge the edit joins. ([`216a462`](https://github.com/mightytribble/knapper/commit/216a462))
 
-- **Test count: 1154 -> 1208.**
+- **Test count: 1154 → 1208.**
 
 ### Changed
 
-- The calibration guidance names note length beside the embedder. The README and the refit tool said to refit `[calibrated]` on an embedder change and not on a corpus change. Only BM25 self-normalizes per query; the semantic half is a raw cosine, and note length moves that distribution with no embedder changing. A vault of much shorter notes than the fit was built on can put the floor inside the band its own correct answers score in, and the symptom is an abstention on a query whose lanes retrieved everything. The numbers and the code are untouched.
+- The calibration guidance names note length beside the embedder. `[calibrated]` also wants a refit when your notes are much shorter or longer than the ones it was fit on; the symptom is a query that retrieves everything and returns nothing. No numbers moved. ([`e7858b0`](https://github.com/mightytribble/knapper/commit/e7858b0))
 
 ## 0.9.4 (2026-09-02)
 
-A patch release over 0.9.3. `top_n` returns the number of results it says it
-will, a merged block is presented under a heading that actually matched, and
-`[calibrated]`'s numbers say which embedder they were fit against. No
-fingerprint moves, so no store re-indexes on the upgrade.
+A patch release over 0.9.3. Nothing re-indexes on the upgrade.
 
 ### Fixed
 
-- `top_n` counts results, not pre-merge chunks (#102). The candidate list was cut at `top_n` and the merge ran afterwards, so a caller received `top_n` minus however many merges fired. The shortfall moved with the data — one row when one merge fired, two once a second section joined the candidate set — so no value returned a known number of results, while the MCP schema called it "Number of results to return". Candidates are now admitted in rank order until the merge counts `top_n` blocks, through one path both ranking stages reach. They are the pool the answer floor already filtered, so the top-up admits no row that was not an answer, and it stops when they run out: `[ranking] candidates` is the ceiling no `top_n` reaches past. Admitting a candidate can also lower the count, when it is the section that gathers rows already admitted, so the scan stops at the first prefix that reaches `top_n` and takes the fewest candidates that answer the request. With `coalesce_adjacent = false` a block is a chunk and the scan reduces to the old truncation exactly.
+- `top_n` returns the number of results it promises. Merging ran after the list was cut, so you got fewer than you asked for, by an amount that moved with the data. ([`fc6a171`](https://github.com/mightytribble/knapper/commit/fc6a171))
 
-- A search says when the token budget is what shortened it (#102). `overflow` named each held-back result, but a caller reading `blocks` alone saw a short list and no reason for it — and the reason is a number they can raise. The envelope now carries that reason, and the text rendering prints it above the excluded list, whose "lower relevance" label is the rank order rather than why those rows were cut. It names no flag, because the CLI spells the budget `--tokens` and MCP and HTTP spell it `budget_tokens`.
+- A search says when the token budget is what shortened the answer. Raise it with `--tokens` on the CLI, `budget_tokens` over MCP and HTTP. ([`fc6a171`](https://github.com/mightytribble/knapper/commit/fc6a171))
 
-- A merged block stays inside one section (#101). The run that decides which abutting chunks present as one block was a contiguous span of a file, which let it cross a heading: the block then took its score from its strongest member and its identity from its leading one, so it was presented under a heading that had not matched, and a caller following that `heading_path` with a section read landed in the wrong section. The label also moved with `top_n` — the same query reported one heading at 13 and another at 8, at one score to fourteen decimals. A run now carries a root heading path and admits an abutting chunk whose path is the root or descends from it; a chunk the root descends from widens the root instead, and the loop runs to a fixed point, so which member ranked highest cannot decide the block. Paths are compared by segment and never by characters, so `Foo` does not swallow the sibling `Foo Bar`. The rule follows the reason the merge exists: a section is one topic, a subsection subdivides it and keeps the premise, a sibling section starts a new one and breaks it.
+- A merged result block stays inside one section. A block could be labelled with a heading that had not matched, so following its path with a section read landed you in the wrong place. ([`e606401`](https://github.com/mightytribble/knapper/commit/e606401))
 
-- `[calibrated]` says which embedder its numbers were fit against (#103). The four numbers are EmbeddingGemma's fit, not a global default: `bm25n` normalizes itself per query, but raw cosine is one model's similarity scale and the floor is a threshold read off it. Point `models.embed` at another embedder and `embedding_fingerprint` correctly prescribes a re-index, the re-index produces correct vectors, and the numbers that interpret them are still fit to the model that is going away — so the floor cuts in the wrong place, and it fails quietly: the path abstains on every query, or on none. `knapper index` now says so on an `embedding_fingerprint` mismatch, and a generated `config.toml` carries the same note above the section. The warning needs all three of: the calibrated path actually running, an embedder the shipped fit does not cover, and the shipped numbers still in place — a user who refit set their own, and calling their fit stale would be false. The numbers themselves do not move, so this changes nothing for anyone on the default embedder. Note that the coefficients and the floor are one fit and do not move apart: scaling the weights while holding the floor moves the decision boundary rather than rescaling it.
+- `[calibrated]` says which embedder its numbers were fit against. `knapper index` warns when you change embedder, and a generated config carries the same note above the section. The numbers do not move, so nothing changes on the default embedder. ([`0e71556`](https://github.com/mightytribble/knapper/commit/0e71556))
 
 - **Test count: 1136 → 1154.**
 
 ### Changed
 
-- The refit tool ships. `calibrated-fusion-eval.py` moves into `scripts/`, since telling a user that refitting `[calibrated]` is theirs to do while the tool sat in a directory they never receive was half an answer. Its documentation now names all four inputs and which two are labels only they can write — the queries, and which chunks of their vault answer each one. The labels come from your corpus, but the corpus is not what makes the numbers stale: both lane scores self-normalize per query, so refit when you change the embedder, not when the vault grows.
+- The refit tool ships, as `scripts/calibrated-fusion-eval.py`. Refitting `[calibrated]` is yours to do, and the tool sat in a directory you never received. ([`0e71556`](https://github.com/mightytribble/knapper/commit/0e71556))
 
 ## 0.9.3 (2026-09-01)
 
-A patch release over 0.9.2. What `read` returns can be written straight back
-through `update`, a section can be renamed, and a note that has been removed
-stops reporting broken links. No fingerprint moves, so no store re-indexes on
-the upgrade.
+A patch release over 0.9.2. Nothing re-indexes on the upgrade.
 
 ### Added
 
-- `update` renames the section it edits (#97). An edit takes a `heading`, the section's new heading text, beside the `section` that names it: `knapper update <note> --section "Norlund to Westport via Bend" --heading "Norlund to Bend"`, and the same field on MCP and HTTP. `content` is optional beside it, because a rename does not restate the body. The note keeps the heading's own markup — a `###` stays a `###`, a promoted bold line keeps its markers — since the field carries the text. A name another section of the note already holds is refused, because two sections of one name leave both unaddressable by name. Renaming a section used to have no spelling at all: `replace` swaps the body and keeps the heading, and the only route left was a whole-note body replace, which means restating every section that was not being renamed.
+- `update` renames the section it edits: `--section "old name" --heading "new name"`, and the same field over MCP and HTTP. `content` is optional beside it, because a rename does not restate the body. Renaming a section had no spelling at all before this. ([`7d7190f`](https://github.com/mightytribble/knapper/commit/7d7190f))
 
 ### Fixed
 
-- A removed note stops reporting broken links (#98). `unresolved_links` was keyed on the source **path**, which made it the one per-file table `DELETE FROM files` could not reach: six removal paths each owed it a manual cleanup and one paid it, so a `delete --mode hard`, an `archive`, a soft delete or the orphan sweep left the note's unresolved wikilinks behind. `health` went on naming a source file that was no longer there, and nothing could clear the row — only a file's own re-index deletes one, and a file that is gone is never re-indexed, so `index --rebuild` re-read the whole vault and reported the same rows afterwards. The table is now keyed on `files(id)` and CASCADEs off it the way `chunks`, `edges` and `file_tags` do, so a removal takes the note's broken links with it and a move carries them to the note's new path. On the upgrade the table is rebuilt in place: a row whose path still names an indexed file carries across, and a row whose path names nothing is dropped — which is exactly the ghosts a carried store was reporting. No fingerprint moves, so no store re-indexes.
+- A note you deleted, archived or soft-deleted stops reporting broken links. `health` went on naming a source file that was no longer there, and nothing could clear the row. The table is repaired in place on the upgrade. ([`c2e9396`](https://github.com/mightytribble/knapper/commit/c2e9396))
 
-- `delete --mode soft` leaves the note searchable (#98). A soft delete relocates a note and keeps it indexed, but it moved the note by deleting its `files` row and inserting a fresh one — and the cascade off the old row took the note's chunks, its vectors, its keyword rows and its edges, with nothing to put them back. The note stayed in `files` and in `list`, and left every search: the same failure `move_note` was fixed for in #27, still live in this path. It now moves the row with `update_file_path`, which keeps the file's id, and everything keyed on that id follows. The docid is recomputed, because it is a hash of the path.
+- `delete --mode soft` keeps the note searchable. It kept the note in `list` and dropped it out of every search. ([`c2e9396`](https://github.com/mightytribble/knapper/commit/c2e9396))
 
-- `read`'s output can be written straight back through `update` (#96). The two disagreed about where content begins, in two places, and both round trips corrupted the note silently. A section read carried its heading line, and a section `replace` writes the body under the heading already on disk, so feeding a read straight back wrote the heading twice — and again on every repeat. A whole-note read counted the blank line under the frontmatter as the body's first, and a body `replace` counts it as the block's last, so each round trip gained a blank line. A section read now returns the body alone and names the section's `heading` and `level` beside it, which is what a caller reassembles the markdown from; a note's body starts where `frontmatter::split_body` says it does, which is the splitter the body edit already used. Content for a section that opens with a heading at or above the section's own level — what a caller holding an older read would send — is now refused rather than written, since such a line ends the section instead of filling it. On the CLI, `read --section` names the section beside the note on its first line, in the markup `list --detailed` uses.
+- What `read` returns can be written straight back through `update`. A section read carried its heading, so feeding it back wrote the heading twice; a whole-note read gained a blank line on every round trip. Both corrupted the note silently. ([`9a818cc`](https://github.com/mightytribble/knapper/commit/9a818cc), [`0f08c59`](https://github.com/mightytribble/knapper/commit/0f08c59))
 
 - **Test count: 1116 → 1136.**
 
 ## 0.9.2 (2026-08-31)
 
-A patch release over 0.9.1. A note written through knapper keeps the rest of
-itself byte for byte, an edited note stays in the index, and a config save
-records the user's own settings rather than the defaults this build shipped
-with. No fingerprint moves, so no store re-indexes on the upgrade.
+A patch release over 0.9.1. Nothing re-indexes on the upgrade.
+
+### Added
+
+- The `:cpu` and `:cuda` images publish to GHCR on release, so `docker pull ghcr.io/mightytribble/knapper` is the install. ([`b24d8be`](https://github.com/mightytribble/knapper/commit/b24d8be))
 
 ### Changed
 
-- A config file records what the user chose, not what the binary shipped with (#90). `Config::save` serialized the whole struct, so the first `knapper configure` after an upgrade materialized every section — `[calibrated]`, `[fts]`, `[ranking]`, `[lane_weights]` — into `~/.knapper/config.toml` with that build's values, and a later release that moved a default never reached that user. A save now edits the file instead of rewriting it: it writes a key whose value differs from its default, and a key the file already holds, because an explicit setting is the user's and is kept even where it equals today's default. Comments, key order, spacing and a key this build does not know are all left as they stand. A data directory with no config file yet is given the whole catalogue commented out under live `[section]` headers, so the file shows what there is to set without setting any of it.
+- A config save records what you chose, not what the binary shipped with. `knapper configure` wrote every default into `~/.knapper/config.toml`, so a later release that moved one never reached you. A save now edits the file, keeping your comments, key order and spacing. A data directory with no config yet gets the whole catalogue, commented out. ([`421ba77`](https://github.com/mightytribble/knapper/commit/421ba77))
+
+- `brew install knapper` installs the published binary on Apple Silicon and Linux x86_64, where it compiled llama.cpp from source on every platform. macOS Intel and Linux arm64 still build from source, because no binary is published for either. ([`4dcffa6`](https://github.com/mightytribble/knapper/commit/4dcffa6))
 
 - **Test count: 1035 → 1116.**
 
 ### Fixed
 
-- Frontmatter writes preserve the note (#92). `create` writes the caller's frontmatter as given, and no longer adds `created`, `created_by` or placement keys. A property edit keeps the key's position and the note's list style, and an empty list writes an empty list instead of deleting the key. `archive` and `unarchive` edit the block instead of rebuilding it, so an archive round trip keeps the note's other keys, its comments and its blank lines byte for byte. `archive` refuses a note that already holds `archived`, `archived_at` or `archived_from`, naming the key it found, rather than lose the note's own value or drop it silently on unarchive. `unarchive` drops a leftover `archived` tag from a note archived by an earlier version of knapper, so the tag does not return to the vocabulary. A value knapper cannot address as a line — a nested mapping, an anchor, a block scalar — refuses the write and names what it found. The placement-correction learning loop no longer fires for a newly created note, because `create` no longer writes the `suggested_folder` and `created_by` keys the loop reads.
+- A note written through knapper keeps the rest of itself byte for byte. `create` writes your frontmatter as given and adds no keys of its own, a property edit keeps the key's position and the note's list style, and an archive round trip returns the file unchanged. A value knapper cannot edit safely refuses the write and names what it found. ([`710eae1`](https://github.com/mightytribble/knapper/commit/710eae1), the `frontmatter-preserving-writes` branch)
 
-- An edited note stays in the index (#93). A rename that replaces a file makes the debouncer report a removal of the target path ahead of the events that describe the new file. The watcher read that removal as a deletion and dropped the note, and the change behind it was the write pipeline's own, which the recent-write check suppresses — so `search`, `list` and `read` lost a note that was still on disk and correct, and a later `index` counted it as a new file. A removal whose path still holds a file is no longer a deletion.
+- An edited note stays in the index. Saving over a note made the file watcher read the save as a deletion, so `search`, `list` and `read` lost a note that was still on disk and correct. ([`bdd9965`](https://github.com/mightytribble/knapper/commit/bdd9965))
 
-- An edit keeps the newline the note ended on (#94). Both edit transforms rebuild the text out of `lines()` and trimmed fragments, and neither carried the note's last byte: a section edit dropped the newline the note ended on, and a replace of the note's last section added one it never had. Either way the write touched a line the caller did not name, so a one-line addition read in `git diff` as that line plus a rewrite of the last one. The final newline now follows the note, in both directions.
+- An edit keeps the newline the note ended on, so a one-line change reads as one line of diff. ([`8fe61a8`](https://github.com/mightytribble/knapper/commit/8fe61a8))
 
 ## 0.9.1 (2026-08-30)
 
-### Calibrated score fusion: the model-free default ranks and abstains
+Search ranks and abstains with no model configured. Nothing re-indexes on the upgrade.
 
-With no cross-encoder configured — the default install — the sorted ranking stage now runs and a three-coefficient logistic sorts the candidate pool, where the build fell to the legacy five-lane fusion order before. Each content lane's score is normalized per query onto an absolute `[0, 1]` evidence scale — BM25 against the query's own upper bound, cosine as the near-absolute signal it already is — and `p = σ(w_s·cos + w_k·bm25n + b)` fuses the pair into one probability per candidate. Results sort by that probability, the answer floor applies to it, and the confidence reported is a probability rather than a share of the top result. No model call runs. Design: `docs/specs/2026-08-30-calibrated-fusion-design.md`.
+### Added
 
-Measured through `eval/pool.sh` at `top_n = 20` on a 240-file / 1501-chunk vault, three arms over one store: the calibrated path and the cross-encoder abstain on the same nine of twelve non-answers and keep the same three negatives, where the previous model-free order returned a full 14-20 block window for every query — the nonsense control included — and reported 100% on all twenty.
+- With no cross-encoder configured — the default install — search scores each result as a probability and sorts by it, where it fell back to a rank-fusion order before. A query your vault cannot answer now returns nothing, on the CLI, over MCP and on `POST /api/search`; the default install could not abstain at all. On the calibration pool it declines the same non-answers the cross-encoder declines. No model call runs. ([`19ba687`](https://github.com/mightytribble/knapper/commit/19ba687))
 
-#### Added
+- `[calibrated]`, the config section behind it: `enabled`, three fitted coefficients, and `floor`, the probability below which a result is not an answer. Every key is query-time, so a change re-indexes nothing. `enabled = false` restores the previous behaviour exactly, and `floor = 0.0` removes nothing. With a cross-encoder configured the section is inert. ([`c450b53`](https://github.com/mightytribble/knapper/commit/c450b53))
 
-- **`[calibrated]`**, a config section read only on the model-free path: `enabled` (default `true`), the fitted coefficients `semantic = 13.878`, `keyword = 13.571`, `intercept = -5.848`, and `floor = 0.75`, the probability below which a candidate is not an answer. Every key is query-time and reaches no fingerprint, so a change re-indexes nothing and a sweep is a config edit. `enabled = false` restores the previous routing — a no-model build takes the legacy stage — byte for byte; `floor = 0.0` removes nothing. With a cross-encoder configured the whole section is inert.
-- **Abstention on the default install.** A query the vault cannot answer returns the empty set with `NO_RELEVANT_CONTENT` on the CLI, over MCP and on `POST /api/search`. The previous model-free path could not abstain at all: `answer_floor` skips a candidate whose score is not a probability, and every score on that path was a fused rank.
-- **`calibrate.rs`**, the fusion arithmetic: FTS5's idf with its clamp, the query's BM25 upper bound `(k1 + 1) · Σ idf`, the `[0, 1]` normalization and the logistic. Pure math with no store and no model, so every formula is tested against hand-computed values.
-- **`--explain` reports the path's working**: the query's BM25 upper bound and each term's idf beside the MATCH expression, and every candidate's probability as a `calibrated` lane contribution.
+- `--explain` reports the working: the query's BM25 upper bound, each term's idf, and every candidate's probability. ([`915e1b8`](https://github.com/mightytribble/knapper/commit/915e1b8))
 
-#### Changed
+- `validate` checks your notes for broken structure and reports what it finds: unclosed code fences and wikilink brackets, unparseable frontmatter, missing or duplicated headings, empty sections, over-long paragraphs, unknown tags and wikilinks that name no note. It takes one note or a scope, reaches all three surfaces, and `--strict` makes a warning exit non-zero. ([`e9d665f`](https://github.com/mightytribble/knapper/commit/e9d665f) … [`f4f8cc6`](https://github.com/mightytribble/knapper/commit/f4f8cc6))
 
-- **Confidence on the model-free path is an absolute probability.** It was `rrf_score` renormalized against the top result, so the first answer of every query printed 100% however bad it was.
-- **The graph and temporal lanes are judged on the same scale as content candidates** on this path. A graph admission is scored by the logistic rather than slotted by reserved-quota position, so provenance no longer caps rank; its features come from the store when no content lane fetched the candidate.
-- **`into_fused` names its sort lane**, `rerank` or `calibrated`, so `--explain` reports which scorer produced the order and the answer floor applies to whichever probability sorted the pool.
-- **Test count: 1014 → 1035.**
+- An external embedder. `models.embed = "gemini:<versioned-id>"` embeds through the Gemini API instead of a local GGUF, with the key in `GEMINI_API_KEY` and never in the config file; `[models.embed_api]` holds `dim`, `timeout_secs`, `max_retries` and `endpoint`. The local form is unchanged. ([`3d9e66a`](https://github.com/mightytribble/knapper/commit/3d9e66a), [`ffa61c5`](https://github.com/mightytribble/knapper/commit/ffa61c5), [`2374eab`](https://github.com/mightytribble/knapper/commit/2374eab))
+
+- The data directory moves. `--data-dir` and `KNAPPER_HOME` both relocate `~/.knapper`, and the store, the models and both config files follow it together. ([`3ce87ba`](https://github.com/mightytribble/knapper/commit/3ce87ba))
+
+- `read --metadata` answers a note's frontmatter, its incoming and outgoing links and its size, in place of its content. It describes the whole note, so it cannot be combined with `--section`. ([`81020ca`](https://github.com/mightytribble/knapper/commit/81020ca))
+
+- Docker images, `:cpu` and `:cuda`, built from a two-stage Dockerfile. ([`81bde46`](https://github.com/mightytribble/knapper/commit/81bde46))
+
+### Changed
+
+- Confidence on the default install is an absolute probability. It was measured against the top result, so the first answer of every query printed 100% however bad it was. ([`19ba687`](https://github.com/mightytribble/knapper/commit/19ba687))
+
+- The file watcher polls where inotify cannot serve the filesystem. `knapper serve` on a Docker bind mount, an overlay, fuse, 9p, nfs or cifs vault never saw a change; it now detects that and polls instead. `[watcher] backend` and `KNAPPER_WATCHER_BACKEND` override the choice. ([`e613d54`](https://github.com/mightytribble/knapper/commit/e613d54))
+
+- `status` reports the embedding model you configured, not a compiled-in constant. ([`099c6e8`](https://github.com/mightytribble/knapper/commit/099c6e8))
+
+- `configure` reports the cross-encoder it resolved and its real download size, in place of a fixed figure. ([`71c7925`](https://github.com/mightytribble/knapper/commit/71c7925))
+
+- `configure --register claude-code` registers through `claude mcp add`. It wrote a `settings.json` Claude Code does not read. ([`74a4310`](https://github.com/mightytribble/knapper/commit/74a4310))
+
+- A cross-encoder knapper cannot prompt is refused at load, with the supported models named, instead of scoring every candidate wrongly. ([`78c0302`](https://github.com/mightytribble/knapper/commit/78c0302))
+
+- **Test count: 918 → 1035.**
+
+### Removed
+
+- The Obsidian CLI integration, which nothing called. No surface, config key or behaviour changes with it. ([`485150d`](https://github.com/mightytribble/knapper/commit/485150d))
 
 ## 0.9.0 (2026-08-16) — knapper
 
-The project leaves fork status: engraph, forked at v1.7.2, becomes knapper. The binary, the repository (mightytribble/knapper), the data directory (`~/.knapper/`) and the store file (`knapper.db`, with a read fallback to an existing `engraph.db`) carry the new name. The MIT license and the full git history stay; see `NOTICE`. Versions restart at 0.9.x; 1.0.0 marks the v1 milestone: functional Metal and Docker build pipelines.
+The project leaves fork status: engraph, forked at v1.7.2, becomes knapper. The
+binary, the repository (mightytribble/knapper), the data directory
+(`~/.knapper/`) and the store file (`knapper.db`, with a read fallback to an
+existing `engraph.db`) carry the new name. The MIT license and the full git
+history stay; see `NOTICE`. Versions restart at 0.9.x; 1.0.0 marks the v1
+milestone: functional Metal and Docker build pipelines.
+([`31a8718`](https://github.com/mightytribble/knapper/commit/31a8718),
+[`da2d325`](https://github.com/mightytribble/knapper/commit/da2d325),
+[`c68944b`](https://github.com/mightytribble/knapper/commit/c68944b))
 
-### Address a section by its heading path ([#69](https://github.com/mightytribble/knapper/issues/69))
+Three changes travel with the rename: every capability gets one name on all
+three surfaces, `knapper list` answers the vault's files, and `--section`
+addresses a section by its heading path.
 
-`--section` names a section by its heading text or by its full heading path, and a promoted bold line is one of the sections it reaches. `list --detailed` enumerates the same set, so what the outline prints is what `read` and `update` can name.
+### Removed
 
-#### Added
+**The renames land with no aliases and no deprecation window.** A script or an agent that calls an old name gets an error, not a warning. This section is the whole list.
 
-- **`--section` takes a heading path.** `read` and `update` accept a heading's own text, as before, or its full path from its own root joined with ` > `: `--section "About the Empire > Current Events > History"` reaches the second `History` of a note that holds two. A partial path resolves nothing, so a wrong guess is an error and never an edit to another section. Two same-named siblings under one parent share a path, and the first in document order is the one that resolves.
-- **A promoted bold heading is addressable** ([#53](https://github.com/mightytribble/knapper/issues/53)). `--section "Spells"`, `--section "**Spells**"` and `--section "Stat Block > Spells"` all reach a `**Spells**` section, which is 107 of the 1559 chunks in the pinned corpus and was reachable by no name at all. The section ends where the chunker ends it: at the next promoted line, or the next `#` heading of any depth. An ATX heading keeps precedence over a promoted one of the same name under the same parent. The fallback runs whatever `promote_bold_headings` says, because what a caller may name is a property of the file and not of what the indexer chunks.
-- **An empty section is addressable**, promoted or ATX, because addressing one is how a caller fills it.
+- CLI command groups. `knapper context <leaf>` and `knapper write <leaf>` are gone and every leaf is a top-level command: `context read` → `read`, `write create` → `create`, and so on for all ten. ([`c6ea35b`](https://github.com/mightytribble/knapper/commit/c6ea35b))
+- `knapper graph`. `graph show` ran the queries `read` runs, so `read` answers it; `graph stats` is folded into `status`. ([`d848cb4`](https://github.com/mightytribble/knapper/commit/d848cb4))
+- `knapper migrate para`. PARA is the only strategy: `knapper migrate --mode preview|apply|undo`. ([`61f0824`](https://github.com/mightytribble/knapper/commit/61f0824))
+- 15 MCP tools (25 → 17). `read_section` is a `section` parameter of `read`; `append`, `edit`, `rewrite`, `edit_frontmatter` and `update_metadata` are one `update` tool; `unarchive` is `archive {undo: true}`; `setup` is `init {mode}`; the three `migrate_*` tools are `migrate {mode}`. `move_note` is renamed `move`. ([`65e2e9d`](https://github.com/mightytribble/knapper/commit/65e2e9d), [`c32bfb0`](https://github.com/mightytribble/knapper/commit/c32bfb0), [`61f0824`](https://github.com/mightytribble/knapper/commit/61f0824), [`b88e043`](https://github.com/mightytribble/knapper/commit/b88e043))
+- `context`, `who` and `project`, the three composite bundle tools, with no replacement. Each one ran the queries the primitives run, in one fixed shape; the composites return as vault-defined commands. `context` was first renamed `topic`, then removed with the other two. ([`d5928b4`](https://github.com/mightytribble/knapper/commit/d5928b4))
+- 14 HTTP routes (26 → 18), the same consolidation, plus path parameters: `GET /api/read/{*file}`, `/api/who/{name}` and `/api/project/{name}` now take `?file=` and `?name=`. ([`94a881a`](https://github.com/mightytribble/knapper/commit/94a881a))
+- `list --folder`, and `folder` on the MCP tool and `GET /api/list`. A directory is a scope term — `--scope /lore/`, a case-sensitive path range — where `--folder lore` was a `LIKE` that folded case and matched `lorekeeper.md`. ([`a411850`](https://github.com/mightytribble/knapper/commit/a411850), [`7e97141`](https://github.com/mightytribble/knapper/commit/7e97141))
+- `rewrite`'s `preserve_frontmatter: false`, `update_metadata`'s `modified_by` stamp, and `total_files` from the `status` JSON. ([`182ff48`](https://github.com/mightytribble/knapper/commit/182ff48), [`dd65285`](https://github.com/mightytribble/knapper/commit/dd65285))
+- `migrate` `mode: apply` no longer falls back to a preview file on disk over MCP and HTTP. Pass the preview your own `mode: preview` returned; the CLI's two-step flow is unchanged. ([`eb61dbd`](https://github.com/mightytribble/knapper/commit/eb61dbd))
 
-#### Changed
+### Added
 
-- **`list --detailed` lists promoted headings** beside the ATX ones, and lists a bodyless promoted heading too, so every entry of an outline is a section `read` and `update` can name. `Heading.level` is now absent for a promoted line rather than carrying a depth it does not have; on the CLI such a line prints in its bold form, `**Spells**`.
-- **`markdown.rs` owns what a heading is** and `chunker.rs` owns which headings start a chunk. The chunker's set is unchanged, so no fingerprint moves and no store re-indexes.
-- **Test count: 893 → 918.**
+- `update`, one capability for every change to an existing note. It takes a list of edits and applies them in order in one write: one conflict check, one file write, one re-index. Each edit names a `section`, a `property`, or neither (the body), with a `mode` of `replace`, `prepend`, `append` or `remove`. Two sections and a tag change in one atomic write is something no call it replaces could do. ([`da4c12a`](https://github.com/mightytribble/knapper/commit/da4c12a), [`c32bfb0`](https://github.com/mightytribble/knapper/commit/c32bfb0))
+- `knapper list` answers every note a scope admits, in path order, one bare path per line — so it pipes, and `wc -l` is the total. `--detailed` puts each note's heading outline under its path. ([`1a07a66`](https://github.com/mightytribble/knapper/commit/1a07a66), [`32b4450`](https://github.com/mightytribble/knapper/commit/32b4450), [`9d16472`](https://github.com/mightytribble/knapper/commit/9d16472))
+- `--section` names a section by its heading text or by its full heading path: `--section "About the Empire > Current Events > History"` reaches the second `History` of a note that holds two. A partial path resolves nothing, so a wrong guess is an error and never an edit to another section. A promoted bold line such as `**Spells**` is addressable too, and was reachable by no name at all; so is an empty section, because addressing one is how you fill it. ([`aa670a3`](https://github.com/mightytribble/knapper/commit/aa670a3), [`19b4c8a`](https://github.com/mightytribble/knapper/commit/19b4c8a))
+- Six MCP tools — `index`, `status`, `tags`, `update`, `init` and `migrate` — and the six HTTP routes beside them fill the gaps, and `health`, `reindex-file`, `move`, `update`, `status` and `index` each reach the CLI. ([`c6ea35b`](https://github.com/mightytribble/knapper/commit/c6ea35b), [`fde3cb6`](https://github.com/mightytribble/knapper/commit/fde3cb6))
+- `explain` and `group_by` are per call on every surface, so one query answers the same way whoever asks it. ([`4720fa0`](https://github.com/mightytribble/knapper/commit/4720fa0))
+- `GET /api/identity?refresh=` and MCP `identity {refresh}` re-extract the L1 facts, which was a CLI-only flag. It writes, so a read-only server refuses it. ([`521d05f`](https://github.com/mightytribble/knapper/commit/521d05f))
+- `docs/surfaces.md`, generated and checked by a test, listing what every capability is called on each surface. ([`cf079cf`](https://github.com/mightytribble/knapper/commit/cf079cf), [`016bc19`](https://github.com/mightytribble/knapper/commit/016bc19))
 
-### List the vault's files ([#68](https://github.com/mightytribble/knapper/issues/68))
+### Changed
 
-`knapper list` is the call an agent makes to see a vault it cannot read: every note the scope admits, in path order, one bare path per line, and each note's heading outline under `--detailed`.
-
-#### Removed
-
-- **`list --folder`**, and the `folder` parameter on the MCP `list` tool and `GET /api/list`. A directory filter is a scope term: `--scope /lore/` — a leading `/` reads a term as a directory path, a trailing `/` its subtree — which is a case-sensitive range anchored at the path boundary, where `--folder lore` was a `LIKE 'lore%'` that folded case, read `_` as a wildcard and matched `lorekeeper.md`. `store::list_files` keeps its `folder` argument for `project`'s sibling gather, which is not a caller-typed filter.
-
-#### Added
-
-- **`list --detailed`** answers each note's ATX heading outline beneath its path. The outline is read from the file, because the index cannot hold it: a short section merges into the chunk before it, an empty heading emits no chunk, and a promoted bold line sits in `chunks.heading` beside real headings. `NoteListItem` gains `headings: Option<Vec<Heading>>` — level, text, and a 1-based line — absent unless `detailed` is set, so an undetailed listing serialises as it did before. On the CLI the headings print as their own `#` markers under the path; over MCP and HTTP they are structured. `detailed=true` is required on the HTTP query string, because `serde_urlencoded` reads no bare flag. A note whose file is missing on disk lists with an empty outline and no error.
-
-#### Changed
-
-- **`list` answers in path order** (`ORDER BY f.path`, SQLite `BINARY` collation, so `Lore/` sorts before `lore/`), where it answered most-recently-indexed first. A folder's notes now arrive together and a subtree scope reads as one block. `project`'s sibling gather takes the same ordering: the first 50 of the folder in path order.
-- **`list`'s limit is unbounded by default.** It was capped at 20. An absent `--limit` now emits no `LIMIT` clause, so a bare `knapper list` answers every note the scope admits, and a caller that wants less names a scope or a `--limit`; `--limit 0` answers none. The default is the same on every surface, so no one surface silently caps the whole vault.
-- **The CLI's plain `list` output is one bare path per line** and nothing else — no docid, tags, edge count, or trailing total — so it pipes and `wc -l` is the total. The path is relative to the vault root, the form `read`, `update` and `move` take, so a listed path pastes into the next call. `--json` still answers the full `NoteListItem` array.
-- **Test count: 877 → 893.**
-
-### One name per capability ([#62](https://github.com/mightytribble/knapper/issues/62))
-
-Every capability now has one name and one parameter set on the CLI, the MCP server and the HTTP API. The name is one word in `kebab-case`, and each surface spells it its own way: the CLI command as written, the MCP tool with `-` as `_`, and the HTTP route under `/api/` and the name. One transform gets from any spelling to any other.
-
-**The renames land with no aliases and with no deprecation window.** Nothing outside this repository named an MCP tool or a CLI command, so no old name is kept working. Everything under "Removed" below is a hard break: an agent or a script that calls an old name gets an error, not a warning. This section is the whole list.
-
-#### Removed
-
-- **CLI command groups.** `knapper context <leaf>` and `knapper write <leaf>` are gone; every leaf is a top-level command. `context read` → `read`, `context list` → `list`, `context tags` → `tags`, `context vault-map` → `vault-map`, `context who` → `who`, `context project` → `project`, `context topic` → `topic`, `write create` → `create`, `write archive` → `archive`, `write delete` → `delete`.
-- **`knapper graph`**, both leaves. `graph show` ran the same four queries `read` runs, so `read` answers it and now carries a docid beside each link. `graph stats` is folded into `status`.
-- **`knapper migrate para`.** PARA is the only strategy, so the leaf is gone: `knapper migrate --mode preview|apply|undo`.
-- **12 MCP tools** (26 → 20, with six added below): `read_section` is a `section` parameter of `read`; `append`, `edit`, `rewrite`, `edit_frontmatter` and `update_metadata` are one `update` tool; `unarchive` is `archive {undo: true}`; `setup` is `init {mode}`; `migrate_preview`, `migrate_apply` and `migrate_undo` are `migrate {mode}`; `context` is renamed `topic`. `move_note` is renamed `move`.
-- **12 HTTP routes** (29 → 23, 27 under `/api` → 21, with five added below): `POST /api/read-section`, `/api/append`, `/api/edit`, `/api/rewrite`, `/api/edit-frontmatter`, `/api/update-metadata`, `/api/unarchive`, `/api/setup`, `/api/context`, and `POST /api/migrate/preview`, `/apply` and `/undo`.
-- **Path parameters.** `GET /api/read/{*file}`, `/api/who/{name}` and `/api/project/{name}` are `?file=`, `?name=` and `?name=` query parameters, because the shared parameter struct carries its arguments the way it names them.
-- **`rewrite`'s `preserve_frontmatter: false`** has no spelling in `update`. A body edit always keeps the note's frontmatter; change the frontmatter with `property` edits in the same list.
-- **`update_metadata`'s `modified_by` stamp.** A whole-note tag or alias replacement no longer writes a `modified_by` property into the note.
-- **`total_files`** from the `status` JSON. `files` already reports it.
-- **The disk fallback for `migrate` `mode: apply`** on the two servers. `apply` now requires the `preview` the caller's own `mode: preview` returned; it no longer falls back to `~/.knapper/migration-preview.json`. The CLI's two-step flow, which saves and reads that file itself, is unchanged.
-
-#### Added
-
-- **`update`**, one capability for every change to an existing note. It takes a list of edits and applies them in order in one write: one mtime conflict check, one file write, one re-index. Each edit names a `section`, a `property`, or neither (the note's body), and carries a `mode` of `replace`, `prepend`, `append` or `remove`. `content` is a string, or a list of strings for a list-valued property. The grammar reaches something no call it replaced could: two sections and a tag change in one atomic write.
-- **`read --section`** narrows the content to one ATX heading's body and adds `heading`, `line_start` and `line_end`. The heading match folds case, and `byte_count` measures the section. The note's tags and links are reported either way, because a section's are its file's.
-- **The gaps fill.** Six MCP tools are new — `index`, `status`, `topic`, `update`, `init` and `migrate` — and five HTTP routes — `POST /api/index`, `/api/update`, `/api/migrate`, `/api/topic` and `GET /api/status`. On the CLI, `health`, `reindex-file`, `move`, `update`, `status` and `index` each reach a surface that did not have them.
-- **`explain` and `group_by` are per call on every surface**, so one query answers the same way whoever asks it.
-- **`GET /api/identity?refresh=` and MCP `identity {refresh}`** re-extract the L1 facts, which was a CLI-only flag. It rewrites the `identity_facts` rows, so it takes the write permission and a read-only server refuses it.
-- **`docs/surfaces.md`**, generated from `src/surface.rs` and checked by a test, listing what every capability is called on each surface.
-- **Parity tests.** Five tests compare the capability table with what `Cli::command()`, `KnapperServer::tool_router()` and `http::routes()` register, including each tool's schema against its clap arguments. A capability added to one surface and forgotten on another fails the build.
-
-#### Changed
-
-- **`search`'s default `top_n` is the configured one** on both servers. It was a hardcoded 10; it is now `top_n` from `config.toml`, whose default is **5** — the same number the CLI has always used. A caller that relied on ten results per query must now ask for `top_n: 10`.
-- **`search` over HTTP returns an envelope**, `{"results": [...], "message": ...}`, replacing the bare array. `explain` joins it when the call asked for it. HTTP was the one surface with nowhere to put the answer-floor signal.
-- **`update`'s `--mode` defaults to `replace`.** The calls it absorbed were stricter — `write rewrite --content` and `write edit --content` were required, and `write edit`'s mode defaulted to `append`. `knapper update <file>` with no `--content` and no `--edits` still reads stdin, and an empty read is now refused for a body or section `replace` rather than blanking the note. `--content ""` is the deliberate spelling for that.
-- **A body edit adds no blank line of its own.** `split_frontmatter` rejoins the body carrying the break after the closing `---`, and the reassembly supplies its own, so successive appends and successive property edits used to push the body one line down per call. Both reassembly paths now normalise it.
-- **`update` checks the mtime.** A note changed outside knapper and not yet re-indexed fails with an mtime conflict, which `edit`, `rewrite` and `edit_frontmatter` did not do.
-- **`delete`'s `mode` is an enum** on all three surfaces. It read `"hard" => hard, _ => soft`, so `mode: "hardd"` archived the note silently; an unknown word is now refused where the request is read.
-- **A read-only server refuses `index` and `init {mode: apply}`** on both servers, as it already refused the write calls.
-- **MCP tools: 26 → 20. HTTP routes: 29 → 23** (27 under `/api` → 21, beside the `/api/health-check` liveness probe and the two discovery routes). **CLI top-level commands: 13 → 24** — twenty capabilities plus `configure`, `models`, `clear` and `serve`, which configure the process and not the vault.
-- **Test count: 785 → 851.**
+- `search`'s default `top_n` on both servers is the configured one, whose default is **5**. It was a hardcoded 10, so a caller that relied on ten results must now ask for `top_n: 10`. ([`06e03e3`](https://github.com/mightytribble/knapper/commit/06e03e3))
+- `search` over HTTP returns `{"results": [...], "message": ...}` in place of a bare array. HTTP was the one surface with nowhere to put the answer-floor signal. ([`0aefc5f`](https://github.com/mightytribble/knapper/commit/0aefc5f))
+- `list` has no default limit. It was capped at 20; a bare `knapper list` now answers every note in scope, and `--limit 0` answers none. ([`1a07a66`](https://github.com/mightytribble/knapper/commit/1a07a66))
+- `update`'s `--mode` defaults to `replace`, and an empty stdin read is refused for a body or section replace rather than blanking the note. `--content ""` is the deliberate spelling for that. ([`07f1125`](https://github.com/mightytribble/knapper/commit/07f1125))
+- `update` checks the mtime, so a note changed outside knapper and not yet re-indexed fails instead of being overwritten. ([`da4c12a`](https://github.com/mightytribble/knapper/commit/da4c12a))
+- `delete`'s `mode` is an enum on all three surfaces. It read anything but `"hard"` as soft, so `mode: "hardd"` archived the note silently. ([`06e03e3`](https://github.com/mightytribble/knapper/commit/06e03e3))
+- A read-only server refuses `index` and `init {mode: apply}`, as it already refused the write calls. ([`07f1125`](https://github.com/mightytribble/knapper/commit/07f1125), [`521d05f`](https://github.com/mightytribble/knapper/commit/521d05f))
+- **CLI commands: 13 → 21. MCP tools: 25 → 17. HTTP routes: 26 → 18.**
+- **Test count: 785 → 918.**
 
 ---
 
