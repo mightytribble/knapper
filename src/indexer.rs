@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -284,6 +284,94 @@ pub fn build_edges_for_file(store: &Store, file_id: i64, content: &str) -> Resul
     Ok(())
 }
 
+/// The notes that write a wikilink to `file_id`.
+///
+/// Read this **before** the note's row goes or its path changes. `edges`
+/// cascades off `files(id)`, so once the row is gone there is nothing left to
+/// ask: the rows that named the note went with it, and the notes that wrote
+/// those links cannot be found again without reading every chunk in the vault.
+///
+/// The answer is the `also` argument of [`reconcile_links`], which re-derives
+/// each of those notes against the vault as it now stands (#108).
+pub fn sources_linking_to(store: &Store, file_id: i64) -> Result<Vec<i64>> {
+    Ok(store
+        .get_incoming(file_id, Some("wikilink"))?
+        .into_iter()
+        .map(|(from_file, _edge_type)| from_file)
+        .collect())
+}
+
+/// Re-derive the links of every note whose resolution a change to a *different*
+/// note has altered (#108).
+///
+/// [`build_edges_for_file`] reads one source, and both of the things it writes
+/// are claims about a second file: the `edges` row says the second file is
+/// there, and the `unresolved_links` row says it is not. A change to that
+/// second file makes the claim wrong, and the source's own content hash cannot
+/// see it — the source did not change — so no walk lists the source as work.
+///
+/// Two sets of notes, one pass:
+///
+/// - the notes that recorded a broken link the vault can now satisfy. The
+///   candidates come from `unresolved_links`, which holds only what failed, so
+///   the query is bounded by the number of broken links and not by the size of
+///   the vault. Each distinct target goes through [`resolve_link_target`]
+///   itself rather than being matched as a string, so this cannot disagree with
+///   the resolver about aliases, case or the `.md` suffix.
+/// - `also`: what the caller read from [`sources_linking_to`] before it removed
+///   or moved the note those links name.
+///
+/// Each note is re-read from the vault and not from `chunks.text`, for the
+/// reason [`rebuild_all_edges`] gives: the chunker strips frontmatter, so a
+/// link written there belongs to no chunk and a chunks-only read would drop it.
+/// A note the vault no longer holds is skipped — its own removal is what
+/// records that, not this.
+///
+/// Returns the number of notes re-derived.
+pub fn reconcile_links(store: &Store, vault_path: &Path, also: &[i64]) -> Result<usize> {
+    let mut sources: BTreeSet<i64> = also.iter().copied().collect();
+
+    let mut resolves: HashMap<String, bool> = HashMap::new();
+    for (file_id, target) in store.unresolved_link_sources()? {
+        if sources.contains(&file_id) {
+            continue; // already listed; the re-derivation covers every link it writes
+        }
+        let now_resolves = match resolves.get(&target) {
+            Some(&known) => known,
+            None => {
+                let known = resolve_link_target(store, &target)?.is_some();
+                resolves.insert(target.clone(), known);
+                known
+            }
+        };
+        if now_resolves {
+            sources.insert(file_id);
+        }
+    }
+
+    rebuild_links_for(store, vault_path, &sources)
+}
+
+/// Re-derive the outgoing links of the given notes from what the vault holds.
+///
+/// Outgoing only: the backlinks into each note belong to other notes' content,
+/// and re-deriving this one must not touch them (#27).
+fn rebuild_links_for(store: &Store, vault_path: &Path, sources: &BTreeSet<i64>) -> Result<usize> {
+    let mut reconciled = 0usize;
+    for &file_id in sources {
+        let Some(file) = store.get_file_by_id(file_id)? else {
+            continue; // the note's own row went while this ran
+        };
+        let Ok(content) = std::fs::read_to_string(vault_path.join(&file.path)) else {
+            continue; // not on disk; the next index removes its row and its links
+        };
+        store.delete_outgoing_edges_for_file(file_id)?;
+        build_edges_for_file(store, file_id, &content)?;
+        reconciled += 1;
+    }
+    Ok(reconciled)
+}
+
 /// Re-derive every wikilink edge from `chunks.text`, with no vault read (#28).
 ///
 /// The adoption path for a store written before edges had chunk granularity.
@@ -378,6 +466,9 @@ pub fn reindex_written_file(
     // Outgoing only — see issue #27.
     store.delete_outgoing_edges_for_file(result.file_id)?;
     build_edges_for_file(store, result.file_id, &content)?;
+    // The file may be one other notes already name. Their own content did not
+    // change, so nothing else revisits the links they wrote (#108).
+    reconcile_links(store, vault_path, &[])?;
 
     Ok(result)
 }
@@ -543,7 +634,11 @@ pub fn index_file(
 ///
 /// sqlite-vec virtual tables don't participate in CASCADE deletes, so we must
 /// manually delete vector entries before removing the file record.
-pub fn remove_file(rel_path: &str, store: &Store) -> Result<()> {
+///
+/// Takes `vault_path` because the removal is not only this file's business: the
+/// notes that link to it now write a link to nothing, and they are re-derived
+/// from the vault before this returns (#108).
+pub fn remove_file(rel_path: &str, store: &Store, vault_path: &Path) -> Result<()> {
     let file = store
         .get_file(rel_path)?
         .ok_or_else(|| anyhow!("File not found: '{}'", rel_path))?;
@@ -552,6 +647,12 @@ pub fn remove_file(rel_path: &str, store: &Store) -> Result<()> {
     if owns_transaction {
         store.conn().execute_batch("BEGIN DEFERRED")?;
     }
+
+    // The notes that link to this one, read before the cascade takes their
+    // edges away. Each of them writes a link that names a note the vault is
+    // about to lose, and only a re-derivation of those notes records that —
+    // their own content does not change, so no walk ever lists them (#108).
+    let linking = sources_linking_to(store, file.id)?;
 
     let vector_ids = store.get_vector_ids_for_file(file.id)?;
     for &vid in &vector_ids {
@@ -567,6 +668,7 @@ pub fn remove_file(rel_path: &str, store: &Store) -> Result<()> {
     // their own either.
     store.delete_file(file.id)?;
     store.prune_unused_tags(&released_tags)?;
+    rebuild_links_for(store, vault_path, &linking.into_iter().collect())?;
 
     if owns_transaction {
         store.commit()?;
@@ -578,9 +680,19 @@ pub fn remove_file(rel_path: &str, store: &Store) -> Result<()> {
 ///
 /// Recomputes the docid from the new path and delegates to `Store::update_file_path`
 /// which performs a collision check and updates the path in place.
-pub fn rename_file(old_rel: &str, new_rel: &str, store: &Store) -> Result<()> {
+///
+/// A wikilink resolves by basename, so most links survive a rename. One written
+/// as `[[folder/note]]` names a path the vault no longer has, and the notes
+/// that wrote it are re-derived here — read before the change, because that is
+/// the last moment the graph can name them (#108).
+pub fn rename_file(old_rel: &str, new_rel: &str, store: &Store, vault_path: &Path) -> Result<()> {
     let new_docid = generate_docid(new_rel);
+    let linking = match store.get_file(old_rel)? {
+        Some(file) => sources_linking_to(store, file.id)?,
+        None => Vec::new(),
+    };
     store.update_file_path(old_rel, new_rel, &new_docid)?;
+    rebuild_links_for(store, vault_path, &linking.into_iter().collect())?;
     Ok(())
 }
 
@@ -762,7 +874,7 @@ fn run_index_inner(
 
     // Step 4: Handle deleted files — remove vectors from vec0, FTS, and store.
     for record in &deleted_files {
-        remove_file(&record.path, store)?;
+        remove_file(&record.path, store, vault_path)?;
     }
 
     // Step 5: Handle changed files — just queue them.
@@ -898,6 +1010,19 @@ fn run_index_inner(
                 "edges re-derived; the remainder are links no chunk contains"
             );
         }
+    }
+
+    // A note that arrives satisfies the links other notes wrote before it
+    // existed. Those notes did not change, so the walk above listed none of
+    // them, and their broken links would otherwise outlive the condition they
+    // describe (#108). Bounded by the number of broken links, so an index of a
+    // vault with none pays one small query.
+    let reconciled = reconcile_links(store, vault_path, &[])?;
+    if reconciled > 0 {
+        info!(
+            notes = reconciled,
+            "re-derived the links of notes whose targets the vault now holds"
+        );
     }
 
     // Step 10: Store vault path in meta.
@@ -2156,6 +2281,115 @@ mod tests {
         );
     }
 
+    /// A wikilink written before its target exists resolves once the target is
+    /// there (#108).
+    ///
+    /// `build_edges_for_file` reads one source, so nothing revisits the note
+    /// that named the target early. The row it wrote outlived the condition it
+    /// described: `health` named a link whose target was in the vault, and the
+    /// `edges` row the link earned was missing.
+    #[test]
+    fn a_link_resolves_when_the_note_it_names_arrives() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write_file(root, "a.md", "# A\nSee [[b]].");
+
+        let store = Store::open_memory().unwrap();
+        let f_a = store
+            .insert_file("a.md", "h1", 100, "aaa111", None, None)
+            .unwrap();
+        let content_a = std::fs::read_to_string(root.join("a.md")).unwrap();
+        build_edges_for_file(&store, f_a, &content_a).unwrap();
+        assert_eq!(store.get_unresolved_links().unwrap().len(), 1);
+
+        write_file(root, "b.md", "# B");
+        let f_b = store
+            .insert_file("b.md", "h2", 100, "bbb222", None, None)
+            .unwrap();
+
+        reconcile_links(&store, root, &[]).unwrap();
+
+        assert!(
+            store.get_unresolved_links().unwrap().is_empty(),
+            "the link is no longer broken: {:?}",
+            store.get_unresolved_links().unwrap()
+        );
+        let a_out = store.get_outgoing(f_a, Some("wikilink")).unwrap();
+        assert_eq!(a_out.len(), 1, "and the edge it earned is in the graph");
+        assert_eq!(a_out[0].0, f_b);
+    }
+
+    /// A wikilink whose target goes is recorded broken (#108).
+    ///
+    /// The other direction of the same fact. The `edges` row goes with the
+    /// target's `files` row through the cascade, and `unresolved_links` never
+    /// held a row for the source, because the resolution succeeded when the
+    /// source was indexed. `health` then stayed quiet about a link to nothing.
+    #[test]
+    fn a_link_is_recorded_broken_when_the_note_it_names_goes() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write_file(root, "a.md", "# A\nSee [[b]].");
+        write_file(root, "b.md", "# B");
+
+        let store = Store::open_memory().unwrap();
+        let f_a = store
+            .insert_file("a.md", "h1", 100, "aaa111", None, None)
+            .unwrap();
+        let f_b = store
+            .insert_file("b.md", "h2", 100, "bbb222", None, None)
+            .unwrap();
+        let content_a = std::fs::read_to_string(root.join("a.md")).unwrap();
+        build_edges_for_file(&store, f_a, &content_a).unwrap();
+        assert_eq!(store.get_outgoing(f_a, Some("wikilink")).unwrap().len(), 1);
+        assert!(store.get_unresolved_links().unwrap().is_empty());
+
+        // Read before the removal: the edges go with the row.
+        let orphaned = sources_linking_to(&store, f_b).unwrap();
+        assert_eq!(orphaned, vec![f_a], "A is the note that links to B");
+
+        std::fs::remove_file(root.join("b.md")).unwrap();
+        store.delete_file(f_b).unwrap();
+        reconcile_links(&store, root, &orphaned).unwrap();
+
+        assert_eq!(
+            store.get_unresolved_links().unwrap(),
+            vec![("a.md".to_string(), "b".to_string())],
+            "the link A still writes now names nothing"
+        );
+    }
+
+    /// A link that names nothing either side of the pass stays broken, and one
+    /// that resolves either side stays resolved (#108).
+    #[test]
+    fn reconciling_leaves_the_links_a_change_did_not_touch() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write_file(root, "a.md", "# A\nSee [[b]] and [[nowhere]].");
+        write_file(root, "b.md", "# B");
+
+        let store = Store::open_memory().unwrap();
+        let f_a = store
+            .insert_file("a.md", "h1", 100, "aaa111", None, None)
+            .unwrap();
+        let f_b = store
+            .insert_file("b.md", "h2", 100, "bbb222", None, None)
+            .unwrap();
+        let content_a = std::fs::read_to_string(root.join("a.md")).unwrap();
+        build_edges_for_file(&store, f_a, &content_a).unwrap();
+
+        reconcile_links(&store, root, &[]).unwrap();
+
+        assert_eq!(
+            store.get_unresolved_links().unwrap(),
+            vec![("a.md".to_string(), "nowhere".to_string())],
+            "the link to nothing is still the only broken one"
+        );
+        let a_out = store.get_outgoing(f_a, Some("wikilink")).unwrap();
+        assert_eq!(a_out.len(), 1);
+        assert_eq!(a_out[0].0, f_b, "and the link that resolved still does");
+    }
+
     /// Wraps an embedder and keeps every string it was asked to embed, so a
     /// test can compare what reached the model against what reached the store.
     struct RecordingEmbed {
@@ -3412,7 +3646,7 @@ mod tests {
         index_once(tmp.path(), &store);
         assert_eq!(tag_counts(&store), (2, 3));
 
-        remove_file("a.md", &store).unwrap();
+        remove_file("a.md", &store, tmp.path()).unwrap();
         assert_eq!(tag_counts(&store), (1, 1));
         let left: String = store
             .conn()
@@ -3472,6 +3706,140 @@ mod tests {
         assert!(
             store.get_file("keeper.md").unwrap().is_some(),
             "the file that is still there is still indexed"
+        );
+    }
+
+    /// `index` resolves a link whose target arrived after it was written (#108).
+    ///
+    /// The walk diffs by mtime and hash, so writing the target changes nothing
+    /// about the note that names it and the walk lists no work. `index` is the
+    /// surface a reader reaches for, and it has to repair the link anyway.
+    #[test]
+    fn an_index_resolves_a_link_whose_target_arrived_after_it() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write_file(root, "a.md", "# A\n\nSee [[b]].\n");
+
+        let store = Store::open_memory().unwrap();
+        let mut embedder = crate::llm::MockLlm::new(256);
+        let config = Config::default();
+        let index = |store: &Store, embedder: &mut crate::llm::MockLlm| {
+            run_index_shared(
+                root,
+                &config,
+                crate::indexer::IndexSettings::from_config(&config),
+                store,
+                embedder,
+                false,
+                None,
+            )
+            .unwrap()
+        };
+
+        index(&store, &mut embedder);
+        assert_eq!(store.get_unresolved_links().unwrap().len(), 1);
+
+        write_file(root, "b.md", "# B\n\nBody.\n");
+        index(&store, &mut embedder);
+
+        assert!(
+            store.get_unresolved_links().unwrap().is_empty(),
+            "the link resolves now that its target is indexed: {:?}",
+            store.get_unresolved_links().unwrap()
+        );
+        let f_a = store.get_file("a.md").unwrap().unwrap();
+        let f_b = store.get_file("b.md").unwrap().unwrap();
+        let a_out = store.get_outgoing(f_a.id, Some("wikilink")).unwrap();
+        assert_eq!(a_out.len(), 1, "and the graph holds the edge");
+        assert_eq!(a_out[0].0, f_b.id);
+    }
+
+    /// Re-indexing one written file resolves the links that were waiting for
+    /// it (#108).
+    ///
+    /// `reindex-file` is what a caller reaches for after writing a note some
+    /// other way, and the note it writes may be one other notes already name.
+    #[test]
+    fn re_indexing_a_written_file_resolves_the_links_that_waited_for_it() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write_file(root, "a.md", "# A\n\nSee [[b]].\n");
+
+        let store = Store::open_memory().unwrap();
+        let mut embedder = crate::llm::MockLlm::new(256);
+        let config = Config::default();
+        run_index_shared(
+            root,
+            &config,
+            IndexSettings::from_config(&config),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(store.get_unresolved_links().unwrap().len(), 1);
+
+        write_file(root, "b.md", "# B\n\nBody.\n");
+        reindex_written_file(
+            "b.md",
+            &store,
+            &mut embedder,
+            root,
+            IndexSettings::from_config(&config),
+        )
+        .unwrap();
+
+        assert!(
+            store.get_unresolved_links().unwrap().is_empty(),
+            "the link A wrote resolves now: {:?}",
+            store.get_unresolved_links().unwrap()
+        );
+        let f_a = store.get_file("a.md").unwrap().unwrap();
+        let f_b = store.get_file("b.md").unwrap().unwrap();
+        let a_out = store.get_outgoing(f_a.id, Some("wikilink")).unwrap();
+        assert_eq!(a_out.len(), 1, "and the graph holds the edge");
+        assert_eq!(a_out[0].0, f_b.id);
+    }
+
+    /// `index` records the links a removed note leaves broken (#108).
+    ///
+    /// The walk removes the target's row, and the cascade takes the edge into
+    /// it. Nothing else names the source, so without this the link to a note
+    /// the vault no longer has is reported by nobody.
+    #[test]
+    fn an_index_records_the_links_a_removed_note_leaves_broken() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write_file(root, "a.md", "# A\n\nSee [[b]].\n");
+        write_file(root, "b.md", "# B\n\nBody.\n");
+
+        let store = Store::open_memory().unwrap();
+        let mut embedder = crate::llm::MockLlm::new(256);
+        let config = Config::default();
+        let index = |store: &Store, embedder: &mut crate::llm::MockLlm| {
+            run_index_shared(
+                root,
+                &config,
+                crate::indexer::IndexSettings::from_config(&config),
+                store,
+                embedder,
+                false,
+                None,
+            )
+            .unwrap()
+        };
+
+        index(&store, &mut embedder);
+        assert!(store.get_unresolved_links().unwrap().is_empty());
+
+        std::fs::remove_file(root.join("b.md")).unwrap();
+        index(&store, &mut embedder);
+
+        assert_eq!(
+            store.get_unresolved_links().unwrap(),
+            vec![("a.md".to_string(), "b".to_string())],
+            "the link A writes names a note the vault no longer has"
         );
     }
 }
