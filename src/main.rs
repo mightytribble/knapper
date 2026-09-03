@@ -1138,25 +1138,60 @@ async fn main() -> Result<()> {
             let indexed_dim = store::Store::open(&config::db_path(&data_dir))
                 .ok()
                 .and_then(|s| s.vec_table_dim().ok().flatten());
+            // What `models.embed` resolves to right now, so a row can be
+            // marked as the one in use rather than merely offered.
+            let selected = Config::load()
+                .ok()
+                .and_then(|c| c.models.embed.clone())
+                .unwrap_or_else(|| defaults.embed_uri.clone());
             match action {
                 ModelsAction::List => {
-                    println!("{:<30}  DESCRIPTION", "NAME");
-                    println!("{}", "-".repeat(70));
-                    println!("{:<30}  Default embedding model (GGUF)", defaults.embed_uri);
+                    for e in knapper::llm::known_embedders() {
+                        let mark = if e.uri == selected { " (in use)" } else { "" };
+                        println!("{}{mark}", e.uri);
+                        println!(
+                            "  {} dim, {} token context, {} download",
+                            e.dim, e.context, e.download
+                        );
+                        println!("  {}", e.note);
+                        println!();
+                    }
+                    println!(
+                        "Set one with: knapper configure --model <NAME>\n\
+                         Any other hf:<repo>/<file>.gguf works too; the width and the\n\
+                         prompt format come from the model itself."
+                    );
                 }
                 ModelsAction::Info { name } => {
-                    if name == defaults.embed_uri {
-                        println!("Name:        {}", defaults.embed_uri);
-                        println!("Format:      GGUF");
-                        match indexed_dim {
-                            Some(d) => println!("Dimensions:  {d} (as indexed)"),
-                            None => println!("Dimensions:  set by the model at load time"),
+                    match knapper::llm::known_embedders()
+                        .iter()
+                        .find(|e| e.uri == name)
+                    {
+                        Some(e) => {
+                            println!("Name:        {}", e.uri);
+                            println!("Format:      GGUF");
+                            println!("Dimensions:  {} (native)", e.dim);
+                            // The store's width is the operational number: it
+                            // is what the index was actually built at, and it
+                            // disagrees with the native one whenever the model
+                            // changed and no re-index has run yet (issue #12).
+                            match indexed_dim {
+                                Some(d) => println!("Indexed at:  {d}"),
+                                None => println!("Indexed at:  nothing indexed yet"),
+                            }
+                            println!("Context:     {} tokens", e.context);
+                            println!("Download:    {}", e.download);
+                            println!(
+                                "In use:      {}",
+                                if e.uri == selected { "yes" } else { "no" }
+                            );
+                            println!("Description: {}", e.note);
                         }
-                        println!("Description: Default embedding model (GGUF)");
-                    } else {
-                        eprintln!("Unknown model: {name}");
-                        eprintln!("Run 'knapper models list' to see available models.");
-                        std::process::exit(1);
+                        None => {
+                            eprintln!("Unknown model: {name}");
+                            eprintln!("Run 'knapper models list' to see available models.");
+                            std::process::exit(1);
+                        }
                     }
                 }
             }

@@ -387,16 +387,18 @@ impl Default for RerankConfig {
 /// **The four numbers below are EmbeddingGemma's fit, not a global default.**
 /// `bm25n` normalizes itself per query and per corpus, but raw cosine is one
 /// model's similarity scale: at `bm25n = 0` the shipped floor asks for
-/// `cos >= 0.5006`, a threshold read off that model's distribution. A
+/// `cos >= 0.4746`, a threshold read off that model's distribution. A
 /// different `models.embed` — an API embedder or another `hf:` GGUF — moves
 /// the scale in an unknown direction, and the failure is silent: the path
-/// abstains on every query, or on none (#103).
+/// abstains on every query, or on none (#103). `config::section_trailer`
+/// carries a measured fit for each other embedder `models list` offers, as a
+/// commented block under the header in the generated file (#8).
 ///
 /// The coefficients and the floor are **one fit** and do not move
 /// independently. Scaling the weights down without moving the floor tightens
-/// the threshold — at `semantic = 11` it becomes `cos >= 0.6315`, above almost
-/// every positive the pin fit was built from, whose top cosines run 0.446 to
-/// 0.633. Refit all four together with `scripts/calibrated-fusion-eval.py`.
+/// the threshold — at `semantic = 11` it becomes `cos >= 0.8964`, above every
+/// positive the pin fit was built from, whose top cosines run 0.446 to 0.633.
+/// Refit all four together with `scripts/calibrated-fusion-eval.py`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CalibratedConfig {
@@ -421,11 +423,17 @@ impl Default for CalibratedConfig {
         // leave-one-query-out validated. Provenance in
         // eval/calibrated-fusion-report-2026-08-30.txt; the fit's tool is
         // scripts/calibrated-fusion-eval.py.
+        //
+        // The three coefficients are the tool's `fused-raw` fit, which is the
+        // variant `probability` computes: it multiplies the candidate's raw
+        // cosine. The tool fits three other semantic features beside it, and a
+        // fit taken from one of those measures a quantity this function never
+        // forms (#8).
         Self {
             enabled: true,
-            semantic: 13.878,
-            keyword: 13.571,
-            intercept: -5.848,
+            semantic: 20.777,
+            keyword: 13.377,
+            intercept: -8.762,
             floor: 0.75,
         }
     }
@@ -1294,6 +1302,19 @@ fn section_note(path: &str) -> Option<&'static str> {
         // The numbers are one embedder's fit, and nothing in the file says so
         // (#103). A user who changes `models.embed` keeps a floor read off a
         // scale that is gone, and the failure is quiet.
+        // Both templates and the field they fill are one family's, and nothing
+        // in the file says so (#8). Point `models.embed` at another family and
+        // every key here stops doing anything, quietly.
+        "embedding_prompt" => Some(
+            "These templates are EmbeddingGemma's, the embedder this build\n\
+             installs. The query and document templates are the two halves of\n\
+             its documented pair, and document_title fills a title: field that\n\
+             only its document template has.\n\
+             \n\
+             Point models.embed at another family and every key here stops\n\
+             doing anything. Qwen3-Embedding, for one, takes its instruct on\n\
+             the query alone and embeds a document as itself.",
+        ),
         "calibrated" => Some(
             "These coefficients and this floor are fit against EmbeddingGemma,\n\
              the embedder this build installs. They are one fit: cosine is one\n\
@@ -1309,6 +1330,57 @@ fn section_note(path: &str) -> Option<&'static str> {
     }
 }
 
+/// Commented lines written under a section's own keys.
+///
+/// A note goes above the header and a trailer below the keys, and the
+/// difference decides what an uncommented line does. A key uncommented above
+/// a header lands in whichever table precedes it, so anything a reader is
+/// invited to switch on has to sit under the header it belongs to.
+fn section_trailer(path: &str) -> Option<&'static str> {
+    match path {
+        // The shipped numbers are one embedder's, and a user who changes
+        // `models.embed` is told to refit. For the two embedders `models list`
+        // offers beside the default, the fit is already taken, so the file
+        // carries it and the refit is a line to uncomment (#8).
+        "calibrated" => Some(
+            "Fits for the other embedders `knapper models list` offers, taken\n\
+             on one corpus and one query pool with\n\
+             scripts/calibrated-fusion-eval.py. Uncomment one block, and set\n\
+             models.embed to the model that block names. The four numbers of a\n\
+             block move together. Two live blocks set one key twice, which is a\n\
+             TOML error.\n\
+             \n\
+             Qwen3-Embedding-0.6B\n\
+             hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf\n\
+             semantic = 17.197\n\
+             keyword = 12.181\n\
+             intercept = -9.057\n\
+             floor = 0.78\n\
+             \n\
+             Qwen3-Embedding-4B\n\
+             hf:Qwen/Qwen3-Embedding-4B-GGUF/Qwen3-Embedding-4B-Q8_0.gguf\n\
+             semantic = 11.618\n\
+             keyword = 11.298\n\
+             intercept = -6.419\n\
+             floor = 0.76",
+        ),
+        _ => None,
+    }
+}
+
+/// Write one comment block, one `# ` per line.
+///
+/// A bare `#` for a blank line: a trailing space is invisible in the file and
+/// visible in every diff of it.
+fn push_comment_block(out: &mut String, text: &str) {
+    for line in text.lines() {
+        match line.trim_start() {
+            "" => out.push_str("#\n"),
+            body => out.push_str(&format!("# {body}\n")),
+        }
+    }
+}
+
 /// A config file holding every default, commented out.
 ///
 /// The section headers stay live and only the key lines are commented, so
@@ -1320,8 +1392,19 @@ fn commented_defaults() -> Result<String> {
     let mut out = String::with_capacity(CONFIG_BANNER.len() + body.len() * 2);
     out.push_str(CONFIG_BANNER);
     let mut emitted: Vec<String> = Vec::new();
+    // A trailer belongs under its own section's keys, so it is held until the
+    // next header arrives — and the blank lines that separate two sections are
+    // held with it, or the trailer would print against the next header instead
+    // of the keys it describes.
+    let mut open_section = String::new();
+    let mut blanks = 0usize;
     for line in body.lines() {
         if let Some(path) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            if let Some(trailer) = section_trailer(&open_section) {
+                push_comment_block(&mut out, trailer);
+            }
+            out.push_str(&"\n".repeat(blanks));
+            blanks = 0;
             // `to_string_pretty` writes `[models.embed_api]` and no `[models]`,
             // because `models` holds no key of its own. Write the parent too:
             // a table the file already names is one no save has to create, and
@@ -1339,24 +1422,25 @@ fn commented_defaults() -> Result<String> {
             }
             emitted.push(path.to_string());
             if let Some(note) = section_note(path) {
-                for note_line in note.lines() {
-                    // A bare `#` for a blank line: a trailing space is
-                    // invisible in the file and visible in every diff of it.
-                    match note_line.trim_start() {
-                        "" => out.push_str("#\n"),
-                        text => out.push_str(&format!("# {text}\n")),
-                    }
-                }
+                push_comment_block(&mut out, note);
             }
             out.push_str(line);
+            out.push('\n');
+            open_section = path.to_string();
+        } else if line.is_empty() {
+            blanks += 1;
         } else {
-            if !line.is_empty() {
-                out.push_str("# ");
-            }
+            out.push_str(&"\n".repeat(blanks));
+            blanks = 0;
+            out.push_str("# ");
             out.push_str(line);
+            out.push('\n');
         }
-        out.push('\n');
     }
+    if let Some(trailer) = section_trailer(&open_section) {
+        push_comment_block(&mut out, trailer);
+    }
+    out.push_str(&"\n".repeat(blanks));
     Ok(out)
 }
 
@@ -2111,9 +2195,9 @@ vault_purpose = "notes"
     fn calibrated_defaults_are_the_pin_fit() {
         let c = CalibratedConfig::default();
         assert!(c.enabled);
-        assert_eq!(c.semantic, 13.878);
-        assert_eq!(c.keyword, 13.571);
-        assert_eq!(c.intercept, -5.848);
+        assert_eq!(c.semantic, 20.777);
+        assert_eq!(c.keyword, 13.377);
+        assert_eq!(c.intercept, -8.762);
         assert_eq!(c.floor, 0.75);
     }
 
@@ -2346,6 +2430,57 @@ answer_floor = 0.5
         assert!(
             note.contains("refit"),
             "the note says what a different embedder costs: {note}"
+        );
+        assert!(
+            note.lines().all(|l| l.starts_with('#')),
+            "every note line is a comment: {note}"
+        );
+    }
+
+    /// A fit for another embedder is only useful where uncommenting it sets
+    /// the key. Above the header the same line sets it in the table before,
+    /// which is the trap the note/trailer split exists for (#8).
+    #[test]
+    fn the_calibrated_section_carries_a_fit_for_every_catalogued_embedder() {
+        let text = commented_defaults().unwrap();
+        let (_, after) = text.split_once("[calibrated]").expect("a header: {text}");
+        let section = after.split("\n[").next().expect("text after the header");
+
+        for model in ["Qwen3-Embedding-0.6B", "Qwen3-Embedding-4B"] {
+            assert!(
+                section.contains(model),
+                "a fit for {model} sits under the header: {section}"
+            );
+        }
+        assert!(
+            section.matches("# semantic = ").count() == 3,
+            "the shipped fit and one per catalogued alternative: {section}"
+        );
+        assert!(
+            section.lines().all(|l| l.is_empty() || l.starts_with('#')),
+            "every line under the header is commented: {section}"
+        );
+    }
+
+    /// `[embedding_prompt]` is one family's templates, and the file has to say
+    /// so (#8). Both templates and the `title:` field they fill are
+    /// EmbeddingGemma's; point `models.embed` at Qwen3-Embedding and every key
+    /// in the section stops doing anything, with nothing in the output to show
+    /// it.
+    #[test]
+    fn the_embedding_prompt_section_names_the_family_it_belongs_to() {
+        let text = commented_defaults().unwrap();
+        let (before, _) = text
+            .split_once("[embedding_prompt]")
+            .expect("a header: {text}");
+        let note = before
+            .rsplit("\n\n")
+            .next()
+            .expect("text before the header");
+
+        assert!(
+            note.contains("EmbeddingGemma"),
+            "the note names the family: {note}"
         );
         assert!(
             note.lines().all(|l| l.starts_with('#')),

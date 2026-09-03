@@ -736,6 +736,16 @@ Search returns **sections**. A note whose "Counterspell" and "Dispel Magic" sect
 
 `embedding_prefix` puts the document's name, path, tags, aliases and the chunk's ancestor headings into the text that is **embedded**, while what is stored, displayed and keyword-matched stays the raw chunk. It is off by default: because the prefix is the same string for every chunk of a document, it separates documents from each other at the cost of separating a document's own sections, and on the test vault that lost more on exact-name lookup than it gained on conceptual queries (`eval/probes.md`). Each component is switchable so the trade can be measured per vault.
 
+`models.embed` also takes another **local** GGUF. `knapper models list` names the ones that are known to work, and any `hf:<repo>/<file>.gguf` beyond them is accepted — the output width, the input context and the prompt template all come from the model itself, so nothing else has to be told what changed:
+
+| model | dim | context | download | |
+|---|---|---|---|---|
+| `embeddinggemma-300M-Q8_0` | 768 | 2 048 | 334 MB | default |
+| `Qwen3-Embedding-0.6B-Q8_0` | 1 024 | 32 768 | 639 MB | runs on CPU |
+| `Qwen3-Embedding-4B-Q8_0` | 2 560 | 40 960 | 4.28 GB | wants a GPU |
+
+Taking one of the Qwen rows costs two things. The store re-indexes at the new width, because the embedder is a fingerprint component and the vector table is declared at the model's dimension. And `[calibrated]`'s four numbers stay EmbeddingGemma's fit — see the calibration note above — so refit them with `scripts/calibrated-fusion-eval.py`, set `[calibrated] floor = 0.0`, or configure a cross-encoder, which sorts instead and makes the section inert. `[embedding_prompt]` is EmbeddingGemma's pair of templates and does nothing under another family: Qwen3-Embedding takes its instruct on the query alone and embeds a document as itself.
+
 `models.embed` takes a hosted provider as well as a local GGUF: `gemini:<versioned-id>` routes embedding to the Gemini API, reading the key from `GEMINI_API_KEY` — environment only, never written to config. The id has to end in a version number, so a moving alias cannot silently re-point an existing store's vectors. Documents batch at 100 per request and inputs are capped at 2048 tokens; `[models.embed_api]` bounds the call and can truncate the 3072-wide output. The embedder is a fingerprint component, so switching re-indexes the vault — and see the calibration note above: the model-free floor is fit against the local embedder, so a hosted one wants `[calibrated] floor = 0.0` or a refit.
 
 The keyword lane indexes each chunk's **full text**. `chunks.snippet` — the leading 200 characters — is the display field only; it is not what BM25 searches.

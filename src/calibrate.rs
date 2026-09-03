@@ -101,8 +101,8 @@ mod tests {
             "no evidence is not an answer"
         );
         assert!(probability(1.0, 1.0, &p) > 0.99, "full evidence saturates");
-        // sigma(-5.848) = 0.00288...
-        assert!((probability(0.0, 0.0, &p) - 0.00288).abs() < 1e-4);
+        // sigma(-8.762) = 0.00015643...
+        assert!((probability(0.0, 0.0, &p) - 0.00015643).abs() < 1e-6);
     }
 
     #[test]

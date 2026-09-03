@@ -259,6 +259,38 @@ impl EmbedTask {
     }
 }
 
+/// Which llama.cpp forward pass an embedding model's graph needs (issue #8).
+///
+/// The two are not interchangeable, and picking the wrong one is a segfault
+/// rather than a bad number. `llama_context::encode` runs the graph with a
+/// **null** memory context, because an encoder needs no KV cache; a model whose
+/// graph opens with `build_attn_inp_kv()` dereferences that null. `decode`
+/// supplies the cache.
+///
+/// llama.cpp's own `llama_model_has_encoder` answers a narrower question — it
+/// is true for T5 alone — so it cannot be the predicate here: it would send
+/// EmbeddingGemma down the decoder pass too, and that is the shipped default's
+/// path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForwardPass {
+    /// `llama_context::encode` — a non-causal graph that builds no cache.
+    Encode,
+    /// `llama_context::decode` — a causal graph that reads a KV cache.
+    Decode,
+}
+
+/// The task a Qwen3-Embedding query names (issue #8).
+///
+/// The model card's own default, verbatim. Qwen documents the instruct as
+/// something to write for your own task, and reports its retrieval numbers
+/// against this string — so a vault-specific rewording is an unmeasured
+/// deviation from the only phrasing the model was published with.
+///
+/// It is query-side. It reaches no fingerprint, so changing it re-indexes
+/// nothing and a sweep costs one search each.
+const QWEN_RETRIEVAL_TASK: &str =
+    "Given a web search query, retrieve relevant passages that answer the query";
+
 /// Model-family-specific prompt templates for embedding models.
 #[derive(Debug, Clone)]
 pub enum PromptFormat {
@@ -294,8 +326,50 @@ impl PromptFormat {
             Self::EmbeddingGemma { document } => {
                 format!("embeddinggemma/{}", document.id())
             }
-            Self::QwenEmbedding => "qwen-embedding".to_string(),
+            Self::QwenEmbedding => "qwen-embedding/text".to_string(),
             Self::Raw => "raw".to_string(),
+        }
+    }
+
+    /// Which llama.cpp forward pass this family's graph needs (issue #8).
+    ///
+    /// - [`Self::EmbeddingGemma`] builds `build_attn_inp_no_cache()`
+    ///   (llama.cpp `src/models/gemma-embedding.cpp`), so `encode` is right and
+    ///   is what every stored vector was produced by.
+    /// - [`Self::QwenEmbedding`] is decoder-only: `llm_build_qwen3` opens with
+    ///   `build_attn_inp_kv()` (`src/models/qwen3.cpp`), and `encode` passes a
+    ///   null memory context into it.
+    /// - [`Self::Raw`] keeps the pass it has always had. An unknown model that
+    ///   needs the other one is why this is a family decision and not a guess.
+    fn forward_pass(&self) -> ForwardPass {
+        match self {
+            Self::EmbeddingGemma { .. } | Self::Raw => ForwardPass::Encode,
+            Self::QwenEmbedding => ForwardPass::Decode,
+        }
+    }
+
+    /// Which special tokens llama.cpp adds of its own when it tokenizes for
+    /// this family (issue #8).
+    ///
+    /// The name of `str_to_token`'s argument is narrower than what it does:
+    /// `AddBos` is llama.cpp's `add_special`, and that flag gates the model's
+    /// declared *trailing EOS* as well as its leading BOS. Which one a family
+    /// wants follows from how it pools.
+    ///
+    /// - [`Self::EmbeddingGemma`] pools the mean, and writes its own `<bos>`
+    ///   into the template — `parse_special` turns the literal into the real
+    ///   token. Asking llama.cpp for the GGUF's own would give it a second BOS
+    ///   and change every stored vector, so this stays `Never`.
+    /// - [`Self::QwenEmbedding`] pools the **last** token. Its GGUF declares
+    ///   `add_bos_token = false, add_eos_token = true`, so asking for the
+    ///   model's own tokens appends exactly the EOS that pooling reads and no
+    ///   BOS. Without it llama.cpp pools the last token of the *content*.
+    /// - [`Self::Raw`] is an unknown model with no template, so it gets no
+    ///   tokens it did not ask for.
+    fn add_special(&self) -> AddBos {
+        match self {
+            Self::EmbeddingGemma { .. } | Self::Raw => AddBos::Never,
+            Self::QwenEmbedding => AddBos::Always,
         }
     }
 
@@ -314,7 +388,7 @@ impl PromptFormat {
                 other => format!("<bos>task: {} | query: {query}", other.description()),
             },
             Self::QwenEmbedding => {
-                format!("Instruct: Retrieve relevant passages\nQuery: {query}")
+                format!("Instruct: {QWEN_RETRIEVAL_TASK}\nQuery:{query}")
             }
             Self::Raw => query.to_string(),
         }
@@ -341,7 +415,13 @@ impl PromptFormat {
                 };
                 format!("<bos>title: {title} | text: {text}")
             }
-            Self::QwenEmbedding | Self::Raw => format!("{title}\n{text}"),
+            // Qwen3-Embedding embeds a document as itself: the model card
+            // gives the instruct to the *query* half alone, and there is no
+            // `title:` field to put a breadcrumb in. Gluing one on invents a
+            // format the card does not have, and at the shipped
+            // `document_title = none` it wrote a leading blank line.
+            Self::QwenEmbedding => text.to_string(),
+            Self::Raw => format!("{title}\n{text}"),
         }
     }
 }
@@ -1028,6 +1108,61 @@ impl Default for ModelDefaults {
     }
 }
 
+/// One embedder `knapper models` offers (issue #8).
+///
+/// The catalogue is a menu, not a policy: every row is something
+/// `models.embed` accepts, the first is the shipped default, and choosing
+/// another is the user's call. Nothing here decides what loads — the width,
+/// the context and the prompt format all come from the GGUF and its filename
+/// at load time (issue #12), and the numbers below are what that model reports
+/// so a user can choose before downloading 4 GB.
+pub struct KnownEmbedder {
+    /// What goes in `models.embed`.
+    pub uri: &'static str,
+    /// The model's native output width, as its GGUF declares it.
+    pub dim: usize,
+    /// The model's training context length, in tokens.
+    pub context: usize,
+    /// The GGUF's size on disk, for the first-use download.
+    pub download: &'static str,
+    /// One line on what taking this row costs.
+    pub note: &'static str,
+}
+
+/// The embedders `models list` offers.
+///
+/// Taking a row that is not the first has two costs, and both fire at runtime
+/// as well: the store re-indexes at the new width, because
+/// `embedding_fingerprint` and the vec table both move; and `[calibrated]`'s
+/// four numbers are EmbeddingGemma's fit, so the model-free ranking path runs
+/// a floor read off a scale that is gone until you refit or configure a
+/// cross-encoder.
+pub fn known_embedders() -> &'static [KnownEmbedder] {
+    &[
+        KnownEmbedder {
+            uri: "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf",
+            dim: 768,
+            context: 2048,
+            download: "334 MB",
+            note: "Default. The embedder [calibrated] is fit against.",
+        },
+        KnownEmbedder {
+            uri: "hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf",
+            dim: 1024,
+            context: 32768,
+            download: "639 MB",
+            note: "Runs on CPU. Re-indexes at 1024; refit [calibrated].",
+        },
+        KnownEmbedder {
+            uri: "hf:Qwen/Qwen3-Embedding-4B-GGUF/Qwen3-Embedding-4B-Q8_0.gguf",
+            dim: 2560,
+            context: 40960,
+            download: "4.28 GB",
+            note: "Wants a GPU. Re-indexes at 2560; refit [calibrated].",
+        },
+    ]
+}
+
 /// The embed model name `status` reports: the configured `models.embed`, or
 /// the shipped default when none is set. An `hf:` URI or a bare path reduces
 /// to the model file's stem, because the rest of the URI names a download
@@ -1297,13 +1432,18 @@ impl LlamaEmbed {
 
         // Tokenize up front: the context has to be sized to the longest input
         // in the batch before any of them can be encoded.
-        // Use AddBos::Never because PromptFormat already adds <bos> for embeddinggemma.
+        //
+        // The flag is llama.cpp's `add_special`, and which tokens a family
+        // wants is [`PromptFormat::add_special`]'s decision (#8): EmbeddingGemma
+        // writes its own `<bos>` into the template, and Qwen3-Embedding needs
+        // the GGUF's trailing EOS because it pools the last token.
+        let add_special = self.prompt_format.add_special();
         let tokenized = texts
             .iter()
             .map(|text| {
                 let tokens = self
                     .model
-                    .str_to_token(text, AddBos::Never)
+                    .str_to_token(text, add_special)
                     .map_err(|e| anyhow::anyhow!("tokenization failed: {e}"))?;
                 if tokens.is_empty() {
                     bail!("tokenizer returned empty token sequence");
@@ -1348,9 +1488,17 @@ impl LlamaEmbed {
                 .add_sequence(tokens, 0, true)
                 .map_err(|e| anyhow::anyhow!("adding sequence to batch: {e}"))?;
 
-            // Encode (compute embeddings). Use encode() for embedding models.
-            ctx.encode(&mut batch)
-                .map_err(|e| anyhow::anyhow!("embedding encode failed: {e}"))?;
+            // Which pass runs is the model family's, not a constant (#8).
+            // `encode` hands the graph a null memory context, which a
+            // decoder-only embedder dereferences — see [`ForwardPass`].
+            match self.prompt_format.forward_pass() {
+                ForwardPass::Encode => ctx
+                    .encode(&mut batch)
+                    .map_err(|e| anyhow::anyhow!("embedding encode failed: {e}"))?,
+                ForwardPass::Decode => ctx
+                    .decode(&mut batch)
+                    .map_err(|e| anyhow::anyhow!("embedding decode failed: {e}"))?,
+            }
 
             // Get embeddings for sequence 0 (mean pooled by llama.cpp).
             let embeddings = ctx
@@ -1973,26 +2121,183 @@ mod tests {
     }
 
     #[test]
-    fn test_prompt_format_qwen_embedding() {
-        let fmt = PromptFormat::detect("qwen-embed-v2.gguf", DocumentTemplate::Documented);
-        let formatted = fmt.format_query("find me something", EmbedTask::SearchResult);
-        assert!(formatted.contains("Instruct:"));
-        assert!(formatted.contains("Query:"));
-        assert!(formatted.contains("find me something"));
-    }
-
-    #[test]
-    fn test_prompt_format_qwen_document() {
-        let fmt = PromptFormat::detect("qwen-embed-v2.gguf", DocumentTemplate::Documented);
-        let formatted = fmt.format_document("Title", "Body text");
-        assert_eq!(formatted, "Title\nBody text");
-    }
-
-    #[test]
     fn test_prompt_format_raw_document() {
         let fmt = PromptFormat::detect("random-model.gguf", DocumentTemplate::Documented);
         let formatted = fmt.format_document("Title", "Body");
         assert_eq!(formatted, "Title\nBody");
+    }
+
+    // ── The Qwen3 embedding family (#8) ────────────────────────────────────
+    //
+    // The family is an *option*, not a default: `models.embed` points at it
+    // and everything else — the width, the fingerprint, the re-index — falls
+    // out of the model's own GGUF. What does not fall out is the special-token
+    // policy. `str_to_token`'s `AddBos` is llama.cpp's `add_special`, which
+    // gates the trailing EOS as well as the leading BOS, and Qwen3-Embedding
+    // pools the **last** token: with no EOS appended, llama.cpp pools the last
+    // token of the content instead. Its GGUF declares
+    // `add_bos_token = false, add_eos_token = true`, so asking llama.cpp for
+    // the model's own special tokens adds exactly that EOS and no BOS.
+
+    fn qwen3(file: &str) -> PromptFormat {
+        PromptFormat::detect(file, DocumentTemplate::Documented)
+    }
+
+    #[test]
+    fn the_shipped_qwen3_embedding_files_detect_as_the_qwen_family() {
+        for file in [
+            "Qwen3-Embedding-0.6B-Q8_0.gguf",
+            "Qwen3-Embedding-4B-Q8_0.gguf",
+            "Qwen3-Embedding-0.6B-f16.gguf",
+        ] {
+            assert!(
+                matches!(qwen3(file), PromptFormat::QwenEmbedding),
+                "{file} should detect as the Qwen embedding family"
+            );
+        }
+    }
+
+    #[test]
+    fn the_qwen_reranker_is_not_an_embedding_model() {
+        assert!(
+            matches!(qwen3("qwen3-reranker-0.6b-q8_0.gguf"), PromptFormat::Raw),
+            "the cross-encoder shares the vendor and not the format"
+        );
+    }
+
+    #[test]
+    fn qwen_asks_llama_cpp_for_the_models_own_special_tokens() {
+        assert_eq!(
+            qwen3("Qwen3-Embedding-0.6B-Q8_0.gguf").add_special(),
+            AddBos::Always,
+            "last-token pooling needs the GGUF's trailing EOS"
+        );
+    }
+
+    #[test]
+    fn qwen_runs_the_decoder_pass_because_its_graph_needs_a_kv_cache() {
+        assert_eq!(
+            qwen3("Qwen3-Embedding-0.6B-Q8_0.gguf").forward_pass(),
+            ForwardPass::Decode,
+            "encode() hands the graph a null memory context and qwen3 dereferences it"
+        );
+    }
+
+    #[test]
+    fn embeddinggemma_runs_the_encoder_pass_it_has_always_run() {
+        assert_eq!(
+            gemma(DocumentTemplate::Documented).forward_pass(),
+            ForwardPass::Encode,
+            "its graph builds no cache, and this is the shipped default's path"
+        );
+    }
+
+    #[test]
+    fn an_unrecognised_model_keeps_the_encoder_pass() {
+        assert_eq!(
+            qwen3("random-model.gguf").forward_pass(),
+            ForwardPass::Encode
+        );
+    }
+
+    #[test]
+    fn embeddinggemma_writes_its_own_bos_and_asks_for_no_others() {
+        assert_eq!(
+            gemma(DocumentTemplate::Documented).add_special(),
+            AddBos::Never,
+            "the template writes <bos> literally; a second one would change every stored vector"
+        );
+    }
+
+    #[test]
+    fn an_unrecognised_model_asks_for_no_special_tokens() {
+        assert_eq!(qwen3("random-model.gguf").add_special(), AddBos::Never);
+    }
+
+    #[test]
+    fn the_qwen_query_template_is_the_model_cards() {
+        assert_eq!(
+            qwen3("Qwen3-Embedding-0.6B-Q8_0.gguf")
+                .format_query("who guards the gate", EmbedTask::SearchResult),
+            "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:who guards the gate"
+        );
+    }
+
+    #[test]
+    fn the_qwen_query_template_ignores_the_gemma_task_setting() {
+        let fmt = qwen3("Qwen3-Embedding-0.6B-Q8_0.gguf");
+        assert_eq!(
+            fmt.format_query("who guards the gate", EmbedTask::Legacy),
+            fmt.format_query("who guards the gate", EmbedTask::SearchResult),
+            "[embedding_prompt] is EmbeddingGemma's and reaches no other family"
+        );
+    }
+
+    #[test]
+    fn a_qwen_document_is_its_text_and_nothing_else() {
+        let fmt = qwen3("Qwen3-Embedding-0.6B-Q8_0.gguf");
+        assert_eq!(fmt.format_document("", "Body text"), "Body text");
+        assert_eq!(
+            fmt.format_document("Note Title > H1", "Body text"),
+            "Body text",
+            "the title: field is a slot in Gemma's template and Qwen has none"
+        );
+    }
+
+    // ── The embedder catalogue (#8) ────────────────────────────────────────
+
+    #[test]
+    fn the_catalogues_first_row_is_the_shipped_default() {
+        assert_eq!(
+            known_embedders()[0].uri,
+            ModelDefaults::default().embed_uri,
+            "one table names the default, or `models list` drifts from what loads"
+        );
+    }
+
+    #[test]
+    fn every_catalogued_embedder_is_a_uri_the_loader_can_parse() {
+        for e in known_embedders() {
+            HfModelUri::parse(e.uri).unwrap_or_else(|err| panic!("{}: {err}", e.uri));
+        }
+    }
+
+    #[test]
+    fn every_catalogued_embedder_detects_a_prompt_format_of_its_own() {
+        for e in known_embedders() {
+            let file = HfModelUri::parse(e.uri).unwrap().filename;
+            assert!(
+                !matches!(
+                    PromptFormat::detect(&file, DocumentTemplate::Documented),
+                    PromptFormat::Raw
+                ),
+                "{file} falls through to the raw format, which embeds it unprompted"
+            );
+        }
+    }
+
+    #[test]
+    fn the_catalogue_offers_both_qwen3_embedders() {
+        let dims: Vec<usize> = known_embedders()
+            .iter()
+            .filter(|e| e.uri.contains("Qwen3-Embedding"))
+            .map(|e| e.dim)
+            .collect();
+        assert_eq!(
+            dims,
+            vec![1024, 2560],
+            "the 0.6B and the 4B, at their native widths"
+        );
+    }
+
+    #[test]
+    fn the_qwen_template_id_is_not_the_one_the_title_glue_wrote() {
+        let id = qwen3("Qwen3-Embedding-0.6B-Q8_0.gguf").template_id();
+        assert_ne!(
+            id, "qwen-embedding",
+            "a store built under the old document template must re-index"
+        );
+        assert!(id.starts_with("qwen-embedding/"), "got {id}");
     }
 
     // ── The documented EmbeddingGemma templates (#10) ──────────────────────
