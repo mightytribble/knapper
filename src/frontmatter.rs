@@ -11,6 +11,7 @@
 //! byte for byte. A block nothing edited therefore renders what it parsed
 //! (#92).
 
+use crate::markdown::{lines_with_endings, newline_of};
 use anyhow::{Result, bail};
 
 /// How a list is written in the block.
@@ -479,30 +480,6 @@ impl Block {
 }
 
 // ── Parsing ──────────────────────────────────────────────────────
-
-/// The line ending a text uses: CRLF when its first break is one.
-fn newline_of(text: &str) -> &'static str {
-    match text.find('\n') {
-        Some(i) if i > 0 && text.as_bytes()[i - 1] == b'\r' => "\r\n",
-        _ => "\n",
-    }
-}
-
-/// Split `text` into lines, each keeping its own line ending.
-fn lines_with_endings(text: &str) -> Vec<&str> {
-    let mut out = Vec::new();
-    let mut start = 0;
-    for (i, b) in text.bytes().enumerate() {
-        if b == b'\n' {
-            out.push(&text[start..=i]);
-            start = i + 1;
-        }
-    }
-    if start < text.len() {
-        out.push(&text[start..]);
-    }
-    out
-}
 
 fn strip_ending(line: &str) -> &str {
     line.trim_end_matches(['\n', '\r'])
