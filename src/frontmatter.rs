@@ -23,6 +23,18 @@ pub enum ListStyle {
     Block { indent: usize },
 }
 
+/// Which quote character a fresh value takes when it needs quoting. YAML
+/// has two, and they spell the same string: `'single'` escapes only its own
+/// quote, by doubling it, and `"double"` escapes with a backslash. A vault
+/// writes one of them — Obsidian's own property writer emits `"` — and a
+/// value re-serialised in the other one changes a line that holds the same
+/// value, which is diff churn in a tracked vault (#112).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuoteStyle {
+    Single,
+    Double,
+}
+
 /// What an entry's value is, as far as an edit can address it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Value {
@@ -85,11 +97,11 @@ impl ListItem {
     }
 
     /// The item's rendered text: its own source when it has one, else fresh
-    /// through `yaml_scalar`.
-    fn render(&self) -> String {
+    /// through `yaml_scalar` in the block's own quote style.
+    fn render(&self, quotes: QuoteStyle) -> String {
         match &self.source {
             Some(source) => source.clone(),
-            None => yaml_scalar(&self.value),
+            None => yaml_scalar(&self.value, quotes),
         }
     }
 
@@ -108,12 +120,12 @@ impl ListItem {
     /// inside `[...]`, because a fallback that renders the value the same
     /// way the failed check just read it reproduces the same corruption
     /// (#92, C2; R1 regression).
-    fn render_in_flow(&self) -> String {
-        let text = self.render();
+    fn render_in_flow(&self, quotes: QuoteStyle) -> String {
+        let text = self.render(quotes);
         if reparses_to_one_flow_item(&text, &self.value) {
             text
         } else {
-            flow_safe_scalar(&self.value)
+            flow_safe_scalar(&self.value, quotes)
         }
     }
 }
@@ -260,10 +272,12 @@ impl Block {
         self.items_of(key).into_iter().map(|i| i.value).collect()
     }
 
-    /// Write `key` as a scalar, quoted when YAML needs it.
+    /// Write `key` as a scalar, quoted when YAML needs it, in the quote
+    /// character the key already used.
     pub fn set_scalar(&mut self, key: &str, value: &str) -> Result<()> {
         self.check_editable(key)?;
-        let text = format!("{key}: {}{}", yaml_scalar(value), self.newline);
+        let quotes = self.quote_style_for(key);
+        let text = format!("{key}: {}{}", yaml_scalar(value, quotes), self.newline);
         self.put(key, text, Value::Scalar);
         Ok(())
     }
@@ -283,8 +297,9 @@ impl Block {
     /// null.
     pub fn set_list(&mut self, key: &str, items: &[String]) -> Result<()> {
         let style = self.list_style_for(key)?;
+        let quotes = self.quote_style_for(key);
         let items: Vec<ListItem> = items.iter().cloned().map(ListItem::fresh).collect();
-        let text = self.render_list(key, &items, style);
+        let text = self.render_list(key, &items, style, quotes);
         self.put(key, text, Value::List(style));
         Ok(())
     }
@@ -295,12 +310,13 @@ impl Block {
     /// only the added item is serialised through `yaml_scalar`.
     pub fn add_to_list(&mut self, key: &str, item: &str) -> Result<()> {
         let style = self.list_style_for(key)?;
+        let quotes = self.quote_style_for(key);
         let mut items = self.items_of(key);
         if items.iter().any(|i| i.value == item) {
             return Ok(());
         }
         items.push(ListItem::fresh(item.to_string()));
-        let text = self.render_list(key, &items, style);
+        let text = self.render_list(key, &items, style, quotes);
         self.put(key, text, Value::List(style));
         Ok(())
     }
@@ -326,9 +342,10 @@ impl Block {
             return Ok(());
         }
         let style = self.list_style_for(key)?;
+        let quotes = self.quote_style_for(key);
         let mut items = self.items_of(key);
         items.retain(|i| i.value != item);
-        let text = self.render_list(key, &items, style);
+        let text = self.render_list(key, &items, style, quotes);
         self.put(key, text, Value::List(style));
         Ok(())
     }
@@ -399,6 +416,30 @@ impl Block {
             .unwrap_or(ListStyle::Block { indent: 2 })
     }
 
+    /// The quote character a fresh value written under `key` takes: the one
+    /// `key`'s own values already use, else the first one the block uses
+    /// anywhere, else `"` — which is what Obsidian's own property writer
+    /// emits, and so what a vault this tool is a guest in most often holds.
+    /// It is the ladder `list_style_for` walks for inline-versus-block, for
+    /// the same reason: a write matches what the file already says (#112).
+    fn quote_style_for(&self, key: &str) -> QuoteStyle {
+        quote_style_of(&self.items_of(key)).unwrap_or_else(|| self.new_quote_style())
+    }
+
+    /// The first quote character the block uses, reading its entries in
+    /// order. `None` from every one of them means the block quotes nothing,
+    /// and the default answers.
+    fn new_quote_style(&self) -> QuoteStyle {
+        self.items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Entry { key, .. } => quote_style_of(&self.items_of(key)),
+                Item::Filler(_) => None,
+            })
+            .next()
+            .unwrap_or(QuoteStyle::Double)
+    }
+
     /// The items `key` holds: its list's, or its scalar as one item, or none.
     /// Each keeps the source text that reproduces it.
     fn items_of(&self, key: &str) -> Vec<ListItem> {
@@ -443,13 +484,19 @@ impl Block {
         }
     }
 
-    fn render_list(&self, key: &str, items: &[ListItem], style: ListStyle) -> String {
+    fn render_list(
+        &self,
+        key: &str,
+        items: &[ListItem],
+        style: ListStyle,
+        quotes: QuoteStyle,
+    ) -> String {
         if items.is_empty() {
             return format!("{key}: []{}", self.newline);
         }
         match style {
             ListStyle::Inline => {
-                let body: Vec<String> = items.iter().map(ListItem::render_in_flow).collect();
+                let body: Vec<String> = items.iter().map(|i| i.render_in_flow(quotes)).collect();
                 format!("{key}: [{}]{}", body.join(", "), self.newline)
             }
             ListStyle::Block { indent } => {
@@ -458,7 +505,7 @@ impl Block {
                 for item in items {
                     out.push_str(&pad);
                     out.push_str("- ");
-                    out.push_str(&item.render());
+                    out.push_str(&item.render(quotes));
                     out.push_str(&self.newline);
                 }
                 out
@@ -739,12 +786,45 @@ fn closing_bracket(head: &str) -> Option<usize> {
     None
 }
 
-/// One scalar as YAML, quoted when it has to be.
-fn yaml_scalar(value: &str) -> String {
-    serde_yaml::to_string(&serde_yaml::Value::String(value.to_string()))
+/// One scalar as YAML, quoted when it has to be, in `style` when there is a
+/// choice. serde_yaml decides *whether* a value needs quoting, which is a
+/// correctness question and stays its; it also always reaches for `'` first,
+/// which is the part `style` overrides. Two answers are not a choice and are
+/// kept whatever `style` says: a value that needs no quotes at all, and a
+/// value serde_yaml did not single-quote, which means single quoting cannot
+/// hold it — they escape nothing, so a line break or a tab has no
+/// single-quoted spelling on one line.
+fn yaml_scalar(value: &str, style: QuoteStyle) -> String {
+    let yaml = serde_yaml::to_string(&serde_yaml::Value::String(value.to_string()))
         .unwrap_or_else(|_| value.to_string())
         .trim_end()
-        .to_string()
+        .to_string();
+    if yaml == value || (style == QuoteStyle::Single && yaml.starts_with('\'')) {
+        return yaml;
+    }
+    double_quoted(value)
+}
+
+/// One scalar as a YAML double-quoted scalar. JSON's string syntax is one —
+/// YAML 1.2 is a superset of JSON, and every escape `serde_json` emits
+/// (`\"`, `\\`, `\n`, `\t`, `\r`, `\b`, `\f`, `\uXXXX`) is one YAML defines —
+/// so the escaping is the serializer's job rather than this module's, and
+/// there is no character it cannot hold.
+fn double_quoted(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| format!("\"{value}\""))
+}
+
+/// The quote character `items` are written in: the first one that carries a
+/// source of its own opening with a quote. Items a write supplied fresh have
+/// no source and say nothing, and neither does an unquoted one.
+fn quote_style_of(items: &[ListItem]) -> Option<QuoteStyle> {
+    items
+        .iter()
+        .find_map(|i| match i.source.as_deref()?.chars().next()? {
+            '\'' => Some(QuoteStyle::Single),
+            '"' => Some(QuoteStyle::Double),
+            _ => None,
+        })
 }
 
 /// Whether `text`, placed inside `[...]`, reparses to exactly one item equal
@@ -764,22 +844,30 @@ fn reparses_to_one_flow_item(text: &str, value: &str) -> bool {
     )
 }
 
-/// `value` as YAML, safe to place inside `[...]`. `yaml_scalar` decides
-/// quoting for a value read alone at the top level, where a comma is
-/// nothing special — it is what a flow item's own source already went
-/// through, and what an unquoted item freshly added to an existing inline
-/// list is rendered through too, so it is exactly the rendering
-/// [`reparses_to_one_flow_item`] just found unsafe. Single-quoting always
+/// `value` as YAML, safe to place inside `[...]`, in `style` where it can
+/// be. `yaml_scalar` decides quoting for a value read alone at the top
+/// level, where a comma is nothing special — it is what a flow item's own
+/// source already went through, and what an unquoted item freshly added to
+/// an existing inline list is rendered through too, so it is exactly the
+/// rendering [`reparses_to_one_flow_item`] just found unsafe. Quoting
 /// closes a flow item against every character flow syntax gives meaning to
-/// — `,`, `#`, `:`, `[`, `]`, `{`, `}` — with only its own quote to escape,
-/// doubled.
-fn flow_safe_scalar(value: &str) -> String {
-    let plain = yaml_scalar(value);
+/// — `,`, `#`, `:`, `[`, `]`, `{`, `}` — so the fallback is the block's own
+/// quote character where that spells the value, and `"` where it does not:
+/// single quoting escapes nothing, so a value carrying a line break has no
+/// single-quoted spelling that reads back as itself, and writing one
+/// silently folded the break into a space.
+fn flow_safe_scalar(value: &str, style: QuoteStyle) -> String {
+    let plain = yaml_scalar(value, style);
     if reparses_to_one_flow_item(&plain, value) {
-        plain
-    } else {
-        format!("'{}'", value.replace('\'', "''"))
+        return plain;
     }
+    if style == QuoteStyle::Single {
+        let single = format!("'{}'", value.replace('\'', "''"));
+        if reparses_to_one_flow_item(&single, value) {
+            return single;
+        }
+    }
+    double_quoted(value)
 }
 
 fn scalar_string(v: &serde_yaml::Value) -> String {
@@ -1196,13 +1284,14 @@ mod tests {
     /// not one, with no error at any point. Reproduced against the exact
     /// input the finding gives: a quoted, commented scalar with a comma,
     /// next to another key already in inline style so the promoted `tags`
-    /// list takes that style too.
+    /// list takes that style too. The promoted item keeps `tags`'s own `"`
+    /// rather than being requoted with `'` (#112).
     #[test]
     fn promoting_a_commented_scalar_holding_a_comma_keeps_it_one_quoted_item() {
         let text = "---\nother: [z]\ntags: \"a, b\" # keep\n---\n\nBody.\n";
         let out = edited(text, |b| b.add_to_list("tags", "new"));
         assert_eq!(
-            out, "---\nother: [z]\ntags: ['a, b', new]\n---\n\nBody.\n",
+            out, "---\nother: [z]\ntags: [\"a, b\", new]\n---\n\nBody.\n",
             "the comma-bearing value must stay one quoted item, not split in two"
         );
         let parsed = assert_block_parses_as_yaml(&out);
@@ -1268,14 +1357,125 @@ mod tests {
     /// shape too. Before the fix, `flow_safe_scalar` did not exist and the
     /// old fallback (`yaml_scalar(&self.value)`) was identical to the text
     /// the check had just rejected, so it changed nothing and the comma
-    /// still leaked through unquoted.
+    /// still leaked through unquoted. The quote character is `"` because
+    /// this block quotes nothing of its own (#112).
     #[test]
     fn a_fresh_value_holding_a_comma_added_to_an_inline_list_is_quoted() {
         let text = "---\naliases: [x]\n---\n";
         assert_eq!(
             edited(text, |b| b.add_to_list("aliases", "Smith, John")),
-            "---\naliases: [x, 'Smith, John']\n---\n"
+            "---\naliases: [x, \"Smith, John\"]\n---\n"
         );
+    }
+
+    /// #112: a vault writes its property values in one quote character —
+    /// Obsidian's own writer emits `"` — and a `replace` re-serialises every
+    /// item of the key it names. The re-emitted items must take the quoting
+    /// the key already used, or every edit writes a changed line for a value
+    /// that did not change.
+    #[test]
+    fn a_replaced_list_keeps_the_double_quotes_the_key_already_used() {
+        let text = "---\nspouse_of: [\"[[Kara]]\"]\nparent_of: [\"[[Isabella]]\"]\n---\n";
+        assert_eq!(
+            edited(text, |b| b.set_list(
+                "parent_of",
+                &["[[Isabella]]".into(), "[[Lucian]]".into()]
+            )),
+            "---\nspouse_of: [\"[[Kara]]\"]\nparent_of: [\"[[Isabella]]\", \"[[Lucian]]\"]\n---\n"
+        );
+    }
+
+    /// The same rule in the other direction: a vault written by a tool that
+    /// prefers `'` keeps `'`, so neither convention churns.
+    #[test]
+    fn a_replaced_list_keeps_the_single_quotes_the_key_already_used() {
+        let text = "---\nparent_of: ['[[Isabella]]']\n---\n";
+        assert_eq!(
+            edited(text, |b| b.set_list("parent_of", &["[[Lucian]]".into()])),
+            "---\nparent_of: ['[[Lucian]]']\n---\n"
+        );
+    }
+
+    /// A key whose own items are all unquoted says nothing about quoting, so
+    /// the block answers instead — the first quoted value it holds, which is
+    /// the ladder `new_list_style` walks for inline-versus-block.
+    #[test]
+    fn a_key_that_quotes_nothing_takes_the_first_quoting_the_block_uses() {
+        let text = "---\nspouse_of: ['[[Kara]]']\ntags: [a]\n---\n";
+        assert_eq!(
+            edited(text, |b| b.add_to_list("tags", "[[Lucian]]")),
+            "---\nspouse_of: ['[[Kara]]']\ntags: [a, '[[Lucian]]']\n---\n"
+        );
+    }
+
+    /// The key wins over the block: `seat` quotes with `'` and is the key
+    /// being written, so `realm`'s `\"` does not decide it.
+    #[test]
+    fn a_key_that_quotes_its_own_value_beats_the_rest_of_the_block() {
+        let text = "---\nrealm: \"New Visland\"\nseat: '[[Kara]]'\n---\n";
+        assert_eq!(
+            edited(text, |b| b.set_scalar("seat", "[[Falconridge]]")),
+            "---\nrealm: \"New Visland\"\nseat: '[[Falconridge]]'\n---\n"
+        );
+    }
+
+    /// A block that quotes nothing at all defaults to `\"`, which is what
+    /// Obsidian's own property writer emits.
+    #[test]
+    fn a_block_that_quotes_nothing_defaults_to_double_quotes() {
+        let text = "---\naliases: [x]\n---\n";
+        assert_eq!(
+            edited(text, |b| b.add_to_list("aliases", "Smith, John")),
+            "---\naliases: [x, \"Smith, John\"]\n---\n"
+        );
+    }
+
+    /// An apostrophe is the character an Obsidian note title actually holds,
+    /// and single quoting is the form that has to double it. Under a
+    /// double-quoted key it is written plainly.
+    #[test]
+    fn an_apostrophe_is_written_plainly_under_double_quotes() {
+        let text = "---\nseat_of: [\"[[Kara]]\"]\n---\n";
+        assert_eq!(
+            edited(text, |b| b
+                .set_list("seat_of", &["[[Dragon's Rest]]".into()])),
+            "---\nseat_of: [\"[[Dragon's Rest]]\"]\n---\n"
+        );
+    }
+
+    /// Whichever quote character a fresh value takes, YAML must read the
+    /// value back unchanged. A double-quoted scalar is written with JSON's
+    /// escaping, which YAML 1.2 accepts; a single-quoted one cannot hold a
+    /// line break or a tab at all, so a value carrying one takes double
+    /// quotes whatever the key prefers.
+    #[test]
+    fn a_fresh_value_survives_whichever_quoting_it_is_given() {
+        for value in [
+            "[[Dragon's Rest]]",
+            "he said \"hi\"",
+            "back\\slash",
+            "a: b, c",
+            "line1\nline2",
+            "tab\there",
+            "#hash",
+            "trailing ",
+        ] {
+            for block in [
+                "---\nk: \"q\"\nother: [x]\n---\n",
+                "---\nk: 'q'\nother: [x]\n---\n",
+                "---\nk: \"q\"\nother:\n  - x\n---\n",
+            ] {
+                let out = edited(block, |b| b.set_list("other", &[value.to_string()]));
+                let parsed = Block::parse(&out)
+                    .unwrap_or_else(|e| panic!("{value:?} wrote unparseable YAML: {out:?}: {e}"))
+                    .expect("a block");
+                assert_eq!(
+                    parsed.list("other"),
+                    vec![value.to_string()],
+                    "{value:?} did not survive {out:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1314,7 +1514,7 @@ mod tests {
         let text = "---\nname: Probe\n---\n";
         assert_eq!(
             edited(text, |b| b.set_scalar("reason", "semantic similarity: 0.5")),
-            "---\nname: Probe\nreason: 'semantic similarity: 0.5'\n---\n"
+            "---\nname: Probe\nreason: \"semantic similarity: 0.5\"\n---\n"
         );
     }
 
@@ -1330,7 +1530,7 @@ mod tests {
     fn a_crlf_block_keeps_crlf_on_the_key_it_gains() {
         assert_eq!(
             edited("---\r\nname: Probe\r\n---\r\n", |b| b.set_scalar("x", "1")),
-            "---\r\nname: Probe\r\nx: '1'\r\n---\r\n"
+            "---\r\nname: Probe\r\nx: \"1\"\r\n---\r\n"
         );
     }
 
@@ -1392,7 +1592,7 @@ mod tests {
         let text = "---\nratings: [1, 2, 3]\n---\n";
         assert_eq!(
             edited(text, |b| b.add_to_list("ratings", "4")),
-            "---\nratings: [1, 2, 3, '4']\n---\n"
+            "---\nratings: [1, 2, 3, \"4\"]\n---\n"
         );
     }
 
