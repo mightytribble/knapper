@@ -5,9 +5,13 @@ Links resolve against https://github.com/mightytribble/knapper.
 
 ## Unreleased
 
+### Removed
+
+- `knapper configure --register <agent>` is gone. It printed MCP setup instructions and set a flag under `[agents]` that nothing ever read, so registering an agent changed no behaviour. The setup instructions live in [install.md](install.md), which now covers Cursor and Windsurf beside Claude Code and Claude Desktop. An `[agents]` block in an existing config is ignored and left in the file. ([`5e6505f`](https://github.com/mightytribble/knapper/commit/5e6505f))
+
 ### Fixed
 
-- The MCP server tells a client which tools it has (#110). The instructions sent on connect named `who`, `project` and `topic`, which no longer exist, and did not name `match`, `properties` or `validate`. The `read` tool's `section` parameter also described output knapper no longer produces: a section read returns the section's body alone, with the heading, its level and its span beside it. The ChatGPT plugin manifest named the same removed tools. ([`005441b`](https://github.com/mightytribble/knapper/commit/005441b))
+- The MCP server now correctly tells a client which tools it has. Future changes to tool surface descriptions are now declared in code, not prose. ([`005441b`](https://github.com/mightytribble/knapper/commit/005441b))
 
 ## 0.9.7 (2026-09-04)
 
