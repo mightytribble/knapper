@@ -147,6 +147,27 @@ const UNRESOLVED_LINKS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS unresolved_lin
 );
 CREATE INDEX IF NOT EXISTS idx_unresolved_file ON unresolved_links(file_id);";
 
+/// Custom properties (#66). One row per value: a frontmatter row sits at
+/// [`DOC_LEVEL`], a Dataview inline field at the chunk that holds it.
+///
+/// `target_file` is the note a `link` row resolves to. It is `SET NULL` and
+/// not `CASCADE`: the property is a fact about the source note, and it
+/// outlives the note it named. The source's own rows cascade off `files(id)`
+/// the way `chunks`, `edges` and `file_tags` do, so no removal path owes
+/// this table a cleanup.
+const PROPERTIES_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS properties (
+    id          INTEGER PRIMARY KEY,
+    file_id     INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    chunk_seq   INTEGER NOT NULL DEFAULT -1,
+    name        TEXT NOT NULL,
+    value       TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    target_file INTEGER REFERENCES files(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_properties_file   ON properties(file_id);
+CREATE INDEX IF NOT EXISTS idx_properties_name   ON properties(name, value);
+CREATE INDEX IF NOT EXISTS idx_properties_target ON properties(target_file);";
+
 /// Reduce a heading to the form two spellings of the same section share.
 ///
 /// Strips the leading `#`s a stored heading carries and a link's does not,
@@ -270,6 +291,54 @@ pub struct IdentityFact {
 pub struct TagCount {
     pub path: String,
     pub display: String,
+    pub note_count: usize,
+}
+
+/// A property row as it is written (#66). One argument rather than five.
+pub struct NewProperty<'a> {
+    /// [`DOC_LEVEL`] for a frontmatter property, else the chunk's `seq`.
+    pub chunk_seq: i64,
+    pub name: &'a str,
+    pub value: &'a str,
+    pub kind: crate::properties::Kind,
+    /// The note a `link` row resolves to, or none when it does not resolve.
+    pub target_file: Option<i64>,
+}
+
+/// A property row as it is read (#66).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PropertyRow {
+    pub chunk_seq: i64,
+    /// The breadcrumb of the chunk that holds a body row. Absent on a
+    /// frontmatter row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heading_path: Option<String>,
+    pub name: String,
+    pub value: String,
+    pub kind: crate::properties::Kind,
+    /// The path of the note a `link` row resolves to. Absent on a row of
+    /// another kind, and on a link that resolves to nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_path: Option<String>,
+}
+
+/// One row of the property registry (#66): a name, how many notes carry it,
+/// the kinds seen, and Obsidian's declared type when `types.json` names it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PropertyCount {
+    pub name: String,
+    pub note_count: usize,
+    pub kinds: Vec<crate::properties::Kind>,
+    /// Filled by `properties::registry`, which reads the vault. The store
+    /// does not.
+    pub declared_type: Option<String>,
+}
+
+/// One distinct value of one property, and how many notes carry it (#66).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ValueCount {
+    pub value: String,
+    pub kind: crate::properties::Kind,
     pub note_count: usize,
 }
 
@@ -776,6 +845,11 @@ impl Store {
             ))?;
         }
         self.conn.execute_batch(UNRESOLVED_LINKS_SCHEMA)?;
+
+        // Custom properties (#66). Created empty; the edge pass fills it, and
+        // the `LINK_RESOLVER_VERSION` bump that shipped with it declares the
+        // rebuild that fills a store an earlier binary built.
+        self.conn.execute_batch(PROPERTIES_SCHEMA)?;
 
         // Migration log table — records PARA migration batch operations.
         self.conn.execute_batch(
@@ -2795,7 +2869,191 @@ impl Store {
         }
         Ok(out)
     }
+}
 
+/// The columns every [`PropertyRow`] reads, over `properties p` joined to
+/// the chunk that holds a body row and the note a link row names.
+const PROPERTY_ROW_SQL: &str = "SELECT p.chunk_seq, c.heading_path, p.name, p.value, p.kind, t.path
+       FROM properties p
+       LEFT JOIN chunks c ON c.file_id = p.file_id AND c.seq = p.chunk_seq
+       LEFT JOIN files t ON t.id = p.target_file";
+
+fn property_row_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<PropertyRow> {
+    let kind: String = row.get(4)?;
+    Ok(PropertyRow {
+        chunk_seq: row.get(0)?,
+        heading_path: row.get(1)?,
+        name: row.get(2)?,
+        value: row.get(3)?,
+        // A kind this build does not know reads as text: it is still a value.
+        kind: crate::properties::Kind::parse(&kind).unwrap_or(crate::properties::Kind::Text),
+        target_path: row.get(5)?,
+    })
+}
+
+impl Store {
+    /// Replace one file's property rows (#66).
+    ///
+    /// Owns the file's rows the way `reconcile_file_tags` owns its tag rows:
+    /// delete, then insert. The edge pass calls this once per file.
+    pub fn replace_file_properties(&self, file_id: i64, rows: &[NewProperty<'_>]) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM properties WHERE file_id = ?1",
+            params![file_id],
+        )?;
+        let mut stmt = self.conn.prepare(
+            "INSERT INTO properties (file_id, chunk_seq, name, value, kind, target_file)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+        for row in rows {
+            stmt.execute(params![
+                file_id,
+                row.chunk_seq,
+                row.name,
+                row.value,
+                row.kind.as_str(),
+                row.target_file
+            ])?;
+        }
+        Ok(())
+    }
+
+    /// Every property row one note holds, frontmatter first, then by chunk.
+    pub fn file_properties(&self, file_id: i64) -> Result<Vec<PropertyRow>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{PROPERTY_ROW_SQL} WHERE p.file_id = ?1 ORDER BY p.chunk_seq, p.name, p.id"
+        ))?;
+        let rows = stmt.query_map(params![file_id], property_row_from)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// The frontmatter rows of each listed note, keyed by file id (#66).
+    ///
+    /// One query for a whole result set. A note with no frontmatter row has
+    /// no entry.
+    pub fn doc_properties_for_files(
+        &self,
+        file_ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, Vec<PropertyRow>>> {
+        let array: rusqlite::vtab::array::Array = std::rc::Rc::new(
+            file_ids
+                .iter()
+                .copied()
+                .map(rusqlite::types::Value::from)
+                .collect(),
+        );
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT p.file_id, p.chunk_seq, c.heading_path, p.name, p.value, p.kind, t.path
+               FROM properties p
+               LEFT JOIN chunks c ON c.file_id = p.file_id AND c.seq = p.chunk_seq
+               LEFT JOIN files t ON t.id = p.target_file
+              WHERE p.chunk_seq = {DOC_LEVEL} AND p.file_id IN rarray(?1)
+              ORDER BY p.file_id, p.name, p.id"
+        ))?;
+        let rows = stmt.query_map(params![array], |row| {
+            let kind: String = row.get(5)?;
+            Ok((
+                row.get::<_, i64>(0)?,
+                PropertyRow {
+                    chunk_seq: row.get(1)?,
+                    heading_path: row.get(2)?,
+                    name: row.get(3)?,
+                    value: row.get(4)?,
+                    kind: crate::properties::Kind::parse(&kind)
+                        .unwrap_or(crate::properties::Kind::Text),
+                    target_path: row.get(6)?,
+                },
+            ))
+        })?;
+        let mut out: std::collections::HashMap<i64, Vec<PropertyRow>> =
+            std::collections::HashMap::new();
+        for row in rows {
+            let (file_id, prop) = row?;
+            out.entry(file_id).or_default().push(prop);
+        }
+        Ok(out)
+    }
+
+    /// One row per property name (#66): how many notes carry it and the
+    /// kinds seen, by note count and then name. `declared_type` is left
+    /// empty; `properties::registry` fills it from the vault.
+    pub fn property_registry(&self) -> Result<Vec<PropertyCount>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT name, COUNT(DISTINCT file_id) AS notes, GROUP_CONCAT(DISTINCT kind)
+               FROM properties GROUP BY name ORDER BY notes DESC, name",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let kinds: String = row.get(2)?;
+            let mut kinds: Vec<crate::properties::Kind> = kinds
+                .split(',')
+                .filter_map(crate::properties::Kind::parse)
+                .collect();
+            kinds.sort_by_key(|k| k.as_str());
+            Ok(PropertyCount {
+                name: row.get(0)?,
+                note_count: row.get::<_, i64>(1)? as usize,
+                kinds,
+                declared_type: None,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// One property's distinct values, each with its kind and the notes
+    /// carrying it, by note count and then value (#66).
+    pub fn property_values(&self, name: &str) -> Result<Vec<ValueCount>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT value, kind, COUNT(DISTINCT file_id) AS notes
+               FROM properties WHERE name = ?1
+              GROUP BY value, kind ORDER BY notes DESC, value",
+        )?;
+        let rows = stmt.query_map(params![name], |row| {
+            let kind: String = row.get(1)?;
+            Ok(ValueCount {
+                value: row.get(0)?,
+                kind: crate::properties::Kind::parse(&kind)
+                    .unwrap_or(crate::properties::Kind::Text),
+                note_count: row.get::<_, i64>(2)? as usize,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// The property names one note files a link to another under (#66).
+    /// Distinct, ordered. Empty when no property carries the link.
+    pub fn property_names_for_link(&self, from_file: i64, to_file: i64) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT name FROM properties
+              WHERE file_id = ?1 AND target_file = ?2 ORDER BY name",
+        )?;
+        let rows = stmt.query_map(params![from_file, to_file], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Empty the table. The edge rebuild calls this beside `clear_edges`.
+    pub fn clear_properties(&self) -> Result<()> {
+        self.conn.execute("DELETE FROM properties", [])?;
+        Ok(())
+    }
+}
+
+impl Store {
     // ── CLI Events ──────────────────────────────────────────────
 
     /// Log a CLI event for observability/analytics.
@@ -6537,6 +6795,181 @@ mod tests {
             "undead.md carries two of them"
         );
         assert!(axes.contains(&("habitat".to_string(), 1)));
+    }
+
+    // ── Custom properties (#66) ──────────────────────────────────
+
+    fn prop<'a>(
+        chunk_seq: i64,
+        name: &'a str,
+        value: &'a str,
+        kind: crate::properties::Kind,
+        target_file: Option<i64>,
+    ) -> NewProperty<'a> {
+        NewProperty {
+            chunk_seq,
+            name,
+            value,
+            kind,
+            target_file,
+        }
+    }
+
+    #[test]
+    fn replacing_a_files_properties_is_idempotent() {
+        use crate::properties::Kind;
+        let store = Store::open_memory().unwrap();
+        let a = store
+            .insert_file("a.md", "h", 0, &generate_docid("a.md"), None, None)
+            .unwrap();
+        let rows = [
+            prop(DOC_LEVEL, "status", "draft", Kind::Text, None),
+            prop(DOC_LEVEL, "rating", "5", Kind::Number, None),
+        ];
+        store.replace_file_properties(a, &rows).unwrap();
+        store.replace_file_properties(a, &rows).unwrap();
+        let got = store.file_properties(a).unwrap();
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(got[0].name, "rating");
+        assert_eq!(got[0].kind, Kind::Number);
+        assert_eq!(got[0].chunk_seq, DOC_LEVEL);
+        assert_eq!(got[0].heading_path, None);
+        assert_eq!(got[1].value, "draft");
+    }
+
+    #[test]
+    fn a_file_removal_cascades_its_property_rows() {
+        use crate::properties::Kind;
+        let store = Store::open_memory().unwrap();
+        let a = store
+            .insert_file("a.md", "h", 0, &generate_docid("a.md"), None, None)
+            .unwrap();
+        store
+            .replace_file_properties(a, &[prop(DOC_LEVEL, "status", "draft", Kind::Text, None)])
+            .unwrap();
+        store.delete_file(a).unwrap();
+        let n: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM properties", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn a_target_removal_keeps_the_row_and_clears_the_target() {
+        use crate::properties::Kind;
+        let store = Store::open_memory().unwrap();
+        let a = store
+            .insert_file("a.md", "h", 0, &generate_docid("a.md"), None, None)
+            .unwrap();
+        let b = store
+            .insert_file("b.md", "h", 0, &generate_docid("b.md"), None, None)
+            .unwrap();
+        store
+            .replace_file_properties(a, &[prop(DOC_LEVEL, "employer", "b", Kind::Link, Some(b))])
+            .unwrap();
+        assert_eq!(
+            store.file_properties(a).unwrap()[0].target_path.as_deref(),
+            Some("b.md")
+        );
+        store.delete_file(b).unwrap();
+        let got = store.file_properties(a).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].target_path, None);
+        assert_eq!(got[0].value, "b");
+    }
+
+    #[test]
+    fn the_registry_counts_a_note_once_and_lists_the_kinds_seen() {
+        use crate::properties::Kind;
+        let store = Store::open_memory().unwrap();
+        let a = store
+            .insert_file("a.md", "h", 0, &generate_docid("a.md"), None, None)
+            .unwrap();
+        let b = store
+            .insert_file("b.md", "h", 0, &generate_docid("b.md"), None, None)
+            .unwrap();
+        store
+            .replace_file_properties(
+                a,
+                &[
+                    prop(DOC_LEVEL, "status", "draft", Kind::Text, None),
+                    prop(DOC_LEVEL, "status", "review", Kind::Text, None),
+                    prop(DOC_LEVEL, "rating", "5", Kind::Number, None),
+                ],
+            )
+            .unwrap();
+        store
+            .replace_file_properties(b, &[prop(DOC_LEVEL, "rating", "high", Kind::Text, None)])
+            .unwrap();
+        let reg = store.property_registry().unwrap();
+        assert_eq!(reg.len(), 2, "{reg:?}");
+        // Ordered by note count, then name.
+        assert_eq!(reg[0].name, "rating");
+        assert_eq!(reg[0].note_count, 2);
+        assert_eq!(reg[0].kinds, vec![Kind::Number, Kind::Text]);
+        assert_eq!(reg[0].declared_type, None);
+        assert_eq!(reg[1].name, "status");
+        assert_eq!(reg[1].note_count, 1, "two values in one note count once");
+
+        let vals = store.property_values("status").unwrap();
+        assert_eq!(vals.len(), 2);
+        assert_eq!(vals[0].value, "draft");
+        assert_eq!(vals[0].note_count, 1);
+    }
+
+    #[test]
+    fn the_names_behind_a_link_are_distinct_and_ordered() {
+        use crate::properties::Kind;
+        let store = Store::open_memory().unwrap();
+        let a = store
+            .insert_file("a.md", "h", 0, &generate_docid("a.md"), None, None)
+            .unwrap();
+        let b = store
+            .insert_file("b.md", "h", 0, &generate_docid("b.md"), None, None)
+            .unwrap();
+        store
+            .replace_file_properties(
+                a,
+                &[
+                    prop(DOC_LEVEL, "mentor", "b", Kind::Link, Some(b)),
+                    prop(0, "employer", "b", Kind::Link, Some(b)),
+                    prop(1, "employer", "b", Kind::Link, Some(b)),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            store.property_names_for_link(a, b).unwrap(),
+            vec!["employer".to_string(), "mentor".to_string()]
+        );
+        assert!(store.property_names_for_link(b, a).unwrap().is_empty());
+    }
+
+    #[test]
+    fn doc_properties_for_files_answers_frontmatter_rows_only() {
+        use crate::properties::Kind;
+        let store = Store::open_memory().unwrap();
+        let a = store
+            .insert_file("a.md", "h", 0, &generate_docid("a.md"), None, None)
+            .unwrap();
+        let b = store
+            .insert_file("b.md", "h", 0, &generate_docid("b.md"), None, None)
+            .unwrap();
+        store
+            .replace_file_properties(
+                a,
+                &[
+                    prop(DOC_LEVEL, "status", "draft", Kind::Text, None),
+                    prop(0, "mentor", "b", Kind::Link, Some(b)),
+                ],
+            )
+            .unwrap();
+        let map = store.doc_properties_for_files(&[a, b]).unwrap();
+        assert_eq!(map.get(&a).map(Vec::len), Some(1));
+        assert_eq!(map[&a][0].name, "status");
+        assert!(!map.contains_key(&b));
+        store.clear_properties().unwrap();
+        assert!(store.doc_properties_for_files(&[a]).unwrap().is_empty());
     }
 
     // ── Calibrated-fusion readers (spec 2026-08-30) ────────────────
