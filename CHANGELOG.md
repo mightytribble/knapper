@@ -3,6 +3,12 @@
 Every entry below the upstream-lineage line names the commit it describes.
 Links resolve against https://github.com/mightytribble/knapper.
 
+## Unreleased
+
+### Fixed
+
+- A property edit keeps the quote character the note already uses (#112). A `replace` re-serialised every value of the key it named in single quotes, so a vault written with `"` — which is what Obsidian's own property writer emits — got a changed line for a value that had not changed, and its quoting drifted to mixed as keys were edited one at a time. A fresh value now takes the quote character the key's own values use, else the first one the block uses, else `"`. A value carrying a line break or a tab takes `"` whatever the key prefers, because single quotes cannot hold one: such a value was written single-quoted before and read back with the break folded to a space. ([`ffab383`](https://github.com/mightytribble/knapper/commit/ffab383))
+
 ## 0.9.8 (2026-09-04)
 
 A documentation release. The README is a landing page and the manual it used
