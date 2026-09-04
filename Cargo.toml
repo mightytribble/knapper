@@ -38,7 +38,7 @@ time = { version = "0.3", features = ["parsing", "formatting", "macros"] }
 strsim = "0.11"
 ignore = "0.4"
 globset = "0.4"
-rmcp = { version = "1.5", features = ["transport-io"] }
+rmcp = { version = "3.2", features = ["transport-io"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time", "net"] }
 notify = "7.0"
 notify-debouncer-full = "0.4"
