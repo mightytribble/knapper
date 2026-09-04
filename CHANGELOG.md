@@ -5,6 +5,10 @@ Links resolve against https://github.com/mightytribble/knapper.
 
 ## Unreleased
 
+### Added
+
+- knapper reads a vault's custom properties (#66): frontmatter keys, and Dataview inline fields such as `Mentor:: [[Bob]]` in a note's body. `knapper properties` lists the vault's property names with their note counts, the kinds seen and Obsidian's declared type, or one property's values with `--name`. `list` and `search` take `--property NAME[=VALUE]`, `--links-to NOTE` and `--linked-from NOTE`; with `--property` beside a link filter, only links filed under that property count. `read --metadata` lists a note's properties and names the property behind each link, and every search hit carries its note's frontmatter properties. `validate` warns on an unquoted `[[link]]` in frontmatter, a value that disagrees with `.obsidian/types.json`, a name that holds more than one kind, two names that differ only in case or separator, and a declared name no note carries. Search ranking does not read the table. Same capability on the MCP `properties` tool and `GET /api/properties`. ([`b7d7be8`](https://github.com/mightytribble/knapper/commit/b7d7be8))
+
 ### Fixed
 
 - A wikilink written before its target exists resolves once the target is there (#108). Such a link was recorded broken and stayed broken after the target was created and indexed: `health` named it, the graph did not hold it, and both notes counted as orphans. `index` did not repair it. Creating, indexing, restoring or moving a note now re-resolves the links that name it. ([`4ffeaea`](https://github.com/mightytribble/knapper/commit/4ffeaea))
@@ -13,7 +17,7 @@ Links resolve against https://github.com/mightytribble/knapper.
 
 - knapper serves MCP clients that speak the 2026-07-28 protocol, such as Google Antigravity (#109). Such a client opens the connection with a `server/discover` request; knapper read that as a failed handshake and exited, and the client reported the connection closed. A client that opens with `initialize` connects as before. ([`fd9a9a6`](https://github.com/mightytribble/knapper/commit/fd9a9a6))
 
-Nothing re-indexes on the upgrade.
+The vault graph is rebuilt once on the upgrade to fill the properties table — a vault read with no model call. Nothing re-embeds.
 
 ## 0.9.6 (2026-09-03)
 

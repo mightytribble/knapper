@@ -97,7 +97,7 @@ fn build_search() -> serde_json::Value {
                     }
                 }}}
             },
-            "responses": { "200": { "description": "An envelope: status ('ok' or 'no_results'); degraded (bool, true when no cross-encoder ranked the results); warnings (array of strings); blocks, the results that fit the token budget, each {id, path, heading_path, provenance: {keyword, semantic, graph, linked_from}, text, untrusted_content, truncated, and score when scores was requested}; and overflow, the results the budget excluded, each {id, path, heading_path, provenance, and score when requested} with no text. explain, the per-lane breakdown, rides beside the envelope when the request asked for it" } }
+            "responses": { "200": { "description": "An envelope: status ('ok' or 'no_results'); degraded (bool, true when no cross-encoder ranked the results); warnings (array of strings); blocks, the results that fit the token budget, each {id, path, heading_path, provenance: {keyword, semantic, graph, linked_from}, text, untrusted_content, truncated, properties (the parent note's frontmatter property rows, omitted when empty), and score when scores was requested}; and overflow, the results the budget excluded, each {id, path, heading_path, provenance, and score when requested} with no text. explain, the per-lane breakdown, rides beside the envelope when the request asked for it" } }
         }
     })
 }
@@ -150,7 +150,7 @@ fn build_read() -> serde_json::Value {
                     "schema": { "type": "boolean" }
                 }
             ],
-            "responses": { "200": { "description": "Content mode returns {path, docid, content, and section when a section was read, which is {heading, level, line_start, line_end} — level absent for a promoted bold line}. Metadata mode returns {path, docid, frontmatter, byte_count, and outgoing_links/incoming_links as arrays of {path, docid}}." } }
+            "responses": { "200": { "description": "Content mode returns {path, docid, content, and section when a section was read, which is {heading, level, line_start, line_end} — level absent for a promoted bold line}. Metadata mode returns {path, docid, frontmatter, byte_count, properties (every property row the note holds), and outgoing_links/incoming_links as arrays of {path, docid, properties} — properties names the custom properties that link is filed under, empty for a plain wikilink}." } }
         }
     })
 }

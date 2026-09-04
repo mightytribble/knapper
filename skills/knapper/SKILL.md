@@ -41,6 +41,7 @@ knapper search "warding" --all type/undead      # Only notes carrying the tag
 | `--explain`       | Show per-lane RRF score breakdown              |
 | `--json`          | Machine-readable JSON output                   |
 | `--all`/`--any`/`--none` | Answer from the notes these tag terms admit. `--scope` is an alias of `--all` |
+| `--property`/`--links-to`/`--linked-from` | Answer from notes carrying a property (`NAME` or `NAME=VALUE`), linking to a note, or linked from one; one value each |
 
 ### Query Tips
 
@@ -69,6 +70,11 @@ knapper read "path/to/note.md" --section "Action Items"   # One section
 knapper list --scope architecture      # Every document the scope admits, one path per line
 knapper list --scope /locations/ --detailed  # ...each with its heading outline
 knapper tags --under type/        # The tag vocabulary, whole or under one term
+knapper properties                # The custom-property registry: name, note count, kinds, declared type
+knapper properties --name status  # One property's values with counts — call before --property NAME=VALUE
+knapper list --property status=draft
+knapper list --property employer --links-to Acme   # Links filed under one property
+knapper read "ada.md" --metadata  # ...also lists the note's properties and names the property behind each link
 ```
 
 `topic` fills a character budget with whole documents: the five that best match the query, and then the documents one wikilink hop from the top three. It returns documents and not sections, and no cross-encoder scores them, so `search` ranks more accurately. `who` returns a person's document, the documents that mention them, and their wikilinks in both directions; the mention list needs a People folder in `vault.toml`, and without one the bundle holds the document and its links alone.
@@ -84,7 +90,9 @@ knapper archive "Old Draft"          # --undo restores it
 knapper delete "Old Draft" --mode soft
 ```
 
-> One capability, one name, three surfaces: `knapper tags` is the MCP `tags` tool and `GET /api/tags`; `knapper list` is the MCP `list` tool and `GET /api/list`. A CLI command's name becomes the MCP tool by writing `-` as `_`, and the HTTP route by putting it under `/api/`. The tag operators are `--all`/`--any`/`--none` on the CLI, spelled `all`/`any`/`none` on both other surfaces, with `scope` an alias of `all`. `list` answers every document the scope admits, in path order and with no default cap, and `detailed` adds each document's heading outline.
+For a list-valued property, prefer `--mode append` and `--mode remove` over `replace`: those two cannot drop a sibling value the model failed to reproduce.
+
+> One capability, one name, three surfaces: `knapper tags` is the MCP `tags` tool and `GET /api/tags`; `knapper list` is the MCP `list` tool and `GET /api/list`. A CLI command's name becomes the MCP tool by writing `-` as `_`, and the HTTP route by putting it under `/api/`. The tag operators are `--all`/`--any`/`--none` on the CLI, spelled `all`/`any`/`none` on both other surfaces, with `scope` an alias of `all`. `list` answers every document the scope admits, in path order and with no default cap, and `detailed` adds each document's heading outline. `knapper properties` is the MCP `properties` tool and `GET /api/properties`. The property filters are `--property`, `--links-to` and `--linked-from` on the CLI, spelled `property`, `links_to` and `linked_from` on both other surfaces, one value each.
 
 > Health diagnostics (orphans, broken links, stale notes, tag hygiene) are `knapper health`, the MCP `health` tool and the HTTP `GET /api/health` endpoint — see `references/http-rest-api.md`.
 

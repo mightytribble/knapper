@@ -14,10 +14,11 @@ Every capability is one route, named after the CLI command it answers. The whole
 
 | Method | Endpoint                | Description                                                      |
 | ------ | ----------------------- | ---------------------------------------------------------------- |
-| POST   | `/api/search`           | Hybrid search with semantic + FTS5 + graph + reranker + temporal, scoped by tag terms (`scope`/`all`, `any`, `none`) |
+| POST   | `/api/search`           | Hybrid search with semantic + FTS5 + graph + reranker + temporal, scoped by tag terms (`scope`/`all`, `any`, `none`); `property`, `links_to`, `linked_from` filter by custom property and by link, one value each |
 | GET    | `/api/read`             | Read a document (`file`), or one section of it (`section`)        |
-| GET    | `/api/list`             | List documents by tag or directory terms (`scope`/`all`, `any`, `none`), in path order; `detailed=true` adds each document's heading outline |
+| GET    | `/api/list`             | List documents by tag or directory terms (`scope`/`all`, `any`, `none`), in path order; `detailed=true` adds each document's heading outline; `property`, `links_to`, `linked_from` filter by custom property and by link, one value each |
 | GET    | `/api/tags`             | The tag vocabulary, whole or under one term (`under`)            |
+| GET    | `/api/properties`       | The custom-property registry, or one property's values (`name`) |
 | GET    | `/api/vault-map`        | Collection structure overview                                    |
 | POST   | `/api/topic`            | Topic context bundle: whole documents and their one-hop neighbours within a character budget, scoped by tag terms (`scope`/`all`, `any`, `none`) |
 | GET    | `/api/health`           | Collection health diagnostics                                    |
