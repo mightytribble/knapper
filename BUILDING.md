@@ -108,7 +108,7 @@ scripts/smoke-docker.sh cpu     # or: cuda, on a box with the NVIDIA Container T
 ```
 
 There is no registry push here. `release.yml` builds native binaries only, and the
-`ghcr.io/mightytribble/knapper` publish is a separate, not-yet-live step (`deployment.md`). So
+`ghcr.io/mightytribble/knapper` publish is a separate, not-yet-live step (`install.md`). So
 "build a new image" is this local `docker build`. A client registered as `docker run --rm …
 knapper:cuda serve` picks up a rebuilt tag on its next session, because `--rm` starts a fresh
 container each time; the `knapper-data` volume survives the rebuild untouched, so the store and

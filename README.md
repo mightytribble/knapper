@@ -99,7 +99,7 @@ docker pull ghcr.io/mightytribble/knapper:cuda    # or :cpu, or :latest for cpu
 docker pull ghcr.io/mightytribble/knapper:0.9.2-cuda      # version-pinned
 ```
 
-[deployment.md](deployment.md) has the full container flow — data volume, `--gpus all`, and wiring the MCP stdio server through `docker run -i`.
+[install.md](install.md) has the full container flow — data volume, `--gpus all`, and wiring the MCP stdio server through `docker run -i`.
 
 **Index your vault:**
 
@@ -150,7 +150,7 @@ Or register the MCP server yourself with the Claude Code CLI:
 claude mcp add --scope user knapper -- knapper serve
 ```
 
-Or add it by hand to `~/.claude.json` (user scope) or a project's `.mcp.json` (project scope). [deployment.md](deployment.md) has the full setup for each platform.
+Or add it by hand to `~/.claude.json` (user scope) or a project's `.mcp.json` (project scope). [install.md](install.md) has the full setup for each platform.
 
 ```json
 {

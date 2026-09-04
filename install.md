@@ -1,4 +1,4 @@
-# Deployment guide
+# Install guide
 
 How to install knapper and connect it to an MCP client (Claude Code) on your
 own machine. Three install tiers, one per target environment:
@@ -23,7 +23,7 @@ native macOS binary, not by a container.
 
 One vault per install. Re-indexing a different vault path replaces the
 active one; running several vaults side by side needs a separate data
-directory per vault (`--data-dir` or `KNAPPER_HOME`) and is not covered here.
+directory per vault — see [faq.md](faq.md#can-i-run-more-than-one-vault).
 
 ## macOS (Apple Silicon, Metal)
 
