@@ -20,7 +20,8 @@ Every capability is one route, named after the CLI command it answers. The whole
 | GET    | `/api/tags`             | The tag vocabulary, whole or under one term (`under`)            |
 | GET    | `/api/properties`       | The custom-property registry, or one property's values (`name`) |
 | GET    | `/api/vault-map`        | Collection structure overview                                    |
-| POST   | `/api/topic`            | Topic context bundle: whole documents and their one-hop neighbours within a character budget, scoped by tag terms (`scope`/`all`, `any`, `none`) |
+| POST   | `/api/match`            | Every note whose text holds a literal string, and the counts — `notes: 0` is a reliable absence answer |
+| POST   | `/api/validate`         | Structural and indexing problems in the vault's markdown          |
 | GET    | `/api/health`           | Collection health diagnostics                                    |
 | POST   | `/api/create`           | Create new document                                              |
 | POST   | `/api/update`           | Apply a list of edits — body, sections and properties — in one write |
