@@ -6,7 +6,7 @@ use std::time::SystemTime;
 use anyhow::{Context, Result};
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo};
 use rmcp::{ErrorData as McpError, ServiceExt, tool, tool_handler, tool_router};
 use tokio::sync::Mutex;
 
@@ -94,7 +94,7 @@ fn to_json_result<T: serde::Serialize>(value: &T) -> Result<CallToolResult, McpE
             None::<serde_json::Value>,
         )
     })?;
-    Ok(CallToolResult::success(vec![Content::text(json)]))
+    Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
 }
 
 /// Record a recently-written file path + mtime so the watcher can skip re-indexing it.
@@ -190,7 +190,7 @@ impl KnapperServer {
         // stays a server setting rather than a per-call flag (#35).
         let mut content = Vec::new();
         if self.output.emit_text_rendering {
-            content.push(Content::text(crate::packaging::render_text(
+            content.push(ContentBlock::text(crate::packaging::render_text(
                 &env,
                 params.0.scores,
             )));
@@ -205,7 +205,7 @@ impl KnapperServer {
         if params.0.explain {
             result
                 .content
-                .push(Content::text(search::explain_report(&output, top_n)));
+                .push(ContentBlock::text(search::explain_report(&output, top_n)));
         }
         Ok(result)
     }
@@ -745,7 +745,7 @@ impl KnapperServer {
         let config = crate::config::Config::load().unwrap_or_default();
         let block =
             crate::identity::format_identity_block(&config, &store).map_err(|e| mcp_err(&e))?;
-        Ok(CallToolResult::success(vec![Content::text(block)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(block)]))
     }
 
     #[tool(

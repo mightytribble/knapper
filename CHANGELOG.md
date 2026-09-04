@@ -11,6 +11,8 @@ Links resolve against https://github.com/mightytribble/knapper.
 
 - `health` reports a link whose target has been removed (#108). It reported nothing. Deleting, archiving or moving a note now records the links it leaves naming nothing. ([`4ffeaea`](https://github.com/mightytribble/knapper/commit/4ffeaea))
 
+- knapper serves MCP clients that speak the 2026-07-28 protocol, such as Google Antigravity (#109). Such a client opens the connection with a `server/discover` request; knapper read that as a failed handshake and exited, and the client reported the connection closed. A client that opens with `initialize` connects as before. ([`fd9a9a6`](https://github.com/mightytribble/knapper/commit/fd9a9a6))
+
 Nothing re-indexes on the upgrade.
 
 ## 0.9.6 (2026-09-03)
