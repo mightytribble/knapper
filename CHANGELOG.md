@@ -5,13 +5,26 @@ Links resolve against https://github.com/mightytribble/knapper.
 
 ## Unreleased
 
+### Changed
+
+- `SKILL.md` is an operating guide, not a tool list. The plugin ships the skill beside the MCP server, so the tools are already in context; the skill now carries only what a tool description cannot. ([`a8dc3a1`](https://github.com/mightytribble/knapper/commit/a8dc3a1))
+- `mcp-setup.md` covers `--scope` and `KNAPPER_HOME`, including a per-project vault via `env` in `.mcp.json`, and warns that a second data directory downloads the embedder again. ([`a8dc3a1`](https://github.com/mightytribble/knapper/commit/a8dc3a1))
+- The README is a landing page: the pitch, what knapper does, a quick start that ends with a working search and a registered MCP server, and a table pointing at the rest. It carried the whole manual before — 794 lines down to 153. ([`2ca66bd`](https://github.com/mightytribble/knapper/commit/2ca66bd))
+- reference material split into separate documents: `install.md` (renamed from `deployment.md`), `configuration.md`, `how-knapper-searches.md`, `faq.md`, `http-rest-api.md` and `chatgpt-actions.md`. Added previously undocumented details to `configuration.md`.  ([`7e06471`](https://github.com/mightytribble/knapper/commit/7e06471))
+
 ### Removed
 
-- `knapper configure --register <agent>` is gone. It printed MCP setup instructions and set a flag under `[agents]` that nothing ever read, so registering an agent changed no behaviour. The setup instructions live in [install.md](install.md), which now covers Cursor and Windsurf beside Claude Code and Claude Desktop. An `[agents]` block in an existing config is ignored and left in the file. ([`5e6505f`](https://github.com/mightytribble/knapper/commit/5e6505f))
+- `knapper configure --register <agent>` is gone. It printed MCP setup instructions and set a flag under `[agents]` that nothing ever read, so registering an agent changed no behaviour. The setup instructions live in [install.md](install.md). ([`5e6505f`](https://github.com/mightytribble/knapper/commit/5e6505f))
 
 ### Fixed
 
 - The MCP server now correctly tells a client which tools it has. Future changes to tool surface descriptions are now declared in code, not prose. ([`005441b`](https://github.com/mightytribble/knapper/commit/005441b))
+- A search result is a chunk, not a section. Docs said otherwise; now they don't. ([`a5dec4b`](https://github.com/mightytribble/knapper/commit/a5dec4b))
+- Fixed `max_chunks_per_file` comments to reflect code reality. ([`6178f8e`](https://github.com/mightytribble/knapper/commit/6178f8e))
+- Fixed `configure --revoke-api-key` and `[[http.api_keys]]` comments to reflect reality. ([`7e06471`](https://github.com/mightytribble/knapper/commit/7e06471))
+- Clarified `KNAPPER_HOME` docs for multi-vault setup. ([`2a08156`](https://github.com/mightytribble/knapper/commit/2a08156))
+- `--property <list> --mode replace` collapses the list to a scalar, not just drops the siblings. The skill warns with a before and after; use `append` or `remove`. ([`a8dc3a1`](https://github.com/mightytribble/knapper/commit/a8dc3a1))
+- Dropped the `topic`, `who` and `project` commands and `POST /api/topic` from the skill and the route table. They went in #73. ([`a8dc3a1`](https://github.com/mightytribble/knapper/commit/a8dc3a1))
 
 ## 0.9.7 (2026-09-04)
 
