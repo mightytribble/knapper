@@ -42,9 +42,10 @@ calibration — see [how-knapper-searches.md](how-knapper-searches.md#when-you-c
 
 ## Can I run more than one vault?
 
-knapper uses sqlite, which really wants to use one database location for
-everything. To get around this restriction, knapper supports one data directory 
-per vault by setting the `KNAPPER_HOME` environment variable:
+knapper keeps one vault per store, and everything lives under a single data
+directory — `~/.knapper` by default. Re-indexing a different vault path
+replaces the active one, so give each vault a directory of its own with
+`KNAPPER_HOME`:
 
 ```bash
 KNAPPER_HOME=~/.knapper-work    knapper index ~/vaults/work
