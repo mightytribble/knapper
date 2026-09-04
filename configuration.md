@@ -114,9 +114,13 @@ enabled = false
 # max_retries = 4      # on 429, 5xx and transport errors
 # endpoint = "..."     # proxy or test-server override
 
-# Registered AI agents
+# Which agents `knapper configure --register <agent>` has been run for.
+# The command prints how to add the MCP server to that agent and sets the
+# flag here. Nothing else reads these — registering changes no behaviour.
 [agents]
-# names = ["claude-code", "cursor"]
+# claude_code = false
+# cursor = false
+# windsurf = false
 
 # What the keyword lane indexes beside the chunk body, and what bm25() pays
 # for a hit there. The flags rebuild the keyword index (0.1 s, no vault read,
