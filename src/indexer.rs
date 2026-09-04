@@ -294,7 +294,7 @@ pub fn build_edges_for_file(store: &Store, file_id: i64, content: &str) -> Resul
     derive_properties(store, file_id, content)
 }
 
-/// Replace one file's property rows from its frontmatter (#66).
+/// Replace one file's property rows from its frontmatter and its chunks (#66).
 ///
 /// Frontmatter comes from `content`, because the chunker strips it; the
 /// rows sit at [`DOC_LEVEL`]. A link's target resolves through
@@ -303,10 +303,17 @@ pub fn build_edges_for_file(store: &Store, file_id: i64, content: &str) -> Resul
 /// resolves to nothing keeps the row and leaves `target_file` null.
 fn derive_properties(store: &Store, file_id: i64, content: &str) -> Result<()> {
     let (frontmatter, _body) = crate::markdown::split_frontmatter(content);
-    let extracted: Vec<crate::properties::Extracted> = frontmatter
+    let mut extracted: Vec<crate::properties::Extracted> = frontmatter
         .as_deref()
         .map(crate::properties::from_frontmatter)
         .unwrap_or_default();
+    // Body rows sit at the chunk that holds the line, read from the store
+    // the way the links above are, so the file's chunks must be inserted
+    // first — every caller does that. A line the oversized-split overlap
+    // repeats writes a row per chunk that holds it, the rule edges follow.
+    for chunk in store.get_chunks_by_file(file_id)? {
+        extracted.extend(crate::properties::from_chunk(chunk.seq, &chunk.text));
+    }
     let mut rows = Vec::with_capacity(extracted.len());
     for e in &extracted {
         let target_file = match &e.link_target {
@@ -4027,5 +4034,46 @@ mod tests {
         store.clear_properties().unwrap();
         let after = snapshot(&store, &mut embedder);
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn a_body_field_is_scoped_to_the_chunk_that_holds_it() {
+        use crate::properties::Kind;
+        use crate::store::NewChunk;
+        let store = Store::open_memory().unwrap();
+        let a = store
+            .insert_file("a.md", "h1", 100, "aaa111", None, None)
+            .unwrap();
+        let _b = store
+            .insert_file("b.md", "h2", 100, "bbb222", None, None)
+            .unwrap();
+        for (seq, heading, text) in [
+            (0, "Intro", "# A\nNothing here.\n"),
+            (1, "Work", "## Work\nEmployer:: [[b]]\nRating:: 5\n"),
+        ] {
+            store
+                .insert_chunk(&NewChunk {
+                    file_id: a,
+                    seq,
+                    heading,
+                    heading_path: &format!("a > {heading}"),
+                    tags_text: "",
+                    text,
+                    vector_id: 100 + seq as u64,
+                    token_count: 10,
+                })
+                .unwrap();
+        }
+        let content = "# A\nNothing here.\n## Work\nEmployer:: [[b]]\nRating:: 5\n";
+        build_edges_for_file(&store, a, content).unwrap();
+        let rows = store.file_properties(a).unwrap();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0].chunk_seq, 1);
+        assert_eq!(rows[0].name, "Employer");
+        assert_eq!(rows[0].kind, Kind::Link);
+        assert_eq!(rows[0].target_path.as_deref(), Some("b.md"));
+        assert_eq!(rows[0].heading_path.as_deref(), Some("a > Work"));
+        assert_eq!(rows[1].name, "Rating");
+        assert_eq!(rows[1].kind, Kind::Number);
     }
 }

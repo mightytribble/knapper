@@ -165,6 +165,135 @@ fn push_yaml_scalar(out: &mut Vec<Extracted>, name: &str, v: &serde_yaml::Value)
     });
 }
 
+/// Every Dataview inline field in one chunk's text, under Dataview's rules.
+///
+/// Three forms: the full-line `Key:: value`, with an optional list-item or
+/// task prefix; and the embedded `[key:: value]` and `(key:: value)`,
+/// any number per line. The key is everything before the `::`, trimmed,
+/// and may contain spaces. A line inside a fenced code block is skipped.
+///
+/// A value with a top-level comma is a list, one row per element. An
+/// element that holds wikilinks writes one link row per link and the text
+/// around them writes nothing. An element with no wikilink is one row
+/// under [`kind_of`].
+pub fn from_chunk(seq: i64, text: &str) -> Vec<Extracted> {
+    let mut out = Vec::new();
+    let mut fenced = false;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced {
+            continue;
+        }
+        for (key, value) in inline_fields(line) {
+            push_inline(&mut out, seq, &key, &value);
+        }
+    }
+    out
+}
+
+/// The `(key, value)` pairs one line holds.
+fn inline_fields(line: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let body = strip_list_prefix(line.trim_start());
+    if !body.starts_with('[')
+        && !body.starts_with('(')
+        && let Some(pair) = split_field(body)
+    {
+        out.push(pair);
+        return out;
+    }
+    for (open, close) in [('[', ']'), ('(', ')')] {
+        let mut rest = line;
+        while let Some(start) = rest.find(open) {
+            let after = &rest[start + 1..];
+            let Some(end) = after.find(close) else { break };
+            if let Some(pair) = split_field(&after[..end]) {
+                out.push(pair);
+            }
+            rest = &after[end + 1..];
+        }
+    }
+    out
+}
+
+/// `Key:: value` split on the first `::`. A key that is empty or holds a
+/// bracket, a parenthesis or a backtick is not one: a wikilink or an
+/// embedded field is not a full-line key.
+fn split_field(text: &str) -> Option<(String, String)> {
+    let (key, value) = text.split_once("::")?;
+    let key = key.trim();
+    if key.is_empty() || key.contains(['[', ']', '(', ')', '`']) {
+        return None;
+    }
+    Some((key.to_string(), value.trim().to_string()))
+}
+
+/// Drop a list-item marker and a task box from the head of a line.
+fn strip_list_prefix(line: &str) -> &str {
+    let after_marker = ["- ", "* ", "+ "]
+        .iter()
+        .find_map(|m| line.strip_prefix(m))
+        .unwrap_or(line)
+        .trim_start();
+    ["[ ] ", "[x] ", "[X] "]
+        .iter()
+        .find_map(|m| after_marker.strip_prefix(m))
+        .unwrap_or(after_marker)
+        .trim_start()
+}
+
+/// Split on commas outside `[...]`, so a note name with a comma stays whole.
+fn split_list(value: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut current = String::new();
+    for c in value.chars() {
+        match c {
+            '[' => depth += 1,
+            ']' => depth -= 1,
+            ',' if depth <= 0 => {
+                out.push(current.trim().to_string());
+                current.clear();
+                continue;
+            }
+            _ => {}
+        }
+        current.push(c);
+    }
+    out.push(current.trim().to_string());
+    out
+}
+
+fn push_inline(out: &mut Vec<Extracted>, seq: i64, name: &str, value: &str) {
+    for element in split_list(value) {
+        let links = crate::graph::extract_wikilinks(&element);
+        if links.is_empty() {
+            let (kind, _) = kind_of(&element);
+            out.push(Extracted {
+                chunk_seq: seq,
+                name: name.to_string(),
+                value: element,
+                kind,
+                link_target: None,
+            });
+            continue;
+        }
+        for link in links {
+            out.push(Extracted {
+                chunk_seq: seq,
+                name: name.to_string(),
+                value: link.target.clone(),
+                kind: Kind::Link,
+                link_target: Some(link.target),
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,5 +403,86 @@ mod tests {
         let rows = from_frontmatter("\"employee of\": Acme\nDue Date: soon\n");
         assert_eq!(rows[0].name, "employee of");
         assert_eq!(rows[1].name, "Due Date");
+    }
+
+    #[test]
+    fn the_three_inline_forms_are_read() {
+        let rows = from_chunk(
+            3,
+            "Employer:: [[Acme]]\nShe joined [rating:: 5] and (status:: active) in one line.\n",
+        );
+        assert_eq!(
+            names_values(&rows),
+            vec![
+                ("Employer".into(), "Acme".into(), Kind::Link),
+                ("rating".into(), "5".into(), Kind::Number),
+                ("status".into(), "active".into(), Kind::Text),
+            ]
+        );
+        assert!(rows.iter().all(|r| r.chunk_seq == 3));
+        assert_eq!(rows[0].link_target.as_deref(), Some("Acme"));
+    }
+
+    #[test]
+    fn a_list_item_or_task_prefix_is_stripped_from_the_full_line_form() {
+        let rows = from_chunk(
+            0,
+            "- Mentor:: [[Bob]]\n* Due:: 2026-09-03\n- [ ] Owner:: Ada\n- [x] Done:: true\n",
+        );
+        assert_eq!(
+            names_values(&rows),
+            vec![
+                ("Mentor".into(), "Bob".into(), Kind::Link),
+                ("Due".into(), "2026-09-03".into(), Kind::Text),
+                ("Owner".into(), "Ada".into(), Kind::Text),
+                ("Done".into(), "true".into(), Kind::Checkbox),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_comma_list_is_one_row_per_element() {
+        let rows = from_chunk(0, "Tags Seen:: alpha, 7, [[Beta, the note]]\n");
+        assert_eq!(
+            names_values(&rows),
+            vec![
+                ("Tags Seen".into(), "alpha".into(), Kind::Text),
+                ("Tags Seen".into(), "7".into(), Kind::Number),
+                ("Tags Seen".into(), "Beta, the note".into(), Kind::Link),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_element_with_links_writes_one_link_row_per_link_and_no_text() {
+        let rows = from_chunk(0, "Example:: see [[Acme]] and [[Bolt|the other]]\n");
+        assert_eq!(
+            names_values(&rows),
+            vec![
+                ("Example".into(), "Acme".into(), Kind::Link),
+                ("Example".into(), "Bolt".into(), Kind::Link),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_fenced_code_line_and_a_bracketed_key_are_not_fields() {
+        let rows = from_chunk(
+            0,
+            "```\nKey:: value\n```\nSee [[Note]]:: not a field\n:::note\nurl:: https://x\n",
+        );
+        assert_eq!(
+            names_values(&rows),
+            vec![("url".into(), "https://x".into(), Kind::Text)]
+        );
+    }
+
+    #[test]
+    fn an_empty_inline_value_is_empty() {
+        let rows = from_chunk(0, "Owner::\n");
+        assert_eq!(
+            names_values(&rows),
+            vec![("Owner".into(), "".into(), Kind::Empty)]
+        );
     }
 }
