@@ -107,9 +107,13 @@ MCP `tools/list` over `docker run -i … serve`, and confirms the volume persist
 scripts/smoke-docker.sh cpu     # or: cuda, on a box with the NVIDIA Container Toolkit
 ```
 
-There is no registry push here. `release.yml` builds native binaries only, and the
-`ghcr.io/mightytribble/knapper` publish is a separate, not-yet-live step (`install.md`). So
-"build a new image" is this local `docker build`. A client registered as `docker run --rm …
+Nothing here pushes. Publishing is `release.yml`'s job: on a manual dispatch it builds both
+variants and pushes them to `ghcr.io/mightytribble/knapper` as `:cpu` and `:cuda`, as
+`:<version>-<variant>`, and — for cpu alone, so a bare `docker pull` cannot land someone on an
+image that needs a GPU driver — as `:latest`. It then runs the pushed cpu image to check it
+starts. So "build a new image" locally is this `docker build`.
+
+A client registered as `docker run --rm …
 knapper:cuda serve` picks up a rebuilt tag on its next session, because `--rm` starts a fresh
 container each time; the `knapper-data` volume survives the rebuild untouched, so the store and
 models are reused.
