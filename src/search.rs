@@ -801,8 +801,10 @@ fn finalize_search_output(
     };
     results.truncate(top_n);
     // Every hit carries its note's frontmatter properties (#66): one query
-    // over the distinct notes in the answer, after the cut, so it costs
-    // nothing a caller did not ask to see.
+    // over the distinct notes in the answer. The position is load-bearing at
+    // both ends. After the merge, because `coalesce::merge_block` builds a
+    // block with no properties and would discard a fill that ran before it.
+    // After the cut, so the query costs nothing a caller did not ask to see.
     let ids: Vec<i64> = {
         let mut seen = std::collections::BTreeSet::new();
         results
@@ -2377,6 +2379,97 @@ A warding effect that ends an ongoing spell.              It reaches an effect a
             &mut embedder,
         );
         assert_eq!(out.results.len(), 5, "the vault holds five blocks");
+    }
+
+    /// `nested_vault`'s one document with two frontmatter properties on it.
+    ///
+    /// Its section and two subsections abut and share a root, so the top hit
+    /// is a **merged** block. That is what pins the property fill after the
+    /// merge: `coalesce::merge_block` builds a block with no properties, so
+    /// a fill that ran before it would answer none here.
+    fn nested_vault_with_properties() -> (tempfile::TempDir, Store, crate::llm::MockLlm) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("rules")).unwrap();
+        std::fs::write(
+            root.join("rules/warding-school.md"),
+            "---
+status: draft
+rank: 3
+---
+## Warding School
+
+The school of warding covers every effect that blocks,              ends or pins magic, and the entries below inherit their rules from this              section rather than restating them each time.
+
+             ### Counterspell
+
+A warding effect that stops a spell mid-cast.              It interrupts the casting itself and does nothing to a spell already in effect,              which is what separates it from the entry below.
+
+             ### Dispel Magic
+
+A warding effect that ends an ongoing spell.              It reaches an effect already in place and cannot interrupt one              that is still being cast, which is the whole of the difference.
+",
+        )
+        .unwrap();
+
+        let store = Store::open_memory().unwrap();
+        let mut embedder = crate::llm::MockLlm::new(256);
+        let config = crate::config::Config::default();
+        crate::indexer::run_index_shared(
+            root,
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
+        (tmp, store, embedder)
+    }
+
+    /// Every hit carries its note's frontmatter property rows (#66).
+    ///
+    /// The fill runs after the merge and after the cut. The merge is what
+    /// this test holds: the top hit is a block of three chunks, and
+    /// `merge_block` gives a block no properties of its own.
+    #[test]
+    fn a_search_hit_carries_its_notes_frontmatter_properties() {
+        let (_tmp, store, mut embedder) = nested_vault_with_properties();
+        let mut config = SearchConfig {
+            fts: crate::config::FtsConfig::default(),
+            scope: crate::tags::Scope::default(),
+            reranker: None,
+            store: &store,
+            rerank_candidates: 30,
+            lane_weights: crate::config::LaneWeights::default(),
+            rerank: crate::config::RerankConfig::default(),
+            max_chunks_per_file: crate::config::default_max_chunks_per_file(),
+            group_by: GroupBy::Chunk,
+            ranking: crate::config::RankingConfig {
+                coalesce_adjacent: true,
+                ..crate::config::RankingConfig::default()
+            },
+            calibrated: crate::config::CalibratedConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        };
+        let out = search_with_intelligence("warding", 10, &mut embedder, &mut config).unwrap();
+        let top = out.results.first().expect("a hit");
+        assert_eq!(top.file_path, "rules/warding-school.md");
+        assert!(
+            top.text.contains("Counterspell") && top.text.contains("Dispel Magic"),
+            "the top hit has to be a merged block, or the fill's position is \
+             not under test: {:#?}",
+            out.results
+        );
+        let rows: Vec<(&str, &str)> = top
+            .properties
+            .iter()
+            .map(|p| (p.name.as_str(), p.value.as_str()))
+            .collect();
+        assert_eq!(rows, [("rank", "3"), ("status", "draft")]);
     }
 
     #[test]

@@ -2987,17 +2987,54 @@ const PROPERTIES_JOIN_SQL: &str = "FROM properties p
        LEFT JOIN chunks c ON c.file_id = p.file_id AND c.seq = p.chunk_seq
        LEFT JOIN files t ON t.id = p.target_file";
 
-fn property_row_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<PropertyRow> {
-    let kind: String = row.get(4)?;
+/// One row of that join, read from the six columns starting at `base`:
+/// `chunk_seq, heading_path, name, value, kind, target_path`.
+fn property_row_at(row: &rusqlite::Row<'_>, base: usize) -> rusqlite::Result<PropertyRow> {
+    let kind: String = row.get(base + 4)?;
     Ok(PropertyRow {
-        chunk_seq: row.get(0)?,
-        heading_path: row.get(1)?,
-        name: row.get(2)?,
-        value: row.get(3)?,
+        chunk_seq: row.get(base)?,
+        heading_path: row.get(base + 1)?,
+        name: row.get(base + 2)?,
+        value: row.get(base + 3)?,
         // A kind this build does not know reads as text: it is still a value.
         kind: crate::properties::Kind::parse(&kind).unwrap_or(crate::properties::Kind::Text),
-        target_path: row.get(5)?,
+        target_path: row.get(base + 5)?,
     })
+}
+
+/// One note's row: the six columns alone.
+fn property_row_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<PropertyRow> {
+    property_row_at(row, 0)
+}
+
+/// A batched reader's row: `p.file_id` and then the six.
+fn keyed_property_row_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, PropertyRow)> {
+    Ok((row.get(0)?, property_row_at(row, 1)?))
+}
+
+/// The map both batched readers answer, grouped in the query's own order.
+fn group_by_file(
+    rows: impl Iterator<Item = rusqlite::Result<(i64, PropertyRow)>>,
+) -> Result<std::collections::HashMap<i64, Vec<PropertyRow>>> {
+    let mut out: std::collections::HashMap<i64, Vec<PropertyRow>> =
+        std::collections::HashMap::new();
+    for row in rows {
+        let (file_id, prop) = row?;
+        out.entry(file_id).or_default().push(prop);
+    }
+    Ok(out)
+}
+
+/// The file ids as one `rarray` argument, so a batched query binds one
+/// pointer rather than one parameter per id.
+fn id_array(file_ids: &[i64]) -> rusqlite::vtab::array::Array {
+    std::rc::Rc::new(
+        file_ids
+            .iter()
+            .copied()
+            .map(rusqlite::types::Value::from)
+            .collect(),
+    )
 }
 
 impl Store {
@@ -3050,41 +3087,54 @@ impl Store {
         &self,
         file_ids: &[i64],
     ) -> Result<std::collections::HashMap<i64, Vec<PropertyRow>>> {
-        let array: rusqlite::vtab::array::Array = std::rc::Rc::new(
-            file_ids
-                .iter()
-                .copied()
-                .map(rusqlite::types::Value::from)
-                .collect(),
-        );
+        let array = id_array(file_ids);
         let mut stmt = self.conn.prepare(&format!(
             "SELECT p.file_id, p.chunk_seq, c.heading_path, p.name, p.value, p.kind, t.path
                {PROPERTIES_JOIN_SQL}
               WHERE p.chunk_seq = {DOC_LEVEL} AND p.file_id IN rarray(?1)
               ORDER BY p.file_id, p.name, p.id"
         ))?;
-        let rows = stmt.query_map(params![array], |row| {
-            let kind: String = row.get(5)?;
-            Ok((
-                row.get::<_, i64>(0)?,
-                PropertyRow {
-                    chunk_seq: row.get(1)?,
-                    heading_path: row.get(2)?,
-                    name: row.get(3)?,
-                    value: row.get(4)?,
-                    kind: crate::properties::Kind::parse(&kind)
-                        .unwrap_or(crate::properties::Kind::Text),
-                    target_path: row.get(6)?,
-                },
-            ))
-        })?;
-        let mut out: std::collections::HashMap<i64, Vec<PropertyRow>> =
-            std::collections::HashMap::new();
-        for row in rows {
-            let (file_id, prop) = row?;
-            out.entry(file_id).or_default().push(prop);
+        group_by_file(stmt.query_map(params![array], keyed_property_row_from)?)
+    }
+
+    /// The rows of each listed note that a scope's `property` term matched,
+    /// keyed by file id (#66).
+    ///
+    /// One query for a whole listing, the way `doc_properties_for_files` is
+    /// one query for a whole result set. The predicate is `scope_clauses`'s
+    /// own: the name, the value when the term carries one, and the link
+    /// target when a `links_to` term narrowed it. So the rows answered are
+    /// the rows that admitted the note, and no other row the note holds.
+    ///
+    /// A note with no matching row has no entry.
+    pub fn matched_properties_for_files(
+        &self,
+        file_ids: &[i64],
+        term: &crate::tags::PropertyTerm,
+        target_file: Option<i64>,
+    ) -> Result<std::collections::HashMap<i64, Vec<PropertyRow>>> {
+        let array = id_array(file_ids);
+        let mut args: Vec<Box<dyn rusqlite::types::ToSql>> =
+            vec![Box::new(array), Box::new(term.name.clone())];
+        let mut sql = format!(
+            "SELECT p.file_id, p.chunk_seq, c.heading_path, p.name, p.value, p.kind, t.path
+               {PROPERTIES_JOIN_SQL}
+              WHERE p.file_id IN rarray(?) AND p.name = ?"
+        );
+        if let Some(value) = &term.value {
+            sql.push_str(" AND p.value = ?");
+            args.push(Box::new(value.clone()));
         }
-        Ok(out)
+        if let Some(target) = target_file {
+            sql.push_str(" AND p.target_file = ?");
+            args.push(Box::new(target));
+        }
+        sql.push_str(" ORDER BY p.file_id, p.chunk_seq, p.name, p.id");
+        let mut stmt = self.conn.prepare(&sql)?;
+        group_by_file(stmt.query_map(
+            rusqlite::params_from_iter(args.iter()),
+            keyed_property_row_from,
+        )?)
     }
 
     /// One row per property name (#66): how many notes carry it and the
@@ -7296,6 +7346,56 @@ mod tests {
             .into_iter()
             .map(|f| f.path)
             .collect()
+    }
+
+    /// The listing's fill reads the same predicate the clause selected on,
+    /// so the rows it answers are the rows that matched (#66).
+    #[test]
+    fn matched_properties_narrow_by_name_value_and_target() {
+        let (store, ada, acme, bob) = property_vault();
+        let ids = [ada, acme, bob];
+        let term = |written: &str| {
+            crate::tags::Scope::default()
+                .with_filters(Some(written), None, None)
+                .unwrap()
+                .property
+                .unwrap()
+        };
+        let values = |map: &std::collections::HashMap<i64, Vec<PropertyRow>>, id: i64| {
+            map.get(&id)
+                .map(|rows| rows.iter().map(|r| r.value.clone()).collect::<Vec<_>>())
+                .unwrap_or_default()
+        };
+
+        // Name alone: every row under that name, and nothing else the note
+        // holds.
+        let by_name = store
+            .matched_properties_for_files(&ids, &term("status"), None)
+            .unwrap();
+        assert_eq!(values(&by_name, ada), ["draft"]);
+        assert_eq!(values(&by_name, acme), ["active"]);
+        assert!(!by_name.contains_key(&bob));
+
+        // Name and value.
+        let by_value = store
+            .matched_properties_for_files(&ids, &term("status=active"), None)
+            .unwrap();
+        assert!(values(&by_value, ada).is_empty());
+        assert_eq!(values(&by_value, acme), ["active"]);
+
+        // Name and target: the rows that name that note, not every row
+        // under the name.
+        let by_target = store
+            .matched_properties_for_files(&ids, &term("employer"), Some(acme))
+            .unwrap();
+        assert_eq!(values(&by_target, ada), ["acme"]);
+        assert!(
+            store
+                .matched_properties_for_files(&ids, &term("employer"), Some(bob))
+                .unwrap()
+                .is_empty(),
+            "no employer row names bob"
+        );
     }
 
     #[test]
