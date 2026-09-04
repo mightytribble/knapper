@@ -32,10 +32,14 @@ vault_path = "~/Documents/MyVault"
 top_n = 10
 exclude = [".obsidian/", "node_modules/", ".git/", "*-index.md", "templates/"]
 
-# Results address sections, not whole documents. "file" restores one result
-# per document; max_chunks_per_file bounds how much of one document can fill
-# a page of results (0 = unlimited).
+# Results address parts of a note, not whole documents. "file" restores one
+# result per document, represented by its best-matching passage.
 group_by = "chunk"
+
+# How much of one note a single retrieval lane may contribute. This key is
+# read only under `[ranking] mode = "legacy"`; the default sorted stage caps
+# the lanes with `[ranking] shortlist_cap` instead. Neither bounds the
+# results — `[ranking] per_note_cap` does that. 0 = unlimited.
 max_chunks_per_file = 3
 
 # Enable the cross-encoder rerank lane
@@ -69,6 +73,8 @@ intelligence = true
 # mode = "sorted"              # "legacy" restores five-lane RRF
 # retrieval_width = 60         # rows each content lane fetches
 # candidates = 30              # size of the shortlist the scorer sorts
+# shortlist_cap = 3            # passages of one note a lane may contribute
+#                              # to that shortlist, 0 = unlimited
 # answer_floor = 0.30          # cross-encoder probability below which a
 #                              # result is not an answer; 0.0 keeps everything
 # per_note_cap = 0             # sections of one note in the results, 0 = no cap
@@ -162,8 +168,9 @@ enabled = false
 Search answers with **chunks** — a note's text cut along its headings and
 packed to about 500 tokens, with the retrieved chunks of one section merged
 back into a block. A note whose "Counterspell" and "Dispel Magic" sections
-both answer a query contributes both, up to `max_chunks_per_file`, and each
-result names the heading path it came from. Pass `--group-by file` (or set
+both answer a query contributes both, and each result names the heading path
+it came from. `[ranking] per_note_cap` bounds how many passages of one note
+reach the results — 0, no bound, by default. Pass `--group-by file` (or set
 `group_by = "file"`) for one result per note, represented by its best-matching
 passage. [how-knapper-searches.md](how-knapper-searches.md#a-result-is-a-chunk)
 has the full rule.
