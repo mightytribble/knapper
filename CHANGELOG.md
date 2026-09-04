@@ -3,6 +3,12 @@
 Every entry below the upstream-lineage line names the commit it describes.
 Links resolve against https://github.com/mightytribble/knapper.
 
+## Unreleased
+
+### Fixed
+
+- The MCP server tells a client which tools it has (#110). The instructions sent on connect named `who`, `project` and `topic`, which no longer exist, and did not name `match`, `properties` or `validate`. The `read` tool's `section` parameter also described output knapper no longer produces: a section read returns the section's body alone, with the heading, its level and its span beside it. The ChatGPT plugin manifest named the same removed tools. ([`005441b`](https://github.com/mightytribble/knapper/commit/005441b))
+
 ## 0.9.7 (2026-09-04)
 
 knapper reads the custom properties your notes carry — frontmatter keys and
