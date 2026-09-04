@@ -71,6 +71,26 @@ pub struct Search {
     #[arg(long, value_delimiter = ',')]
     #[serde(default, deserialize_with = "deserialize_tag_list")]
     pub none: Vec<String>,
+    /// Filter to notes carrying a custom property, as `NAME`, or carrying
+    /// it with one value equal to `VALUE`, as `NAME=VALUE`. The split is on
+    /// the first `=`, values compare as text, and a name with spaces is
+    /// quoted. One property per call; `properties` lists the names and
+    /// values a vault holds (#66).
+    #[arg(long)]
+    #[serde(default)]
+    pub property: Option<String>,
+    /// Filter to notes that link to this note, named the way a wikilink
+    /// names it. With `property`, only links filed under that property
+    /// count. An unknown note is an error naming the nearest one (#66).
+    #[arg(long)]
+    #[serde(default)]
+    pub links_to: Option<String>,
+    /// Filter to the notes this note links to, named the way a wikilink
+    /// names it. With `property`, only links filed under that property
+    /// count. An unknown note is an error naming the nearest one (#66).
+    #[arg(long)]
+    #[serde(default)]
+    pub linked_from: Option<String>,
     /// Token budget for the returned text. Fill is greedy in rank order; the
     /// first result is always included. Omit for the configured default (#35).
     #[arg(long = "tokens")]
@@ -145,6 +165,26 @@ pub struct List {
     #[arg(long, value_delimiter = ',')]
     #[serde(default, deserialize_with = "deserialize_tag_list")]
     pub none: Vec<String>,
+    /// Filter to notes carrying a custom property, as `NAME`, or carrying
+    /// it with one value equal to `VALUE`, as `NAME=VALUE`. The split is on
+    /// the first `=`, values compare as text, and a name with spaces is
+    /// quoted. One property per call; `properties` lists the names and
+    /// values a vault holds (#66).
+    #[arg(long)]
+    #[serde(default)]
+    pub property: Option<String>,
+    /// Filter to notes that link to this note, named the way a wikilink
+    /// names it. With `property`, only links filed under that property
+    /// count. An unknown note is an error naming the nearest one (#66).
+    #[arg(long)]
+    #[serde(default)]
+    pub links_to: Option<String>,
+    /// Filter to the notes this note links to, named the way a wikilink
+    /// names it. With `property`, only links filed under that property
+    /// count. An unknown note is an error naming the nearest one (#66).
+    #[arg(long)]
+    #[serde(default)]
+    pub linked_from: Option<String>,
     /// Filter to notes created by one agent.
     #[arg(long)]
     pub created_by: Option<String>,

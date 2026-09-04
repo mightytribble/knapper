@@ -262,7 +262,12 @@ async fn main() -> Result<()> {
             cfg.merge_top_n(args.top_n);
             let group_by = args.group_by.unwrap_or(cfg.group_by);
             let all_terms = knapper::tags::merge_scope_alias(args.scope, args.all);
-            let scope = knapper::tags::Scope::parse(&all_terms, &args.any, &args.none)?;
+            let scope = knapper::tags::Scope::parse(&all_terms, &args.any, &args.none)?
+                .with_filters(
+                    args.property.as_deref(),
+                    args.links_to.as_deref(),
+                    args.linked_from.as_deref(),
+                )?;
 
             if !index_exists(&data_dir) {
                 eprintln!("No index found. Run 'knapper index <path>' first.");
@@ -382,7 +387,12 @@ async fn main() -> Result<()> {
                 profile: profile.as_ref(),
             };
             let all_terms = knapper::tags::merge_scope_alias(args.scope, args.all);
-            let filter = knapper::tags::Scope::parse(&all_terms, &args.any, &args.none)?;
+            let filter = knapper::tags::Scope::parse(&all_terms, &args.any, &args.none)?
+                .with_filters(
+                    args.property.as_deref(),
+                    args.links_to.as_deref(),
+                    args.linked_from.as_deref(),
+                )?;
             let items = knapper::context::context_list(
                 &params,
                 &filter,

@@ -367,7 +367,9 @@ async fn handle_plugin_manifest(State(state): State<ApiState>) -> impl IntoRespo
 /// nearest tag or folder in the message, the cheapest honest signal this far
 /// from where the error is built (#60, #65).
 fn is_scope_typo(message: &str) -> bool {
-    message.starts_with("no such tag") || message.starts_with("no such folder")
+    message.starts_with("no such tag")
+        || message.starts_with("no such folder")
+        || message.starts_with("no such note")
 }
 
 async fn handle_match(
@@ -406,6 +408,13 @@ async fn handle_search(
     let top_n = body.top_n.unwrap_or(state.top_n);
     let all_terms = crate::tags::merge_scope_alias(body.scope, body.all);
     let scope = crate::tags::Scope::parse(&all_terms, &body.any, &body.none)
+        .and_then(|s| {
+            s.with_filters(
+                body.property.as_deref(),
+                body.links_to.as_deref(),
+                body.linked_from.as_deref(),
+            )
+        })
         .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
     let store = state.store.lock().await;
     let mut embedder = state.embedder.lock().await;
@@ -524,6 +533,13 @@ async fn handle_list(
     };
     let all_terms = crate::tags::merge_scope_alias(params.scope, params.all);
     let filter = crate::tags::Scope::parse(&all_terms, &params.any, &params.none)
+        .and_then(|s| {
+            s.with_filters(
+                params.property.as_deref(),
+                params.links_to.as_deref(),
+                params.linked_from.as_deref(),
+            )
+        })
         .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
     let items = context::context_list(
         &ctx,
@@ -2346,5 +2362,38 @@ mod tests {
             blocks.iter().all(|b| b["score"].is_number()),
             "--scores must fill a number on every block, got {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_list_filters_by_property_and_an_unknown_note_is_a_400() {
+        let state = test_api_state();
+        {
+            let store = state.store.lock().await;
+            let a = store
+                .insert_file("ada.md", "h1", 100, "aaa111", None, None)
+                .unwrap();
+            let acme = store
+                .insert_file("acme.md", "h2", 200, "bbb222", None, None)
+                .unwrap();
+            store
+                .replace_file_properties(
+                    a,
+                    &[crate::store::NewProperty {
+                        chunk_seq: crate::store::DOC_LEVEL,
+                        name: "employer",
+                        value: "acme",
+                        kind: crate::properties::Kind::Link,
+                        target_file: Some(acme),
+                    }],
+                )
+                .unwrap();
+        }
+        let rows = json_body(get(state.clone(), "/api/list?property=employer%3Dacme").await).await;
+        assert_eq!(paths(&rows), vec!["ada.md"]);
+        let rows =
+            json_body(get(state.clone(), "/api/list?property=employer&links_to=acme").await).await;
+        assert_eq!(paths(&rows), vec!["ada.md"]);
+        let response = get(state, "/api/list?links_to=nobody").await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }

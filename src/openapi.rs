@@ -87,6 +87,9 @@ fn build_search() -> serde_json::Value {
                         "all": { "type": "array", "items": { "type": "string" }, "description": "Tag terms a note carries every one of, or directory terms (starting with /, case-sensitive, a trailing / its subtree) it lies under" },
                         "any": { "type": "array", "items": { "type": "string" }, "description": "Tag terms a note carries at least one of, or directory terms (starting with /, case-sensitive, a trailing / its subtree) it lies under" },
                         "none": { "type": "array", "items": { "type": "string" }, "description": "Tag terms a note carries none of, or directory terms (starting with /, case-sensitive, a trailing / its subtree) it does not lie under" },
+                        "property": { "type": "string", "description": "Answer from notes carrying a custom property: NAME, or NAME=VALUE for one value compared as text. One per call; GET /api/properties lists the names and values" },
+                        "links_to": { "type": "string", "description": "Answer from notes that link to this note, named the way a wikilink names it. With property, only links filed under that property count. An unknown note is a 400 naming the nearest one" },
+                        "linked_from": { "type": "string", "description": "Answer from the notes this note links to, named the way a wikilink names it. With property, only links filed under that property count. An unknown note is a 400 naming the nearest one" },
                         "budget_tokens": { "type": "integer", "description": "Token budget for the returned text. Fill is greedy in rank order and the first result is always included. Defaults to the configured output budget" },
                         "full": { "type": "boolean", "description": "Return every result's full text, ignoring the token budget. Conflicts with summaries" },
                         "summaries": { "type": "boolean", "description": "Return breadcrumb and provenance only, no text, for every result. Conflicts with full" },
@@ -162,6 +165,9 @@ fn build_list() -> serde_json::Value {
                 { "name": "all", "in": "query", "required": false, "description": "Comma-separated tag terms a note carries every one of, or directory terms (starting with /, case-sensitive, a trailing / its subtree) it lies under", "schema": { "type": "string" } },
                 { "name": "any", "in": "query", "required": false, "description": "Comma-separated tag terms a note carries at least one of, or directory terms (starting with /, case-sensitive, a trailing / its subtree) it lies under", "schema": { "type": "string" } },
                 { "name": "none", "in": "query", "required": false, "description": "Comma-separated tag terms a note carries none of, or directory terms (starting with /, case-sensitive, a trailing / its subtree) it does not lie under", "schema": { "type": "string" } },
+                { "name": "property", "in": "query", "required": false, "description": "Notes carrying a custom property: NAME, or NAME=VALUE for one value compared as text, URL-encoded. One per call; /api/properties lists the names and values", "schema": { "type": "string" } },
+                { "name": "links_to", "in": "query", "required": false, "description": "Notes that link to this note, named the way a wikilink names it. With property, only links filed under that property count. An unknown note is a 400 naming the nearest one", "schema": { "type": "string" } },
+                { "name": "linked_from", "in": "query", "required": false, "description": "The notes this note links to, named the way a wikilink names it. With property, only links filed under that property count. An unknown note is a 400 naming the nearest one", "schema": { "type": "string" } },
                 { "name": "created_by", "in": "query", "required": false, "description": "Agent filter", "schema": { "type": "string" } },
                 { "name": "limit", "in": "query", "required": false, "description": "Maximum notes to answer. Absent, every note the scope admits", "schema": { "type": "integer" } },
                 { "name": "detailed", "in": "query", "required": false, "description": "detailed=true answers each note's heading outline beside its path. The value is required; a bare `detailed` does not parse", "schema": { "type": "boolean" } }
@@ -712,5 +718,22 @@ mod tests {
             .collect();
 
         assert_eq!(served, described, "the spec and the router disagree");
+    }
+
+    #[test]
+    fn test_list_and_search_document_the_property_filters() {
+        let spec = build_openapi_spec("http://localhost:3000");
+        let list: Vec<&str> = spec["paths"]["/api/list"]["get"]["parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["name"].as_str().unwrap())
+            .collect();
+        let search = &spec["paths"]["/api/search"]["post"]["requestBody"]["content"]["application/json"]
+            ["schema"]["properties"];
+        for name in ["property", "links_to", "linked_from"] {
+            assert!(list.contains(&name), "list is missing {name}");
+            assert!(search.get(name).is_some(), "search is missing {name}");
+        }
     }
 }

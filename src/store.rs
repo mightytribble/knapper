@@ -1852,6 +1852,15 @@ impl Store {
     }
 }
 
+/// The note ids a scope's link terms resolve to (#66). Built by
+/// [`Store::resolve_scope_links`] and handed to `scope_clauses` beside the
+/// scope, so a clause cannot be built from an unresolved name.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct LinkIds {
+    pub links_to: Option<i64>,
+    pub linked_from: Option<i64>,
+}
+
 /// A scope over a note query: SQL over a `files` row aliased `f`, and its
 /// arguments in the order the SQL binds them (#65).
 ///
@@ -1859,7 +1868,10 @@ impl Store {
 /// `list_files` and `files_in_scope` ask the same question and a second copy is
 /// a second thing to keep right. A tag term is an `EXISTS` over the junction; a
 /// directory term is a range predicate on `files.path`, which needs no join.
-fn scope_clauses(scope: &crate::tags::Scope) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
+fn scope_clauses(
+    scope: &crate::tags::Scope,
+    links: &LinkIds,
+) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
     use crate::tags::ScopeTerm;
 
     fn fragment(term: &ScopeTerm, args: &mut Vec<Box<dyn rusqlite::types::ToSql>>) -> String {
@@ -1903,6 +1915,73 @@ fn scope_clauses(scope: &crate::tags::Scope) -> (String, Vec<Box<dyn rusqlite::t
             sql.push_str(&format!(" AND ({group})"));
         }
     }
+
+    // The property and link filters (#66). A link term alone reads `edges`,
+    // so a plain `[[X]]` counts; with a property beside it, only links filed
+    // under that name count, and the plain property clause is not added:
+    // the property names the link, not the note being selected.
+    let property = scope.property.as_ref();
+    let push_value = |sql: &mut String, args: &mut Vec<Box<dyn rusqlite::types::ToSql>>| {
+        if let Some(p) = property
+            && let Some(v) = &p.value
+        {
+            sql.push_str(" AND p.value = ?");
+            args.push(Box::new(v.clone()));
+        }
+    };
+    if let Some(to) = links.links_to {
+        match property {
+            Some(p) => {
+                sql.push_str(
+                    " AND EXISTS (SELECT 1 FROM properties p
+                                   WHERE p.file_id = f.id AND p.name = ? AND p.target_file = ?",
+                );
+                args.push(Box::new(p.name.clone()));
+                args.push(Box::new(to));
+                push_value(&mut sql, &mut args);
+                sql.push(')');
+            }
+            None => {
+                sql.push_str(
+                    " AND EXISTS (SELECT 1 FROM edges e
+                                   WHERE e.from_file = f.id AND e.to_file = ? AND e.edge_type = 'wikilink')",
+                );
+                args.push(Box::new(to));
+            }
+        }
+    }
+    if let Some(from) = links.linked_from {
+        match property {
+            Some(p) => {
+                sql.push_str(
+                    " AND EXISTS (SELECT 1 FROM properties p
+                                   WHERE p.file_id = ? AND p.name = ? AND p.target_file = f.id",
+                );
+                args.push(Box::new(from));
+                args.push(Box::new(p.name.clone()));
+                push_value(&mut sql, &mut args);
+                sql.push(')');
+            }
+            None => {
+                sql.push_str(
+                    " AND EXISTS (SELECT 1 FROM edges e
+                                   WHERE e.from_file = ? AND e.to_file = f.id AND e.edge_type = 'wikilink')",
+                );
+                args.push(Box::new(from));
+            }
+        }
+    }
+    if let Some(p) = property
+        && links.links_to.is_none()
+        && links.linked_from.is_none()
+    {
+        sql.push_str(
+            " AND EXISTS (SELECT 1 FROM properties p WHERE p.file_id = f.id AND p.name = ?",
+        );
+        args.push(Box::new(p.name.clone()));
+        push_value(&mut sql, &mut args);
+        sql.push(')');
+    }
     (sql, args)
 }
 
@@ -1928,10 +2007,11 @@ impl Store {
         let checked: Vec<&crate::tags::ScopeTerm> =
             tags.all.iter().chain(tags.any.iter()).collect();
         crate::tags::check_terms(&self.conn, &checked)?;
+        let links = self.resolve_scope_links(tags)?;
 
         let mut sql = format!("SELECT {FILE_COLUMNS} FROM files f WHERE 1=1");
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        let (tag_sql, tag_args) = scope_clauses(tags);
+        let (tag_sql, tag_args) = scope_clauses(tags, &links);
         sql.push_str(&tag_sql);
         param_values.extend(tag_args);
         if let Some(cb) = created_by {
@@ -1972,8 +2052,9 @@ impl Store {
         let checked: Vec<&crate::tags::ScopeTerm> =
             scope.all.iter().chain(scope.any.iter()).collect();
         crate::tags::check_terms(&self.conn, &checked)?;
+        let links = self.resolve_scope_links(scope)?;
 
-        let (scope_sql, args) = scope_clauses(scope);
+        let (scope_sql, args) = scope_clauses(scope, &links);
         let mut stmt = self.conn.prepare(&format!(
             "SELECT f.path, c.heading_path, c.text
                FROM chunks c JOIN files f ON f.id = c.file_id
@@ -2005,8 +2086,9 @@ impl Store {
         let checked: Vec<&crate::tags::ScopeTerm> =
             filter.all.iter().chain(filter.any.iter()).collect();
         crate::tags::check_terms(&self.conn, &checked)?;
+        let links = self.resolve_scope_links(filter)?;
 
-        let (tag_sql, args) = scope_clauses(filter);
+        let (tag_sql, args) = scope_clauses(filter, &links);
         let mut stmt = self
             .conn
             .prepare(&format!("SELECT f.id FROM files f WHERE 1=1{tag_sql}"))?;
@@ -2016,6 +2098,30 @@ impl Store {
             ids.push(row?);
         }
         Ok(ids)
+    }
+
+    /// Resolve a scope's link terms to note ids (#66), the way a wikilink
+    /// target resolves. An unresolvable name errors, naming the nearest note
+    /// the fuzzy file resolver finds.
+    pub fn resolve_scope_links(&self, scope: &crate::tags::Scope) -> Result<LinkIds> {
+        let resolve = |field: &str, term: &Option<crate::tags::LinkTerm>| -> Result<Option<i64>> {
+            let Some(term) = term else { return Ok(None) };
+            if let Some(id) = crate::graph::resolve_link_target(self, &term.written)? {
+                return Ok(Some(id));
+            }
+            match self.resolve_file(&term.written).ok().flatten() {
+                Some(near) => anyhow::bail!(
+                    "no such note '{}' for '{field}'; nearest: '{}'",
+                    term.written,
+                    near.path
+                ),
+                None => anyhow::bail!("no such note '{}' for '{field}'", term.written),
+            }
+        };
+        Ok(LinkIds {
+            links_to: resolve("links_to", &scope.links_to)?,
+            linked_from: resolve("linked_from", &scope.linked_from)?,
+        })
     }
 
     /// Top-level folder grouping with note counts.
@@ -7130,5 +7236,162 @@ mod tests {
         // And the carried row is keyed on the file, so the cascade reaches it.
         store.delete_file(file_id).unwrap();
         assert!(store.get_unresolved_links().unwrap().is_empty());
+    }
+
+    /// ada links to acme under `employer` (frontmatter) and to bob under
+    /// `mentor` (body); bob links to acme with a plain body wikilink; acme
+    /// carries `status: active`.
+    fn property_vault() -> (Store, i64, i64, i64) {
+        use crate::properties::Kind;
+        let store = Store::open_memory().unwrap();
+        let ada = store
+            .insert_file("ada.md", "h", 0, &generate_docid("ada.md"), None, None)
+            .unwrap();
+        let acme = store
+            .insert_file("acme.md", "h", 0, &generate_docid("acme.md"), None, None)
+            .unwrap();
+        let bob = store
+            .insert_file("bob.md", "h", 0, &generate_docid("bob.md"), None, None)
+            .unwrap();
+        store
+            .replace_file_properties(
+                ada,
+                &[
+                    prop(DOC_LEVEL, "employer", "acme", Kind::Link, Some(acme)),
+                    prop(DOC_LEVEL, "status", "draft", Kind::Text, None),
+                    prop(0, "mentor", "bob", Kind::Link, Some(bob)),
+                ],
+            )
+            .unwrap();
+        store
+            .replace_file_properties(
+                acme,
+                &[prop(DOC_LEVEL, "status", "active", Kind::Text, None)],
+            )
+            .unwrap();
+        store
+            .insert_edge(ada, DOC_LEVEL, acme, DOC_LEVEL, "wikilink")
+            .unwrap();
+        store
+            .insert_edge(ada, 0, bob, DOC_LEVEL, "wikilink")
+            .unwrap();
+        store
+            .insert_edge(bob, 0, acme, DOC_LEVEL, "wikilink")
+            .unwrap();
+        (store, ada, acme, bob)
+    }
+
+    fn scoped(
+        store: &Store,
+        property: Option<&str>,
+        to: Option<&str>,
+        from: Option<&str>,
+    ) -> Vec<String> {
+        let scope = crate::tags::Scope::default()
+            .with_filters(property, to, from)
+            .unwrap();
+        store
+            .list_files(&scope, None, None)
+            .unwrap()
+            .into_iter()
+            .map(|f| f.path)
+            .collect()
+    }
+
+    #[test]
+    fn a_property_term_selects_by_name_and_by_value() {
+        let (store, ..) = property_vault();
+        assert_eq!(
+            scoped(&store, Some("status"), None, None),
+            ["acme.md", "ada.md"]
+        );
+        assert_eq!(
+            scoped(&store, Some("status=active"), None, None),
+            ["acme.md"]
+        );
+        assert_eq!(
+            scoped(&store, Some("mentor"), None, None),
+            ["ada.md"],
+            "a body row counts"
+        );
+        assert!(scoped(&store, Some("status=gone"), None, None).is_empty());
+    }
+
+    #[test]
+    fn links_to_alone_reads_edges_and_with_a_property_reads_the_name() {
+        let (store, ..) = property_vault();
+        assert_eq!(
+            scoped(&store, None, Some("acme"), None),
+            ["ada.md", "bob.md"]
+        );
+        assert_eq!(
+            scoped(&store, Some("employer"), Some("acme"), None),
+            ["ada.md"]
+        );
+        assert!(scoped(&store, Some("mentor"), Some("acme"), None).is_empty());
+        assert_eq!(
+            scoped(&store, Some("employer=acme"), Some("acme"), None),
+            ["ada.md"]
+        );
+    }
+
+    #[test]
+    fn linked_from_alone_reads_edges_and_with_a_property_reads_the_name() {
+        let (store, ..) = property_vault();
+        assert_eq!(
+            scoped(&store, None, None, Some("ada")),
+            ["acme.md", "bob.md"]
+        );
+        assert_eq!(
+            scoped(&store, Some("mentor"), None, Some("ada")),
+            ["bob.md"]
+        );
+        assert_eq!(
+            scoped(&store, Some("employer"), None, Some("ada")),
+            ["acme.md"]
+        );
+    }
+
+    #[test]
+    fn the_filters_and_together_with_a_tag_term() {
+        let (store, ada, ..) = property_vault();
+        let tag = |p: &str| crate::tags::Tag {
+            path: p.to_string(),
+            display: p.to_string(),
+        };
+        store
+            .reconcile_file_tags(ada, &[tag("type/person")])
+            .unwrap();
+        let scope = crate::tags::Scope::parse(&["type/person".into()], &[], &[])
+            .unwrap()
+            .with_filters(Some("status"), None, None)
+            .unwrap();
+        let got: Vec<String> = store
+            .list_files(&scope, None, None)
+            .unwrap()
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+        assert_eq!(got, ["ada.md"]);
+        assert_eq!(store.files_in_scope(&scope).unwrap(), vec![ada]);
+    }
+
+    #[test]
+    fn an_unknown_link_note_errors_with_the_nearest_one() {
+        let (store, ..) = property_vault();
+        let scope = crate::tags::Scope::default()
+            .with_filters(None, Some("acmee"), None)
+            .unwrap();
+        let err = store
+            .list_files(&scope, None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("no such note 'acmee'"), "{err}");
+        assert!(err.contains("nearest: 'acme.md'"), "{err}");
+        let scope = crate::tags::Scope::default()
+            .with_filters(None, None, Some("zzzzzz"))
+            .unwrap();
+        let err = store.files_in_scope(&scope).unwrap_err().to_string();
+        assert_eq!(err, "no such note 'zzzzzz' for 'linked_from'");
     }
 }
