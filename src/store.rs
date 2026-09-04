@@ -2871,10 +2871,13 @@ impl Store {
     }
 }
 
-/// The columns every [`PropertyRow`] reads, over `properties p` joined to
-/// the chunk that holds a body row and the note a link row names.
-const PROPERTY_ROW_SQL: &str = "SELECT p.chunk_seq, c.heading_path, p.name, p.value, p.kind, t.path
-       FROM properties p
+/// The join every property reader runs, from `properties p` to the chunk
+/// that holds a body row and the note a link row names.
+///
+/// Both [`Store::file_properties`] and [`Store::doc_properties_for_files`]
+/// compose their `SELECT` and `WHERE` around this one copy, so a column or
+/// join added here reaches both readers at once.
+const PROPERTIES_JOIN_SQL: &str = "FROM properties p
        LEFT JOIN chunks c ON c.file_id = p.file_id AND c.seq = p.chunk_seq
        LEFT JOIN files t ON t.id = p.target_file";
 
@@ -2921,7 +2924,9 @@ impl Store {
     /// Every property row one note holds, frontmatter first, then by chunk.
     pub fn file_properties(&self, file_id: i64) -> Result<Vec<PropertyRow>> {
         let mut stmt = self.conn.prepare(&format!(
-            "{PROPERTY_ROW_SQL} WHERE p.file_id = ?1 ORDER BY p.chunk_seq, p.name, p.id"
+            "SELECT p.chunk_seq, c.heading_path, p.name, p.value, p.kind, t.path
+               {PROPERTIES_JOIN_SQL}
+              WHERE p.file_id = ?1 ORDER BY p.chunk_seq, p.name, p.id"
         ))?;
         let rows = stmt.query_map(params![file_id], property_row_from)?;
         let mut out = Vec::new();
@@ -2948,9 +2953,7 @@ impl Store {
         );
         let mut stmt = self.conn.prepare(&format!(
             "SELECT p.file_id, p.chunk_seq, c.heading_path, p.name, p.value, p.kind, t.path
-               FROM properties p
-               LEFT JOIN chunks c ON c.file_id = p.file_id AND c.seq = p.chunk_seq
-               LEFT JOIN files t ON t.id = p.target_file
+               {PROPERTIES_JOIN_SQL}
               WHERE p.chunk_seq = {DOC_LEVEL} AND p.file_id IN rarray(?1)
               ORDER BY p.file_id, p.name, p.id"
         ))?;
