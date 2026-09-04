@@ -3,7 +3,12 @@
 Every entry below the upstream-lineage line names the commit it describes.
 Links resolve against https://github.com/mightytribble/knapper.
 
-## Unreleased
+## 0.9.7 (2026-09-04)
+
+knapper reads the custom properties your notes carry — frontmatter keys and
+Dataview inline fields — and `list` and `search` filter on them. The vault
+graph is rebuilt once on the upgrade to fill the properties table, which is a
+vault read with no model call. Nothing re-embeds.
 
 ### Added
 
@@ -17,7 +22,7 @@ Links resolve against https://github.com/mightytribble/knapper.
 
 - knapper serves MCP clients that speak the 2026-07-28 protocol, such as Google Antigravity (#109). Such a client opens the connection with a `server/discover` request; knapper read that as a failed handshake and exited, and the client reported the connection closed. A client that opens with `initialize` connects as before. ([`fd9a9a6`](https://github.com/mightytribble/knapper/commit/fd9a9a6))
 
-The vault graph is rebuilt once on the upgrade to fill the properties table — a vault read with no model call. Nothing re-embeds.
+- **Test count: 1224 → 1289.**
 
 ## 0.9.6 (2026-09-03)
 
