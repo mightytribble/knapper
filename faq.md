@@ -170,7 +170,9 @@ not tell you what a note is *about* — that is what `search` is for.
 
 Read the section, change it, write it back. What `read --section` returns is
 exactly what `update --section` takes: the body **below** the heading, with
-the heading named beside it rather than carried in the text.
+the heading named beside it rather than carried in the text. `knapper list
+--detailed` prints each note's heading outline, which is how an agent finds
+the section to name before it reads or writes one.
 
 ```bash
 knapper update "Meeting Notes" --section "Action Items" \
