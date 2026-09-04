@@ -195,18 +195,24 @@ fn split_frontmatter(content: &str) -> (String, String) {
 /// The notes at the far end of a set of edges, each with the property
 /// names the link is filed under (#66). `names` answers those for one far
 /// note, so the caller decides which end of the link is this note.
+///
+/// A failed property read is the caller's error, the policy the
+/// `properties` module states: `context_read` returns `Result`, so it
+/// carries one rather than reporting a link no property names.
 fn link_refs<T>(
     store: &Store,
     edges: &[(i64, T)],
-    names: impl Fn(i64) -> Vec<String>,
-) -> Vec<LinkRef> {
+    names: impl Fn(i64) -> Result<Vec<String>>,
+) -> Result<Vec<LinkRef>> {
     edges
         .iter()
         .filter_map(|(fid, _)| store.get_file_by_id(*fid).ok().flatten())
-        .map(|f| LinkRef {
-            properties: names(f.id),
-            path: f.path,
-            docid: f.docid,
+        .map(|f| {
+            Ok(LinkRef {
+                properties: names(f.id)?,
+                path: f.path,
+                docid: f.docid,
+            })
         })
         .collect()
 }
@@ -250,23 +256,13 @@ pub fn context_read(
             outgoing_links: link_refs(
                 params.store,
                 &params.store.get_outgoing(id, Some("wikilink"))?,
-                |to| {
-                    params
-                        .store
-                        .property_names_for_link(id, to)
-                        .unwrap_or_default()
-                },
-            ),
+                |to| params.store.property_names_for_link(id, to),
+            )?,
             incoming_links: link_refs(
                 params.store,
                 &params.store.get_incoming(id, Some("wikilink"))?,
-                |from| {
-                    params
-                        .store
-                        .property_names_for_link(from, id)
-                        .unwrap_or_default()
-                },
-            ),
+                |from| params.store.property_names_for_link(from, id),
+            )?,
             properties: params.store.file_properties(id)?,
             byte_count,
         }));

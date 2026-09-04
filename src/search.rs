@@ -813,10 +813,16 @@ fn finalize_search_output(
             .map(|r| r.file_id)
             .collect()
     };
-    if let Ok(by_file) = present.store.doc_properties_for_files(&ids) {
-        for r in &mut results {
-            r.properties = by_file.get(&r.file_id).cloned().unwrap_or_default();
+    // A failed read is logged and never silent, the policy the `properties`
+    // module states. This function answers a `SearchOutput` and not a
+    // `Result`, so it is the one site that cannot propagate.
+    match present.store.doc_properties_for_files(&ids) {
+        Ok(by_file) => {
+            for r in &mut results {
+                r.properties = by_file.get(&r.file_id).cloned().unwrap_or_default();
+            }
         }
+        Err(e) => tracing::warn!("search hits carry no properties: {e:#}"),
     }
     SearchOutput {
         results,

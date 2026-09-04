@@ -251,10 +251,14 @@ pub fn build_edges_for_file(store: &Store, file_id: i64, content: &str) -> Resul
     // Clear stale unresolved entries for this file before re-recording.
     store.clear_unresolved_links_for_file(file_id)?;
 
+    // The file's chunks, read once: the link pass below and the property
+    // pass after it both read every chunk's text.
+    let chunks = store.get_chunks_by_file(file_id)?;
+
     // Which passage each link came from. A link in more than one chunk gets an
     // edge from each — the multiplicity the old file-level UNIQUE discarded.
     let mut sources: HashMap<Wikilink, Vec<i64>> = HashMap::new();
-    for chunk in store.get_chunks_by_file(file_id)? {
+    for chunk in &chunks {
         for link in extract_wikilinks(&chunk.text) {
             sources.entry(link).or_default().push(chunk.seq);
         }
@@ -291,27 +295,34 @@ pub fn build_edges_for_file(store: &Store, file_id: i64, content: &str) -> Resul
     // reads the raw content and the chunk rows, and resolves every target,
     // and it is what every caller runs to keep a note's links right. A
     // property link is a link with a name, so it keeps right the same way.
-    derive_properties(store, file_id, content)
+    derive_properties(store, file_id, content, &chunks)
 }
 
 /// Replace one file's property rows from its frontmatter and its chunks (#66).
 ///
 /// Frontmatter comes from `content`, because the chunker strips it; the
-/// rows sit at [`DOC_LEVEL`]. A link's target resolves through
-/// [`resolve_link_target`], the function every edge resolves through, so a
-/// property row and its edge name one note by construction. A target that
-/// resolves to nothing keeps the row and leaves `target_file` null.
-fn derive_properties(store: &Store, file_id: i64, content: &str) -> Result<()> {
+/// rows sit at [`DOC_LEVEL`]. Body rows come from `chunks`, the file's
+/// chunk rows, which the caller has already read. A link's target resolves
+/// through [`resolve_link_target`], the function every edge resolves
+/// through, so a property row and its edge name one note by construction.
+/// A target that resolves to nothing keeps the row and leaves
+/// `target_file` null.
+fn derive_properties(
+    store: &Store,
+    file_id: i64,
+    content: &str,
+    chunks: &[crate::store::ChunkRecord],
+) -> Result<()> {
     let (frontmatter, _body) = crate::markdown::split_frontmatter(content);
     let mut extracted: Vec<crate::properties::Extracted> = frontmatter
         .as_deref()
         .map(crate::properties::from_frontmatter)
         .unwrap_or_default();
-    // Body rows sit at the chunk that holds the line, read from the store
-    // the way the links above are, so the file's chunks must be inserted
-    // first — every caller does that. A line the oversized-split overlap
-    // repeats writes a row per chunk that holds it, the rule edges follow.
-    for chunk in store.get_chunks_by_file(file_id)? {
+    // Body rows sit at the chunk that holds the line, so the file's chunks
+    // must be inserted first — every caller does that. `chunks` is the
+    // vector the link pass read. A line the oversized-split overlap repeats
+    // writes a row per chunk that holds it, the rule edges follow.
+    for chunk in chunks {
         extracted.extend(crate::properties::from_chunk(chunk.seq, &chunk.text));
     }
     let mut rows = Vec::with_capacity(extracted.len());

@@ -786,49 +786,62 @@ pub fn validate_target(
     let mut checked = 0usize;
     for path in &all {
         let rel = rel_path(root, path).unwrap_or_else(|| path.to_string_lossy().into_owned());
+        // One read per file. A scope with a tag term needs the text to
+        // decide admission, and every check below reads the same text; a
+        // scope with no tag term decides on the path alone, so a note it
+        // excludes is never read (#65, #66).
+        let mut text: Option<String> = None;
         if let Target::Scope(scope) = target {
-            let content_tags = if needs_tags {
-                match std::fs::read_to_string(path) {
-                    Ok(text) => Some(crate::tags::extract(&text)),
-                    Err(e) => {
-                        findings.push(Finding::new(
-                            &rel,
-                            None,
-                            Rule::FileUnreadable,
-                            format!("cannot read file: {e}"),
-                        ));
+            if needs_tags {
+                match read_note(path, &rel) {
+                    Ok(read) => text = Some(read),
+                    Err(finding) => {
+                        findings.push(finding);
                         continue;
                     }
                 }
-            } else {
-                None
-            };
+            }
+            let content_tags = text.as_deref().map(crate::tags::extract);
             if !scope_admits(&rel, content_tags.as_deref(), scope) {
                 continue;
             }
         }
-        findings.extend(check_path(path, &rel, &names, limits));
-        if let Ok(text) = std::fs::read_to_string(path) {
-            findings.extend(check_properties(&rel, &text, &declared));
-            tally.record(&text);
-        }
+        let text = match text {
+            Some(text) => text,
+            None => match read_note(path, &rel) {
+                Ok(read) => read,
+                Err(finding) => {
+                    // A file that cannot be read is still a file this run
+                    // looked at, which is what the walk has always counted.
+                    findings.push(finding);
+                    checked += 1;
+                    continue;
+                }
+            },
+        };
+        findings.extend(validate_file(&rel, &text, &names, limits));
+        findings.extend(check_properties(&rel, &text, &declared));
+        tally.record(&text);
         checked += 1;
     }
     findings.extend(tally.findings(&declared, matches!(target, Target::Vault)));
     Ok(ValidateReport::build(findings, checked, strict))
 }
 
-/// Read one file and validate it, or report it unreadable.
-pub fn check_path(path: &Path, rel: &str, names: &NameSet, limits: &ChunkLimits) -> Vec<Finding> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => validate_file(rel, &text, names, limits),
-        Err(e) => vec![Finding::new(
+/// One file's text, or the finding that says it cannot be read.
+///
+/// The walk's one reader: the scope's tag terms, every per-file check and
+/// the vault-wide tally all read the text it answers, so a file is read
+/// once however many of them run (#66).
+fn read_note(path: &Path, rel: &str) -> std::result::Result<String, Finding> {
+    std::fs::read_to_string(path).map_err(|e| {
+        Finding::new(
             rel,
             None,
             Rule::FileUnreadable,
             format!("cannot read file: {e}"),
-        )],
-    }
+        )
+    })
 }
 
 /// Resolve a vault-relative note reference to a path: exact relative path
@@ -1180,20 +1193,14 @@ mod tests {
     }
 
     #[test]
-    fn check_path_reports_an_unreadable_file() {
-        let names = NameSet::empty();
-        let limits = ChunkLimits {
-            min_chars: 120,
-            target_tokens: 512,
-        };
-        let findings = check_path(
-            std::path::Path::new("does/not/exist.md"),
-            "exist.md",
-            &names,
-            &limits,
+    fn a_file_that_cannot_be_read_is_a_finding_and_not_an_error() {
+        let finding = read_note(std::path::Path::new("does/not/exist.md"), "exist.md")
+            .expect_err("no such file");
+        assert_eq!(finding.rule, Rule::FileUnreadable);
+        assert!(
+            finding.message.starts_with("cannot read file:"),
+            "{finding:?}"
         );
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].rule, Rule::FileUnreadable);
     }
 
     // ── Custom properties (#66) ──────────────────────────────────

@@ -3,6 +3,17 @@
 //!
 //! This module owns the kind vocabulary and the two extractors. Nothing else
 //! in the crate reads a property out of a note.
+//!
+//! # Reading rows back
+//!
+//! A property read can fail the way any store read can. One policy across
+//! the crate: propagate it where the signature carries an error, and log it
+//! where the signature cannot. A caller that filtered on a property asked
+//! for those rows, so answering an empty list in place of a failure would
+//! report the vault holds nothing when the read is what went wrong.
+//! `context_read` and `context_list` return `Result` and propagate;
+//! `search::finalize_search_output` returns a `SearchOutput` and cannot, so
+//! it warns and leaves the field empty.
 
 /// The kind of a property value, read from the value's shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
@@ -198,7 +209,7 @@ pub fn from_chunk(seq: i64, text: &str) -> Vec<Extracted> {
 /// The `(key, value)` pairs one line holds.
 fn inline_fields(line: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    let body = strip_list_prefix(line.trim_start());
+    let body = strip_line_prefix(line.trim_start());
     if !body.starts_with('[')
         && !body.starts_with('(')
         && let Some(pair) = split_field(body)
@@ -254,12 +265,21 @@ fn split_field(text: &str) -> Option<(String, String)> {
     Some((key.to_string(), value.trim().to_string()))
 }
 
-/// Drop a list-item marker and a task box from the head of a line.
-fn strip_list_prefix(line: &str) -> &str {
+/// Drop a blockquote marker, a list-item marker and a task box from the
+/// head of a line, in that order.
+///
+/// A callout body is `> Key:: value`, and `>` is not a character
+/// `split_field` rejects, so the marker would otherwise be filed as part of
+/// the name. The space after `>` is optional and the quote may nest (#66).
+fn strip_line_prefix(line: &str) -> &str {
+    let mut quoted = line;
+    while let Some(rest) = quoted.strip_prefix('>') {
+        quoted = rest.trim_start();
+    }
     let after_marker = ["- ", "* ", "+ "]
         .iter()
-        .find_map(|m| line.strip_prefix(m))
-        .unwrap_or(line)
+        .find_map(|m| quoted.strip_prefix(m))
+        .unwrap_or(quoted)
         .trim_start();
     ["[ ] ", "[x] ", "[X] "]
         .iter()
@@ -571,6 +591,26 @@ mod tests {
                 ("Due".into(), "2026-09-03".into(), Kind::Text),
                 ("Owner".into(), "Ada".into(), Kind::Text),
                 ("Done".into(), "true".into(), Kind::Checkbox),
+            ]
+        );
+    }
+
+    /// A callout body is `> Key:: value`, and `>` is not a character
+    /// `split_field` rejects, so the marker would otherwise be filed as
+    /// part of the name (#66).
+    #[test]
+    fn a_blockquote_or_callout_marker_is_stripped_from_the_full_line_form() {
+        let rows = from_chunk(
+            0,
+            "> [!note] Client\n> Owner:: Ada\n>> Deputy:: Bob\n>Rank:: 3\n> - Mentor:: [[Bob]]\n",
+        );
+        assert_eq!(
+            names_values(&rows),
+            vec![
+                ("Owner".into(), "Ada".into(), Kind::Text),
+                ("Deputy".into(), "Bob".into(), Kind::Text),
+                ("Rank".into(), "3".into(), Kind::Number),
+                ("Mentor".into(), "Bob".into(), Kind::Link),
             ]
         );
     }
