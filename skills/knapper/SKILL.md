@@ -5,7 +5,7 @@ license: MIT
 compatibility: Requires knapper CLI. Install via `brew install mightytribble/tap/knapper` or from GitHub releases.
 metadata:
   author: mightytribble
-  version: "0.9.7"
+  version: "0.9.8"
 allowed-tools: Bash(knapper:*), mcp__knapper__*
 ---
 

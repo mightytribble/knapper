@@ -10,7 +10,7 @@
       "name": "knapper",
       "source": "./",
       "description": "Local hybrid search and MCP retrieval for Obsidian-format vaults",
-      "version": "0.9.7",
+      "version": "0.9.8",
       "author": {
         "name": "mightytribble",
         "url": "https://github.com/mightytribble",

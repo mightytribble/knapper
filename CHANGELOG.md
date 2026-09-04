@@ -3,7 +3,15 @@
 Every entry below the upstream-lineage line names the commit it describes.
 Links resolve against https://github.com/mightytribble/knapper.
 
-## Unreleased
+## 0.9.8 (2026-09-04)
+
+A documentation release. The README is a landing page and the manual it used
+to carry now lives in documents of its own; the bundled skill is an operating
+guide rather than a restatement of the tool list. Several things the docs said
+were wrong and are corrected here. The one code change removes a configuration
+section that never did anything.
+
+Nothing re-indexes and nothing re-embeds on the upgrade.
 
 ### Changed
 
