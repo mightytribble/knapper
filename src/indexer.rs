@@ -195,6 +195,9 @@ pub fn diff_vault(
 /// costs seconds where a reindex costs minutes.
 fn rebuild_all_edges(store: &Store, vault_path: &Path, files: &[PathBuf]) -> Result<usize> {
     store.clear_edges()?;
+    // The pass below derives `properties` beside `edges` (#66), so the
+    // table it fills is cleared with the one it fills.
+    store.clear_properties()?;
     let mut rebuilt = 0usize;
     for path in files {
         let rel = path.strip_prefix(vault_path).unwrap_or(path);
@@ -233,6 +236,9 @@ fn rebuild_all_edges(store: &Store, vault_path: &Path, files: &[PathBuf]) -> Res
 /// - **Target**: the chunks under the named `#Heading`, or [`DOC_LEVEL`] for a
 ///   plain `[[Note]]`. A heading that no longer resolves degrades to
 ///   [`DOC_LEVEL`] as well — never to nothing.
+///
+/// The pass also derives the file's custom properties into the `properties`
+/// table (#66), so a caller that keeps edges right keeps properties right.
 ///
 /// Clears pre-existing `unresolved_links` entries for the source file
 /// before re-recording, so this is safe to call repeatedly during
@@ -281,7 +287,41 @@ pub fn build_edges_for_file(store: &Store, file_id: i64, content: &str) -> Resul
             }
         }
     }
-    Ok(())
+    // The same pass derives the file's custom properties (#66): it already
+    // reads the raw content and the chunk rows, and resolves every target,
+    // and it is what every caller runs to keep a note's links right. A
+    // property link is a link with a name, so it keeps right the same way.
+    derive_properties(store, file_id, content)
+}
+
+/// Replace one file's property rows from its frontmatter (#66).
+///
+/// Frontmatter comes from `content`, because the chunker strips it; the
+/// rows sit at [`DOC_LEVEL`]. A link's target resolves through
+/// [`resolve_link_target`], the function every edge resolves through, so a
+/// property row and its edge name one note by construction. A target that
+/// resolves to nothing keeps the row and leaves `target_file` null.
+fn derive_properties(store: &Store, file_id: i64, content: &str) -> Result<()> {
+    let (frontmatter, _body) = crate::markdown::split_frontmatter(content);
+    let extracted: Vec<crate::properties::Extracted> = frontmatter
+        .as_deref()
+        .map(crate::properties::from_frontmatter)
+        .unwrap_or_default();
+    let mut rows = Vec::with_capacity(extracted.len());
+    for e in &extracted {
+        let target_file = match &e.link_target {
+            Some(target) => resolve_link_target(store, target)?,
+            None => None,
+        };
+        rows.push(crate::store::NewProperty {
+            chunk_seq: e.chunk_seq,
+            name: &e.name,
+            value: &e.value,
+            kind: e.kind,
+            target_file,
+        });
+    }
+    store.replace_file_properties(file_id, &rows)
 }
 
 /// The notes that write a wikilink to `file_id`.
@@ -3841,5 +3881,151 @@ mod tests {
             vec![("a.md".to_string(), "b".to_string())],
             "the link A writes names a note the vault no longer has"
         );
+    }
+
+    // ── Custom properties ride the edge pass (#66) ───────────────
+
+    #[test]
+    fn the_edge_pass_derives_frontmatter_properties() {
+        use crate::properties::Kind;
+        let store = Store::open_memory().unwrap();
+        let a = store
+            .insert_file("a.md", "h1", 100, "aaa111", None, None)
+            .unwrap();
+        let b = store
+            .insert_file("b.md", "h2", 100, "bbb222", None, None)
+            .unwrap();
+        let content_a = "---\ntags: [x]\nstatus: draft\nrating: 5\ndone: true\nemployer: \"[[b]]\"\nmanager: [[b]]\nghost: \"[[nobody]]\"\n---\n# A\n";
+        build_edges_for_file(&store, a, content_a).unwrap();
+
+        let rows = store.file_properties(a).unwrap();
+        let got: Vec<(&str, &str, Kind, Option<&str>)> = rows
+            .iter()
+            .map(|r| {
+                (
+                    r.name.as_str(),
+                    r.value.as_str(),
+                    r.kind,
+                    r.target_path.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("done", "true", Kind::Checkbox, None),
+                ("employer", "b", Kind::Link, Some("b.md")),
+                ("ghost", "nobody", Kind::Link, None),
+                ("rating", "5", Kind::Number, None),
+                ("status", "draft", Kind::Text, None),
+            ],
+            "no row for tags, none for the unquoted manager link"
+        );
+        // The quoted link still writes its edge through the existing path.
+        assert_eq!(store.get_outgoing(a, Some("wikilink")).unwrap()[0].0, b);
+    }
+
+    #[test]
+    fn a_second_pass_replaces_the_rows_it_wrote() {
+        let store = Store::open_memory().unwrap();
+        let a = store
+            .insert_file("a.md", "h1", 100, "aaa111", None, None)
+            .unwrap();
+        build_edges_for_file(&store, a, "---\nstatus: draft\n---\n# A\n").unwrap();
+        build_edges_for_file(&store, a, "---\nstatus: final\n---\n# A\n").unwrap();
+        let rows = store.file_properties(a).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].value, "final");
+    }
+
+    #[test]
+    fn rebuild_all_edges_fills_properties_from_empty() {
+        use crate::llm::MockLlm;
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write_file(root, "a.md", "---\nstatus: draft\n---\n# A\nSee [[b]].\n");
+        write_file(root, "b.md", "# B\nNothing.\n");
+        let store = Store::open_memory().unwrap();
+        let mut embedder = MockLlm::new(256);
+        let config = Config::default();
+        run_index_shared(
+            root,
+            &config,
+            IndexSettings::from_config(&config),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
+        let a = store.get_file("a.md").unwrap().unwrap().id;
+        assert_eq!(store.file_properties(a).unwrap().len(), 1);
+
+        store.clear_properties().unwrap();
+        assert!(store.file_properties(a).unwrap().is_empty());
+        let files = walk_vault(root, &[], true).unwrap();
+        rebuild_all_edges(&store, root, &files).unwrap();
+        assert_eq!(store.file_properties(a).unwrap().len(), 1);
+        assert_eq!(store.get_outgoing(a, Some("wikilink")).unwrap().len(), 1);
+    }
+
+    /// The table is inert to search (#66): the spec's invariance. Search
+    /// output and the graph counts are byte-identical before and after the
+    /// table is emptied, because nothing on the query path reads it.
+    #[test]
+    fn the_properties_table_is_inert_to_search() {
+        use crate::llm::MockLlm;
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write_file(
+            root,
+            "ada.md",
+            "---\nemployer: \"[[acme]]\"\nstatus: active\n---\n# Ada\nAda works on the swamp survey.\n",
+        );
+        write_file(root, "acme.md", "# Acme\nA firm that surveys swamps.\n");
+        write_file(
+            root,
+            "bob.md",
+            "---\nstatus: draft\n---\n# Bob\nBob writes about swamps too.\n",
+        );
+        let store = Store::open_memory().unwrap();
+        let mut embedder = MockLlm::new(256);
+        let config = Config::default();
+        run_index_shared(
+            root,
+            &config,
+            IndexSettings::from_config(&config),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let snapshot = |store: &Store, embedder: &mut MockLlm| -> String {
+            let mut sc = crate::search::SearchConfig::new(store, &config);
+            let out = crate::search::search_with_intelligence("swamp survey", 5, embedder, &mut sc)
+                .unwrap();
+            let results: Vec<(String, i64, String)> = out
+                .results
+                .iter()
+                .map(|r| (r.file_path.clone(), r.chunk_seq, format!("{:.6}", r.score)))
+                .collect();
+            let edges: i64 = store
+                .conn()
+                .query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))
+                .unwrap();
+            format!("{results:?} edges={edges}")
+        };
+
+        let before = snapshot(&store, &mut embedder);
+        let props: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM properties", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(props, 3, "the fixture wrote rows");
+        store.clear_properties().unwrap();
+        let after = snapshot(&store, &mut embedder);
+        assert_eq!(before, after);
     }
 }
