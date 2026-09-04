@@ -340,6 +340,13 @@ async fn main() -> Result<()> {
                             .unwrap_or_default()
                     )
                 };
+                let via = |names: &[String]| {
+                    if names.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" via {}", names.join(", "))
+                    }
+                };
                 match result {
                     ReadResult::Content(note) => {
                         // The content is the section's body, so the heading is
@@ -365,11 +372,21 @@ async fn main() -> Result<()> {
                         println!("Bytes: {}", meta.byte_count);
                         println!("Outgoing links: {}", meta.outgoing_links.len());
                         for l in &meta.outgoing_links {
-                            println!("  {}", ident(&l.path, &l.docid));
+                            println!("  {}{}", ident(&l.path, &l.docid), via(&l.properties));
                         }
                         println!("Incoming links: {}", meta.incoming_links.len());
                         for l in &meta.incoming_links {
-                            println!("  {}", ident(&l.path, &l.docid));
+                            println!("  {}{}", ident(&l.path, &l.docid), via(&l.properties));
+                        }
+                        if !meta.properties.is_empty() {
+                            println!("Properties: {}", meta.properties.len());
+                            for p in &meta.properties {
+                                let at = match &p.heading_path {
+                                    Some(h) => format!(" @ {h}"),
+                                    None => String::new(),
+                                };
+                                println!("  {} = {} ({}){at}", p.name, p.value, p.kind.as_str());
+                            }
                         }
                         if !meta.frontmatter.is_empty() {
                             println!("Frontmatter:\n{}", meta.frontmatter);

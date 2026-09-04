@@ -26,6 +26,10 @@ pub struct Block {
     pub text: String,
     pub untrusted_content: bool,
     pub truncated: bool,
+    /// The parent note's frontmatter properties. Omitted when empty, so a
+    /// vault with no custom properties renders as before (#66).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub properties: Vec<crate::store::PropertyRow>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub score: Option<f64>,
 }
@@ -123,6 +127,7 @@ fn block_of(r: &InternalSearchResult) -> Block {
         text: r.text.clone(),
         untrusted_content: true,
         truncated: r.truncated,
+        properties: r.properties.clone(),
         score: None,
     }
 }
@@ -327,6 +332,7 @@ mod assemble_tests {
                 graph: false,
                 linked_from: vec![],
             },
+            properties: Vec::new(),
         }
     }
     fn params(budget: u32) -> AssembleParams {
@@ -494,6 +500,33 @@ mod assemble_tests {
         assert!(scored_block_json["score"].is_number());
         assert_eq!(scored_block_json["score"], 90.0);
     }
+
+    #[test]
+    fn a_block_carries_its_notes_properties_and_omits_an_empty_list() {
+        let mut r = result(0, 10);
+        r.properties = vec![crate::store::PropertyRow {
+            chunk_seq: crate::store::DOC_LEVEL,
+            heading_path: None,
+            name: "status".into(),
+            value: "draft".into(),
+            kind: crate::properties::Kind::Text,
+            target_path: None,
+        }];
+        let p = || AssembleParams {
+            budget_tokens: 10_000,
+            full: false,
+            summaries: false,
+            degraded: false,
+            per_note_cap: 0,
+        };
+        let env = assemble(&[r.clone()], p());
+        let json = serde_json::to_value(&env).unwrap();
+        assert_eq!(json["blocks"][0]["properties"][0]["name"], "status");
+        r.properties.clear();
+        let env = assemble(&[r], p());
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(!json.contains("\"properties\""), "{json}");
+    }
 }
 
 #[cfg(test)]
@@ -569,6 +602,7 @@ mod render_tests {
                 text: "body".into(),
                 untrusted_content: true,
                 truncated: false,
+                properties: Vec::new(),
                 score: None,
             }],
             overflow: vec![],
@@ -643,6 +677,7 @@ mod render_tests {
                 text: "body".into(),
                 untrusted_content: true,
                 truncated: false,
+                properties: Vec::new(),
                 score: Some(83.0),
             }],
             overflow: vec![],

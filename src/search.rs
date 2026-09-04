@@ -34,6 +34,8 @@ pub struct InternalSearchResult {
     pub truncated: bool,
     /// Which lanes account for this result, in place of a numeric score (#35).
     pub provenance: crate::packaging::Provenance,
+    /// The parent note's frontmatter properties, on every hit (#66).
+    pub properties: Vec<crate::store::PropertyRow>,
 }
 
 /// Output from the search pipeline: structured results plus raw fused data for --explain.
@@ -798,6 +800,22 @@ fn finalize_search_output(
         built
     };
     results.truncate(top_n);
+    // Every hit carries its note's frontmatter properties (#66): one query
+    // over the distinct notes in the answer, after the cut, so it costs
+    // nothing a caller did not ask to see.
+    let ids: Vec<i64> = {
+        let mut seen = std::collections::BTreeSet::new();
+        results
+            .iter()
+            .filter(|r| seen.insert(r.file_id))
+            .map(|r| r.file_id)
+            .collect()
+    };
+    if let Ok(by_file) = present.store.doc_properties_for_files(&ids) {
+        for r in &mut results {
+            r.properties = by_file.get(&r.file_id).cloned().unwrap_or_default();
+        }
+    }
     SearchOutput {
         results,
         fused,
@@ -921,6 +939,7 @@ fn build_result(
         token_count,
         truncated,
         provenance: crate::packaging::Provenance::derive(&f.lane_contributions, f.graph_provenance),
+        properties: Vec::new(),
     }
 }
 

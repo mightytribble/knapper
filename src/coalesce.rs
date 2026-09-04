@@ -164,6 +164,7 @@ fn merge_block(results: &[InternalSearchResult], members: &[usize]) -> InternalS
         token_count,
         truncated,
         provenance,
+        properties: Vec::new(),
     }
 }
 
@@ -205,6 +206,7 @@ mod tests {
                 graph: false,
                 linked_from: Vec::new(),
             },
+            properties: Vec::new(),
         }
     }
 
