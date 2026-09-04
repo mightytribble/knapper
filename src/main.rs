@@ -702,7 +702,6 @@ async fn main() -> Result<()> {
             enable_intelligence,
             disable_intelligence,
             model,
-            register,
             add_api_key,
             key_name,
             key_permissions,
@@ -748,15 +747,6 @@ async fn main() -> Result<()> {
                         anyhow::bail!("Unknown model type: {other}. Use: embed or rerank.");
                     }
                 }
-            }
-
-            if let Some(agent) = register {
-                let hint = cfg.agents.register(&agent).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Unknown agent: {agent}. Use: claude-code, cursor, or windsurf."
-                    )
-                })?;
-                println!("{hint}");
             }
 
             if add_api_key {

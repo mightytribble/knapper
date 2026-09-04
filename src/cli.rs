@@ -204,10 +204,6 @@ pub enum Command {
         #[arg(long, num_args = 2, value_names = &["TYPE", "URI"])]
         model: Option<Vec<String>>,
 
-        /// Register with an AI agent: "claude-code", "cursor", or "windsurf".
-        #[arg(long)]
-        register: Option<String>,
-
         /// Generate and add a new API key.
         #[arg(long)]
         add_api_key: bool,

@@ -114,14 +114,6 @@ enabled = false
 # max_retries = 4      # on 429, 5xx and transport errors
 # endpoint = "..."     # proxy or test-server override
 
-# Which agents `knapper configure --register <agent>` has been run for.
-# The command prints how to add the MCP server to that agent and sets the
-# flag here. Nothing else reads these — registering changes no behaviour.
-[agents]
-# claude_code = false
-# cursor = false
-# windsurf = false
-
 # What the keyword lane indexes beside the chunk body, and what bm25() pays
 # for a hit there. The flags rebuild the keyword index (0.1 s, no vault read,
 # no model); the weights are query-time and cost nothing.
@@ -171,9 +163,8 @@ enabled = false
 
 Search answers with **chunks** — a note's text cut along its headings and
 packed to about 500 tokens, with the retrieved chunks of one section merged
-back into a block. A note whose "Counterspell" and "Dispel Magic" sections
-both answer a query contributes both, and each result names the heading path
-it came from. `[ranking] per_note_cap` bounds how many passages of one note
+back into a block. Each result names the heading path it came from. 
+`[ranking] per_note_cap` bounds how many passages of one note
 reach the results — 0, no bound, by default. Pass `--group-by file` (or set
 `group_by = "file"`) for one result per note, represented by its best-matching
 passage. [how-knapper-searches.md](how-knapper-searches.md#a-result-is-a-chunk)

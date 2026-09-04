@@ -259,5 +259,6 @@ your wikilinks, and — the part that costs you — always returns its top *k*,
 so an agent cannot tell a real answer from the nearest thing in the vault.
 
 knapper runs both lanes plus the link graph, scores what comes out as a
-calibrated probability, and abstains below the floor. And it writes: an agent
-can edit a section by heading, not just read one.
+calibrated probability, and abstains below the floor. It can also discover
+and filter content via tags, folder layout, and links, all of which can surface
+relevant content that keyword or semantic search might miss.

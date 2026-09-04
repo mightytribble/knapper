@@ -365,6 +365,30 @@ not `~/.claude/settings.json` (see the note in the macOS section above):
 
 Use the same `/home/you/vault` path you indexed with.
 
+## Other MCP clients
+
+knapper speaks stdio MCP, so any client that reads a server definition can
+run it. The command is `knapper serve` in every case; only the file the
+client reads changes.
+
+**Cursor** — `~/.cursor/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "knapper": { "command": "knapper", "args": ["serve"] }
+  }
+}
+```
+
+**Windsurf** — `~/.codeium/windsurf/mcp_config.json`, same block.
+
+**Claude Desktop** — `~/Library/Application Support/Claude/claude_desktop_config.json`,
+same block.
+
+Use the full path to the binary as `command` if `knapper` is not on the
+`PATH` of the process that launches the client.
+
 ## Verifying the install
 
 Restart Claude Code after registering the server, then ask it to search
