@@ -21,8 +21,9 @@ pub struct NoteContent {
     pub path: String,
     pub docid: Option<String>,
     /// The requested text: the whole note's body with the frontmatter
-    /// stripped, or one section's markdown with its heading line included
-    /// (#80, #81).
+    /// stripped, or one section's body alone — the heading is named in
+    /// `section` rather than carried here, so the text can be written
+    /// straight back through `update` (#80, #96).
     pub content: String,
     /// The section's span, only when a section was asked for (#80).
     #[serde(skip_serializing_if = "Option::is_none")]

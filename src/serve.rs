@@ -842,20 +842,160 @@ impl KnapperServer {
     }
 }
 
+/// One capability's place in the orientation string an MCP client is sent
+/// on connect: the group it sits under, and the words that follow its name.
+///
+/// The string is assembled from this table rather than written out, because
+/// prose naming tools drifts and no test reads prose: `topic`, `who` and
+/// `project` were still named here two releases after #73 removed them, and
+/// `match`, `properties` and `validate` were never added. A name is emitted
+/// from `surface::CAPABILITIES` now, so a retired tool has nowhere to be
+/// named and a new one fails the build until it is described (#110).
+pub struct Orientation {
+    /// The capability's kebab-case name, as `surface::CAPABILITIES` writes
+    /// it. The tool name printed is its MCP spelling.
+    pub capability: &'static str,
+    /// The heading this capability sits under. Rows sharing a group are
+    /// contiguous, and the groups print in declaration order.
+    pub group: &'static str,
+    /// What follows the tool's name — one sentence, with no closing period,
+    /// because the assembler writes it.
+    pub clause: &'static str,
+}
+
+/// The sentence the orientation opens with, before the first group.
+const ORIENTATION_PREAMBLE: &str = "knapper: vault intelligence for Obsidian.";
+
+/// What the orientation says about each tool.
+pub const ORIENTATION: &[Orientation] = &[
+    Orientation {
+        capability: "vault-map",
+        group: "Read",
+        clause: "to orient",
+    },
+    Orientation {
+        capability: "tags",
+        group: "Read",
+        clause: "for the tag vocabulary",
+    },
+    Orientation {
+        capability: "properties",
+        group: "Read",
+        clause: "for the custom-property vocabulary, or one property's values with `name`",
+    },
+    Orientation {
+        capability: "search",
+        group: "Read",
+        clause: "to find what a note is about; it is ranked and cut to `top_n`, so it always answers something",
+    },
+    Orientation {
+        capability: "match",
+        group: "Read",
+        clause: "for every note whose text holds a literal string, and for learning that none does — the question `search` cannot answer",
+    },
+    Orientation {
+        capability: "read",
+        group: "Read",
+        clause: "for content, where a `section` parameter narrows it to one heading and returns that section's body with the heading named beside it, and `metadata` returns the note's frontmatter, links and size instead",
+    },
+    Orientation {
+        capability: "list",
+        group: "Read",
+        clause: "to filter notes by scope (tags or directory paths), with `detailed` adding each note's heading outline",
+    },
+    Orientation {
+        capability: "create",
+        group: "Write",
+        clause: "for a new note, which needs a `filename` (a bare name or one ending in `.md`) that becomes the note's breadcrumb root, so name it the way it should read as provenance; a colliding filename is refused",
+    },
+    Orientation {
+        capability: "update",
+        group: "Write",
+        clause: "for every change to an existing one — a list of edits over the body, a section or a frontmatter property, applied in one write",
+    },
+    Orientation {
+        capability: "move",
+        group: "Lifecycle",
+        clause: "to relocate",
+    },
+    Orientation {
+        capability: "archive",
+        group: "Lifecycle",
+        clause: "to soft-delete (`undo: true` to restore)",
+    },
+    Orientation {
+        capability: "delete",
+        group: "Lifecycle",
+        clause: "for permanent removal",
+    },
+    Orientation {
+        capability: "reindex-file",
+        group: "Index",
+        clause: "to refresh a single file after external edits",
+    },
+    Orientation {
+        capability: "index",
+        group: "Index",
+        clause: "to walk the whole vault (`rebuild: true` builds it again from nothing)",
+    },
+    Orientation {
+        capability: "status",
+        group: "Diagnostics",
+        clause: "for what the index holds",
+    },
+    Orientation {
+        capability: "health",
+        group: "Diagnostics",
+        clause: "for orphans, broken links, stale notes and tag hygiene",
+    },
+    Orientation {
+        capability: "validate",
+        group: "Diagnostics",
+        clause: "for the markdown and property problems a note carries, read from the files on disk",
+    },
+    Orientation {
+        capability: "identity",
+        group: "Identity",
+        clause: "for user context at session start",
+    },
+    Orientation {
+        capability: "init",
+        group: "Identity",
+        clause: "to run first-time onboarding (`mode: detect` or `mode: apply`)",
+    },
+    Orientation {
+        capability: "migrate",
+        group: "Migration",
+        clause: "with `mode: preview` to classify notes into PARA folders, `mode: apply` to execute the migration, `mode: undo` to revert",
+    },
+];
+
+/// The instructions an MCP client is sent on connect, assembled from
+/// `ORIENTATION`. One sentence per tool, under the group it belongs to.
+pub fn instructions() -> String {
+    let mut out = String::from(ORIENTATION_PREAMBLE);
+    let mut group = "";
+    for row in ORIENTATION {
+        if row.group != group {
+            group = row.group;
+            out.push(' ');
+            out.push_str(group);
+            out.push(':');
+        }
+        out.push(' ');
+        out.push_str(&crate::surface::mcp_spelling(row.capability));
+        out.push(' ');
+        out.push_str(row.clause);
+        out.push('.');
+    }
+    out
+}
+
 #[tool_handler]
 impl rmcp::handler::server::ServerHandler for KnapperServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions(
-                "knapper: vault intelligence for Obsidian. \
-                 Read: vault_map to orient, tags for the tag vocabulary, search to find, read for content (a section parameter narrows it to one heading, or metadata for the note's frontmatter, links and size), list to filter notes by scope (tags or directory paths), who/project for context bundles, topic for a budgeted bundle of the sections about one subject. \
-                 Write: create for a new note, which needs a `filename` (a bare name or one ending in `.md`) that becomes the note's breadcrumb root, so name it the way it should read as provenance; a colliding filename is refused. update for every change to an existing one — a list of edits over the body, a section or a frontmatter property, applied in one write. \
-                 Lifecycle: move to relocate, archive to soft-delete (`undo: true` to restore), delete for permanent removal. \
-                 Index: reindex_file to refresh a single file after external edits, index to walk the whole vault (`rebuild: true` builds it again from nothing). \
-                 Diagnostics: status for what the index holds, health for orphans, broken links, stale notes and tag hygiene. \
-                 Identity: identity for user context at session start, init to run first-time onboarding (`mode: detect` or `mode: apply`). \
-                 Migration: migrate with `mode: preview` to classify notes into PARA folders, `mode: apply` to execute the migration, `mode: undo` to revert.",
-            )
+            .with_instructions(instructions())
             .with_server_info(rmcp::model::Implementation::new(
                 "knapper",
                 env!("CARGO_PKG_VERSION"),

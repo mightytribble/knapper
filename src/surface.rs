@@ -43,10 +43,19 @@ pub struct Capability {
     pub server_only_args: &'static [(&'static str, &'static str)],
 }
 
+/// The MCP spelling of a capability's name: `-` written as `_`.
+///
+/// `Capability::mcp_name` is this transform on a table row, and this is it
+/// for a caller holding the name alone — the orientation table in `serve.rs`
+/// holds names, not rows — so the transform still has one home (#110).
+pub fn mcp_spelling(name: &str) -> String {
+    name.replace('-', "_")
+}
+
 impl Capability {
     /// The MCP tool name.
     pub fn mcp_name(&self) -> String {
-        self.name.replace('-', "_")
+        mcp_spelling(self.name)
     }
 
     /// The HTTP route path.
@@ -312,6 +321,13 @@ pub const PENDING_HTTP: &[Pending] = &[];
 /// that has to opt out, and `every_capability_with_a_split_declaration_is_named`
 /// holds each entry to a real capability with a reason.
 pub const PARAMS_NOT_SHARED: &[(&str, &str)] = &[];
+
+/// Capabilities the MCP orientation string leaves out, each with its
+/// reason. The shape `PARAMS_NOT_SHARED` uses — a name and a non-empty
+/// reason — so an omission is a decision on the record rather than the
+/// oversight that left `match`, `properties` and `validate` unmentioned for
+/// three releases (#110).
+pub const ORIENTATION_OMITTED: &[(&str, &str)] = &[];
 
 /// Routes the transport serves for itself. They name no capability.
 pub const HTTP_TRANSPORT_ROUTES: &[(&str, &str)] = &[
@@ -662,6 +678,107 @@ mod tests {
         assert!(
             !named.contains(&"folder"),
             "/api/list still documents a folder parameter"
+        );
+    }
+
+    /// The orientation string an MCP client is sent on connect names tools,
+    /// and a tool name in prose drifts the way a parameter cannot: `topic`,
+    /// `who` and `project` outlived their removal in the string, and `match`,
+    /// `properties` and `validate` never reached it. The #62 net reads which
+    /// calls exist and what they take, and no prose at all (#110).
+    #[test]
+    fn the_instructions_name_every_tool_the_server_registers() {
+        let text = crate::serve::instructions();
+        let omitted: BTreeSet<&str> = ORIENTATION_OMITTED.iter().map(|(n, _)| *n).collect();
+
+        for tool in crate::serve::KnapperServer::tool_router().list_all() {
+            if omitted.contains(tool.name.as_ref()) {
+                continue;
+            }
+            assert!(
+                text.contains(&format!(" {} ", tool.name)),
+                "the instructions do not name the `{}` tool",
+                tool.name
+            );
+        }
+    }
+
+    /// `serve::ORIENTATION` is the prose half of the table, so it answers to
+    /// the same parity the three registrations answer to: it describes every
+    /// tool the MCP server registers, describes each one once, and describes
+    /// nothing that is not a capability. That last clause is what a
+    /// hand-written string could not be held to — `topic`, `who` and
+    /// `project` were named in prose for two releases after they stopped
+    /// existing, and no rule separates a retired tool's name from an
+    /// ordinary word in a sentence (#110).
+    #[test]
+    fn the_orientation_describes_every_mcp_tool_and_no_other() {
+        use crate::serve::ORIENTATION;
+
+        let table: BTreeSet<&str> = CAPABILITIES.iter().map(|c| c.name).collect();
+
+        let mut described: BTreeSet<&str> = BTreeSet::new();
+        let mut seen_groups: Vec<&str> = Vec::new();
+        for row in ORIENTATION {
+            assert!(
+                table.contains(row.capability),
+                "the orientation describes `{}`, which is not a capability",
+                row.capability
+            );
+            assert!(
+                described.insert(row.capability),
+                "the orientation describes `{}` twice",
+                row.capability
+            );
+            assert!(
+                !row.clause.trim().is_empty(),
+                "`{}` has an empty clause",
+                row.capability
+            );
+            assert!(
+                !row.clause.ends_with('.'),
+                "`{}`'s clause ends the sentence the assembler ends",
+                row.capability
+            );
+            if seen_groups.last() != Some(&row.group) {
+                assert!(
+                    !seen_groups.contains(&row.group),
+                    "the `{}` group is split; rows of one group are contiguous",
+                    row.group
+                );
+                seen_groups.push(row.group);
+            }
+        }
+
+        let omitted: BTreeSet<&str> = ORIENTATION_OMITTED.iter().map(|(n, _)| *n).collect();
+        for (name, reason) in ORIENTATION_OMITTED {
+            assert!(
+                table.contains(name),
+                "`{name}` is left out of the orientation but is not a capability"
+            );
+            assert!(
+                !reason.trim().is_empty(),
+                "`{name}` is left out of the orientation with no reason"
+            );
+            assert!(
+                !described.contains(name),
+                "`{name}` is both described and declared left out"
+            );
+        }
+
+        let want: BTreeSet<&str> = CAPABILITIES
+            .iter()
+            .filter(|c| matches!(c.mcp, Presence::On))
+            .map(|c| c.name)
+            .filter(|n| !omitted.contains(n))
+            .collect();
+
+        assert_eq!(
+            described,
+            want,
+            "\nonly in the orientation: {:?}\nonly in the table: {:?}",
+            described.difference(&want).collect::<Vec<_>>(),
+            want.difference(&described).collect::<Vec<_>>()
         );
     }
 

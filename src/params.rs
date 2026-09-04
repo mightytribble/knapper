@@ -122,8 +122,9 @@ pub struct Read {
     /// a bold-only line is a section too, in either spelling — `**Spells**`
     /// and `Spells` name the same one (#69).
     ///
-    /// A section read narrows `content` to that section, its heading line
-    /// included, and reports the section's span (#80, #81).
+    /// A section read narrows `content` to that section's body. The heading
+    /// comes back beside it, in the `section` object with the level and the
+    /// span, so what a read returns is what an `update` takes back (#96).
     #[arg(long)]
     pub section: Option<String>,
     /// Return the note's metadata — its frontmatter, its inbound and outbound

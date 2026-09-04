@@ -499,7 +499,7 @@ pub fn build_plugin_manifest(config: &HttpConfig, server_url: &str) -> serde_jso
         "name_for_model": "knapper",
         "description_for_human": config.plugin.description.as_deref()
             .unwrap_or("Search and manage your Obsidian vault with AI-powered hybrid search."),
-        "description_for_model": "Access an Obsidian knowledge vault. Use search to find notes by content or time. read for full content. who/project for context bundles. Write tools create, edit, and organize notes.",
+        "description_for_model": "Access an Obsidian knowledge vault. Use search to find notes by content or time, match to find a literal string or learn that no note holds one, read for a note's content or one of its sections, and list to filter notes by tag or folder. Write tools create, update, and organize notes.",
         "auth": {
             "type": "service_http",
             "authorization_type": "bearer",
