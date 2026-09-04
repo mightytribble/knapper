@@ -6,16 +6,16 @@ MCP and over HTTP.
 
 ## Which build and which models should I use?
 
-Three configurations are worth knowing:
+Three main configurations:
 
 | | embedder | scorer | build |
 |---|---|---|---|
-| **Sweet spot** | EmbeddingGemma (default, local) | calibrated fusion, no model | CPU |
+| **Sweet spot** | EmbeddingGemma (default, local) | calibrated fusion, no cross-encoder model | CPU |
 | **Best results** | Gemini API | 4B cross-encoder | CUDA |
-| **Long sections** | Gemini API, or Qwen3-Embedding | either | either |
+| **Very long passages** | Gemini API, or Qwen3-Embedding | either | either |
 
 The default is the sweet spot on purpose: no API key, no second download, and
-about 22 ms a query. Reach past it for a reason.
+about 22 ms a query. Adjust to taste.
 
 **CUDA** speeds up embedding, but the real reason to want it is that it makes
 a cross-encoder affordable. A 4B cross-encoder is a little better than the
@@ -28,19 +28,23 @@ NVIDIA Container Toolkit and never `nvcc`.
 latency, and sending your notes' text to Google. Set
 `models.embed = "gemini:<versioned-id>"` and put the key in `GEMINI_API_KEY`.
 
-**Long sections** are the one case where the default is the wrong tool.
-EmbeddingGemma's input wall is 2048 tokens, and a section longer than that is
-split before it is embedded. If your notes are genuinely long-form, Qwen3-
-Embedding (32k) or the Gemini API keeps a section whole.
+**Very long passages** are the one case where the default embedder is the
+wrong tool. knapper packs a section's paragraphs into chunks of about 500
+tokens, so an ordinary long section is simply several chunks and no embedder
+sees more than the budget. A single paragraph or table that cannot be split
+that way is emitted whole — and if it is over the embedder's input wall, 2048
+tokens for EmbeddingGemma, it is torn with overlap before it is embedded.
+Qwen3-Embedding (32k) or the Gemini API takes such a block whole, and reads
+complex passages better.
 
 Changing the embedder re-indexes the vault, and it invalidates the
 calibration — see [how-knapper-searches.md](how-knapper-searches.md#when-you-change-the-embedder).
 
 ## Can I run more than one vault?
 
-Yes, one data directory per vault. knapper holds a single vault per store,
-and re-indexing a different path replaces the active one — so give each vault
-its own `KNAPPER_HOME`:
+knapper uses sqlite, which really wants to use one database location for
+everything. To get around this restriction, knapper supports one data directory 
+per vault by setting the `KNAPPER_HOME` environment variable:
 
 ```bash
 KNAPPER_HOME=~/.knapper-work    knapper index ~/vaults/work
@@ -73,20 +77,24 @@ that directory at a shared copy if you do not want a second GGUF on disk.
 
 ## How do I write notes that retrieve well?
 
-knapper retrieves **sections**, so the section is the unit to write for. None
-of this is a hard rule; each one makes the results better.
+knapper cuts a note into chunks of about 500 tokens along its headings, and
+merges the retrieved chunks of one section back together in the results — so
+a tidy section is a unit that retrieves as a unit. None of this is a hard
+rule; each one makes the results better.
 
 - **One subject per section.** A section that covers two topics matches both
-  weakly and answers neither.
-- **Keep a section under about 2000 tokens** on the default embedder. Longer
-  sections are split before embedding, and a split section loses the shape
-  that made it coherent. (Qwen3 or Gemini raise this ceiling a lot.)
+  weakly and scores well for neither.
+- **A section of a few hundred tokens lands in one chunk.** Past about 500 it
+  becomes several, and those come back merged only when more than one of them
+  ranks — so the tighter the section, the more reliably it retrieves whole.
+  This budget is knapper's, not the model's: a bigger embedder does not raise
+  it.
 - **Use a real heading hierarchy.** Headings are how knapper cuts the note,
   and the breadcrumb — `Note > H1 > H2` — is indexed as searchable text, so a
   descriptive heading is worth more than a decorative one.
-- **Group related topics in one note** and separate unrelated ones. Sections
-  of one note merge in the results when they abut; unrelated neighbours do
-  not merge, but they do compete.
+- **Group related topics in one note** and separate unrelated ones. Chunks of
+  one note merge in the results when they abut and share a section; a sibling
+  section stops the merge, and unrelated neighbours still compete.
 - **Tag, and use folders.** Both are how an agent narrows a search before it
   runs one — `--scope /projects/`, `--all type/decision` — and a scoped query
   is faster and more accurate than a broad one.

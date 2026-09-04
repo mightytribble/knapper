@@ -2,14 +2,14 @@
 
 **Local hybrid search, retrieval and editing MCP for Obsidian-format vaults.**
 knapper indexes a markdown vault into section-level chunks and serves them to
-AI agents — Claude Code over [MCP](https://modelcontextprotocol.io), anything
-else over a REST API. Semantic embeddings, full-text search, wikilink graph
+AI agents — either over [MCP](https://modelcontextprotocol.io) or via 
+a REST API. Semantic embeddings, full-text search, wikilink graph
 traversal and an optional cross-encoder run in one local binary. No API keys,
 no cloud.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-It works on any tree of markdown files, and it is built for Obsidian: it reads
+It works on any tree of markdown files but it is built for Obsidian: it reads
 and writes Obsidian's frontmatter, tag and wikilink conventions. Under active
 development — still experimental.
 
@@ -17,13 +17,14 @@ development — still experimental.
 
 You have notes, and you want an agent to work with them. Filesystem tools can
 do it, but grep and glob are slow and token-heavy: fine for a handful of files,
-and on a real vault they eat the context window and still miss the section you
+but on a large vault they eat the context window and can still miss the section you
 wanted.
 
 knapper gives the agent search that ranks, cites its sources, and returns
 nothing when the vault holds no answer — so a wrong guess does not arrive
-looking like a fact. Retrieval and edits both address **sections**, so working
-on one heading costs neither a full-file read nor a full-file rewrite. Edit in
+looking like a fact. Retrieval and edits both work below the file — a search
+answers with the passage that answers it, and an edit rewrites one heading —
+so neither costs a full-file read or a full-file rewrite. Edit in
 Obsidian and the index follows within seconds.
 
 ## What it does
@@ -31,12 +32,12 @@ Obsidian and the index follows within seconds.
 - **Hybrid search that abstains** — semantic embeddings, BM25, wikilink graph
   expansion and an optional cross-encoder, scored as one calibrated
   probability and dropped below a confidence floor.
-- **Section-level retrieval** — a result is a section with its heading path
-  and docid, not a whole file.
+- **Sub-file retrieval** — a result is a chunk of a note, named by its heading
+  path and docid; retrieved chunks of one section come back merged.
 - **Section-level editing** — read a section, change it, write it back; the
   rest of the note and its frontmatter stay byte for byte.
 - **MCP server** — `knapper serve` exposes 20 tools to Claude Code, Cursor or
-  any MCP client.
+  any other MCP client.
 - **HTTP REST API** — `knapper serve --http` serves the same capabilities to
   web agents and scripts, with API keys, rate limiting and CORS.
 - **Real-time sync** — a file watcher re-indexes what you change in Obsidian.
@@ -62,6 +63,8 @@ platform.
 knapper index ~/path/to/vault
 # Downloads the embedding model on first run (~300 MB).
 # Incremental after that — only changed files re-embed.
+# See install.md for how to run multiple vaults or 
+# constrain knapper to a single workspace.
 ```
 
 **Search it:**
@@ -79,9 +82,9 @@ How authentication works across our services. Owned by [[Sarah Chen]]; the publi
 We use OAuth 2.0 with PKCE for every client type, including the web app and the [[Mobile App]]. There are no client secrets in any client. The authorization server issues short-lived access tokens (15 minutes) and rotating refresh tokens (30 days, single use).
 ```
 
-One result is one section of a note, with its full text — here the note's head
-and its `## Overview`, which abut and so come back as one block. The
-percentage is the probability that the section answers the query, and a query
+A result is a chunk of a note, with its full text — here the note's head and
+its `## Overview`, which abut and so come back as one block. The
+percentage is the probability that the passage answers the query, and a query
 the vault cannot answer prints `No relevant content found for this query in
 the vault.` rather than its nearest miss.
 [How knapper searches](how-knapper-searches.md) explains both.
@@ -98,6 +101,9 @@ That registers the MCP server and the skills. To register the server alone:
 ```bash
 claude mcp add --scope user knapper -- knapper serve
 ```
+
+Set `--scope project` or `--scope local` to only use knapper on specific
+workspaces. See [install](install.md) for multi-vault setup.
 
 Claude can now search your vault, read and edit sections, and create notes
 through structured tool calls.
@@ -124,7 +130,7 @@ claimed, parts of the API described methods that were never built, and the
 project had been stale for three months with critical fixes outstanding. A week
 in, I was replacing more than I was keeping: the search pipeline, the chunker,
 the graph lane, and one command surface across all three endpoints. Dropping
-the pretence that this was a fork was the honest move. The bones are engraph's
+the pretence that this was a fork seemed the right thing to do. The bones are engraph's
 and gratefully acknowledged; see [NOTICE](NOTICE) and the git history.
 
 ## Development
@@ -135,7 +141,7 @@ cargo clippy -- -D warnings
 cargo fmt --check
 ```
 
-`CLAUDE.md` carries the architecture documentation, module by module.
+See `CLAUDE.md` for the architecture documentation, module by module.
 
 ## Contributing
 

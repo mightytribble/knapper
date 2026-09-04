@@ -157,9 +157,16 @@ enabled = false
 # permissions = "write"        # or "read"
 ```
 
-## Results are sections
+## Results are parts of notes
 
-Search returns **sections**. A note whose "Counterspell" and "Dispel Magic" sections both answer a query contributes both, up to `max_chunks_per_file`, and each result names the heading it came from. Pass `--group-by file` (or set `group_by = "file"`) for one result per document, representing it by its best-matching section.
+Search answers with **chunks** — a note's text cut along its headings and
+packed to about 500 tokens, with the retrieved chunks of one section merged
+back into a block. A note whose "Counterspell" and "Dispel Magic" sections
+both answer a query contributes both, up to `max_chunks_per_file`, and each
+result names the heading path it came from. Pass `--group-by file` (or set
+`group_by = "file"`) for one result per note, represented by its best-matching
+passage. [how-knapper-searches.md](how-knapper-searches.md#a-result-is-a-chunk)
+has the full rule.
 
 ## Embedding models
 

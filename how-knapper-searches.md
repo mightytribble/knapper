@@ -4,25 +4,35 @@ Why a query returned what it returned, what the percentage means, and which
 knobs are worth turning. For the keys themselves, see
 [configuration.md](configuration.md).
 
-## A result is a section
+## A result is a chunk
 
-knapper does not return files. It indexes each note as a set of **chunks** —
-one per section, packed to a token budget — and a result is one of those,
-named by the heading path it came from:
+knapper does not return files, and it does not quite return sections either.
+It cuts each note into **chunks**: it follows the note's headings, and packs
+each section's paragraphs up to about 500 tokens. Two things follow from that
+budget. A section longer than it becomes several chunks, cut on paragraph
+boundaries. A section shorter than `chunk_min_chars` merges into the chunk
+before it, heading line included. So a chunk is usually one section, and at
+either edge of the budget it is part of one, or a run of small ones.
+
+Each result names the chunk it came from:
 
 ```
 --- [6e1b70#0] [99%] 02-Areas/Development/Auth-Architecture.md > Auth Architecture (matched: semantic+keyword)
 ```
 
-`6e1b70` is the note's docid, `#0` the section's ordinal within it, and
-`matched:` names the lanes that found the section. A note can contribute
-several sections to one answer.
+`6e1b70` is the note's docid, `#0` the chunk's ordinal within that note, and
+`matched:` names the lanes that found it.
 
-Abutting chunks of one section — and of the subsections below it — come back
-as **one block**, scored at its strongest member. The merge stops at a
-sibling section, so two neighbouring topics stay two results. This is why a
-result can be longer than one chunk, and why `top_n` counts merged blocks
-rather than chunks.
+**Retrieved chunks then merge.** After ranking, chunks of one note that abut —
+consecutive ordinals — and belong to one section, or to the subsections below
+it, are presented as a single block: at the strongest member's score, under
+the leading member's heading, with the members' text in document order. The
+merge stops at a sibling section, because a sibling starts a new topic.
+
+The merge only ever sees chunks the search **retrieved**. A long section comes
+back whole when all of its chunks ranked, and comes back in part when only
+part of it did. It is also why `top_n` counts blocks and not chunks: the
+results are counted after the merge, so ten results are ten blocks.
 
 ## The lanes
 
