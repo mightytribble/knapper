@@ -86,10 +86,10 @@ rule; each one makes the results better.
 - **One subject per section.** A section that covers two topics matches both
   weakly and scores well for neither.
 - **A section of a few hundred tokens lands in one chunk.** Past about 500 it
-  becomes several, and those come back merged only when more than one of them
-  ranks — so the tighter the section, the more reliably it retrieves whole.
-  This budget is knapper's, not the model's: a bigger embedder does not raise
-  it.
+  becomes several, and those come back merged only when contiguous chunks are
+  returned in the same search result — so the tighter the section, the more 
+  reliably it retrieves whole. This budget is knapper's, not the model's: 
+  a bigger embedder does not raise it.
 - **Use a real heading hierarchy.** Headings are how knapper cuts the note,
   and the breadcrumb — `Note > H1 > H2` — is indexed as searchable text, so a
   descriptive heading is worth more than a decorative one.
@@ -116,7 +116,8 @@ status: active
 Mentor:: [[Ada Lovelace]]
 ```
 
-Both rows are indexed beside the wikilink graph, and both are queryable:
+Both rows are indexed beside the wikilink graph, and both become filters an
+agent can narrow by — here on the CLI:
 
 ```bash
 knapper list --property employer --links-to "Acme Corp"
@@ -175,41 +176,46 @@ The counts come back whole even when `--limit` shortens the listed lines. It
 reads the indexed note bodies, so it does not see frontmatter, and it will
 not tell you what a note is *about* — that is what `search` is for.
 
-## How do I edit a note without breaking it?
+## What stops an agent from mangling my notes?
 
-Read the section, change it, write it back. What `read --section` returns is
-exactly what `update --section` takes: the body **below** the heading, with
-the heading named beside it rather than carried in the text. `knapper list
---detailed` prints each note's heading outline, which is how an agent finds
-the section to name before it reads or writes one.
+An agent edits by naming a section, not by rewriting a file. `read` returns a
+section's body — the text **below** its heading — and `update` takes exactly
+that back, so a read, change and write round trip leaves the rest of the note
+byte for byte. `list --detailed` gives the agent each note's heading outline,
+which is how it finds the section to name before it touches anything.
+
+The write pipeline refuses the edits that would damage a note, rather than
+performing them and reporting success:
+
+- **Content that opens with a heading at or above the section's own level is
+  refused.** Such a line would end the section rather than fill it.
+- **A rename keeps the markup.** The new heading carries text only, so a `###`
+  stays a `###`. A name another section already holds is refused, because two
+  sections of one name leave both unaddressable.
+- **A write changes only what it names.** A property edit keeps the key's
+  place and the note's own list style; the rest of the frontmatter and the
+  whole body are untouched.
+- **A value knapper cannot edit as a line** — a nested mapping, an anchor, a
+  block scalar — refuses the write and says what it found, rather than
+  re-styling your frontmatter.
+- **Blank lines are handled at the joining edge.** A blank line where new
+  content meets the old body asks for a paragraph break; blank lines at the
+  content's other edges are dropped, so a section keeps one blank line under
+  its heading.
+
+A batch is one write: the agent sends a list of edits, and knapper applies
+them in one file write, one conflict check and one re-index. Every write is
+atomic — a temp file and a rename — and logged to an audit table.
+
+The same capability is on the CLI when you want to make an edit by hand:
 
 ```bash
 knapper update "Meeting Notes" --section "Action Items" \
   --mode append --content="- [ ] Follow up with Sarah"
 ```
 
-Five things the write pipeline will not let you get wrong, and one shell
-gotcha:
-
-- **Content that opens with a heading at or above the section's own level is
-  refused.** Such a line would end the section rather than fill it.
-- **A rename keeps the markup.** `--heading` carries text only, so a `###`
-  stays a `###`. A name another section already holds is refused, because two
-  sections of one name leave both unaddressable.
-- **A write changes only what it names.** A property edit keeps the key's
-  place and the note's own list style; the rest of the frontmatter and the
-  whole body stay byte for byte.
-- **A value knapper cannot edit as a line** — a nested mapping, an anchor, a
-  block scalar — refuses the write and says what it found, rather than
-  re-styling your frontmatter.
-- **Blank lines are handled at the joining edge.** A blank line where the
-  content meets the old body asks for a paragraph break; blank lines at the
-  other edges are dropped.
-- **Write `--content=` with an equals sign** when the value starts with `-`,
-  or clap reads it as a flag.
-
-Batch edits are one call: `--edits` takes a JSON list, and the whole list is
-one file write, one conflict check and one re-index.
+Write `--content=` with an equals sign when the value starts with a `-`, or
+clap reads it as a flag.
 
 ## How do I restructure my vault into PARA?
 
