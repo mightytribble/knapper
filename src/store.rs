@@ -7354,13 +7354,20 @@ mod tests {
 
     #[test]
     fn the_filters_and_together_with_a_tag_term() {
-        let (store, ada, ..) = property_vault();
+        let (store, ada, _acme, bob) = property_vault();
         let tag = |p: &str| crate::tags::Tag {
             path: p.to_string(),
             display: p.to_string(),
         };
+        // ada and bob are the people; acme is the firm. So the tag term
+        // alone answers ada and bob, and `status` alone answers ada and
+        // acme: each term admits a note the other refuses, and only the
+        // AND of the two answers ada by herself.
         store
             .reconcile_file_tags(ada, &[tag("type/person")])
+            .unwrap();
+        store
+            .reconcile_file_tags(bob, &[tag("type/person")])
             .unwrap();
         let scope = crate::tags::Scope::parse(&["type/person".into()], &[], &[])
             .unwrap()
@@ -7374,6 +7381,11 @@ mod tests {
             .collect();
         assert_eq!(got, ["ada.md"]);
         assert_eq!(store.files_in_scope(&scope).unwrap(), vec![ada]);
+
+        // Two link terms AND together the same way: bob is the note that
+        // links to acme and that ada links to. `links_to` alone answers ada
+        // and bob, `linked_from` alone answers acme and bob.
+        assert_eq!(scoped(&store, None, Some("acme"), Some("ada")), ["bob.md"]);
     }
 
     #[test]
