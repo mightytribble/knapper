@@ -210,7 +210,9 @@ fn inline_fields(line: &str) -> Vec<(String, String)> {
         let mut rest = line;
         while let Some(start) = rest.find(open) {
             let after = &rest[start + 1..];
-            let Some(end) = after.find(close) else { break };
+            let Some(end) = find_close(after, open, close) else {
+                break;
+            };
             if let Some(pair) = split_field(&after[..end]) {
                 out.push(pair);
             }
@@ -218,6 +220,26 @@ fn inline_fields(line: &str) -> Vec<(String, String)> {
         }
     }
     out
+}
+
+/// The index in `text` of the `close` that matches an `open` already
+/// consumed, honouring nesting: a wikilink's own `[[Target]]` brackets
+/// nest inside the bracket field form, so the bracket form's own close is
+/// the one that brings the count back to zero rather than the first one
+/// found. `None` on an unclosed `open`.
+fn find_close(text: &str, open: char, close: char) -> Option<usize> {
+    let mut depth = 1i32;
+    for (i, c) in text.char_indices() {
+        if c == open {
+            depth += 1;
+        } else if c == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i);
+            }
+        }
+    }
+    None
 }
 
 /// `Key:: value` split on the first `::`. A key that is empty or holds a
@@ -269,6 +291,9 @@ fn split_list(value: &str) -> Vec<String> {
 }
 
 fn push_inline(out: &mut Vec<Extracted>, seq: i64, name: &str, value: &str) {
+    if BUILT_IN.contains(&name) {
+        return;
+    }
     for element in split_list(value) {
         let links = crate::graph::extract_wikilinks(&element);
         if links.is_empty() {
@@ -483,6 +508,37 @@ mod tests {
         assert_eq!(
             names_values(&rows),
             vec![("Owner".into(), "".into(), Kind::Empty)]
+        );
+    }
+
+    #[test]
+    fn the_bracket_form_finds_its_own_matching_close_not_the_first_one() {
+        let rows = from_chunk(0, "[Owner:: [[Alice]]]\n");
+        assert_eq!(
+            names_values(&rows),
+            vec![("Owner".into(), "Alice".into(), Kind::Link)]
+        );
+        assert_eq!(rows[0].link_target.as_deref(), Some("Alice"));
+
+        let rows = from_chunk(0, "[Both:: [[Alice]] and [[Bob]]]\n");
+        assert_eq!(
+            names_values(&rows),
+            vec![
+                ("Both".into(), "Alice".into(), Kind::Link),
+                ("Both".into(), "Bob".into(), Kind::Link),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_body_field_named_for_a_built_in_writes_no_row() {
+        let rows = from_chunk(
+            0,
+            "tags:: work, urgent\naliases:: Al\ncssclasses:: x\ntagsmith:: y\n",
+        );
+        assert_eq!(
+            names_values(&rows),
+            vec![("tagsmith".into(), "y".into(), Kind::Text)]
         );
     }
 }
