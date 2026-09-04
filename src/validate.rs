@@ -30,6 +30,11 @@ pub enum Rule {
     LongParagraph,
     MalformedTags,
     FileUnreadable,
+    UnquotedFrontmatterLink,
+    PropertyTypeMismatch,
+    MixedPropertyKinds,
+    PropertyDeclaredUnused,
+    PropertyNameCollision,
 }
 
 impl Rule {
@@ -477,6 +482,185 @@ fn check_tags(file: &str, content: &str) -> Vec<Finding> {
     }
 }
 
+/// The per-file property checks (#66): an unquoted frontmatter link, which
+/// Obsidian reads as no link, and a value or a count that disagrees with
+/// the type `types.json` declares.
+pub fn check_properties(
+    file: &str,
+    content: &str,
+    declared: &std::collections::BTreeMap<String, String>,
+) -> Vec<Finding> {
+    let (fm, _) = crate::markdown::split_frontmatter(content);
+    let Some(fm) = fm else {
+        return vec![];
+    };
+    let mut out = Vec::new();
+
+    // Line 1 is the opening `---`, so frontmatter line i is file line i + 2.
+    for (i, line) in fm.lines().enumerate() {
+        let value = if line.starts_with(char::is_whitespace) {
+            line.trim_start().strip_prefix("- ").map(str::trim_start)
+        } else {
+            line.split_once(':').map(|(_, v)| v.trim_start())
+        };
+        if value.is_some_and(|v| v.starts_with("[[")) {
+            out.push(Finding::new(
+                file,
+                Some(i + 2),
+                Rule::UnquotedFrontmatterLink,
+                "an unquoted [[link]] in frontmatter is a nested list to YAML, not a link; quote it".into(),
+            ));
+        }
+    }
+
+    let rows = crate::properties::from_frontmatter(&fm);
+    let mut by_name: std::collections::BTreeMap<&str, Vec<&crate::properties::Extracted>> =
+        std::collections::BTreeMap::new();
+    for r in &rows {
+        by_name.entry(r.name.as_str()).or_default().push(r);
+    }
+    for (name, values) in by_name {
+        let Some(ty) = declared.get(name) else {
+            continue;
+        };
+        if values.len() > 1 && single_valued(ty) {
+            out.push(Finding::new(
+                file,
+                Some(1),
+                Rule::PropertyTypeMismatch,
+                format!(
+                    "property `{name}` is declared {ty} but holds {} values",
+                    values.len()
+                ),
+            ));
+            continue;
+        }
+        for v in values {
+            if !accepts(ty, v.kind) {
+                out.push(Finding::new(
+                    file,
+                    Some(1),
+                    Rule::PropertyTypeMismatch,
+                    format!(
+                        "property `{name}` is declared {ty} but `{}` is {}",
+                        v.value,
+                        v.kind.as_str()
+                    ),
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// Obsidian's declared types that hold one value.
+fn single_valued(ty: &str) -> bool {
+    matches!(ty, "text" | "number" | "checkbox" | "date" | "datetime")
+}
+
+/// Whether a declared type accepts a value of this kind. An empty value
+/// matches every type; a link is text to a text type; the list types and
+/// a type this build does not know accept anything.
+fn accepts(ty: &str, kind: crate::properties::Kind) -> bool {
+    use crate::properties::Kind;
+    match (ty, kind) {
+        (_, Kind::Empty) => true,
+        ("text" | "date" | "datetime", k) => matches!(k, Kind::Text | Kind::Link),
+        ("number", k) => k == Kind::Number,
+        ("checkbox", k) => k == Kind::Checkbox,
+        _ => true,
+    }
+}
+
+/// What the vault-wide property rules accumulate over a walk (#66).
+#[derive(Default)]
+struct PropertyTally {
+    kinds: std::collections::BTreeMap<String, std::collections::BTreeSet<crate::properties::Kind>>,
+}
+
+impl PropertyTally {
+    fn record(&mut self, content: &str) {
+        use crate::properties::Kind;
+        let (fm, body) = crate::markdown::split_frontmatter(content);
+        let mut rows = fm
+            .as_deref()
+            .map(crate::properties::from_frontmatter)
+            .unwrap_or_default();
+        rows.extend(crate::properties::from_chunk(0, &body));
+        for r in rows {
+            if r.kind == Kind::Empty {
+                continue;
+            }
+            self.kinds.entry(r.name).or_default().insert(r.kind);
+        }
+    }
+
+    /// The findings a single note cannot raise. `whole_vault` is whether
+    /// every note was checked, which is what a declared-unused finding
+    /// needs to be true.
+    fn findings(
+        &self,
+        declared: &std::collections::BTreeMap<String, String>,
+        whole_vault: bool,
+    ) -> Vec<Finding> {
+        let mut out = Vec::new();
+        for (name, kinds) in &self.kinds {
+            if kinds.len() > 1 {
+                let list: Vec<&str> = kinds.iter().map(|k| k.as_str()).collect();
+                out.push(Finding::new(
+                    "(vault)",
+                    None,
+                    Rule::MixedPropertyKinds,
+                    format!(
+                        "property `{name}` holds more than one kind: {}",
+                        list.join(", ")
+                    ),
+                ));
+            }
+        }
+        let names: Vec<String> = self.kinds.keys().cloned().collect();
+        for (a, b) in near_duplicate_names(&names) {
+            out.push(Finding::new(
+                "(vault)",
+                None,
+                Rule::PropertyNameCollision,
+                format!("properties `{a}` and `{b}` differ only in case or separator"),
+            ));
+        }
+        if whole_vault {
+            for name in declared.keys() {
+                if crate::properties::BUILT_IN.contains(&name.as_str())
+                    || self.kinds.contains_key(name)
+                {
+                    continue;
+                }
+                out.push(Finding::new(
+                    "(vault)",
+                    None,
+                    Rule::PropertyDeclaredUnused,
+                    format!("property `{name}` is declared in .obsidian/types.json and no note carries it"),
+                ));
+            }
+        }
+        out
+    }
+}
+
+/// Pairs of names that fold to one string when case is folded and `-` and
+/// `_` are read as spaces.
+fn near_duplicate_names(names: &[String]) -> Vec<(String, String)> {
+    let fold = |n: &str| n.to_lowercase().replace(['-', '_'], " ");
+    let mut out = Vec::new();
+    for (i, a) in names.iter().enumerate() {
+        for b in &names[i + 1..] {
+            if a != b && fold(a) == fold(b) {
+                out.push((a.clone(), b.clone()));
+            }
+        }
+    }
+    out
+}
+
 fn check_wikilink_targets(file: &str, content: &str, names: &NameSet) -> Vec<Finding> {
     let mut out = Vec::new();
     let mut in_fence = false;
@@ -560,6 +744,8 @@ pub fn validate_target(
     limits: &ChunkLimits,
     strict: bool,
 ) -> anyhow::Result<ValidateReport> {
+    let declared = crate::properties::declared_types(root);
+
     // A single note walks names lazily: only if it holds a wikilink.
     if let Target::Note(rel) = target {
         let path = resolve_note(root, rel)?;
@@ -572,7 +758,9 @@ pub fn validate_target(
                 } else {
                     NameSet::empty()
                 };
-                ValidateReport::build(validate_file(&file, &text, &names, limits), 1, strict)
+                let mut findings = validate_file(&file, &text, &names, limits);
+                findings.extend(check_properties(&file, &text, &declared));
+                ValidateReport::build(findings, 1, strict)
             }
             Err(e) => ValidateReport::build(
                 vec![Finding::new(
@@ -594,47 +782,66 @@ pub fn validate_target(
         if s.all.iter().chain(&s.any).chain(&s.none).any(|t| matches!(t, crate::tags::ScopeTerm::Tag(_))));
 
     let mut findings = Vec::new();
+    let mut tally = PropertyTally::default();
     let mut checked = 0usize;
     for path in &all {
         let rel = rel_path(root, path).unwrap_or_else(|| path.to_string_lossy().into_owned());
+        // One read per file. A scope with a tag term needs the text to
+        // decide admission, and every check below reads the same text; a
+        // scope with no tag term decides on the path alone, so a note it
+        // excludes is never read (#65, #66).
+        let mut text: Option<String> = None;
         if let Target::Scope(scope) = target {
-            let content_tags = if needs_tags {
-                match std::fs::read_to_string(path) {
-                    Ok(text) => Some(crate::tags::extract(&text)),
-                    Err(e) => {
-                        findings.push(Finding::new(
-                            &rel,
-                            None,
-                            Rule::FileUnreadable,
-                            format!("cannot read file: {e}"),
-                        ));
+            if needs_tags {
+                match read_note(path, &rel) {
+                    Ok(read) => text = Some(read),
+                    Err(finding) => {
+                        findings.push(finding);
                         continue;
                     }
                 }
-            } else {
-                None
-            };
+            }
+            let content_tags = text.as_deref().map(crate::tags::extract);
             if !scope_admits(&rel, content_tags.as_deref(), scope) {
                 continue;
             }
         }
-        findings.extend(check_path(path, &rel, &names, limits));
+        let text = match text {
+            Some(text) => text,
+            None => match read_note(path, &rel) {
+                Ok(read) => read,
+                Err(finding) => {
+                    // A file that cannot be read is still a file this run
+                    // looked at, so it counts as checked.
+                    findings.push(finding);
+                    checked += 1;
+                    continue;
+                }
+            },
+        };
+        findings.extend(validate_file(&rel, &text, &names, limits));
+        findings.extend(check_properties(&rel, &text, &declared));
+        tally.record(&text);
         checked += 1;
     }
+    findings.extend(tally.findings(&declared, matches!(target, Target::Vault)));
     Ok(ValidateReport::build(findings, checked, strict))
 }
 
-/// Read one file and validate it, or report it unreadable.
-pub fn check_path(path: &Path, rel: &str, names: &NameSet, limits: &ChunkLimits) -> Vec<Finding> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => validate_file(rel, &text, names, limits),
-        Err(e) => vec![Finding::new(
+/// One file's text, or the finding that says it cannot be read.
+///
+/// The walk's one reader: the scope's tag terms, every per-file check and
+/// the vault-wide tally all read the text it answers, so a file is read
+/// once however many of them run (#66).
+fn read_note(path: &Path, rel: &str) -> std::result::Result<String, Finding> {
+    std::fs::read_to_string(path).map_err(|e| {
+        Finding::new(
             rel,
             None,
             Rule::FileUnreadable,
             format!("cannot read file: {e}"),
-        )],
-    }
+        )
+    })
 }
 
 /// Resolve a vault-relative note reference to a path: exact relative path
@@ -986,19 +1193,131 @@ mod tests {
     }
 
     #[test]
-    fn check_path_reports_an_unreadable_file() {
-        let names = NameSet::empty();
+    fn a_file_that_cannot_be_read_is_a_finding_and_not_an_error() {
+        let finding = read_note(std::path::Path::new("does/not/exist.md"), "exist.md")
+            .expect_err("no such file");
+        assert_eq!(finding.rule, Rule::FileUnreadable);
+        assert!(
+            finding.message.starts_with("cannot read file:"),
+            "{finding:?}"
+        );
+    }
+
+    // ── Custom properties (#66) ──────────────────────────────────
+
+    fn rules_of(findings: &[Finding]) -> Vec<Rule> {
+        findings.iter().map(|f| f.rule).collect()
+    }
+
+    #[test]
+    fn an_unquoted_frontmatter_link_is_a_warning_with_its_line() {
+        let declared = std::collections::BTreeMap::new();
+        let r = check_properties(
+            "n.md",
+            "---\nok: \"[[A]]\"\nbad: [[A]]\nlist:\n  - [[B]]\n---\n# T\n",
+            &declared,
+        );
+        assert_eq!(
+            rules_of(&r),
+            vec![Rule::UnquotedFrontmatterLink, Rule::UnquotedFrontmatterLink]
+        );
+        assert_eq!(r[0].line, Some(3));
+        assert_eq!(r[1].line, Some(5));
+        assert_eq!(r[0].severity, Severity::Warning);
+    }
+
+    #[test]
+    fn a_value_that_disagrees_with_the_declared_type_is_a_warning() {
+        let declared: std::collections::BTreeMap<String, String> = [
+            ("rating".to_string(), "number".to_string()),
+            ("status".to_string(), "text".to_string()),
+            ("people".to_string(), "multitext".to_string()),
+            ("when".to_string(), "date".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        assert!(
+            check_properties(
+                "n.md",
+                "---\nrating: 5\nstatus: draft\npeople: [a, 2]\nwhen: 2026-09-03\n---\n",
+                &declared
+            )
+            .is_empty()
+        );
+        let r = check_properties("n.md", "---\nrating: high\n---\n", &declared);
+        assert_eq!(rules_of(&r), vec![Rule::PropertyTypeMismatch]);
+        assert!(r[0].message.contains("rating"), "{}", r[0].message);
+        let r = check_properties("n.md", "---\nstatus: [a, b]\n---\n", &declared);
+        assert_eq!(
+            rules_of(&r),
+            vec![Rule::PropertyTypeMismatch],
+            "two values under a text type"
+        );
+        let r = check_properties("n.md", "---\nstatus: \"[[A]]\"\nrating:\n---\n", &declared);
+        assert!(
+            r.is_empty(),
+            "a link is text, and an empty value matches every type: {r:?}"
+        );
+    }
+
+    #[test]
+    fn the_vault_wide_rules_read_every_checked_note() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".obsidian")).unwrap();
+        std::fs::write(
+            root.join(".obsidian/types.json"),
+            r#"{"types":{"phantom":"checkbox","status":"text"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("a.md"),
+            "---\nstatus: draft\nDue-Date: soon\n---\n# A\n\nBody.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("b.md"),
+            "---\nstatus: 5\ndue date: later\n---\n# B\n\nRating:: 4\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("c.md"), "# C\n\nRating:: high\n").unwrap();
         let limits = ChunkLimits {
-            min_chars: 120,
+            min_chars: 0,
             target_tokens: 512,
         };
-        let findings = check_path(
-            std::path::Path::new("does/not/exist.md"),
-            "exist.md",
-            &names,
-            &limits,
+
+        let report = validate_target(root, &Target::Vault, &limits, false).unwrap();
+        let rules = rules_of(&report.findings);
+        assert!(rules.contains(&Rule::MixedPropertyKinds), "{rules:?}");
+        assert!(rules.contains(&Rule::PropertyNameCollision), "{rules:?}");
+        assert!(rules.contains(&Rule::PropertyDeclaredUnused), "{rules:?}");
+        let mixed: Vec<&Finding> = report
+            .findings
+            .iter()
+            .filter(|f| f.rule == Rule::MixedPropertyKinds)
+            .collect();
+        assert_eq!(
+            mixed.len(),
+            2,
+            "status (text, number) and Rating (number, text): {mixed:?}"
         );
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].rule, Rule::FileUnreadable);
+        assert!(
+            mixed
+                .iter()
+                .all(|f| f.file == "(vault)" && f.line.is_none())
+        );
+
+        let scoped = validate_target(
+            root,
+            &Target::Scope(crate::tags::Scope::default()),
+            &limits,
+            false,
+        )
+        .unwrap();
+        assert!(
+            !rules_of(&scoped.findings).contains(&Rule::PropertyDeclaredUnused),
+            "a scope may exclude the notes that carry a declared name"
+        );
+        assert!(rules_of(&scoped.findings).contains(&Rule::MixedPropertyKinds));
     }
 }

@@ -11,6 +11,7 @@ pub fn build_openapi_spec(server_url: &str) -> serde_json::Value {
     paths.insert("/api/read".into(), build_read());
     paths.insert("/api/list".into(), build_list());
     paths.insert("/api/tags".into(), build_tags());
+    paths.insert("/api/properties".into(), build_properties());
     paths.insert("/api/vault-map".into(), build_vault_map());
     paths.insert("/api/health".into(), build_health());
     paths.insert("/api/validate".into(), build_validate());
@@ -86,6 +87,9 @@ fn build_search() -> serde_json::Value {
                         "all": { "type": "array", "items": { "type": "string" }, "description": "Tag terms a note carries every one of, or directory terms (starting with /, case-sensitive, a trailing / its subtree) it lies under" },
                         "any": { "type": "array", "items": { "type": "string" }, "description": "Tag terms a note carries at least one of, or directory terms (starting with /, case-sensitive, a trailing / its subtree) it lies under" },
                         "none": { "type": "array", "items": { "type": "string" }, "description": "Tag terms a note carries none of, or directory terms (starting with /, case-sensitive, a trailing / its subtree) it does not lie under" },
+                        "property": { "type": "string", "description": "Answer from notes carrying a custom property: NAME, or NAME=VALUE for one value compared as text. One per call; GET /api/properties lists the names and values" },
+                        "links_to": { "type": "string", "description": "Answer from notes that link to this note, named the way a wikilink names it. With property, only links filed under that property count. An unknown note is a 400 naming the nearest one" },
+                        "linked_from": { "type": "string", "description": "Answer from the notes this note links to, named the way a wikilink names it. With property, only links filed under that property count. An unknown note is a 400 naming the nearest one" },
                         "budget_tokens": { "type": "integer", "description": "Token budget for the returned text. Fill is greedy in rank order and the first result is always included. Defaults to the configured output budget" },
                         "full": { "type": "boolean", "description": "Return every result's full text, ignoring the token budget. Conflicts with summaries" },
                         "summaries": { "type": "boolean", "description": "Return breadcrumb and provenance only, no text, for every result. Conflicts with full" },
@@ -93,7 +97,7 @@ fn build_search() -> serde_json::Value {
                     }
                 }}}
             },
-            "responses": { "200": { "description": "An envelope: status ('ok' or 'no_results'); degraded (bool, true when no cross-encoder ranked the results); warnings (array of strings); blocks, the results that fit the token budget, each {id, path, heading_path, provenance: {keyword, semantic, graph, linked_from}, text, untrusted_content, truncated, and score when scores was requested}; and overflow, the results the budget excluded, each {id, path, heading_path, provenance, and score when requested} with no text. explain, the per-lane breakdown, rides beside the envelope when the request asked for it" } }
+            "responses": { "200": { "description": "An envelope: status ('ok' or 'no_results'); degraded (bool, true when no cross-encoder ranked the results); warnings (array of strings); blocks, the results that fit the token budget, each {id, path, heading_path, provenance: {keyword, semantic, graph, linked_from}, text, untrusted_content, truncated, properties (the parent note's frontmatter property rows, omitted when empty), and score when scores was requested}; and overflow, the results the budget excluded, each {id, path, heading_path, provenance, and score when requested} with no text. explain, the per-lane breakdown, rides beside the envelope when the request asked for it" } }
         }
     })
 }
@@ -146,7 +150,7 @@ fn build_read() -> serde_json::Value {
                     "schema": { "type": "boolean" }
                 }
             ],
-            "responses": { "200": { "description": "Content mode returns {path, docid, content, and section when a section was read, which is {heading, level, line_start, line_end} — level absent for a promoted bold line}. Metadata mode returns {path, docid, frontmatter, byte_count, and outgoing_links/incoming_links as arrays of {path, docid}}." } }
+            "responses": { "200": { "description": "Content mode returns {path, docid, content, and section when a section was read, which is {heading, level, line_start, line_end} — level absent for a promoted bold line}. Metadata mode returns {path, docid, frontmatter, byte_count, properties (every property row the note holds), and outgoing_links/incoming_links as arrays of {path, docid, properties} — properties names the custom properties that link is filed under, empty for a plain wikilink}." } }
         }
     })
 }
@@ -161,11 +165,14 @@ fn build_list() -> serde_json::Value {
                 { "name": "all", "in": "query", "required": false, "description": "Comma-separated tag terms a note carries every one of, or directory terms (starting with /, case-sensitive, a trailing / its subtree) it lies under", "schema": { "type": "string" } },
                 { "name": "any", "in": "query", "required": false, "description": "Comma-separated tag terms a note carries at least one of, or directory terms (starting with /, case-sensitive, a trailing / its subtree) it lies under", "schema": { "type": "string" } },
                 { "name": "none", "in": "query", "required": false, "description": "Comma-separated tag terms a note carries none of, or directory terms (starting with /, case-sensitive, a trailing / its subtree) it does not lie under", "schema": { "type": "string" } },
+                { "name": "property", "in": "query", "required": false, "description": "Notes carrying a custom property: NAME, or NAME=VALUE for one value compared as text, URL-encoded. One per call; /api/properties lists the names and values", "schema": { "type": "string" } },
+                { "name": "links_to", "in": "query", "required": false, "description": "Notes that link to this note, named the way a wikilink names it. With property, only links filed under that property count. An unknown note is a 400 naming the nearest one", "schema": { "type": "string" } },
+                { "name": "linked_from", "in": "query", "required": false, "description": "The notes this note links to, named the way a wikilink names it. With property, only links filed under that property count. An unknown note is a 400 naming the nearest one", "schema": { "type": "string" } },
                 { "name": "created_by", "in": "query", "required": false, "description": "Agent filter", "schema": { "type": "string" } },
                 { "name": "limit", "in": "query", "required": false, "description": "Maximum notes to answer. Absent, every note the scope admits", "schema": { "type": "integer" } },
                 { "name": "detailed", "in": "query", "required": false, "description": "detailed=true answers each note's heading outline beside its path. The value is required; a bare `detailed` does not parse", "schema": { "type": "boolean" } }
             ],
-            "responses": { "200": { "description": "Array of note summaries" } }
+            "responses": { "200": { "description": "Array of note summaries. Under a property filter each note also carries properties, the rows that term matched — narrowed to the links that name the note when links_to is set beside it, and omitted under linked_from, where the matched row belongs to the naming note" } }
         }
     })
 }
@@ -179,6 +186,19 @@ fn build_tags() -> serde_json::Value {
                 { "name": "under", "in": "query", "required": false, "description": "One tag term; the rows returned are that tag and its descendants. Omit for the whole vocabulary", "schema": { "type": "string" } }
             ],
             "responses": { "200": { "description": "Array of tag rows: path, display, note_count" } }
+        }
+    })
+}
+
+fn build_properties() -> serde_json::Value {
+    serde_json::json!({
+        "get": {
+            "operationId": "listProperties",
+            "summary": "The vault's custom properties: every name with its note count, the kinds seen and Obsidian's declared type, or one property's values.",
+            "parameters": [
+                { "name": "name", "in": "query", "required": false, "description": "One property name; the rows returned are its distinct values, each with its kind and note count. Omit for the registry", "schema": { "type": "string" } }
+            ],
+            "responses": { "200": { "description": "Without name, an array of {name, note_count, kinds, declared_type}; with name, an array of {value, kind, note_count}" } }
         }
     })
 }
@@ -582,6 +602,18 @@ mod tests {
         assert_eq!(named, vec!["under"]);
     }
 
+    #[test]
+    fn test_properties_documents_name() {
+        let spec = build_openapi_spec("http://localhost:3000");
+        let named: Vec<&str> = spec["paths"]["/api/properties"]["get"]["parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(named, vec!["name"]);
+    }
+
     /// `read` absorbed `graph show`'s docid fact (#62). Every endpoint here
     /// is description-only, with no per-field schema to keep it honest, so
     /// the shape change has to be said in the one line that exists.
@@ -627,6 +659,7 @@ mod tests {
             "readNote",
             "listNotes",
             "listTags",
+            "listProperties",
             "getVaultMap",
             "getHealth",
             "validateVault",
@@ -685,5 +718,22 @@ mod tests {
             .collect();
 
         assert_eq!(served, described, "the spec and the router disagree");
+    }
+
+    #[test]
+    fn test_list_and_search_document_the_property_filters() {
+        let spec = build_openapi_spec("http://localhost:3000");
+        let list: Vec<&str> = spec["paths"]["/api/list"]["get"]["parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["name"].as_str().unwrap())
+            .collect();
+        let search = &spec["paths"]["/api/search"]["post"]["requestBody"]["content"]["application/json"]
+            ["schema"]["properties"];
+        for name in ["property", "links_to", "linked_from"] {
+            assert!(list.contains(&name), "list is missing {name}");
+            assert!(search.get(name).is_some(), "search is missing {name}");
+        }
     }
 }

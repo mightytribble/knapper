@@ -39,6 +39,9 @@ pub struct NoteMetadata {
     pub frontmatter: String,
     pub outgoing_links: Vec<LinkRef>,
     pub incoming_links: Vec<LinkRef>,
+    /// Every custom property the note holds, frontmatter and body; a body
+    /// row names its section through `heading_path` (#66).
+    pub properties: Vec<crate::store::PropertyRow>,
     pub byte_count: usize,
 }
 
@@ -59,6 +62,9 @@ pub enum ReadResult {
 pub struct LinkRef {
     pub path: String,
     pub docid: Option<String>,
+    /// The custom properties this link is filed under. Empty for a plain
+    /// wikilink (#66).
+    pub properties: Vec<String>,
 }
 
 /// Where a section sits in its file. `read` reports it when a section was
@@ -115,6 +121,14 @@ pub struct NoteListItem {
     /// serialises as it did before this field existed (#68, #69).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub headings: Option<Vec<Heading>>,
+    /// The property rows the scope's `property` term matched, narrowed by a
+    /// `links_to` term beside it. Absent when the scope carries no property
+    /// term, so a listing with no property filter serialises as it did
+    /// before, and absent under `linked_from`, where the matched row
+    /// belongs to the naming note (#66). `context::matched_properties`
+    /// states the rule.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub properties: Option<Vec<crate::store::PropertyRow>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -178,15 +192,27 @@ fn split_frontmatter(content: &str) -> (String, String) {
 // Public API
 // ---------------------------------------------------------------------------
 
-/// The links off one file, as `LinkRef` rows. One reader for both directions,
-/// so the two cannot drift.
-fn link_refs<T>(store: &Store, edges: &[(i64, T)]) -> Vec<LinkRef> {
+/// The notes at the far end of a set of edges, each with the property
+/// names the link is filed under (#66). `names` answers those for one far
+/// note, so the caller decides which end of the link is this note.
+///
+/// A failed property read is the caller's error, the policy the
+/// `properties` module states: `context_read` returns `Result`, so it
+/// carries one rather than reporting a link no property names.
+fn link_refs<T>(
+    store: &Store,
+    edges: &[(i64, T)],
+    names: impl Fn(i64) -> Result<Vec<String>>,
+) -> Result<Vec<LinkRef>> {
     edges
         .iter()
         .filter_map(|(fid, _)| store.get_file_by_id(*fid).ok().flatten())
-        .map(|f| LinkRef {
-            path: f.path,
-            docid: f.docid,
+        .map(|f| {
+            Ok(LinkRef {
+                properties: names(f.id)?,
+                path: f.path,
+                docid: f.docid,
+            })
         })
         .collect()
 }
@@ -222,18 +248,22 @@ pub fn context_read(
             // empty rather than invented.
             None => (String::new(), 0),
         };
+        let id = record.id;
         return Ok(ReadResult::Metadata(NoteMetadata {
             path: record.path,
             docid: record.docid,
             frontmatter,
             outgoing_links: link_refs(
                 params.store,
-                &params.store.get_outgoing(record.id, Some("wikilink"))?,
-            ),
+                &params.store.get_outgoing(id, Some("wikilink"))?,
+                |to| params.store.property_names_for_link(id, to),
+            )?,
             incoming_links: link_refs(
                 params.store,
-                &params.store.get_incoming(record.id, Some("wikilink"))?,
-            ),
+                &params.store.get_incoming(id, Some("wikilink"))?,
+                |from| params.store.property_names_for_link(from, id),
+            )?,
+            properties: params.store.file_properties(id)?,
             byte_count,
         }));
     }
@@ -330,6 +360,42 @@ fn outline(vault_path: &Path, path: &str) -> Vec<Heading> {
         .collect()
 }
 
+/// The property rows each listed note shows, keyed by file id, or `None`
+/// when the listing shows none (#66).
+///
+/// `NoteListItem.properties` is the rows the scope's property term matched,
+/// so the fill reads the predicate the clause selected on:
+///
+/// - `property` alone: the note's rows under that name, and its value when
+///   the term carries one.
+/// - `property` with `links_to`: those rows narrowed to the ones that name
+///   the note asked for, because that is what the clause matched.
+/// - `property` with `linked_from`: `None`. The matched row belongs to the
+///   naming note, so no row of the listed note answers the term, and an
+///   empty array would claim the note carries the property.
+///
+/// The link ids come from `Store::resolve_scope_links`, the resolution
+/// `list_files` itself ran, so a clause and a fill cannot read one name two
+/// ways and neither is built from an unresolved one.
+fn matched_properties(
+    params: &ContextParams,
+    tags: &crate::tags::Scope,
+    file_ids: &[i64],
+) -> Result<Option<std::collections::HashMap<i64, Vec<crate::store::PropertyRow>>>> {
+    let Some(term) = &tags.property else {
+        return Ok(None);
+    };
+    if tags.linked_from.is_some() {
+        return Ok(None);
+    }
+    let links = params.store.resolve_scope_links(tags)?;
+    Ok(Some(params.store.matched_properties_for_files(
+        file_ids,
+        term,
+        links.links_to,
+    )?))
+}
+
 /// The notes a scope admits, in path order (#68). A caller's directory
 /// filter is a scope term, which is a case-sensitive range and not a `LIKE`.
 ///
@@ -348,10 +414,14 @@ pub fn context_list(
         .store
         .edge_counts_for_files(&file_ids)
         .unwrap_or_default();
+    let mut matched = matched_properties(params, tags, &file_ids)?;
     let mut items = Vec::new();
     for f in files {
         let edge_count = edge_counts.get(&f.id).copied().unwrap_or(0);
         let headings = detailed.then(|| outline(params.vault_path, &f.path));
+        let properties = matched
+            .as_mut()
+            .map(|m| m.remove(&f.id).unwrap_or_default());
         items.push(NoteListItem {
             path: f.path,
             docid: f.docid,
@@ -359,6 +429,7 @@ pub fn context_list(
             indexed_at: f.indexed_at,
             edge_count,
             headings,
+            properties,
         });
     }
     Ok(items)
@@ -1061,5 +1132,193 @@ mod tests {
         .unwrap();
 
         assert_eq!(written, original);
+    }
+
+    // ── Custom properties on read and list (#66) ─────────────────
+
+    fn with_properties() -> (TempDir, Store, std::path::PathBuf) {
+        use crate::properties::Kind;
+        use crate::store::NewProperty;
+        let (tmp, store, root) = setup_vault();
+        let note = store.get_file("note.md").unwrap().unwrap().id;
+        let other = store.get_file("other.md").unwrap().unwrap().id;
+        store
+            .replace_file_properties(
+                note,
+                &[
+                    NewProperty {
+                        chunk_seq: DOC_LEVEL,
+                        name: "status",
+                        value: "draft",
+                        kind: Kind::Text,
+                        target_file: None,
+                    },
+                    NewProperty {
+                        chunk_seq: DOC_LEVEL,
+                        name: "related",
+                        value: "other",
+                        kind: Kind::Link,
+                        target_file: Some(other),
+                    },
+                ],
+            )
+            .unwrap();
+        (tmp, store, root)
+    }
+
+    #[test]
+    fn metadata_lists_every_property_row_and_names_the_property_behind_a_link() {
+        let (_tmp, store, root) = with_properties();
+        let params = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+        let meta = metadata_of(context_read(&params, "note.md", None, true).unwrap());
+        let names: Vec<&str> = meta.properties.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["related", "status"]);
+        assert_eq!(meta.outgoing_links[0].path, "other.md");
+        assert_eq!(
+            meta.outgoing_links[0].properties,
+            vec!["related".to_string()]
+        );
+        assert!(meta.incoming_links[0].properties.is_empty());
+
+        let other = metadata_of(context_read(&params, "other.md", None, true).unwrap());
+        assert!(other.properties.is_empty());
+        assert_eq!(
+            other.incoming_links[0].properties,
+            vec!["related".to_string()]
+        );
+    }
+
+    /// `ada` files two `employer` links, to `acme` and to `beta`, and one
+    /// `mentor` link to `bob`. `bob` carries no property of its own.
+    fn with_link_properties() -> (TempDir, Store, std::path::PathBuf) {
+        use crate::properties::Kind;
+        use crate::store::NewProperty;
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let store = Store::open_memory().unwrap();
+        let add = |name: &str| {
+            let rel = format!("{name}.md");
+            std::fs::write(root.join(&rel), format!("# {name}\n")).unwrap();
+            store
+                .insert_file(&rel, "h", 0, &generate_docid(&rel), None, None)
+                .unwrap()
+        };
+        let ada = add("ada");
+        let acme = add("acme");
+        let beta = add("beta");
+        let bob = add("bob");
+        store
+            .replace_file_properties(
+                ada,
+                &[
+                    NewProperty {
+                        chunk_seq: DOC_LEVEL,
+                        name: "employer",
+                        value: "acme",
+                        kind: Kind::Link,
+                        target_file: Some(acme),
+                    },
+                    NewProperty {
+                        chunk_seq: DOC_LEVEL,
+                        name: "employer",
+                        value: "beta",
+                        kind: Kind::Link,
+                        target_file: Some(beta),
+                    },
+                    NewProperty {
+                        chunk_seq: 0,
+                        name: "mentor",
+                        value: "bob",
+                        kind: Kind::Link,
+                        target_file: Some(bob),
+                    },
+                ],
+            )
+            .unwrap();
+        for target in [acme, beta, bob] {
+            store
+                .insert_edge(ada, DOC_LEVEL, target, DOC_LEVEL, "wikilink")
+                .unwrap();
+        }
+        (tmp, store, root)
+    }
+
+    /// The rows shown are the rows the clause matched: a note carrying two
+    /// `employer` links shows the one that names the note asked for (#66).
+    #[test]
+    fn a_listing_under_links_to_shows_the_rows_that_name_that_note() {
+        let (_tmp, store, root) = with_link_properties();
+        let params = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+        let scope = crate::tags::Scope::default()
+            .with_filters(Some("employer"), Some("acme"), None)
+            .unwrap();
+        let items = context_list(&params, &scope, None, None, false).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].path, "ada.md");
+        let rows = items[0].properties.as_ref().unwrap();
+        let values: Vec<&str> = rows.iter().map(|r| r.value.as_str()).collect();
+        assert_eq!(values, ["acme"], "the beta row did not match: {rows:?}");
+    }
+
+    /// Under `linked_from` the matched row belongs to the naming note, so
+    /// no row of the listed note answers the term and the field is absent
+    /// rather than empty (#66).
+    #[test]
+    fn a_listing_under_linked_from_carries_no_property_rows() {
+        let (_tmp, store, root) = with_link_properties();
+        let params = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+        let scope = crate::tags::Scope::default()
+            .with_filters(Some("mentor"), None, Some("ada"))
+            .unwrap();
+        let items = context_list(&params, &scope, None, None, false).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].path, "bob.md");
+        assert!(
+            items[0].properties.is_none(),
+            "bob carries no mentor row: {:?}",
+            items[0].properties
+        );
+        let json = serde_json::to_string(&items).unwrap();
+        assert!(!json.contains("\"properties\""), "{json}");
+    }
+
+    #[test]
+    fn a_listing_carries_the_matched_rows_only_under_a_property_term() {
+        let (_tmp, store, root) = with_properties();
+        let params = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+        let plain =
+            context_list(&params, &crate::tags::Scope::default(), None, None, false).unwrap();
+        assert!(plain.iter().all(|i| i.properties.is_none()));
+        let json = serde_json::to_string(&plain).unwrap();
+        assert!(!json.contains("\"properties\""), "{json}");
+
+        let scope = crate::tags::Scope::default()
+            .with_filters(Some("status=draft"), None, None)
+            .unwrap();
+        let items = context_list(&params, &scope, None, None, false).unwrap();
+        assert_eq!(items.len(), 1);
+        let rows = items[0].properties.as_ref().unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "only the matched row, not every row: {rows:?}"
+        );
+        assert_eq!(rows[0].value, "draft");
     }
 }

@@ -262,7 +262,12 @@ async fn main() -> Result<()> {
             cfg.merge_top_n(args.top_n);
             let group_by = args.group_by.unwrap_or(cfg.group_by);
             let all_terms = knapper::tags::merge_scope_alias(args.scope, args.all);
-            let scope = knapper::tags::Scope::parse(&all_terms, &args.any, &args.none)?;
+            let scope = knapper::tags::Scope::parse(&all_terms, &args.any, &args.none)?
+                .with_filters(
+                    args.property.as_deref(),
+                    args.links_to.as_deref(),
+                    args.linked_from.as_deref(),
+                )?;
 
             if !index_exists(&data_dir) {
                 eprintln!("No index found. Run 'knapper index <path>' first.");
@@ -325,15 +330,19 @@ async fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
                 use knapper::context::ReadResult;
-                let ident = |path: &str, docid: &Option<String>| {
-                    format!(
-                        "{} {}",
-                        path,
-                        docid
-                            .as_deref()
-                            .map(|d| format!("(#{})", d))
-                            .unwrap_or_default()
-                    )
+                // A note with no docid is its path alone: one space
+                // separates the two, and nothing trails a path that is on
+                // its own.
+                let ident = |path: &str, docid: &Option<String>| match docid.as_deref() {
+                    Some(d) => format!("{path} (#{d})"),
+                    None => path.to_string(),
+                };
+                let via = |names: &[String]| {
+                    if names.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" via {}", names.join(", "))
+                    }
                 };
                 match result {
                     ReadResult::Content(note) => {
@@ -360,11 +369,21 @@ async fn main() -> Result<()> {
                         println!("Bytes: {}", meta.byte_count);
                         println!("Outgoing links: {}", meta.outgoing_links.len());
                         for l in &meta.outgoing_links {
-                            println!("  {}", ident(&l.path, &l.docid));
+                            println!("  {}{}", ident(&l.path, &l.docid), via(&l.properties));
                         }
                         println!("Incoming links: {}", meta.incoming_links.len());
                         for l in &meta.incoming_links {
-                            println!("  {}", ident(&l.path, &l.docid));
+                            println!("  {}{}", ident(&l.path, &l.docid), via(&l.properties));
+                        }
+                        if !meta.properties.is_empty() {
+                            println!("Properties: {}", meta.properties.len());
+                            for p in &meta.properties {
+                                let at = match &p.heading_path {
+                                    Some(h) => format!(" @ {h}"),
+                                    None => String::new(),
+                                };
+                                println!("  {} = {} ({}){at}", p.name, p.value, p.kind.as_str());
+                            }
                         }
                         if !meta.frontmatter.is_empty() {
                             println!("Frontmatter:\n{}", meta.frontmatter);
@@ -382,7 +401,12 @@ async fn main() -> Result<()> {
                 profile: profile.as_ref(),
             };
             let all_terms = knapper::tags::merge_scope_alias(args.scope, args.all);
-            let filter = knapper::tags::Scope::parse(&all_terms, &args.any, &args.none)?;
+            let filter = knapper::tags::Scope::parse(&all_terms, &args.any, &args.none)?
+                .with_filters(
+                    args.property.as_deref(),
+                    args.links_to.as_deref(),
+                    args.linked_from.as_deref(),
+                )?;
             let items = knapper::context::context_list(
                 &params,
                 &filter,
@@ -431,6 +455,16 @@ async fn main() -> Result<()> {
                 for row in &rows {
                     println!("{} ({})", row.display, row.note_count);
                 }
+            }
+        }
+
+        Command::Properties(args) => {
+            let (store, vault_path, _profile) = open_vault(&data_dir)?;
+            let report = knapper::properties::run(&store, &vault_path, &args)?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", knapper::properties::render_text(&report));
             }
         }
 

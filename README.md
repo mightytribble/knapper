@@ -17,8 +17,8 @@ Knapper solves this by providing your LLM with effective search, realtime indexi
 - **5-lane hybrid search...** — semantic embeddings + BM25 full-text + graph expansion + cross-encoder reranking + temporal scoring. The content lanes fuse via Reciprocal Rank Fusion, and graph and temporal candidates join the shortlist by reserved quota. One absolute scorer then sorts it: by default a **calibrated convex combination** of the lanes' own scores extending TM2C2 — [score fusion rather than rank fusion](https://arxiv.org/abs/2210.11934), with BM25 measured against each query's own theoretical maximum so a score means the same thing from one query to the next — and the cross-encoder when intelligence is enabled. Lane weights are configurable. Time-aware queries like "what happened last week" or "March 2026 notes" activate the temporal lane automatically.
 - **...that knows what it doesn't know...** — Conventional semantic and BM25 search will return results even if they're not relevant, which not only wastes tokens but can actively lead an LLM astray. Knapper scores every result as a calibrated probability and drops anything below a confidence floor — when nothing clears it you get nothing back, rather than a plausible-looking wrong answer.
 - **...quickly.** — Against a 240-note test vault the default path refuses exactly the same unanswerable queries as the local cross-encoder, missing on only one particularly tricky question compared to it — but much, much faster: 22 ms a query instead of 13.8 seconds on a CPU-only system.
-- **MCP server for AI agents** — `knapper serve` exposes 18 tools (search, read, list, tags, vault_map, create, update, delete, move, archive, index, reindex_file, status, health, validate, identity, init, migrate) that Claude, Cursor, or any MCP client can call directly.
-- **HTTP REST API** — `knapper serve --http` adds an axum-based HTTP server alongside MCP with 19 REST endpoints, API key authentication, rate limiting, and CORS. Web-based agents and scripts can query your vault with simple `curl` calls.
+- **MCP server for AI agents** — `knapper serve` exposes 20 tools (search, match, read, list, tags, properties, vault_map, create, update, delete, move, archive, index, reindex_file, status, health, validate, identity, init, migrate) that Claude, Cursor, or any MCP client can call directly.
+- **HTTP REST API** — `knapper serve --http` adds an axum-based HTTP server alongside MCP with 21 REST endpoints, API key authentication, rate limiting, and CORS. Web-based agents and scripts can query your vault with simple `curl` calls.
 - **Section-level editing** — AI agents can read, replace, prepend, append to or rename a section by heading, edit the note's body, or edit a frontmatter property — every change is one `update` call carrying a list of edits, and what `read` returns is what `update` takes back.
 - **Vault health diagnostics** — detect orphan notes, broken wikilinks, links naming a heading that no longer exists, stale content, and tag hygiene issues. Available as MCP tool and CLI command.
 - **Real-time sync** — file watcher keeps the index fresh as you edit in Obsidian. No manual re-indexing needed.
@@ -67,7 +67,7 @@ Your vault (markdown files)
 │          → calibrated probability sorts,    │
 │            or the cross-encoder if enabled  │
 │                                             │
-│  18 MCP tools + 19 REST endpoints           │
+│  20 MCP tools + 21 REST endpoints           │
 └─────────────────────────────────────────────┘
         │
         ▼
@@ -288,6 +288,18 @@ locations/aurelian-empire.md
 
 One bare path per line, in path order, so a folder's notes arrive together and `wc -l` is the total. A bare `knapper list` returns every indexed note; `--scope`, `--all`, `--any` and `--none` narrow it by tag or by directory, and `--limit` keeps the first n. `--detailed` reads each listed note and prints its headings, which is how an agent finds the section to read or write before it calls `read` or `update`.
 
+**Custom properties:**
+
+```bash
+knapper properties                          # every property name: note count, kinds seen, Obsidian's declared type
+knapper properties --name status            # one property's values, each with its count
+knapper list --property status=draft        # notes where status is draft
+knapper list --property employer --links-to Acme   # notes whose employer property links to Acme
+knapper search "swamp survey" --linked-from Ada    # answer from the notes Ada links to
+```
+
+A property is a named value on a note: a frontmatter key, or a Dataview inline field such as `Mentor:: [[Bob]]` in the body. knapper reads both, stores them beside the graph, and lists what the vault holds — the vocabulary is the vault's own, and `.obsidian/types.json` is read as a hint for the declared type. `--property`, `--links-to` and `--linked-from` filter `list` and `search` and take one value each; with `--property` beside a link filter, only links filed under that property count. Search ranking never reads the table. `read --metadata` lists a note's properties and names the property behind each link, and every search hit carries its note's frontmatter properties. `validate` warns on an unquoted `[[link]]` in frontmatter, a value that disagrees with the declared type, a name that holds more than one kind, two names that differ only in case or separator, and a declared name no note carries.
+
 **Create a note via the write pipeline:**
 
 ```bash
@@ -351,18 +363,19 @@ Returns orphan notes (no links in or out), broken wikilinks, stale headings, sta
 
 `knapper serve --http` adds a full REST API alongside the MCP server, exposing the same capabilities over HTTP for web agents, scripts, and integrations.
 
-**20 endpoints:**
+**21 endpoints:**
 
 Every capability is one route, and the route is the CLI command's name under `/api/`. `surfaces.md` is the generated table of all three surfaces.
 
 | Method | Endpoint | Permission | Description |
 |--------|----------|------------|-------------|
 | GET | `/api/health-check` | read | Server health check |
-| POST | `/api/search` | read | Hybrid search (semantic + FTS5 + graph + reranker + temporal), scoped by tag or directory terms — a leading `/` reads a term as a directory path (`scope`/`all`, `any`, `none`) |
+| POST | `/api/search` | read | Hybrid search (semantic + FTS5 + graph + reranker + temporal), scoped by tag or directory terms — a leading `/` reads a term as a directory path (`scope`/`all`, `any`, `none`), and `property`, `links_to`, `linked_from` (one value each) |
 | POST | `/api/match` | read | Find every note whose text holds a literal string, and count them — scoped the same way. For verification, not discovery: `notes: 0` means nothing in scope says it |
 | GET | `/api/read` | read | Read a note (`file`), or one of its sections (`section`) |
-| GET | `/api/list` | read | List notes by tag or directory terms — a leading `/` reads a term as a directory path (`scope`/`all`, `any`, `none`), creator, limit, and `detailed=true` for each note's heading outline |
+| GET | `/api/list` | read | List notes by tag or directory terms — a leading `/` reads a term as a directory path (`scope`/`all`, `any`, `none`), creator, limit, and `detailed=true` for each note's heading outline, and `property`, `links_to`, `linked_from` (one value each) |
 | GET | `/api/tags` | read | The tag vocabulary, whole or under one term (`under`) |
+| GET | `/api/properties` | read | The custom-property registry, or one property's values (`name`) |
 | GET | `/api/vault-map` | read | Vault structure overview (folders, tags, recent files) |
 | GET | `/api/status` | read | Index status and statistics |
 | GET | `/api/health` | read | Vault health diagnostics |
@@ -403,6 +416,10 @@ curl -X POST http://localhost:3000/api/search \
   -H "Authorization: Bearer kn_..." \
   -H "Content-Type: application/json" \
   -d '{"query": "authentication architecture", "top_n": 5, "scope": ["project/auth", "/01-Projects/"], "all": ["type/decision"], "any": ["status/reviewed", "status/draft"], "none": ["status/archived"]}'
+
+# The property registry, and a list filtered by a property value
+curl "http://localhost:3000/api/properties" -H "Authorization: Bearer kn_..."
+curl "http://localhost:3000/api/list?property=status%3Ddraft" -H "Authorization: Bearer kn_..."
 
 # Read a note, or one of its sections
 curl "http://localhost:3000/api/read?file=01-Projects/API-Design.md" \
@@ -617,7 +634,7 @@ STYLE:
 | Search method | 5-lane hybrid (semantic + BM25 + graph + reranker + temporal): content lanes RRF-fused, cross-encoder sorts | Vector similarity only | Keyword only |
 | Query understanding | Cross-encoder reads each candidate jointly with the query | None | None |
 | Understands note links | Yes (wikilink graph traversal) | No | Limited (backlinks panel) |
-| AI agent access | MCP server (18 tools) + HTTP REST API (19 endpoints) | Custom API needed | No |
+| AI agent access | MCP server (20 tools) + HTTP REST API (21 endpoints) | Custom API needed | No |
 | Write capability | Create/edit/rewrite/delete with smart filing | No | Manual |
 | Vault health | Orphans, broken links, stale headings, stale notes, tag hygiene | No | Limited |
 | Real-time sync | File watcher, 2s debounce | Manual re-index | N/A |
@@ -640,8 +657,8 @@ Similarly, Gemini Embedding 2 gives superior results to EmbeddingGemma, at the c
 - llama.cpp inference via Rust bindings (GGUF models, Metal GPU on macOS, CUDA on Linux)
 - Intelligence opt-in: the cross-encoder lane is off unless enabled
 - Literal matching: `match` answers whether a string still appears anywhere in scope, exhaustively and unranked, with a count that survives the reported-line cap — the question `search` cannot answer, because it is ranked and always returns something
-- MCP server with 19 tools (6 read, 5 write, 6 index and diagnostic, 1 setup, 1 migrate) via stdio
-- HTTP REST API with 20 endpoints, API key auth (`kn_` prefix), rate limiting, CORS — enabled via `knapper serve --http`
+- MCP server with 20 tools (7 read, 5 write, 6 index and diagnostic, 1 setup, 1 migrate) via stdio
+- HTTP REST API with 21 endpoints, API key auth (`kn_` prefix), rate limiting, CORS — enabled via `knapper serve --http`
 - User identity with L0/L1 tiered context for AI agent session starts
 - Section-level reading and editing: target specific headings with replace/prepend/append modes
 - Full note rewriting with automatic frontmatter preservation

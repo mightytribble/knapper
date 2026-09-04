@@ -569,6 +569,46 @@ fn longest_existing_folder_ancestor(conn: &Connection, path: &str) -> Result<Opt
     Ok(None)
 }
 
+/// A property filter (#66): a name, or a name and one value compared as
+/// text. The split is on the first `=`, so a name may not contain one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PropertyTerm {
+    pub name: String,
+    pub value: Option<String>,
+}
+
+/// A note a link filter names, as the caller wrote it (#66). It resolves
+/// the way a wikilink target does, in `Store::resolve_scope_links`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkTerm {
+    pub written: String,
+}
+
+/// Read a property term. An empty name is an error naming the field.
+pub fn parse_property_term(written: &str) -> Result<PropertyTerm> {
+    let (name, value) = match written.split_once('=') {
+        Some((n, v)) => (n.trim(), Some(v.trim().to_string())),
+        None => (written.trim(), None),
+    };
+    if name.is_empty() {
+        anyhow::bail!("'property' names no property");
+    }
+    Ok(PropertyTerm {
+        name: name.to_string(),
+        value,
+    })
+}
+
+fn parse_link_term(field: &str, written: &str) -> Result<LinkTerm> {
+    let written = written.trim();
+    if written.is_empty() {
+        anyhow::bail!("'{field}' names no note");
+    }
+    Ok(LinkTerm {
+        written: written.to_string(),
+    })
+}
+
 /// A scope over a note query: three fields that combine with AND (#65).
 ///
 /// A note is admitted when it matches every `all` term, at least one `any`
@@ -579,6 +619,12 @@ pub struct Scope {
     pub all: Vec<ScopeTerm>,
     pub any: Vec<ScopeTerm>,
     pub none: Vec<ScopeTerm>,
+    /// Notes carrying a custom property, or carrying it with one value (#66).
+    pub property: Option<PropertyTerm>,
+    /// Notes with a link to this note; under `property`, filed there (#66).
+    pub links_to: Option<LinkTerm>,
+    /// The notes this note links to; under `property`, filed there (#66).
+    pub linked_from: Option<LinkTerm>,
 }
 
 impl Scope {
@@ -600,7 +646,26 @@ impl Scope {
             all: read("all", all)?,
             any: read("any", any)?,
             none: read("none", none)?,
+            ..Default::default()
         })
+    }
+
+    /// Add the three property and link filters (#66). Each takes one value
+    /// per call on every surface; an empty one is an error naming the field.
+    pub fn with_filters(
+        mut self,
+        property: Option<&str>,
+        links_to: Option<&str>,
+        linked_from: Option<&str>,
+    ) -> Result<Self> {
+        self.property = property.map(parse_property_term).transpose()?;
+        self.links_to = links_to
+            .map(|w| parse_link_term("links_to", w))
+            .transpose()?;
+        self.linked_from = linked_from
+            .map(|w| parse_link_term("linked_from", w))
+            .transpose()?;
+        Ok(self)
     }
 
     /// Whether the filter constrains nothing.
@@ -608,7 +673,12 @@ impl Scope {
     /// The one test for "no scope", so a caller never decides that question by
     /// inspecting the three fields itself and getting one of them wrong (#60).
     pub fn is_empty(&self) -> bool {
-        self.all.is_empty() && self.any.is_empty() && self.none.is_empty()
+        self.all.is_empty()
+            && self.any.is_empty()
+            && self.none.is_empty()
+            && self.property.is_none()
+            && self.links_to.is_none()
+            && self.linked_from.is_none()
     }
 
     /// The filter as one line, for `--explain` (#60).
@@ -628,10 +698,25 @@ impl Scope {
                 .join(",");
             Some(format!("{name}={joined}"))
         };
+        let property = self.property.as_ref().map(|p| match &p.value {
+            Some(v) => format!("property={}={v}", p.name),
+            None => format!("property={}", p.name),
+        });
+        let links_to = self
+            .links_to
+            .as_ref()
+            .map(|l| format!("links_to={}", l.written));
+        let linked_from = self
+            .linked_from
+            .as_ref()
+            .map(|l| format!("linked_from={}", l.written));
         [
             field("all", &self.all),
             field("any", &self.any),
             field("none", &self.none),
+            property,
+            links_to,
+            linked_from,
         ]
         .into_iter()
         .flatten()
@@ -1231,5 +1316,45 @@ mod tests {
         ];
         let resolved = resolve_tags(store.conn(), &input).unwrap();
         assert_eq!(resolved, vec!["domaine", "domaine", "completely-new"]);
+    }
+
+    // ── Property and link filters (#66) ───────────────────────────
+
+    #[test]
+    fn a_property_term_splits_on_the_first_equals() {
+        let t = parse_property_term("status").unwrap();
+        assert_eq!((t.name.as_str(), t.value.as_deref()), ("status", None));
+        let t = parse_property_term(" employee of = Smith, John ").unwrap();
+        assert_eq!(
+            (t.name.as_str(), t.value.as_deref()),
+            ("employee of", Some("Smith, John"))
+        );
+        let t = parse_property_term("a=b=c").unwrap();
+        assert_eq!(t.value.as_deref(), Some("b=c"));
+        assert!(parse_property_term("").is_err());
+        assert!(parse_property_term("=draft").is_err());
+    }
+
+    #[test]
+    fn with_filters_fills_the_three_fields_and_is_empty_reads_them() {
+        let empty = Scope::default();
+        assert!(empty.is_empty());
+        let scope = Scope::default()
+            .with_filters(Some("status=draft"), Some("Acme"), None)
+            .unwrap();
+        assert!(!scope.is_empty());
+        assert_eq!(scope.property.as_ref().unwrap().name, "status");
+        assert_eq!(scope.links_to.as_ref().unwrap().written, "Acme");
+        assert!(scope.linked_from.is_none());
+        assert_eq!(scope.describe(), "property=status=draft links_to=Acme");
+        assert!(
+            Scope::default()
+                .with_filters(None, Some("  "), None)
+                .is_err()
+        );
+        let with_from = Scope::default()
+            .with_filters(None, None, Some("Ada"))
+            .unwrap();
+        assert_eq!(with_from.describe(), "linked_from=Ada");
     }
 }

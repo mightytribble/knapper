@@ -93,12 +93,18 @@ pub const CHUNKER_VERSION: u32 = 5;
 pub const CHUNK_RECORD_VERSION: u32 = 2;
 
 /// Bump when wikilink resolution changes: extraction, the exact → basename →
-/// shortest-path ladder, or how an end that names no passage is stored.
+/// shortest-path ladder, how an end that names no passage is stored, or what
+/// the pass that resolves links derives beside them.
 ///
 /// Version 2 is issue #73: the edge builder writes no mention edges, and the
 /// rebuild this bump declares is what clears the stale rows out of a store an
 /// earlier binary built.
-pub const LINK_RESOLVER_VERSION: u32 = 2;
+///
+/// Version 3 is issue #66: the pass derives `properties` beside `edges`, and
+/// the rebuild this bump declares is what fills the table on a store an
+/// earlier binary built. A change to the property grammar or the shape rule
+/// is a bump here too, because that pass is what re-derives the rows.
+pub const LINK_RESOLVER_VERSION: u32 = 3;
 
 /// Bump when the *text* of a [`crate::llm::PromptFormat`] template changes
 /// while the template keeps its name.

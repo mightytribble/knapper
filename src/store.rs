@@ -147,6 +147,27 @@ const UNRESOLVED_LINKS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS unresolved_lin
 );
 CREATE INDEX IF NOT EXISTS idx_unresolved_file ON unresolved_links(file_id);";
 
+/// Custom properties (#66). One row per value: a frontmatter row sits at
+/// [`DOC_LEVEL`], a Dataview inline field at the chunk that holds it.
+///
+/// `target_file` is the note a `link` row resolves to. It is `SET NULL` and
+/// not `CASCADE`: the property is a fact about the source note, and it
+/// outlives the note it named. The source's own rows cascade off `files(id)`
+/// the way `chunks`, `edges` and `file_tags` do, so no removal path owes
+/// this table a cleanup.
+const PROPERTIES_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS properties (
+    id          INTEGER PRIMARY KEY,
+    file_id     INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    chunk_seq   INTEGER NOT NULL DEFAULT -1,
+    name        TEXT NOT NULL,
+    value       TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    target_file INTEGER REFERENCES files(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_properties_file   ON properties(file_id);
+CREATE INDEX IF NOT EXISTS idx_properties_name   ON properties(name, value);
+CREATE INDEX IF NOT EXISTS idx_properties_target ON properties(target_file);";
+
 /// Reduce a heading to the form two spellings of the same section share.
 ///
 /// Strips the leading `#`s a stored heading carries and a link's does not,
@@ -270,6 +291,54 @@ pub struct IdentityFact {
 pub struct TagCount {
     pub path: String,
     pub display: String,
+    pub note_count: usize,
+}
+
+/// A property row as it is written (#66). One argument rather than five.
+pub struct NewProperty<'a> {
+    /// [`DOC_LEVEL`] for a frontmatter property, else the chunk's `seq`.
+    pub chunk_seq: i64,
+    pub name: &'a str,
+    pub value: &'a str,
+    pub kind: crate::properties::Kind,
+    /// The note a `link` row resolves to, or none when it does not resolve.
+    pub target_file: Option<i64>,
+}
+
+/// A property row as it is read (#66).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PropertyRow {
+    pub chunk_seq: i64,
+    /// The breadcrumb of the chunk that holds a body row. Absent on a
+    /// frontmatter row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heading_path: Option<String>,
+    pub name: String,
+    pub value: String,
+    pub kind: crate::properties::Kind,
+    /// The path of the note a `link` row resolves to. Absent on a row of
+    /// another kind, and on a link that resolves to nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_path: Option<String>,
+}
+
+/// One row of the property registry (#66): a name, how many notes carry it,
+/// the kinds seen, and Obsidian's declared type when `types.json` names it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PropertyCount {
+    pub name: String,
+    pub note_count: usize,
+    pub kinds: Vec<crate::properties::Kind>,
+    /// Filled by `properties::registry`, which reads the vault. The store
+    /// does not.
+    pub declared_type: Option<String>,
+}
+
+/// One distinct value of one property, and how many notes carry it (#66).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ValueCount {
+    pub value: String,
+    pub kind: crate::properties::Kind,
     pub note_count: usize,
 }
 
@@ -776,6 +845,11 @@ impl Store {
             ))?;
         }
         self.conn.execute_batch(UNRESOLVED_LINKS_SCHEMA)?;
+
+        // Custom properties (#66). Created empty; the edge pass fills it, and
+        // the `LINK_RESOLVER_VERSION` bump that shipped with it declares the
+        // rebuild that fills a store an earlier binary built.
+        self.conn.execute_batch(PROPERTIES_SCHEMA)?;
 
         // Migration log table — records PARA migration batch operations.
         self.conn.execute_batch(
@@ -1778,6 +1852,15 @@ impl Store {
     }
 }
 
+/// The note ids a scope's link terms resolve to (#66). Built by
+/// [`Store::resolve_scope_links`] and handed to `scope_clauses` beside the
+/// scope, so a clause cannot be built from an unresolved name.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct LinkIds {
+    pub links_to: Option<i64>,
+    pub linked_from: Option<i64>,
+}
+
 /// A scope over a note query: SQL over a `files` row aliased `f`, and its
 /// arguments in the order the SQL binds them (#65).
 ///
@@ -1785,7 +1868,10 @@ impl Store {
 /// `list_files` and `files_in_scope` ask the same question and a second copy is
 /// a second thing to keep right. A tag term is an `EXISTS` over the junction; a
 /// directory term is a range predicate on `files.path`, which needs no join.
-fn scope_clauses(scope: &crate::tags::Scope) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
+fn scope_clauses(
+    scope: &crate::tags::Scope,
+    links: &LinkIds,
+) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
     use crate::tags::ScopeTerm;
 
     fn fragment(term: &ScopeTerm, args: &mut Vec<Box<dyn rusqlite::types::ToSql>>) -> String {
@@ -1829,6 +1915,73 @@ fn scope_clauses(scope: &crate::tags::Scope) -> (String, Vec<Box<dyn rusqlite::t
             sql.push_str(&format!(" AND ({group})"));
         }
     }
+
+    // The property and link filters (#66). A link term alone reads `edges`,
+    // so a plain `[[X]]` counts; with a property beside it, only links filed
+    // under that name count, and the plain property clause is not added:
+    // the property names the link, not the note being selected.
+    let property = scope.property.as_ref();
+    let push_value = |sql: &mut String, args: &mut Vec<Box<dyn rusqlite::types::ToSql>>| {
+        if let Some(p) = property
+            && let Some(v) = &p.value
+        {
+            sql.push_str(" AND p.value = ?");
+            args.push(Box::new(v.clone()));
+        }
+    };
+    if let Some(to) = links.links_to {
+        match property {
+            Some(p) => {
+                sql.push_str(
+                    " AND EXISTS (SELECT 1 FROM properties p
+                                   WHERE p.file_id = f.id AND p.name = ? AND p.target_file = ?",
+                );
+                args.push(Box::new(p.name.clone()));
+                args.push(Box::new(to));
+                push_value(&mut sql, &mut args);
+                sql.push(')');
+            }
+            None => {
+                sql.push_str(
+                    " AND EXISTS (SELECT 1 FROM edges e
+                                   WHERE e.from_file = f.id AND e.to_file = ? AND e.edge_type = 'wikilink')",
+                );
+                args.push(Box::new(to));
+            }
+        }
+    }
+    if let Some(from) = links.linked_from {
+        match property {
+            Some(p) => {
+                sql.push_str(
+                    " AND EXISTS (SELECT 1 FROM properties p
+                                   WHERE p.file_id = ? AND p.name = ? AND p.target_file = f.id",
+                );
+                args.push(Box::new(from));
+                args.push(Box::new(p.name.clone()));
+                push_value(&mut sql, &mut args);
+                sql.push(')');
+            }
+            None => {
+                sql.push_str(
+                    " AND EXISTS (SELECT 1 FROM edges e
+                                   WHERE e.from_file = ? AND e.to_file = f.id AND e.edge_type = 'wikilink')",
+                );
+                args.push(Box::new(from));
+            }
+        }
+    }
+    if let Some(p) = property
+        && links.links_to.is_none()
+        && links.linked_from.is_none()
+    {
+        sql.push_str(
+            " AND EXISTS (SELECT 1 FROM properties p WHERE p.file_id = f.id AND p.name = ?",
+        );
+        args.push(Box::new(p.name.clone()));
+        push_value(&mut sql, &mut args);
+        sql.push(')');
+    }
     (sql, args)
 }
 
@@ -1854,10 +2007,11 @@ impl Store {
         let checked: Vec<&crate::tags::ScopeTerm> =
             tags.all.iter().chain(tags.any.iter()).collect();
         crate::tags::check_terms(&self.conn, &checked)?;
+        let links = self.resolve_scope_links(tags)?;
 
         let mut sql = format!("SELECT {FILE_COLUMNS} FROM files f WHERE 1=1");
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        let (tag_sql, tag_args) = scope_clauses(tags);
+        let (tag_sql, tag_args) = scope_clauses(tags, &links);
         sql.push_str(&tag_sql);
         param_values.extend(tag_args);
         if let Some(cb) = created_by {
@@ -1898,8 +2052,9 @@ impl Store {
         let checked: Vec<&crate::tags::ScopeTerm> =
             scope.all.iter().chain(scope.any.iter()).collect();
         crate::tags::check_terms(&self.conn, &checked)?;
+        let links = self.resolve_scope_links(scope)?;
 
-        let (scope_sql, args) = scope_clauses(scope);
+        let (scope_sql, args) = scope_clauses(scope, &links);
         let mut stmt = self.conn.prepare(&format!(
             "SELECT f.path, c.heading_path, c.text
                FROM chunks c JOIN files f ON f.id = c.file_id
@@ -1931,8 +2086,9 @@ impl Store {
         let checked: Vec<&crate::tags::ScopeTerm> =
             filter.all.iter().chain(filter.any.iter()).collect();
         crate::tags::check_terms(&self.conn, &checked)?;
+        let links = self.resolve_scope_links(filter)?;
 
-        let (tag_sql, args) = scope_clauses(filter);
+        let (tag_sql, args) = scope_clauses(filter, &links);
         let mut stmt = self
             .conn
             .prepare(&format!("SELECT f.id FROM files f WHERE 1=1{tag_sql}"))?;
@@ -1942,6 +2098,30 @@ impl Store {
             ids.push(row?);
         }
         Ok(ids)
+    }
+
+    /// Resolve a scope's link terms to note ids (#66), the way a wikilink
+    /// target resolves. An unresolvable name errors, naming the nearest note
+    /// the fuzzy file resolver finds.
+    pub fn resolve_scope_links(&self, scope: &crate::tags::Scope) -> Result<LinkIds> {
+        let resolve = |field: &str, term: &Option<crate::tags::LinkTerm>| -> Result<Option<i64>> {
+            let Some(term) = term else { return Ok(None) };
+            if let Some(id) = crate::graph::resolve_link_target(self, &term.written)? {
+                return Ok(Some(id));
+            }
+            match self.resolve_file(&term.written).ok().flatten() {
+                Some(near) => anyhow::bail!(
+                    "no such note '{}' for '{field}'; nearest: '{}'",
+                    term.written,
+                    near.path
+                ),
+                None => anyhow::bail!("no such note '{}' for '{field}'", term.written),
+            }
+        };
+        Ok(LinkIds {
+            links_to: resolve("links_to", &scope.links_to)?,
+            linked_from: resolve("linked_from", &scope.linked_from)?,
+        })
     }
 
     /// Top-level folder grouping with note counts.
@@ -2795,7 +2975,244 @@ impl Store {
         }
         Ok(out)
     }
+}
 
+/// The join every property reader runs, from `properties p` to the chunk
+/// that holds a body row and the note a link row names.
+///
+/// Both [`Store::file_properties`] and [`Store::doc_properties_for_files`]
+/// compose their `SELECT` and `WHERE` around this one copy, so a column or
+/// join added here reaches both readers at once.
+const PROPERTIES_JOIN_SQL: &str = "FROM properties p
+       LEFT JOIN chunks c ON c.file_id = p.file_id AND c.seq = p.chunk_seq
+       LEFT JOIN files t ON t.id = p.target_file";
+
+/// One row of that join, read from the six columns starting at `base`:
+/// `chunk_seq, heading_path, name, value, kind, target_path`.
+fn property_row_at(row: &rusqlite::Row<'_>, base: usize) -> rusqlite::Result<PropertyRow> {
+    let kind: String = row.get(base + 4)?;
+    Ok(PropertyRow {
+        chunk_seq: row.get(base)?,
+        heading_path: row.get(base + 1)?,
+        name: row.get(base + 2)?,
+        value: row.get(base + 3)?,
+        // A kind this build does not know reads as text: it is still a value.
+        kind: crate::properties::Kind::parse(&kind).unwrap_or(crate::properties::Kind::Text),
+        target_path: row.get(base + 5)?,
+    })
+}
+
+/// One note's row: the six columns alone.
+fn property_row_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<PropertyRow> {
+    property_row_at(row, 0)
+}
+
+/// A batched reader's row: `p.file_id` and then the six.
+fn keyed_property_row_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, PropertyRow)> {
+    Ok((row.get(0)?, property_row_at(row, 1)?))
+}
+
+/// The map both batched readers answer, grouped in the query's own order.
+fn group_by_file(
+    rows: impl Iterator<Item = rusqlite::Result<(i64, PropertyRow)>>,
+) -> Result<std::collections::HashMap<i64, Vec<PropertyRow>>> {
+    let mut out: std::collections::HashMap<i64, Vec<PropertyRow>> =
+        std::collections::HashMap::new();
+    for row in rows {
+        let (file_id, prop) = row?;
+        out.entry(file_id).or_default().push(prop);
+    }
+    Ok(out)
+}
+
+/// The file ids as one `rarray` argument, so a batched query binds one
+/// pointer rather than one parameter per id.
+fn id_array(file_ids: &[i64]) -> rusqlite::vtab::array::Array {
+    std::rc::Rc::new(
+        file_ids
+            .iter()
+            .copied()
+            .map(rusqlite::types::Value::from)
+            .collect(),
+    )
+}
+
+impl Store {
+    /// Replace one file's property rows (#66).
+    ///
+    /// Owns the file's rows the way `reconcile_file_tags` owns its tag rows:
+    /// delete, then insert. The edge pass calls this once per file.
+    pub fn replace_file_properties(&self, file_id: i64, rows: &[NewProperty<'_>]) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM properties WHERE file_id = ?1",
+            params![file_id],
+        )?;
+        let mut stmt = self.conn.prepare(
+            "INSERT INTO properties (file_id, chunk_seq, name, value, kind, target_file)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+        for row in rows {
+            stmt.execute(params![
+                file_id,
+                row.chunk_seq,
+                row.name,
+                row.value,
+                row.kind.as_str(),
+                row.target_file
+            ])?;
+        }
+        Ok(())
+    }
+
+    /// Every property row one note holds, frontmatter first, then by chunk.
+    pub fn file_properties(&self, file_id: i64) -> Result<Vec<PropertyRow>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT p.chunk_seq, c.heading_path, p.name, p.value, p.kind, t.path
+               {PROPERTIES_JOIN_SQL}
+              WHERE p.file_id = ?1 ORDER BY p.chunk_seq, p.name, p.id"
+        ))?;
+        let rows = stmt.query_map(params![file_id], property_row_from)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// The frontmatter rows of each listed note, keyed by file id (#66).
+    ///
+    /// One query for a whole result set. A note with no frontmatter row has
+    /// no entry.
+    pub fn doc_properties_for_files(
+        &self,
+        file_ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, Vec<PropertyRow>>> {
+        let array = id_array(file_ids);
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT p.file_id, p.chunk_seq, c.heading_path, p.name, p.value, p.kind, t.path
+               {PROPERTIES_JOIN_SQL}
+              WHERE p.chunk_seq = {DOC_LEVEL} AND p.file_id IN rarray(?1)
+              ORDER BY p.file_id, p.name, p.id"
+        ))?;
+        group_by_file(stmt.query_map(params![array], keyed_property_row_from)?)
+    }
+
+    /// The rows of each listed note that a scope's `property` term matched,
+    /// keyed by file id (#66).
+    ///
+    /// One query for a whole listing, the way `doc_properties_for_files` is
+    /// one query for a whole result set. The predicate is `scope_clauses`'s
+    /// own: the name, the value when the term carries one, and the link
+    /// target when a `links_to` term narrowed it. So the rows answered are
+    /// the rows that admitted the note, and no other row the note holds.
+    ///
+    /// A note with no matching row has no entry.
+    pub fn matched_properties_for_files(
+        &self,
+        file_ids: &[i64],
+        term: &crate::tags::PropertyTerm,
+        target_file: Option<i64>,
+    ) -> Result<std::collections::HashMap<i64, Vec<PropertyRow>>> {
+        let array = id_array(file_ids);
+        let mut args: Vec<Box<dyn rusqlite::types::ToSql>> =
+            vec![Box::new(array), Box::new(term.name.clone())];
+        let mut sql = format!(
+            "SELECT p.file_id, p.chunk_seq, c.heading_path, p.name, p.value, p.kind, t.path
+               {PROPERTIES_JOIN_SQL}
+              WHERE p.file_id IN rarray(?) AND p.name = ?"
+        );
+        if let Some(value) = &term.value {
+            sql.push_str(" AND p.value = ?");
+            args.push(Box::new(value.clone()));
+        }
+        if let Some(target) = target_file {
+            sql.push_str(" AND p.target_file = ?");
+            args.push(Box::new(target));
+        }
+        sql.push_str(" ORDER BY p.file_id, p.chunk_seq, p.name, p.id");
+        let mut stmt = self.conn.prepare(&sql)?;
+        group_by_file(stmt.query_map(
+            rusqlite::params_from_iter(args.iter()),
+            keyed_property_row_from,
+        )?)
+    }
+
+    /// One row per property name (#66): how many notes carry it and the
+    /// kinds seen, by note count and then name. `declared_type` is left
+    /// empty; `properties::registry` fills it from the vault.
+    pub fn property_registry(&self) -> Result<Vec<PropertyCount>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT name, COUNT(DISTINCT file_id) AS notes, GROUP_CONCAT(DISTINCT kind)
+               FROM properties GROUP BY name ORDER BY notes DESC, name",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let kinds: String = row.get(2)?;
+            let mut kinds: Vec<crate::properties::Kind> = kinds
+                .split(',')
+                .filter_map(crate::properties::Kind::parse)
+                .collect();
+            kinds.sort_by_key(|k| k.as_str());
+            Ok(PropertyCount {
+                name: row.get(0)?,
+                note_count: row.get::<_, i64>(1)? as usize,
+                kinds,
+                declared_type: None,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// One property's distinct values, each with its kind and the notes
+    /// carrying it, by note count and then value (#66).
+    pub fn property_values(&self, name: &str) -> Result<Vec<ValueCount>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT value, kind, COUNT(DISTINCT file_id) AS notes
+               FROM properties WHERE name = ?1
+              GROUP BY value, kind ORDER BY notes DESC, value",
+        )?;
+        let rows = stmt.query_map(params![name], |row| {
+            let kind: String = row.get(1)?;
+            Ok(ValueCount {
+                value: row.get(0)?,
+                kind: crate::properties::Kind::parse(&kind)
+                    .unwrap_or(crate::properties::Kind::Text),
+                note_count: row.get::<_, i64>(2)? as usize,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// The property names one note files a link to another under (#66).
+    /// Distinct, ordered. Empty when no property carries the link.
+    pub fn property_names_for_link(&self, from_file: i64, to_file: i64) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT name FROM properties
+              WHERE file_id = ?1 AND target_file = ?2 ORDER BY name",
+        )?;
+        let rows = stmt.query_map(params![from_file, to_file], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Empty the table. The edge rebuild calls this beside `clear_edges`.
+    pub fn clear_properties(&self) -> Result<()> {
+        self.conn.execute("DELETE FROM properties", [])?;
+        Ok(())
+    }
+}
+
+impl Store {
     // ── CLI Events ──────────────────────────────────────────────
 
     /// Log a CLI event for observability/analytics.
@@ -6539,6 +6956,181 @@ mod tests {
         assert!(axes.contains(&("habitat".to_string(), 1)));
     }
 
+    // ── Custom properties (#66) ──────────────────────────────────
+
+    fn prop<'a>(
+        chunk_seq: i64,
+        name: &'a str,
+        value: &'a str,
+        kind: crate::properties::Kind,
+        target_file: Option<i64>,
+    ) -> NewProperty<'a> {
+        NewProperty {
+            chunk_seq,
+            name,
+            value,
+            kind,
+            target_file,
+        }
+    }
+
+    #[test]
+    fn replacing_a_files_properties_is_idempotent() {
+        use crate::properties::Kind;
+        let store = Store::open_memory().unwrap();
+        let a = store
+            .insert_file("a.md", "h", 0, &generate_docid("a.md"), None, None)
+            .unwrap();
+        let rows = [
+            prop(DOC_LEVEL, "status", "draft", Kind::Text, None),
+            prop(DOC_LEVEL, "rating", "5", Kind::Number, None),
+        ];
+        store.replace_file_properties(a, &rows).unwrap();
+        store.replace_file_properties(a, &rows).unwrap();
+        let got = store.file_properties(a).unwrap();
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(got[0].name, "rating");
+        assert_eq!(got[0].kind, Kind::Number);
+        assert_eq!(got[0].chunk_seq, DOC_LEVEL);
+        assert_eq!(got[0].heading_path, None);
+        assert_eq!(got[1].value, "draft");
+    }
+
+    #[test]
+    fn a_file_removal_cascades_its_property_rows() {
+        use crate::properties::Kind;
+        let store = Store::open_memory().unwrap();
+        let a = store
+            .insert_file("a.md", "h", 0, &generate_docid("a.md"), None, None)
+            .unwrap();
+        store
+            .replace_file_properties(a, &[prop(DOC_LEVEL, "status", "draft", Kind::Text, None)])
+            .unwrap();
+        store.delete_file(a).unwrap();
+        let n: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM properties", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn a_target_removal_keeps_the_row_and_clears_the_target() {
+        use crate::properties::Kind;
+        let store = Store::open_memory().unwrap();
+        let a = store
+            .insert_file("a.md", "h", 0, &generate_docid("a.md"), None, None)
+            .unwrap();
+        let b = store
+            .insert_file("b.md", "h", 0, &generate_docid("b.md"), None, None)
+            .unwrap();
+        store
+            .replace_file_properties(a, &[prop(DOC_LEVEL, "employer", "b", Kind::Link, Some(b))])
+            .unwrap();
+        assert_eq!(
+            store.file_properties(a).unwrap()[0].target_path.as_deref(),
+            Some("b.md")
+        );
+        store.delete_file(b).unwrap();
+        let got = store.file_properties(a).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].target_path, None);
+        assert_eq!(got[0].value, "b");
+    }
+
+    #[test]
+    fn the_registry_counts_a_note_once_and_lists_the_kinds_seen() {
+        use crate::properties::Kind;
+        let store = Store::open_memory().unwrap();
+        let a = store
+            .insert_file("a.md", "h", 0, &generate_docid("a.md"), None, None)
+            .unwrap();
+        let b = store
+            .insert_file("b.md", "h", 0, &generate_docid("b.md"), None, None)
+            .unwrap();
+        store
+            .replace_file_properties(
+                a,
+                &[
+                    prop(DOC_LEVEL, "status", "draft", Kind::Text, None),
+                    prop(DOC_LEVEL, "status", "review", Kind::Text, None),
+                    prop(DOC_LEVEL, "rating", "5", Kind::Number, None),
+                ],
+            )
+            .unwrap();
+        store
+            .replace_file_properties(b, &[prop(DOC_LEVEL, "rating", "high", Kind::Text, None)])
+            .unwrap();
+        let reg = store.property_registry().unwrap();
+        assert_eq!(reg.len(), 2, "{reg:?}");
+        // Ordered by note count, then name.
+        assert_eq!(reg[0].name, "rating");
+        assert_eq!(reg[0].note_count, 2);
+        assert_eq!(reg[0].kinds, vec![Kind::Number, Kind::Text]);
+        assert_eq!(reg[0].declared_type, None);
+        assert_eq!(reg[1].name, "status");
+        assert_eq!(reg[1].note_count, 1, "two values in one note count once");
+
+        let vals = store.property_values("status").unwrap();
+        assert_eq!(vals.len(), 2);
+        assert_eq!(vals[0].value, "draft");
+        assert_eq!(vals[0].note_count, 1);
+    }
+
+    #[test]
+    fn the_names_behind_a_link_are_distinct_and_ordered() {
+        use crate::properties::Kind;
+        let store = Store::open_memory().unwrap();
+        let a = store
+            .insert_file("a.md", "h", 0, &generate_docid("a.md"), None, None)
+            .unwrap();
+        let b = store
+            .insert_file("b.md", "h", 0, &generate_docid("b.md"), None, None)
+            .unwrap();
+        store
+            .replace_file_properties(
+                a,
+                &[
+                    prop(DOC_LEVEL, "mentor", "b", Kind::Link, Some(b)),
+                    prop(0, "employer", "b", Kind::Link, Some(b)),
+                    prop(1, "employer", "b", Kind::Link, Some(b)),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            store.property_names_for_link(a, b).unwrap(),
+            vec!["employer".to_string(), "mentor".to_string()]
+        );
+        assert!(store.property_names_for_link(b, a).unwrap().is_empty());
+    }
+
+    #[test]
+    fn doc_properties_for_files_answers_frontmatter_rows_only() {
+        use crate::properties::Kind;
+        let store = Store::open_memory().unwrap();
+        let a = store
+            .insert_file("a.md", "h", 0, &generate_docid("a.md"), None, None)
+            .unwrap();
+        let b = store
+            .insert_file("b.md", "h", 0, &generate_docid("b.md"), None, None)
+            .unwrap();
+        store
+            .replace_file_properties(
+                a,
+                &[
+                    prop(DOC_LEVEL, "status", "draft", Kind::Text, None),
+                    prop(0, "mentor", "b", Kind::Link, Some(b)),
+                ],
+            )
+            .unwrap();
+        let map = store.doc_properties_for_files(&[a, b]).unwrap();
+        assert_eq!(map.get(&a).map(Vec::len), Some(1));
+        assert_eq!(map[&a][0].name, "status");
+        assert!(!map.contains_key(&b));
+        store.clear_properties().unwrap();
+        assert!(store.doc_properties_for_files(&[a]).unwrap().is_empty());
+    }
+
     // ── Calibrated-fusion readers (spec 2026-08-30) ────────────────
 
     /// Two files, three chunks: "storm wolf" is in two of them, "basilisk"
@@ -6694,5 +7286,224 @@ mod tests {
         // And the carried row is keyed on the file, so the cascade reaches it.
         store.delete_file(file_id).unwrap();
         assert!(store.get_unresolved_links().unwrap().is_empty());
+    }
+
+    /// ada links to acme under `employer` (frontmatter) and to bob under
+    /// `mentor` (body); bob links to acme with a plain body wikilink; acme
+    /// carries `status: active`.
+    fn property_vault() -> (Store, i64, i64, i64) {
+        use crate::properties::Kind;
+        let store = Store::open_memory().unwrap();
+        let ada = store
+            .insert_file("ada.md", "h", 0, &generate_docid("ada.md"), None, None)
+            .unwrap();
+        let acme = store
+            .insert_file("acme.md", "h", 0, &generate_docid("acme.md"), None, None)
+            .unwrap();
+        let bob = store
+            .insert_file("bob.md", "h", 0, &generate_docid("bob.md"), None, None)
+            .unwrap();
+        store
+            .replace_file_properties(
+                ada,
+                &[
+                    prop(DOC_LEVEL, "employer", "acme", Kind::Link, Some(acme)),
+                    prop(DOC_LEVEL, "status", "draft", Kind::Text, None),
+                    prop(0, "mentor", "bob", Kind::Link, Some(bob)),
+                ],
+            )
+            .unwrap();
+        store
+            .replace_file_properties(
+                acme,
+                &[prop(DOC_LEVEL, "status", "active", Kind::Text, None)],
+            )
+            .unwrap();
+        store
+            .insert_edge(ada, DOC_LEVEL, acme, DOC_LEVEL, "wikilink")
+            .unwrap();
+        store
+            .insert_edge(ada, 0, bob, DOC_LEVEL, "wikilink")
+            .unwrap();
+        store
+            .insert_edge(bob, 0, acme, DOC_LEVEL, "wikilink")
+            .unwrap();
+        (store, ada, acme, bob)
+    }
+
+    fn scoped(
+        store: &Store,
+        property: Option<&str>,
+        to: Option<&str>,
+        from: Option<&str>,
+    ) -> Vec<String> {
+        let scope = crate::tags::Scope::default()
+            .with_filters(property, to, from)
+            .unwrap();
+        store
+            .list_files(&scope, None, None)
+            .unwrap()
+            .into_iter()
+            .map(|f| f.path)
+            .collect()
+    }
+
+    /// The listing's fill reads the same predicate the clause selected on,
+    /// so the rows it answers are the rows that matched (#66).
+    #[test]
+    fn matched_properties_narrow_by_name_value_and_target() {
+        let (store, ada, acme, bob) = property_vault();
+        let ids = [ada, acme, bob];
+        let term = |written: &str| {
+            crate::tags::Scope::default()
+                .with_filters(Some(written), None, None)
+                .unwrap()
+                .property
+                .unwrap()
+        };
+        let values = |map: &std::collections::HashMap<i64, Vec<PropertyRow>>, id: i64| {
+            map.get(&id)
+                .map(|rows| rows.iter().map(|r| r.value.clone()).collect::<Vec<_>>())
+                .unwrap_or_default()
+        };
+
+        // Name alone: every row under that name, and nothing else the note
+        // holds.
+        let by_name = store
+            .matched_properties_for_files(&ids, &term("status"), None)
+            .unwrap();
+        assert_eq!(values(&by_name, ada), ["draft"]);
+        assert_eq!(values(&by_name, acme), ["active"]);
+        assert!(!by_name.contains_key(&bob));
+
+        // Name and value.
+        let by_value = store
+            .matched_properties_for_files(&ids, &term("status=active"), None)
+            .unwrap();
+        assert!(values(&by_value, ada).is_empty());
+        assert_eq!(values(&by_value, acme), ["active"]);
+
+        // Name and target: the rows that name that note, not every row
+        // under the name.
+        let by_target = store
+            .matched_properties_for_files(&ids, &term("employer"), Some(acme))
+            .unwrap();
+        assert_eq!(values(&by_target, ada), ["acme"]);
+        assert!(
+            store
+                .matched_properties_for_files(&ids, &term("employer"), Some(bob))
+                .unwrap()
+                .is_empty(),
+            "no employer row names bob"
+        );
+    }
+
+    #[test]
+    fn a_property_term_selects_by_name_and_by_value() {
+        let (store, ..) = property_vault();
+        assert_eq!(
+            scoped(&store, Some("status"), None, None),
+            ["acme.md", "ada.md"]
+        );
+        assert_eq!(
+            scoped(&store, Some("status=active"), None, None),
+            ["acme.md"]
+        );
+        assert_eq!(
+            scoped(&store, Some("mentor"), None, None),
+            ["ada.md"],
+            "a body row counts"
+        );
+        assert!(scoped(&store, Some("status=gone"), None, None).is_empty());
+    }
+
+    #[test]
+    fn links_to_alone_reads_edges_and_with_a_property_reads_the_name() {
+        let (store, ..) = property_vault();
+        assert_eq!(
+            scoped(&store, None, Some("acme"), None),
+            ["ada.md", "bob.md"]
+        );
+        assert_eq!(
+            scoped(&store, Some("employer"), Some("acme"), None),
+            ["ada.md"]
+        );
+        assert!(scoped(&store, Some("mentor"), Some("acme"), None).is_empty());
+        assert_eq!(
+            scoped(&store, Some("employer=acme"), Some("acme"), None),
+            ["ada.md"]
+        );
+    }
+
+    #[test]
+    fn linked_from_alone_reads_edges_and_with_a_property_reads_the_name() {
+        let (store, ..) = property_vault();
+        assert_eq!(
+            scoped(&store, None, None, Some("ada")),
+            ["acme.md", "bob.md"]
+        );
+        assert_eq!(
+            scoped(&store, Some("mentor"), None, Some("ada")),
+            ["bob.md"]
+        );
+        assert_eq!(
+            scoped(&store, Some("employer"), None, Some("ada")),
+            ["acme.md"]
+        );
+    }
+
+    #[test]
+    fn the_filters_and_together_with_a_tag_term() {
+        let (store, ada, _acme, bob) = property_vault();
+        let tag = |p: &str| crate::tags::Tag {
+            path: p.to_string(),
+            display: p.to_string(),
+        };
+        // ada and bob are the people; acme is the firm. So the tag term
+        // alone answers ada and bob, and `status` alone answers ada and
+        // acme: each term admits a note the other refuses, and only the
+        // AND of the two answers ada by herself.
+        store
+            .reconcile_file_tags(ada, &[tag("type/person")])
+            .unwrap();
+        store
+            .reconcile_file_tags(bob, &[tag("type/person")])
+            .unwrap();
+        let scope = crate::tags::Scope::parse(&["type/person".into()], &[], &[])
+            .unwrap()
+            .with_filters(Some("status"), None, None)
+            .unwrap();
+        let got: Vec<String> = store
+            .list_files(&scope, None, None)
+            .unwrap()
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+        assert_eq!(got, ["ada.md"]);
+        assert_eq!(store.files_in_scope(&scope).unwrap(), vec![ada]);
+
+        // Two link terms AND together the same way: bob is the note that
+        // links to acme and that ada links to. `links_to` alone answers ada
+        // and bob, `linked_from` alone answers acme and bob.
+        assert_eq!(scoped(&store, None, Some("acme"), Some("ada")), ["bob.md"]);
+    }
+
+    #[test]
+    fn an_unknown_link_note_errors_with_the_nearest_one() {
+        let (store, ..) = property_vault();
+        let scope = crate::tags::Scope::default()
+            .with_filters(None, Some("acmee"), None)
+            .unwrap();
+        let err = store
+            .list_files(&scope, None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("no such note 'acmee'"), "{err}");
+        assert!(err.contains("nearest: 'acme.md'"), "{err}");
+        let scope = crate::tags::Scope::default()
+            .with_filters(None, None, Some("zzzzzz"))
+            .unwrap();
+        let err = store.files_in_scope(&scope).unwrap_err().to_string();
+        assert_eq!(err, "no such note 'zzzzzz' for 'linked_from'");
     }
 }

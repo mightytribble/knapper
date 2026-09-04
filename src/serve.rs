@@ -131,6 +131,13 @@ impl KnapperServer {
         let top_n = params.0.top_n.unwrap_or(self.top_n);
         let all_terms = crate::tags::merge_scope_alias(params.0.scope, params.0.all);
         let scope = crate::tags::Scope::parse(&all_terms, &params.0.any, &params.0.none)
+            .and_then(|s| {
+                s.with_filters(
+                    params.0.property.as_deref(),
+                    params.0.links_to.as_deref(),
+                    params.0.linked_from.as_deref(),
+                )
+            })
             .map_err(|e| mcp_err(&e))?;
         let store = self.store.lock().await;
         let mut embedder = self.embedder.lock().await;
@@ -250,6 +257,13 @@ impl KnapperServer {
         };
         let all_terms = crate::tags::merge_scope_alias(params.0.scope, params.0.all);
         let tags = crate::tags::Scope::parse(&all_terms, &params.0.any, &params.0.none)
+            .and_then(|s| {
+                s.with_filters(
+                    params.0.property.as_deref(),
+                    params.0.links_to.as_deref(),
+                    params.0.linked_from.as_deref(),
+                )
+            })
             .map_err(|e| mcp_err(&e))?;
         let items = context::context_list(
             &ctx,
@@ -287,6 +301,20 @@ impl KnapperServer {
         let prefix = params.0.under.as_deref().and_then(crate::tags::parse_term);
         let rows = store.tags_under(prefix.as_ref()).map_err(|e| mcp_err(&e))?;
         to_json_result(&rows)
+    }
+
+    #[tool(
+        name = "properties",
+        description = "The vault's custom properties: every property name with the notes carrying it, the kinds seen and Obsidian's declared type — or, with `name`, one property's distinct values with their counts. Call before filtering list or search with `property`."
+    )]
+    async fn properties(
+        &self,
+        params: Parameters<crate::params::Properties>,
+    ) -> Result<CallToolResult, McpError> {
+        let store = self.store.lock().await;
+        let report =
+            crate::properties::run(&store, &self.vault_path, &params.0).map_err(|e| mcp_err(&e))?;
+        to_json_result(&report)
     }
 
     #[tool(
@@ -1365,6 +1393,9 @@ mod tests {
             all: vec![],
             any: vec![],
             none: vec![],
+            property: None,
+            links_to: None,
+            linked_from: None,
             budget_tokens: None,
             full: false,
             summaries: false,

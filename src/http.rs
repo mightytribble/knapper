@@ -290,6 +290,7 @@ pub fn routes() -> Vec<(&'static str, MethodRouter<ApiState>)> {
         ("/api/read", get(handle_read)),
         ("/api/list", get(handle_list)),
         ("/api/tags", get(handle_tags)),
+        ("/api/properties", get(handle_properties)),
         ("/api/vault-map", get(handle_vault_map)),
         ("/api/health", get(handle_health)),
         ("/api/validate", post(handle_validate)),
@@ -363,10 +364,13 @@ async fn handle_plugin_manifest(State(state): State<ApiState>) -> impl IntoRespo
 
 /// Whether an error message is a caller's own scope typo, which is a bad
 /// request rather than a server fault. `check_terms` gives the caller the
-/// nearest tag or folder in the message, the cheapest honest signal this far
-/// from where the error is built (#60, #65).
+/// nearest tag or folder in the message, and `resolve_scope_links` the
+/// nearest note for a `links_to` or `linked_from` name — the cheapest honest
+/// signal this far from where the error is built (#60, #65, #66).
 fn is_scope_typo(message: &str) -> bool {
-    message.starts_with("no such tag") || message.starts_with("no such folder")
+    message.starts_with("no such tag")
+        || message.starts_with("no such folder")
+        || message.starts_with("no such note")
 }
 
 async fn handle_match(
@@ -405,6 +409,13 @@ async fn handle_search(
     let top_n = body.top_n.unwrap_or(state.top_n);
     let all_terms = crate::tags::merge_scope_alias(body.scope, body.all);
     let scope = crate::tags::Scope::parse(&all_terms, &body.any, &body.none)
+        .and_then(|s| {
+            s.with_filters(
+                body.property.as_deref(),
+                body.links_to.as_deref(),
+                body.linked_from.as_deref(),
+            )
+        })
         .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
     let store = state.store.lock().await;
     let mut embedder = state.embedder.lock().await;
@@ -523,6 +534,13 @@ async fn handle_list(
     };
     let all_terms = crate::tags::merge_scope_alias(params.scope, params.all);
     let filter = crate::tags::Scope::parse(&all_terms, &params.any, &params.none)
+        .and_then(|s| {
+            s.with_filters(
+                params.property.as_deref(),
+                params.links_to.as_deref(),
+                params.linked_from.as_deref(),
+            )
+        })
         .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
     let items = context::context_list(
         &ctx,
@@ -558,6 +576,21 @@ async fn handle_tags(
         .tags_under(prefix.as_ref())
         .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
     Ok(Json(serde_json::json!(rows)))
+}
+
+/// The vault's custom-property registry, or one property's values — the
+/// call to make before filtering `/api/list` or `/api/search` with
+/// `property` (#66).
+async fn handle_properties(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(params): Query<crate::params::Properties>,
+) -> Result<impl IntoResponse, ApiError> {
+    authorize(&headers, &state, false)?;
+    let store = state.store.lock().await;
+    let report = crate::properties::run(&store, &state.vault_path, &params)
+        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    Ok(Json(serde_json::json!(report)))
 }
 
 async fn handle_vault_map(
@@ -1550,6 +1583,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_properties_lists_the_registry_and_one_names_values() {
+        let state = test_api_state();
+        {
+            let store = state.store.lock().await;
+            let a = store
+                .insert_file("ada.md", "h1", 100, "aaa111", None, None)
+                .unwrap();
+            store
+                .replace_file_properties(
+                    a,
+                    &[crate::store::NewProperty {
+                        chunk_seq: crate::store::DOC_LEVEL,
+                        name: "status",
+                        value: "draft",
+                        kind: crate::properties::Kind::Text,
+                        target_file: None,
+                    }],
+                )
+                .unwrap();
+        }
+        let rows = json_body(get(state.clone(), "/api/properties").await).await;
+        assert_eq!(rows[0]["name"], "status");
+        assert_eq!(rows[0]["note_count"], 1);
+        assert_eq!(rows[0]["kinds"][0], "text");
+        let vals = json_body(get(state, "/api/properties?name=status").await).await;
+        assert_eq!(vals[0]["value"], "draft");
+        assert_eq!(vals[0]["kind"], "text");
+    }
+
+    #[tokio::test]
     async fn test_list_any_matches_either_term() {
         let state = test_api_state();
         seed_tags(&state).await;
@@ -2300,5 +2363,38 @@ mod tests {
             blocks.iter().all(|b| b["score"].is_number()),
             "--scores must fill a number on every block, got {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_list_filters_by_property_and_an_unknown_note_is_a_400() {
+        let state = test_api_state();
+        {
+            let store = state.store.lock().await;
+            let a = store
+                .insert_file("ada.md", "h1", 100, "aaa111", None, None)
+                .unwrap();
+            let acme = store
+                .insert_file("acme.md", "h2", 200, "bbb222", None, None)
+                .unwrap();
+            store
+                .replace_file_properties(
+                    a,
+                    &[crate::store::NewProperty {
+                        chunk_seq: crate::store::DOC_LEVEL,
+                        name: "employer",
+                        value: "acme",
+                        kind: crate::properties::Kind::Link,
+                        target_file: Some(acme),
+                    }],
+                )
+                .unwrap();
+        }
+        let rows = json_body(get(state.clone(), "/api/list?property=employer%3Dacme").await).await;
+        assert_eq!(paths(&rows), vec!["ada.md"]);
+        let rows =
+            json_body(get(state.clone(), "/api/list?property=employer&links_to=acme").await).await;
+        assert_eq!(paths(&rows), vec!["ada.md"]);
+        let response = get(state, "/api/list?links_to=nobody").await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }

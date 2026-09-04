@@ -75,6 +75,10 @@ pub enum Command {
     /// List the vault's tag vocabulary.
     Tags(crate::params::Tags),
 
+    /// List the vault's custom properties, or one property's values with
+    /// `--name`.
+    Properties(crate::params::Properties),
+
     /// Vault structure overview.
     VaultMap(crate::params::VaultMap),
 
