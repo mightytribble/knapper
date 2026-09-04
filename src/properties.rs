@@ -15,6 +15,11 @@
 //! `search::finalize_search_output` returns a `SearchOutput` and cannot, so
 //! it warns and leaves the field empty.
 
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use crate::store::DOC_LEVEL;
+
 /// The kind of a property value, read from the value's shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -51,8 +56,6 @@ impl Kind {
         }
     }
 }
-
-use crate::store::DOC_LEVEL;
 
 /// The three properties Obsidian provides. They keep their own handling
 /// and write no property row.
@@ -339,9 +342,6 @@ fn push_inline(out: &mut Vec<Extracted>, seq: i64, name: &str, value: &str) {
     }
 }
 
-use std::collections::BTreeMap;
-use std::path::Path;
-
 /// Obsidian's declared property types, from `<vault>/.obsidian/types.json`,
 /// read when the call runs. Obsidian does not document the file, so it is a
 /// hint and never a source of rows. Absent or unparseable answers empty.
@@ -423,12 +423,12 @@ pub fn render_text(report: &PropertiesReport) -> String {
         PropertiesReport::Registry(rows) => {
             for r in rows {
                 let kinds: Vec<&str> = r.kinds.iter().map(|k| k.as_str()).collect();
-                out.push_str(&format!(
-                    "{} ({}) {}",
-                    r.name,
-                    r.note_count,
-                    kinds.join(",")
-                ));
+                out.push_str(&format!("{} ({})", r.name, r.note_count));
+                // A declared name no note carries has no kind, so the field
+                // is left out rather than printed as nothing.
+                if !kinds.is_empty() {
+                    out.push_str(&format!(" {}", kinds.join(",")));
+                }
                 if let Some(ty) = &r.declared_type {
                     out.push_str(&format!(" [{ty}]"));
                 }
@@ -753,6 +753,11 @@ mod tests {
                 ("phantom", 0, Some("checkbox"))
             ],
             "tags is a built-in and is not a declared-only row"
+        );
+        assert_eq!(
+            render_text(&PropertiesReport::Registry(rows)),
+            "status (1) text [text]\nphantom (0) [checkbox]\n",
+            "a declared-only row has no kind and prints no empty field"
         );
     }
 

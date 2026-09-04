@@ -364,8 +364,9 @@ async fn handle_plugin_manifest(State(state): State<ApiState>) -> impl IntoRespo
 
 /// Whether an error message is a caller's own scope typo, which is a bad
 /// request rather than a server fault. `check_terms` gives the caller the
-/// nearest tag or folder in the message, the cheapest honest signal this far
-/// from where the error is built (#60, #65).
+/// nearest tag or folder in the message, and `resolve_scope_links` the
+/// nearest note for a `links_to` or `linked_from` name — the cheapest honest
+/// signal this far from where the error is built (#60, #65, #66).
 fn is_scope_typo(message: &str) -> bool {
     message.starts_with("no such tag")
         || message.starts_with("no such folder")

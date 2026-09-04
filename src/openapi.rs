@@ -172,7 +172,7 @@ fn build_list() -> serde_json::Value {
                 { "name": "limit", "in": "query", "required": false, "description": "Maximum notes to answer. Absent, every note the scope admits", "schema": { "type": "integer" } },
                 { "name": "detailed", "in": "query", "required": false, "description": "detailed=true answers each note's heading outline beside its path. The value is required; a bare `detailed` does not parse", "schema": { "type": "boolean" } }
             ],
-            "responses": { "200": { "description": "Array of note summaries" } }
+            "responses": { "200": { "description": "Array of note summaries. Under a property filter each note also carries properties, the rows that term matched — narrowed to the links that name the note when links_to is set beside it, and omitted under linked_from, where the matched row belongs to the naming note" } }
         }
     })
 }

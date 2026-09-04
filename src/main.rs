@@ -330,15 +330,12 @@ async fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
                 use knapper::context::ReadResult;
-                let ident = |path: &str, docid: &Option<String>| {
-                    format!(
-                        "{} {}",
-                        path,
-                        docid
-                            .as_deref()
-                            .map(|d| format!("(#{})", d))
-                            .unwrap_or_default()
-                    )
+                // A note with no docid is its path alone: one space
+                // separates the two, and nothing trails a path that is on
+                // its own.
+                let ident = |path: &str, docid: &Option<String>| match docid.as_deref() {
+                    Some(d) => format!("{path} (#{d})"),
+                    None => path.to_string(),
                 };
                 let via = |names: &[String]| {
                     if names.is_empty() {

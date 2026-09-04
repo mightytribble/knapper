@@ -812,7 +812,7 @@ pub fn validate_target(
                 Ok(read) => read,
                 Err(finding) => {
                     // A file that cannot be read is still a file this run
-                    // looked at, which is what the walk has always counted.
+                    // looked at, so it counts as checked.
                     findings.push(finding);
                     checked += 1;
                     continue;
