@@ -290,6 +290,20 @@ impl KnapperServer {
     }
 
     #[tool(
+        name = "properties",
+        description = "The vault's custom properties: every property name with the notes carrying it, the kinds seen and Obsidian's declared type — or, with `name`, one property's distinct values with their counts. Call before filtering list or search with `property`."
+    )]
+    async fn properties(
+        &self,
+        params: Parameters<crate::params::Properties>,
+    ) -> Result<CallToolResult, McpError> {
+        let store = self.store.lock().await;
+        let report =
+            crate::properties::run(&store, &self.vault_path, &params.0).map_err(|e| mcp_err(&e))?;
+        to_json_result(&report)
+    }
+
+    #[tool(
         name = "vault_map",
         description = "Vault structure overview: folders, tags, file counts, recent files. Use to orient before deeper queries."
     )]

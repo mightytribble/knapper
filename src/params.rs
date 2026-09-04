@@ -221,6 +221,15 @@ pub struct Tags {
 }
 
 #[derive(Debug, Args, Deserialize, JsonSchema)]
+pub struct Properties {
+    /// One property's distinct values, each with its kind and the notes
+    /// carrying it, instead of the vocabulary. The call to make before
+    /// filtering with `property=NAME=VALUE` (#66).
+    #[arg(long)]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Args, Deserialize, JsonSchema)]
 pub struct VaultMap {}
 
 /// One field, three shapes: a JSON array of strings, one comma-separated

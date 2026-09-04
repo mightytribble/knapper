@@ -319,6 +319,116 @@ fn push_inline(out: &mut Vec<Extracted>, seq: i64, name: &str, value: &str) {
     }
 }
 
+use std::collections::BTreeMap;
+use std::path::Path;
+
+/// Obsidian's declared property types, from `<vault>/.obsidian/types.json`,
+/// read when the call runs. Obsidian does not document the file, so it is a
+/// hint and never a source of rows. Absent or unparseable answers empty.
+pub fn declared_types(vault_path: &Path) -> BTreeMap<String, String> {
+    let Ok(text) = std::fs::read_to_string(vault_path.join(".obsidian/types.json")) else {
+        return BTreeMap::new();
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return BTreeMap::new();
+    };
+    json.get("types")
+        .and_then(serde_json::Value::as_object)
+        .map(|types| {
+            types
+                .iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The vault's property registry: one row per name, by note count and then
+/// name, each with the kinds seen and Obsidian's declared type. A name
+/// `types.json` declares that no note carries appears with a count of zero.
+/// This mirrors Obsidian's "All properties" view.
+pub fn registry(
+    store: &crate::store::Store,
+    vault_path: &Path,
+) -> anyhow::Result<Vec<crate::store::PropertyCount>> {
+    let declared = declared_types(vault_path);
+    let mut rows = store.property_registry()?;
+    for row in &mut rows {
+        row.declared_type = declared.get(&row.name).cloned();
+    }
+    for (name, ty) in &declared {
+        if BUILT_IN.contains(&name.as_str()) || rows.iter().any(|r| &r.name == name) {
+            continue;
+        }
+        rows.push(crate::store::PropertyCount {
+            name: name.clone(),
+            note_count: 0,
+            kinds: Vec::new(),
+            declared_type: Some(ty.clone()),
+        });
+    }
+    rows.sort_by(|a, b| {
+        b.note_count
+            .cmp(&a.note_count)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    Ok(rows)
+}
+
+/// What `properties` answers: the registry, or one name's values.
+#[derive(Debug, serde::Serialize)]
+#[serde(untagged)]
+pub enum PropertiesReport {
+    Registry(Vec<crate::store::PropertyCount>),
+    Values(Vec<crate::store::ValueCount>),
+}
+
+/// The one path the three surfaces take (#66).
+pub fn run(
+    store: &crate::store::Store,
+    vault_path: &Path,
+    params: &crate::params::Properties,
+) -> anyhow::Result<PropertiesReport> {
+    Ok(match &params.name {
+        Some(name) => PropertiesReport::Values(store.property_values(name)?),
+        None => PropertiesReport::Registry(registry(store, vault_path)?),
+    })
+}
+
+/// The CLI's text form: `name (count) kinds [declared]` per registry row,
+/// `value (count) kind` per value row.
+pub fn render_text(report: &PropertiesReport) -> String {
+    let mut out = String::new();
+    match report {
+        PropertiesReport::Registry(rows) => {
+            for r in rows {
+                let kinds: Vec<&str> = r.kinds.iter().map(|k| k.as_str()).collect();
+                out.push_str(&format!(
+                    "{} ({}) {}",
+                    r.name,
+                    r.note_count,
+                    kinds.join(",")
+                ));
+                if let Some(ty) = &r.declared_type {
+                    out.push_str(&format!(" [{ty}]"));
+                }
+                out.push('\n');
+            }
+        }
+        PropertiesReport::Values(rows) => {
+            for r in rows {
+                out.push_str(&format!(
+                    "{} ({}) {}\n",
+                    r.value,
+                    r.note_count,
+                    r.kind.as_str()
+                ));
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -540,5 +650,109 @@ mod tests {
             names_values(&rows),
             vec![("tagsmith".into(), "y".into(), Kind::Text)]
         );
+    }
+
+    #[test]
+    fn declared_types_reads_the_obsidian_file_and_answers_empty_otherwise() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        assert!(declared_types(root).is_empty(), "no .obsidian at all");
+        std::fs::create_dir_all(root.join(".obsidian")).unwrap();
+        std::fs::write(root.join(".obsidian/types.json"), "{not json").unwrap();
+        assert!(
+            declared_types(root).is_empty(),
+            "a broken file raises nothing"
+        );
+        std::fs::write(
+            root.join(".obsidian/types.json"),
+            r#"{"types":{"status":"text","rating":"number","tags":"tags"}}"#,
+        )
+        .unwrap();
+        let got = declared_types(root);
+        assert_eq!(got.get("status").map(String::as_str), Some("text"));
+        assert_eq!(got.get("rating").map(String::as_str), Some("number"));
+        assert_eq!(got.len(), 3);
+    }
+
+    #[test]
+    fn the_registry_carries_declared_types_and_declared_only_names() {
+        use crate::store::{DOC_LEVEL, NewProperty, Store};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".obsidian")).unwrap();
+        std::fs::write(
+            root.join(".obsidian/types.json"),
+            r#"{"types":{"status":"text","phantom":"checkbox","tags":"tags"}}"#,
+        )
+        .unwrap();
+        let store = Store::open_memory().unwrap();
+        let a = store
+            .insert_file("a.md", "h", 0, "aaa111", None, None)
+            .unwrap();
+        store
+            .replace_file_properties(
+                a,
+                &[NewProperty {
+                    chunk_seq: DOC_LEVEL,
+                    name: "status",
+                    value: "draft",
+                    kind: Kind::Text,
+                    target_file: None,
+                }],
+            )
+            .unwrap();
+        let rows = registry(&store, root).unwrap();
+        let got: Vec<(&str, usize, Option<&str>)> = rows
+            .iter()
+            .map(|r| (r.name.as_str(), r.note_count, r.declared_type.as_deref()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("status", 1, Some("text")),
+                ("phantom", 0, Some("checkbox"))
+            ],
+            "tags is a built-in and is not a declared-only row"
+        );
+    }
+
+    #[test]
+    fn run_answers_the_registry_or_one_names_values() {
+        use crate::store::{DOC_LEVEL, NewProperty, Store};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open_memory().unwrap();
+        let a = store
+            .insert_file("a.md", "h", 0, "aaa111", None, None)
+            .unwrap();
+        store
+            .replace_file_properties(
+                a,
+                &[NewProperty {
+                    chunk_seq: DOC_LEVEL,
+                    name: "status",
+                    value: "draft",
+                    kind: Kind::Text,
+                    target_file: None,
+                }],
+            )
+            .unwrap();
+        let whole = run(
+            &store,
+            tmp.path(),
+            &crate::params::Properties { name: None },
+        )
+        .unwrap();
+        assert_eq!(render_text(&whole), "status (1) text\n");
+        let one = run(
+            &store,
+            tmp.path(),
+            &crate::params::Properties {
+                name: Some("status".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(render_text(&one), "draft (1) text\n");
+        let json = serde_json::to_value(&one).unwrap();
+        assert_eq!(json[0]["value"], "draft");
     }
 }

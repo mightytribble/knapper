@@ -290,6 +290,7 @@ pub fn routes() -> Vec<(&'static str, MethodRouter<ApiState>)> {
         ("/api/read", get(handle_read)),
         ("/api/list", get(handle_list)),
         ("/api/tags", get(handle_tags)),
+        ("/api/properties", get(handle_properties)),
         ("/api/vault-map", get(handle_vault_map)),
         ("/api/health", get(handle_health)),
         ("/api/validate", post(handle_validate)),
@@ -558,6 +559,21 @@ async fn handle_tags(
         .tags_under(prefix.as_ref())
         .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
     Ok(Json(serde_json::json!(rows)))
+}
+
+/// The vault's custom-property registry, or one property's values — the
+/// call to make before filtering `/api/list` or `/api/search` with
+/// `property` (#66).
+async fn handle_properties(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(params): Query<crate::params::Properties>,
+) -> Result<impl IntoResponse, ApiError> {
+    authorize(&headers, &state, false)?;
+    let store = state.store.lock().await;
+    let report = crate::properties::run(&store, &state.vault_path, &params)
+        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    Ok(Json(serde_json::json!(report)))
 }
 
 async fn handle_vault_map(
@@ -1547,6 +1563,36 @@ mod tests {
             .collect();
         assert_eq!(listed, vec!["type/beast", "type/undead"]);
         assert_eq!(bare, slash);
+    }
+
+    #[tokio::test]
+    async fn test_properties_lists_the_registry_and_one_names_values() {
+        let state = test_api_state();
+        {
+            let store = state.store.lock().await;
+            let a = store
+                .insert_file("ada.md", "h1", 100, "aaa111", None, None)
+                .unwrap();
+            store
+                .replace_file_properties(
+                    a,
+                    &[crate::store::NewProperty {
+                        chunk_seq: crate::store::DOC_LEVEL,
+                        name: "status",
+                        value: "draft",
+                        kind: crate::properties::Kind::Text,
+                        target_file: None,
+                    }],
+                )
+                .unwrap();
+        }
+        let rows = json_body(get(state.clone(), "/api/properties").await).await;
+        assert_eq!(rows[0]["name"], "status");
+        assert_eq!(rows[0]["note_count"], 1);
+        assert_eq!(rows[0]["kinds"][0], "text");
+        let vals = json_body(get(state, "/api/properties?name=status").await).await;
+        assert_eq!(vals[0]["value"], "draft");
+        assert_eq!(vals[0]["kind"], "text");
     }
 
     #[tokio::test]

@@ -122,6 +122,14 @@ pub const CAPABILITIES: &[Capability] = &[
         server_only_args: &[],
     },
     Capability {
+        name: "properties",
+        cli: Presence::On,
+        mcp: Presence::On,
+        http: Http::Get,
+        cli_only_args: &[],
+        server_only_args: &[],
+    },
+    Capability {
         name: "vault-map",
         cli: Presence::On,
         mcp: Presence::On,
@@ -666,8 +674,8 @@ mod tests {
     }
 
     #[test]
-    fn there_are_nineteen_capabilities() {
-        assert_eq!(CAPABILITIES.len(), 19);
+    fn there_are_twenty_capabilities() {
+        assert_eq!(CAPABILITIES.len(), 20);
     }
 
     #[test]

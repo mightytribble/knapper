@@ -11,6 +11,7 @@ pub fn build_openapi_spec(server_url: &str) -> serde_json::Value {
     paths.insert("/api/read".into(), build_read());
     paths.insert("/api/list".into(), build_list());
     paths.insert("/api/tags".into(), build_tags());
+    paths.insert("/api/properties".into(), build_properties());
     paths.insert("/api/vault-map".into(), build_vault_map());
     paths.insert("/api/health".into(), build_health());
     paths.insert("/api/validate".into(), build_validate());
@@ -179,6 +180,19 @@ fn build_tags() -> serde_json::Value {
                 { "name": "under", "in": "query", "required": false, "description": "One tag term; the rows returned are that tag and its descendants. Omit for the whole vocabulary", "schema": { "type": "string" } }
             ],
             "responses": { "200": { "description": "Array of tag rows: path, display, note_count" } }
+        }
+    })
+}
+
+fn build_properties() -> serde_json::Value {
+    serde_json::json!({
+        "get": {
+            "operationId": "listProperties",
+            "summary": "The vault's custom properties: every name with its note count, the kinds seen and Obsidian's declared type, or one property's values.",
+            "parameters": [
+                { "name": "name", "in": "query", "required": false, "description": "One property name; the rows returned are its distinct values, each with its kind and note count. Omit for the registry", "schema": { "type": "string" } }
+            ],
+            "responses": { "200": { "description": "Without name, an array of {name, note_count, kinds, declared_type}; with name, an array of {value, kind, note_count}" } }
         }
     })
 }
@@ -582,6 +596,18 @@ mod tests {
         assert_eq!(named, vec!["under"]);
     }
 
+    #[test]
+    fn test_properties_documents_name() {
+        let spec = build_openapi_spec("http://localhost:3000");
+        let named: Vec<&str> = spec["paths"]["/api/properties"]["get"]["parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(named, vec!["name"]);
+    }
+
     /// `read` absorbed `graph show`'s docid fact (#62). Every endpoint here
     /// is description-only, with no per-field schema to keep it honest, so
     /// the shape change has to be said in the one line that exists.
@@ -627,6 +653,7 @@ mod tests {
             "readNote",
             "listNotes",
             "listTags",
+            "listProperties",
             "getVaultMap",
             "getHealth",
             "validateVault",

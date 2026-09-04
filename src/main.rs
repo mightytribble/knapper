@@ -434,6 +434,16 @@ async fn main() -> Result<()> {
             }
         }
 
+        Command::Properties(args) => {
+            let (store, vault_path, _profile) = open_vault(&data_dir)?;
+            let report = knapper::properties::run(&store, &vault_path, &args)?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", knapper::properties::render_text(&report));
+            }
+        }
+
         Command::VaultMap(_) => {
             let (store, vault_path, profile) = open_vault(&data_dir)?;
             let params = knapper::context::ContextParams {
