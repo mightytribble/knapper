@@ -1072,6 +1072,7 @@ mod tests {
                 heading: None,
                 mode: crate::writer::EditMode::Replace,
                 content: Some(crate::writer::EditContent::Text(body)),
+                placement: crate::frontmatter::KeyPlacement::End,
             }],
         )
         .unwrap();
@@ -1128,6 +1129,7 @@ mod tests {
                 heading: None,
                 mode: crate::writer::EditMode::Replace,
                 content: Some(crate::writer::EditContent::Text(body)),
+                placement: crate::frontmatter::KeyPlacement::End,
             }],
         )
         .unwrap();

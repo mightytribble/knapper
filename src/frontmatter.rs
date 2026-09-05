@@ -35,6 +35,38 @@ enum QuoteStyle {
     Double,
 }
 
+/// Where a key the block does not already hold is written. A key it does
+/// hold has a place already — the file's — so a placement says where to
+/// *put* a key and never where to move one, and re-running an edit changes
+/// nothing (#113).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyPlacement {
+    /// After the last key, which is what a caller naming nothing gets.
+    End,
+    /// Directly below the key named, and above the comment that introduces
+    /// whatever follows it.
+    After(String),
+    /// Directly above the key named, and above the comment that introduces
+    /// *it* — a comment on its own line belongs to the key below it. It is
+    /// the only way to name the top of the block.
+    Before(String),
+}
+
+impl KeyPlacement {
+    /// The placement two optional anchors mean. Both name a place, and
+    /// picking one of the two would be guessing which the caller meant.
+    pub fn new(after: Option<&str>, before: Option<&str>) -> Result<KeyPlacement> {
+        match (after, before) {
+            (Some(_), Some(_)) => {
+                bail!("a placement names one of `after` or `before`, not both")
+            }
+            (Some(key), None) => Ok(KeyPlacement::After(key.to_string())),
+            (None, Some(key)) => Ok(KeyPlacement::Before(key.to_string())),
+            (None, None) => Ok(KeyPlacement::End),
+        }
+    }
+}
+
 /// What an entry's value is, as far as an edit can address it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Value {
@@ -274,12 +306,11 @@ impl Block {
 
     /// Write `key` as a scalar, quoted when YAML needs it, in the quote
     /// character the key already used.
-    pub fn set_scalar(&mut self, key: &str, value: &str) -> Result<()> {
+    pub fn set_scalar(&mut self, key: &str, value: &str, at: &KeyPlacement) -> Result<()> {
         self.check_editable(key)?;
         let quotes = self.quote_style_for(key);
         let text = format!("{key}: {}{}", yaml_scalar(value, quotes), self.newline);
-        self.put(key, text, Value::Scalar);
-        Ok(())
+        self.put(key, text, Value::Scalar, at)
     }
 
     /// Write `key` as a bare `true` or `false`, which a quoted scalar would
@@ -287,28 +318,26 @@ impl Block {
     pub fn set_bool(&mut self, key: &str, value: bool) -> Result<()> {
         self.check_editable(key)?;
         let text = format!("{key}: {value}{}", self.newline);
-        self.put(key, text, Value::Scalar);
-        Ok(())
+        self.put(key, text, Value::Scalar, &KeyPlacement::End)
     }
 
     /// Write `key` as a list. Every item comes from the caller, so every item
     /// is serialised fresh through `yaml_scalar`. An empty list is written
     /// `[]` in any style, because block style with no items reads back as
     /// null.
-    pub fn set_list(&mut self, key: &str, items: &[String]) -> Result<()> {
+    pub fn set_list(&mut self, key: &str, items: &[String], at: &KeyPlacement) -> Result<()> {
         let style = self.list_style_for(key)?;
         let quotes = self.quote_style_for(key);
         let items: Vec<ListItem> = items.iter().cloned().map(ListItem::fresh).collect();
         let text = self.render_list(key, &items, style, quotes);
-        self.put(key, text, Value::List(style));
-        Ok(())
+        self.put(key, text, Value::List(style), at)
     }
 
     /// Add `item` to `key`'s list, creating the list when the key is absent
     /// and promoting it when the key holds a scalar. An item the list already
     /// holds changes nothing. Every existing item keeps its own source text;
     /// only the added item is serialised through `yaml_scalar`.
-    pub fn add_to_list(&mut self, key: &str, item: &str) -> Result<()> {
+    pub fn add_to_list(&mut self, key: &str, item: &str, at: &KeyPlacement) -> Result<()> {
         let style = self.list_style_for(key)?;
         let quotes = self.quote_style_for(key);
         let mut items = self.items_of(key);
@@ -317,8 +346,7 @@ impl Block {
         }
         items.push(ListItem::fresh(item.to_string()));
         let text = self.render_list(key, &items, style, quotes);
-        self.put(key, text, Value::List(style));
-        Ok(())
+        self.put(key, text, Value::List(style), at)
     }
 
     /// Remove `item` from `key`'s list. A scalar equal to `item` removes the
@@ -346,8 +374,7 @@ impl Block {
         let mut items = self.items_of(key);
         items.retain(|i| i.value != item);
         let text = self.render_list(key, &items, style, quotes);
-        self.put(key, text, Value::List(style));
-        Ok(())
+        self.put(key, text, Value::List(style), &KeyPlacement::End)
     }
 
     /// Remove `key` and the lines it owns. An absent key changes nothing.
@@ -513,7 +540,7 @@ impl Block {
         }
     }
 
-    fn put(&mut self, key: &str, text: String, value: Value) {
+    fn put(&mut self, key: &str, text: String, value: Value, at: &KeyPlacement) -> Result<()> {
         let entry = Item::Entry {
             key: key.to_string(),
             value,
@@ -521,8 +548,45 @@ impl Block {
         };
         match self.find(key) {
             Some(idx) => self.items[idx] = entry,
-            None => self.items.push(entry),
+            None => {
+                let idx = self.insert_index(key, at)?;
+                self.items.insert(idx, entry);
+            }
         }
+        Ok(())
+    }
+
+    /// Where a new key's item goes. An anchor the block does not hold is
+    /// refused rather than appended: appending anyway is the silence #113
+    /// reports, and the caller named a key it believed was there.
+    fn insert_index(&self, key: &str, at: &KeyPlacement) -> Result<usize> {
+        let (anchor, before) = match at {
+            KeyPlacement::End => return Ok(self.items.len()),
+            KeyPlacement::After(anchor) => (anchor, false),
+            KeyPlacement::Before(anchor) => (anchor, true),
+        };
+        let Some(idx) = self.find(anchor) else {
+            bail!(
+                "no property '{anchor}' in the frontmatter to place '{key}' {}",
+                if before { "before" } else { "after" }
+            );
+        };
+        if !before {
+            // Immediately below the anchor, which leaves a comment on the
+            // next line with the key it introduces.
+            return Ok(idx + 1);
+        }
+        // Above the anchor, stepping back over the comment lines that
+        // introduce it. A blank line separates groups rather than
+        // introducing a key, so it is where the walk stops.
+        let mut at = idx;
+        while at > 0 {
+            match &self.items[at - 1] {
+                Item::Filler(line) if is_comment(line) => at -= 1,
+                _ => break,
+            }
+        }
+        Ok(at)
     }
 }
 
@@ -1139,7 +1203,11 @@ mod tests {
     fn an_edit_keeps_the_key_in_its_place_and_its_style() {
         let text = "---\nname: Probe\naliases: []\ntags: [type/lore, realm/rudd]\n---\n\nBody.\n";
         assert_eq!(
-            edited(text, |b| b.set_list("tags", &["type/history".into()])),
+            edited(text, |b| b.set_list(
+                "tags",
+                &["type/history".into()],
+                &KeyPlacement::End
+            )),
             "---\nname: Probe\naliases: []\ntags: [type/history]\n---\n\nBody.\n"
         );
     }
@@ -1148,7 +1216,7 @@ mod tests {
     fn a_block_style_list_stays_block_style_at_its_own_indent() {
         let text = "---\ntags:\n    - a\n    - b\nname: Probe\n---\n";
         assert_eq!(
-            edited(text, |b| b.add_to_list("tags", "c")),
+            edited(text, |b| b.add_to_list("tags", "c", &KeyPlacement::End)),
             "---\ntags:\n    - a\n    - b\n    - c\nname: Probe\n---\n"
         );
     }
@@ -1157,7 +1225,7 @@ mod tests {
     fn an_empty_list_writes_an_empty_list_and_keeps_the_key() {
         let text = "---\nname: Probe\ntags:\n  - a\n---\n";
         assert_eq!(
-            edited(text, |b| b.set_list("tags", &[])),
+            edited(text, |b| b.set_list("tags", &[], &KeyPlacement::End)),
             "---\nname: Probe\ntags: []\n---\n"
         );
     }
@@ -1166,7 +1234,11 @@ mod tests {
     fn a_comment_and_a_blank_line_survive_an_edit_to_a_neighbour() {
         let text = "---\n# why this note exists\nname: Probe\n\ntags: [a]\n---\n";
         assert_eq!(
-            edited(text, |b| b.set_scalar("name", "Renamed")),
+            edited(text, |b| b.set_scalar(
+                "name",
+                "Renamed",
+                &KeyPlacement::End
+            )),
             "---\n# why this note exists\nname: Renamed\n\ntags: [a]\n---\n"
         );
     }
@@ -1175,17 +1247,29 @@ mod tests {
     fn a_key_that_is_new_is_appended_in_the_style_the_block_already_uses() {
         let inline = "---\nname: Probe\ntags: [a]\n---\n";
         assert_eq!(
-            edited(inline, |b| b.add_to_list("aliases", "Other")),
+            edited(inline, |b| b.add_to_list(
+                "aliases",
+                "Other",
+                &KeyPlacement::End
+            )),
             "---\nname: Probe\ntags: [a]\naliases: [Other]\n---\n"
         );
         let blocked = "---\nname: Probe\ntags:\n  - a\n---\n";
         assert_eq!(
-            edited(blocked, |b| b.add_to_list("aliases", "Other")),
+            edited(blocked, |b| b.add_to_list(
+                "aliases",
+                "Other",
+                &KeyPlacement::End
+            )),
             "---\nname: Probe\ntags:\n  - a\naliases:\n  - Other\n---\n"
         );
         let none = "---\nname: Probe\n---\n";
         assert_eq!(
-            edited(none, |b| b.add_to_list("aliases", "Other")),
+            edited(none, |b| b.add_to_list(
+                "aliases",
+                "Other",
+                &KeyPlacement::End
+            )),
             "---\nname: Probe\naliases:\n  - Other\n---\n"
         );
     }
@@ -1198,7 +1282,7 @@ mod tests {
     fn a_bare_key_with_no_value_gains_only_the_item_a_write_adds() {
         let text = "---\nname: X\ntags:\n---\n";
         assert_eq!(
-            edited(text, |b| b.add_to_list("tags", "x")),
+            edited(text, |b| b.add_to_list("tags", "x", &KeyPlacement::End)),
             "---\nname: X\ntags:\n  - x\n---\n"
         );
     }
@@ -1212,7 +1296,7 @@ mod tests {
     fn promoting_a_multi_line_scalar_keeps_its_continuation() {
         let text = "---\nname: some\n  continued\n---\n";
         assert_eq!(
-            edited(text, |b| b.add_to_list("name", "x")),
+            edited(text, |b| b.add_to_list("name", "x", &KeyPlacement::End)),
             "---\nname:\n  - some continued\n  - x\n---\n"
         );
     }
@@ -1221,7 +1305,11 @@ mod tests {
     fn a_scalar_is_promoted_when_a_list_operation_names_it() {
         let text = "---\ntags: work\n---\n";
         assert_eq!(
-            edited(text, |b| b.add_to_list("tags", "archived")),
+            edited(text, |b| b.add_to_list(
+                "tags",
+                "archived",
+                &KeyPlacement::End
+            )),
             "---\ntags:\n  - work\n  - archived\n---\n"
         );
     }
@@ -1247,7 +1335,7 @@ mod tests {
     #[test]
     fn promoting_a_commented_scalar_into_an_inline_list_writes_parseable_yaml() {
         let text = "---\nother: [z]\ntags: work # keep\n---\n";
-        let out = edited(text, |b| b.add_to_list("tags", "new"));
+        let out = edited(text, |b| b.add_to_list("tags", "new", &KeyPlacement::End));
         assert_eq!(out, "---\nother: [z]\ntags: [work, new]\n---\n");
         // The promise this exists to keep: the result must itself parse,
         // and parse to the two items the write actually meant to write.
@@ -1267,7 +1355,7 @@ mod tests {
     #[test]
     fn promoting_a_quoted_commented_scalar_into_an_inline_list_writes_parseable_yaml() {
         let text = "---\ntags: \"work\" # keep\n---\n";
-        let out = edited(text, |b| b.add_to_list("tags", "new"));
+        let out = edited(text, |b| b.add_to_list("tags", "new", &KeyPlacement::End));
         let parsed = assert_block_parses_as_yaml(&out);
         assert_eq!(
             parsed.get("tags"),
@@ -1289,7 +1377,7 @@ mod tests {
     #[test]
     fn promoting_a_commented_scalar_holding_a_comma_keeps_it_one_quoted_item() {
         let text = "---\nother: [z]\ntags: \"a, b\" # keep\n---\n\nBody.\n";
-        let out = edited(text, |b| b.add_to_list("tags", "new"));
+        let out = edited(text, |b| b.add_to_list("tags", "new", &KeyPlacement::End));
         assert_eq!(
             out, "---\nother: [z]\ntags: [\"a, b\", new]\n---\n\nBody.\n",
             "the comma-bearing value must stay one quoted item, not split in two"
@@ -1311,7 +1399,7 @@ mod tests {
     fn promoting_a_scalar_holding_a_comma_with_no_comment_keeps_its_own_quoting() {
         let text = "---\nother: [z]\ntags: \"a, b\"\n---\n\nBody.\n";
         assert_eq!(
-            edited(text, |b| b.add_to_list("tags", "new")),
+            edited(text, |b| b.add_to_list("tags", "new", &KeyPlacement::End)),
             "---\nother: [z]\ntags: [\"a, b\", new]\n---\n\nBody.\n"
         );
     }
@@ -1322,7 +1410,7 @@ mod tests {
     fn a_single_quoted_value_holding_a_comma_keeps_its_own_quoting() {
         let text = "---\nother: [z]\ntags: 'a, b'\n---\n";
         assert_eq!(
-            edited(text, |b| b.add_to_list("tags", "new")),
+            edited(text, |b| b.add_to_list("tags", "new", &KeyPlacement::End)),
             "---\nother: [z]\ntags: ['a, b', new]\n---\n"
         );
     }
@@ -1333,7 +1421,7 @@ mod tests {
     fn a_hash_that_is_not_a_comment_is_kept_verbatim() {
         let text = "---\nother: [z]\ntags: tag#one\n---\n";
         assert_eq!(
-            edited(text, |b| b.add_to_list("tags", "new")),
+            edited(text, |b| b.add_to_list("tags", "new", &KeyPlacement::End)),
             "---\nother: [z]\ntags: [tag#one, new]\n---\n"
         );
     }
@@ -1345,7 +1433,7 @@ mod tests {
     fn an_ordinary_uncommented_scalar_keeps_its_own_source_text() {
         let text = "---\nother: [z]\ntags: work\n---\n";
         assert_eq!(
-            edited(text, |b| b.add_to_list("tags", "new")),
+            edited(text, |b| b.add_to_list("tags", "new", &KeyPlacement::End)),
             "---\nother: [z]\ntags: [work, new]\n---\n"
         );
     }
@@ -1363,7 +1451,11 @@ mod tests {
     fn a_fresh_value_holding_a_comma_added_to_an_inline_list_is_quoted() {
         let text = "---\naliases: [x]\n---\n";
         assert_eq!(
-            edited(text, |b| b.add_to_list("aliases", "Smith, John")),
+            edited(text, |b| b.add_to_list(
+                "aliases",
+                "Smith, John",
+                &KeyPlacement::End
+            )),
             "---\naliases: [x, \"Smith, John\"]\n---\n"
         );
     }
@@ -1379,7 +1471,8 @@ mod tests {
         assert_eq!(
             edited(text, |b| b.set_list(
                 "parent_of",
-                &["[[Isabella]]".into(), "[[Lucian]]".into()]
+                &["[[Isabella]]".into(), "[[Lucian]]".into()],
+                &KeyPlacement::End
             )),
             "---\nspouse_of: [\"[[Kara]]\"]\nparent_of: [\"[[Isabella]]\", \"[[Lucian]]\"]\n---\n"
         );
@@ -1391,7 +1484,11 @@ mod tests {
     fn a_replaced_list_keeps_the_single_quotes_the_key_already_used() {
         let text = "---\nparent_of: ['[[Isabella]]']\n---\n";
         assert_eq!(
-            edited(text, |b| b.set_list("parent_of", &["[[Lucian]]".into()])),
+            edited(text, |b| b.set_list(
+                "parent_of",
+                &["[[Lucian]]".into()],
+                &KeyPlacement::End
+            )),
             "---\nparent_of: ['[[Lucian]]']\n---\n"
         );
     }
@@ -1403,7 +1500,11 @@ mod tests {
     fn a_key_that_quotes_nothing_takes_the_first_quoting_the_block_uses() {
         let text = "---\nspouse_of: ['[[Kara]]']\ntags: [a]\n---\n";
         assert_eq!(
-            edited(text, |b| b.add_to_list("tags", "[[Lucian]]")),
+            edited(text, |b| b.add_to_list(
+                "tags",
+                "[[Lucian]]",
+                &KeyPlacement::End
+            )),
             "---\nspouse_of: ['[[Kara]]']\ntags: [a, '[[Lucian]]']\n---\n"
         );
     }
@@ -1414,7 +1515,11 @@ mod tests {
     fn a_key_that_quotes_its_own_value_beats_the_rest_of_the_block() {
         let text = "---\nrealm: \"New Visland\"\nseat: '[[Kara]]'\n---\n";
         assert_eq!(
-            edited(text, |b| b.set_scalar("seat", "[[Falconridge]]")),
+            edited(text, |b| b.set_scalar(
+                "seat",
+                "[[Falconridge]]",
+                &KeyPlacement::End
+            )),
             "---\nrealm: \"New Visland\"\nseat: '[[Falconridge]]'\n---\n"
         );
     }
@@ -1425,7 +1530,11 @@ mod tests {
     fn a_block_that_quotes_nothing_defaults_to_double_quotes() {
         let text = "---\naliases: [x]\n---\n";
         assert_eq!(
-            edited(text, |b| b.add_to_list("aliases", "Smith, John")),
+            edited(text, |b| b.add_to_list(
+                "aliases",
+                "Smith, John",
+                &KeyPlacement::End
+            )),
             "---\naliases: [x, \"Smith, John\"]\n---\n"
         );
     }
@@ -1437,8 +1546,11 @@ mod tests {
     fn an_apostrophe_is_written_plainly_under_double_quotes() {
         let text = "---\nseat_of: [\"[[Kara]]\"]\n---\n";
         assert_eq!(
-            edited(text, |b| b
-                .set_list("seat_of", &["[[Dragon's Rest]]".into()])),
+            edited(text, |b| b.set_list(
+                "seat_of",
+                &["[[Dragon's Rest]]".into()],
+                &KeyPlacement::End
+            )),
             "---\nseat_of: [\"[[Dragon's Rest]]\"]\n---\n"
         );
     }
@@ -1465,7 +1577,9 @@ mod tests {
                 "---\nk: 'q'\nother: [x]\n---\n",
                 "---\nk: \"q\"\nother:\n  - x\n---\n",
             ] {
-                let out = edited(block, |b| b.set_list("other", &[value.to_string()]));
+                let out = edited(block, |b| {
+                    b.set_list("other", &[value.to_string()], &KeyPlacement::End)
+                });
                 let parsed = Block::parse(&out)
                     .unwrap_or_else(|e| panic!("{value:?} wrote unparseable YAML: {out:?}: {e}"))
                     .expect("a block");
@@ -1478,10 +1592,128 @@ mod tests {
         }
     }
 
+    /// #113: a key the note does not carry has no place of its own, and the
+    /// end of the block is not where a vault with a fixed key order wants
+    /// it. `after` names the key it sits below.
+    #[test]
+    fn a_new_key_lands_after_the_key_after_names() {
+        let text = "---\nname: X\nparent_of: [a]\nniece_of: [b]\n---\n";
+        assert_eq!(
+            edited(text, |b| b.set_list(
+                "sibling_of",
+                &["c".into()],
+                &KeyPlacement::After("parent_of".into())
+            )),
+            "---\nname: X\nparent_of: [a]\nsibling_of: [c]\nniece_of: [b]\n---\n"
+        );
+    }
+
+    /// `before` is the other half, and the only way to name the top of the
+    /// block: `after` cannot place a key above the first key there is.
+    #[test]
+    fn a_new_key_lands_before_the_key_before_names() {
+        let text = "---\nname: X\ntags: [t]\n---\n";
+        assert_eq!(
+            edited(text, |b| b.set_scalar(
+                "id",
+                "7",
+                &KeyPlacement::Before("name".into())
+            )),
+            "---\nid: \"7\"\nname: X\ntags: [t]\n---\n"
+        );
+    }
+
+    /// A comment on its own line introduces the key below it, so `after`
+    /// puts the new key above that comment and not between it and the key
+    /// it belongs to.
+    #[test]
+    fn placing_after_a_key_leaves_the_comment_with_the_key_it_introduces() {
+        let text = "---\nparent_of: [a]\n# the non-family ties\nrules: [b]\n---\n";
+        assert_eq!(
+            edited(text, |b| b.set_list(
+                "sibling_of",
+                &["c".into()],
+                &KeyPlacement::After("parent_of".into())
+            )),
+            "---\nparent_of: [a]\nsibling_of: [c]\n# the non-family ties\nrules: [b]\n---\n"
+        );
+    }
+
+    /// The mirror: `before` steps back over the comment that introduces the
+    /// anchor, so the new key joins the group rather than splitting its
+    /// heading off. It stops at a blank line, which separates groups — a key
+    /// placed before the first of a group belongs below that separator.
+    #[test]
+    fn placing_before_a_key_steps_over_its_comment_but_not_a_blank_line() {
+        let text = "---\nname: X\n\n# the ties\nparent_of: [a]\n---\n";
+        assert_eq!(
+            edited(text, |b| b.set_list(
+                "child_of",
+                &["c".into()],
+                &KeyPlacement::Before("parent_of".into())
+            )),
+            "---\nname: X\n\nchild_of: [c]\n# the ties\nparent_of: [a]\n---\n"
+        );
+    }
+
+    /// An anchor the block does not hold is the caller's own mistake, and
+    /// appending anyway is the silence #113 is about. The error names it.
+    #[test]
+    fn an_anchor_the_block_does_not_hold_is_an_error() {
+        let mut block = Block::parse("---\nname: X\n---\n")
+            .unwrap()
+            .expect("a block");
+        let err = block
+            .set_scalar("ties", "none", &KeyPlacement::After("parent_of".into()))
+            .unwrap_err();
+        assert!(err.to_string().contains("parent_of"), "{err}");
+    }
+
+    /// A key the block already holds has a place, and that place is the
+    /// file's. The placement says where to *put* a key, so re-running an
+    /// edit moves nothing.
+    #[test]
+    fn a_key_the_block_already_holds_keeps_its_place() {
+        let text = "---\nname: X\nties: [a]\ntags: [t]\n---\n";
+        assert_eq!(
+            edited(text, |b| b.set_list(
+                "ties",
+                &["b".into()],
+                &KeyPlacement::After("tags".into())
+            )),
+            "---\nname: X\nties: [b]\ntags: [t]\n---\n"
+        );
+    }
+
+    /// The default is unchanged: a new key with no placement is appended.
+    #[test]
+    fn a_new_key_with_no_placement_is_appended() {
+        let text = "---\nname: X\ntags: [t]\n---\n";
+        assert_eq!(
+            edited(text, |b| b.set_scalar("ties", "none", &KeyPlacement::End)),
+            "---\nname: X\ntags: [t]\nties: none\n---\n"
+        );
+    }
+
+    /// One placement or none. Two anchors name two places, and picking one
+    /// would be guessing which the caller meant.
+    #[test]
+    fn naming_both_after_and_before_is_refused() {
+        let err = KeyPlacement::new(Some("a"), Some("b")).unwrap_err();
+        assert!(err.to_string().contains("one of"), "{err}");
+        assert!(matches!(
+            KeyPlacement::new(None, None),
+            Ok(KeyPlacement::End)
+        ));
+    }
+
     #[test]
     fn adding_an_item_the_list_already_holds_changes_nothing() {
         let text = "---\ntags: [a, b]\n---\n";
-        assert_eq!(edited(text, |b| b.add_to_list("tags", "b")), text);
+        assert_eq!(
+            edited(text, |b| b.add_to_list("tags", "b", &KeyPlacement::End)),
+            text
+        );
     }
 
     #[test]
@@ -1513,7 +1745,11 @@ mod tests {
     fn a_value_that_needs_quoting_gets_it() {
         let text = "---\nname: Probe\n---\n";
         assert_eq!(
-            edited(text, |b| b.set_scalar("reason", "semantic similarity: 0.5")),
+            edited(text, |b| b.set_scalar(
+                "reason",
+                "semantic similarity: 0.5",
+                &KeyPlacement::End
+            )),
             "---\nname: Probe\nreason: \"semantic similarity: 0.5\"\n---\n"
         );
     }
@@ -1529,7 +1765,11 @@ mod tests {
     #[test]
     fn a_crlf_block_keeps_crlf_on_the_key_it_gains() {
         assert_eq!(
-            edited("---\r\nname: Probe\r\n---\r\n", |b| b.set_scalar("x", "1")),
+            edited("---\r\nname: Probe\r\n---\r\n", |b| b.set_scalar(
+                "x",
+                "1",
+                &KeyPlacement::End
+            )),
             "---\r\nname: Probe\r\nx: \"1\"\r\n---\r\n"
         );
     }
@@ -1547,7 +1787,9 @@ mod tests {
             block.value("name"),
             Some(&Value::Opaque("a value that is not one mapping entry"))
         );
-        let err = block.set_scalar("name", "Y").unwrap_err();
+        let err = block
+            .set_scalar("name", "Y", &KeyPlacement::End)
+            .unwrap_err();
         assert!(err.to_string().contains("`name`"), "{err}");
         assert_eq!(
             block.render(),
@@ -1560,7 +1802,9 @@ mod tests {
     fn an_edit_to_an_opaque_value_is_refused_and_writes_nothing() {
         let text = "---\nname: Probe\nnested:\n  inner: 1\n---\n";
         let mut block = Block::parse(text).unwrap().unwrap();
-        let err = block.set_list("nested", &["a".into()]).unwrap_err();
+        let err = block
+            .set_list("nested", &["a".into()], &KeyPlacement::End)
+            .unwrap_err();
         assert!(err.to_string().contains("nested mapping"), "{err}");
         assert!(err.to_string().contains("`nested`"), "{err}");
         assert_eq!(block.render(), text);
@@ -1591,7 +1835,7 @@ mod tests {
     fn an_inline_list_of_numbers_gains_an_item_and_the_numbers_stay_numbers() {
         let text = "---\nratings: [1, 2, 3]\n---\n";
         assert_eq!(
-            edited(text, |b| b.add_to_list("ratings", "4")),
+            edited(text, |b| b.add_to_list("ratings", "4", &KeyPlacement::End)),
             "---\nratings: [1, 2, 3, \"4\"]\n---\n"
         );
     }
@@ -1618,7 +1862,7 @@ mod tests {
     fn an_item_holding_a_comma_inside_quotes_is_one_item_not_two() {
         let text = "---\ntags: [a, \"b, c\", d]\n---\n";
         assert_eq!(
-            edited(text, |b| b.add_to_list("tags", "e")),
+            edited(text, |b| b.add_to_list("tags", "e", &KeyPlacement::End)),
             "---\ntags: [a, \"b, c\", d, e]\n---\n"
         );
     }
@@ -1636,7 +1880,9 @@ mod tests {
     fn an_inline_list_with_a_trailing_comment_refuses_the_write_and_leaves_the_block_unchanged() {
         let text = "---\ntags: [a, b]  # trailing comment\n---\n";
         let mut block = Block::parse(text).unwrap().unwrap();
-        let err = block.add_to_list("tags", "c").unwrap_err();
+        let err = block
+            .add_to_list("tags", "c", &KeyPlacement::End)
+            .unwrap_err();
         assert!(err.to_string().contains("flow list"), "{err}");
         assert!(err.to_string().contains("`tags`"), "{err}");
         assert_eq!(block.render(), text);
@@ -1652,7 +1898,7 @@ mod tests {
     fn a_trailing_comma_in_a_flow_list_reaches_the_guard_through_the_public_api() {
         let text = "---\ntags: [a, b,]\n---\n";
         assert_eq!(
-            edited(text, |b| b.add_to_list("tags", "c")),
+            edited(text, |b| b.add_to_list("tags", "c", &KeyPlacement::End)),
             "---\ntags: [a, b, c]\n---\n"
         );
     }
@@ -1682,7 +1928,7 @@ mod tests {
             "---\ntags:\n  - a\n  - b\nname: Probe\n---\n\nBody.\n",
         ] {
             let mut block = Block::parse(text).unwrap().unwrap();
-            block.add_to_list("tags", "zz").unwrap();
+            block.add_to_list("tags", "zz", &KeyPlacement::End).unwrap();
             block.remove_from_list("tags", "zz").unwrap();
             assert_eq!(block.render(), text);
         }
@@ -1691,7 +1937,9 @@ mod tests {
     #[test]
     fn a_note_with_no_block_gets_one_above_its_body() {
         let mut block = Block::parse_or_open("# Title\n\nBody.\n").unwrap();
-        block.add_to_list("tags", "type/lore").unwrap();
+        block
+            .add_to_list("tags", "type/lore", &KeyPlacement::End)
+            .unwrap();
         assert_eq!(
             block.render(),
             "---\ntags:\n  - type/lore\n---\n\n# Title\n\nBody.\n"
@@ -1720,7 +1968,9 @@ mod tests {
     #[test]
     fn a_fence_with_trailing_whitespace_is_parsed_not_reopened() {
         let mut block = Block::parse_or_open("--- \nname: X\n---\n\nBody\n").unwrap();
-        block.add_to_list("tags", "new").unwrap();
+        block
+            .add_to_list("tags", "new", &KeyPlacement::End)
+            .unwrap();
         assert_eq!(
             block.render(),
             "--- \nname: X\ntags:\n  - new\n---\n\nBody\n",
@@ -1731,14 +1981,14 @@ mod tests {
     #[test]
     fn opening_a_block_on_an_empty_note_writes_no_separator() {
         let mut block = Block::parse_or_open("").unwrap();
-        block.set_scalar("name", "X").unwrap();
+        block.set_scalar("name", "X", &KeyPlacement::End).unwrap();
         assert_eq!(block.render(), "---\nname: X\n---\n");
     }
 
     #[test]
     fn opening_a_block_on_a_crlf_note_writes_crlf() {
         let mut block = Block::parse_or_open("# Title\r\n").unwrap();
-        block.set_scalar("name", "X").unwrap();
+        block.set_scalar("name", "X", &KeyPlacement::End).unwrap();
         assert_eq!(block.render(), "---\r\nname: X\r\n---\r\n\r\n# Title\r\n");
     }
 

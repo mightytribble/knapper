@@ -8,6 +8,7 @@ use time::OffsetDateTime;
 
 use crate::chunker::{ChunkOptions, chunk_markdown, split_oversized_chunks};
 use crate::docid::generate_docid;
+use crate::frontmatter::KeyPlacement;
 use crate::indexer::build_edges_for_file;
 use crate::links;
 use crate::llm::{EmbedDoc, EmbedModel};
@@ -100,6 +101,10 @@ pub struct NoteEdit {
     pub heading: Option<String>,
     pub mode: EditMode,
     pub content: Option<EditContent>,
+    /// Where a property key the note does not carry is written. It places a
+    /// key rather than moving one, so it belongs to `EditTarget::Property`
+    /// and is inert for a key the note already holds (#113).
+    pub placement: KeyPlacement,
 }
 
 #[derive(Debug, Clone)]
@@ -503,7 +508,7 @@ pub fn create_note(
     // key create writes is `tags`, and only what `--tags` resolved to (#92).
     let mut block = crate::frontmatter::Block::parse_or_open(&content_with_links)?;
     for tag in &resolved_tags {
-        block.add_to_list("tags", tag)?;
+        block.add_to_list("tags", tag, &KeyPlacement::End)?;
     }
     let full_content = if block.is_empty() {
         content_with_links.clone()
@@ -987,11 +992,12 @@ fn apply_property_edit(
     key: &str,
     mode: EditMode,
     content: Option<&EditContent>,
+    at: &KeyPlacement,
 ) -> Result<()> {
     match (mode, content) {
-        (EditMode::Replace, Some(EditContent::Text(v))) => block.set_scalar(key, v),
-        (EditMode::Replace, Some(EditContent::List(vs))) => block.set_list(key, vs),
-        (EditMode::Append, Some(EditContent::Text(v))) => block.add_to_list(key, v),
+        (EditMode::Replace, Some(EditContent::Text(v))) => block.set_scalar(key, v, at),
+        (EditMode::Replace, Some(EditContent::List(vs))) => block.set_list(key, vs, at),
+        (EditMode::Append, Some(EditContent::Text(v))) => block.add_to_list(key, v, at),
         (EditMode::Remove, None) => block.remove(key),
         (EditMode::Remove, Some(EditContent::Text(v))) => block.remove_from_list(key, v),
         (mode, content) => anyhow::bail!(
@@ -1018,6 +1024,11 @@ pub fn apply_note_edits(content: &str, edits: &[NoteEdit]) -> Result<String> {
         if edit.heading.is_some() && !matches!(edit.target, EditTarget::Section(_)) {
             bail!("a heading renames the section an edit names, so it needs `section`");
         }
+        // A placement names where a frontmatter key goes, and a body and a
+        // section have places of their own already (#113).
+        if edit.placement != KeyPlacement::End && !matches!(edit.target, EditTarget::Property(_)) {
+            bail!("`after` and `before` place a frontmatter key, so they need `property`");
+        }
     }
 
     let mut text = content.to_string();
@@ -1035,7 +1046,13 @@ pub fn apply_note_edits(content: &str, edits: &[NoteEdit]) -> Result<String> {
                     let EditTarget::Property(key) = &property.target else {
                         bail!("a run of property edits holds property edits alone");
                     };
-                    apply_property_edit(&mut block, key, property.mode, property.content.as_ref())?;
+                    apply_property_edit(
+                        &mut block,
+                        key,
+                        property.mode,
+                        property.content.as_ref(),
+                        &property.placement,
+                    )?;
                 }
                 text = block.render();
                 rest = tail;
@@ -1390,8 +1407,8 @@ pub fn archive_note(
     }
     let tags = block.list("tags");
     block.set_bool("archived", true)?;
-    block.set_scalar("archived_at", &today_date())?;
-    block.set_scalar("archived_from", &file_record.path)?;
+    block.set_scalar("archived_at", &today_date(), &KeyPlacement::End)?;
+    block.set_scalar("archived_from", &file_record.path, &KeyPlacement::End)?;
     let new_content = block.render();
 
     // Ensure target directory
@@ -1725,6 +1742,7 @@ mod tests {
                 heading: Some("Norlund to Bend".into()),
                 mode: EditMode::Replace,
                 content: Some(EditContent::Text("The road as it now runs.".into())),
+                placement: crate::frontmatter::KeyPlacement::End,
             }],
         )
         .unwrap();
@@ -1747,6 +1765,7 @@ mod tests {
                 heading: Some("Alfa".into()),
                 mode: EditMode::Replace,
                 content: None,
+                placement: crate::frontmatter::KeyPlacement::End,
             }],
         )
         .unwrap();
@@ -1768,10 +1787,55 @@ mod tests {
                 heading: Some("beta".into()),
                 mode: EditMode::Replace,
                 content: None,
+                placement: crate::frontmatter::KeyPlacement::End,
             }],
         )
         .expect_err("a name the note already holds is refused");
         assert!(format!("{err}").contains("Beta"), "{err}");
+    }
+
+    /// #113: a vault that orders its frontmatter keys deliberately cannot
+    /// express its own schema when a new key can only be appended. `after`
+    /// names the key the new one sits below, through the whole edit path.
+    #[test]
+    fn a_property_edit_places_a_new_key_where_after_names() {
+        let doc = "---\nname: X\nparent_of: [a]\nrules: [b]\n---\n\nBody.\n";
+        let out = apply_note_edits(
+            doc,
+            &[NoteEdit {
+                target: EditTarget::Property("sibling_of".into()),
+                heading: None,
+                mode: EditMode::Replace,
+                content: Some(EditContent::List(vec!["c".into()])),
+                placement: crate::frontmatter::KeyPlacement::After("parent_of".into()),
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "---\nname: X\nparent_of: [a]\nsibling_of: [c]\nrules: [b]\n---\n\nBody.\n"
+        );
+    }
+
+    /// A placement names where a frontmatter key goes. A body and a section
+    /// have places of their own, so an edit carrying one and naming neither
+    /// a property is refused before any of the list is applied — the rule
+    /// `heading` already follows (#97, #113).
+    #[test]
+    fn a_placement_on_a_section_edit_is_refused() {
+        let doc = "# Note\n\n## Alpha\n\nOne.\n";
+        let err = apply_note_edits(
+            doc,
+            &[NoteEdit {
+                target: EditTarget::Section("Alpha".into()),
+                heading: None,
+                mode: EditMode::Replace,
+                content: Some(EditContent::Text("Two.".into())),
+                placement: crate::frontmatter::KeyPlacement::Before("name".into()),
+            }],
+        )
+        .expect_err("a placement needs a property");
+        assert!(format!("{err}").contains("property"), "{err}");
     }
 
     /// A promoted bold line is renamed in its own markup: the field carries
@@ -1786,6 +1850,7 @@ mod tests {
                 heading: Some("Cantrips".into()),
                 mode: EditMode::Replace,
                 content: None,
+                placement: crate::frontmatter::KeyPlacement::End,
             }],
         )
         .unwrap();
@@ -1806,6 +1871,7 @@ mod tests {
                     heading: Some(value.into()),
                     mode: EditMode::Replace,
                     content: None,
+                    placement: crate::frontmatter::KeyPlacement::End,
                 }],
             )
             .expect_err("markup is not a heading's text");
@@ -1826,6 +1892,7 @@ mod tests {
                     heading: Some("Alfa".into()),
                     mode: EditMode::Replace,
                     content: Some(EditContent::Text("x".into())),
+                    placement: crate::frontmatter::KeyPlacement::End,
                 }],
             )
             .expect_err("only a section has a heading");
@@ -1844,6 +1911,7 @@ mod tests {
                 "type/lore".into(),
                 "realm/skaldi".into(),
             ])),
+            placement: crate::frontmatter::KeyPlacement::End,
         }];
         assert_eq!(
             apply_note_edits(note, &edits).unwrap(),
@@ -1859,6 +1927,7 @@ mod tests {
             heading: None,
             mode: EditMode::Replace,
             content: Some(EditContent::List(vec![])),
+            placement: crate::frontmatter::KeyPlacement::End,
         }];
         assert_eq!(
             apply_note_edits(note, &edits).unwrap(),
@@ -1875,18 +1944,21 @@ mod tests {
                 heading: None,
                 mode: EditMode::Append,
                 content: Some(EditContent::Text("b".into())),
+                placement: crate::frontmatter::KeyPlacement::End,
             },
             NoteEdit {
                 target: EditTarget::Property("status".into()),
                 heading: None,
                 mode: EditMode::Replace,
                 content: Some(EditContent::Text("draft".into())),
+                placement: crate::frontmatter::KeyPlacement::End,
             },
             NoteEdit {
                 target: EditTarget::Property("name".into()),
                 heading: None,
                 mode: EditMode::Remove,
                 content: None,
+                placement: crate::frontmatter::KeyPlacement::End,
             },
         ];
         assert_eq!(
@@ -1904,12 +1976,14 @@ mod tests {
                 heading: None,
                 mode: EditMode::Replace,
                 content: Some(EditContent::Text("Renamed".into())),
+                placement: crate::frontmatter::KeyPlacement::End,
             },
             NoteEdit {
                 target: EditTarget::Body,
                 heading: None,
                 mode: EditMode::Replace,
                 content: Some(EditContent::Text("New body.".into())),
+                placement: crate::frontmatter::KeyPlacement::End,
             },
         ];
         let out = apply_note_edits(note, &edits).unwrap();
@@ -1926,6 +2000,7 @@ mod tests {
             heading: None,
             mode: EditMode::Replace,
             content: Some(EditContent::Text("flat".into())),
+            placement: crate::frontmatter::KeyPlacement::End,
         }];
         let err = apply_note_edits(note, &edits).unwrap_err();
         assert!(err.to_string().contains("nested mapping"), "{err}");
@@ -2967,6 +3042,7 @@ mod tests {
                 heading: None,
                 mode,
                 content: content.map(|c| EditContent::Text(c.to_string())),
+                placement: crate::frontmatter::KeyPlacement::End,
             }],
         }
     }
@@ -3050,6 +3126,7 @@ mod tests {
                     heading: None,
                     mode: EditMode::Append,
                     content: Some(EditContent::Text("x".into())),
+                    placement: crate::frontmatter::KeyPlacement::End,
                 }],
             },
         )
@@ -3137,12 +3214,14 @@ mod tests {
                         heading: None,
                         mode: EditMode::Replace,
                         content: Some(EditContent::Text("active".into())),
+                        placement: crate::frontmatter::KeyPlacement::End,
                     },
                     NoteEdit {
                         target: EditTarget::Property("tags".into()),
                         heading: None,
                         mode: EditMode::Append,
                         content: Some(EditContent::Text("new-tag".into())),
+                        placement: crate::frontmatter::KeyPlacement::End,
                     },
                 ],
             },
@@ -3302,6 +3381,7 @@ mod tests {
                     heading: Some("Norlund to Westport".into()),
                     mode: EditMode::Replace,
                     content: None,
+                    placement: crate::frontmatter::KeyPlacement::End,
                 }],
             },
         )
@@ -3343,6 +3423,7 @@ mod tests {
                     heading: Some("Norlund to Westport".into()),
                     mode: EditMode::Replace,
                     content: None,
+                    placement: crate::frontmatter::KeyPlacement::End,
                 }],
             },
         )
@@ -3378,6 +3459,7 @@ mod tests {
                     heading: None,
                     mode: EditMode::Replace,
                     content: Some(EditContent::Text("The northern leg, rewritten.".into())),
+                    placement: crate::frontmatter::KeyPlacement::End,
                 }],
             },
         )
@@ -3420,12 +3502,14 @@ mod tests {
                         heading: Some("Cantrips".into()),
                         mode: EditMode::Replace,
                         content: Some(EditContent::Text("new".into())),
+                        placement: crate::frontmatter::KeyPlacement::End,
                     },
                     NoteEdit {
                         target: EditTarget::Property("name".into()),
                         heading: None,
                         mode: EditMode::Replace,
                         content: Some(EditContent::Text("Y".into())),
+                        placement: crate::frontmatter::KeyPlacement::End,
                     },
                 ],
             },
@@ -3474,12 +3558,14 @@ mod tests {
                         heading: None,
                         mode: EditMode::Replace,
                         content: Some(EditContent::Text("new".into())),
+                        placement: crate::frontmatter::KeyPlacement::End,
                     },
                     NoteEdit {
                         target: EditTarget::Property("tags".into()),
                         heading: None,
                         mode: EditMode::Append,
                         content: Some(EditContent::Text("b".into())),
+                        placement: crate::frontmatter::KeyPlacement::End,
                     },
                 ],
             },
@@ -3503,6 +3589,7 @@ mod tests {
                     heading: None,
                     mode: EditMode::Replace,
                     content: Some(EditContent::Text("done".into())),
+                    placement: crate::frontmatter::KeyPlacement::End,
                 },
                 "status: done",
                 true,
@@ -3513,6 +3600,7 @@ mod tests {
                     heading: None,
                     mode: EditMode::Replace,
                     content: Some(EditContent::List(vec!["x".into(), "y".into()])),
+                    placement: crate::frontmatter::KeyPlacement::End,
                 },
                 "- x",
                 true,
@@ -3523,6 +3611,7 @@ mod tests {
                     heading: None,
                     mode: EditMode::Remove,
                     content: None,
+                    placement: crate::frontmatter::KeyPlacement::End,
                 },
                 "keep:",
                 false,
@@ -3533,6 +3622,7 @@ mod tests {
                     heading: None,
                     mode: EditMode::Remove,
                     content: Some(EditContent::Text("a".into())),
+                    placement: crate::frontmatter::KeyPlacement::End,
                 },
                 "- a",
                 false,
@@ -3547,6 +3637,7 @@ mod tests {
                     heading: None,
                     mode: EditMode::Append,
                     content: Some(EditContent::Text("wip".into())),
+                    placement: crate::frontmatter::KeyPlacement::End,
                 },
                 "status:\n  - wip",
                 true,
@@ -3557,6 +3648,7 @@ mod tests {
                     heading: None,
                     mode: EditMode::Append,
                     content: Some(EditContent::Text("wip".into())),
+                    placement: crate::frontmatter::KeyPlacement::End,
                 },
                 "- a\n- wip",
                 false,
@@ -3585,6 +3677,7 @@ mod tests {
                 heading: None,
                 mode: EditMode::Append,
                 content: Some(EditContent::Text("b".into())),
+                placement: crate::frontmatter::KeyPlacement::End,
             }],
         )
         .unwrap();
@@ -3598,12 +3691,14 @@ mod tests {
                     heading: None,
                     mode: EditMode::Append,
                     content: Some(EditContent::Text("b".into())),
+                    placement: crate::frontmatter::KeyPlacement::End,
                 },
                 NoteEdit {
                     target: EditTarget::Property("status".into()),
                     heading: None,
                     mode: EditMode::Replace,
                     content: Some(EditContent::Text("done".into())),
+                    placement: crate::frontmatter::KeyPlacement::End,
                 },
             ],
         )
@@ -3649,6 +3744,7 @@ mod tests {
                 heading: None,
                 mode: EditMode::Replace,
                 content: Some(EditContent::Text("active".into())),
+                placement: crate::frontmatter::KeyPlacement::End,
             }],
         };
         update_note(&store, &vault, &input).unwrap();
@@ -3705,6 +3801,7 @@ mod tests {
             heading: None,
             mode: EditMode::Append,
             content: Some(EditContent::Text("- [[Three]]".into())),
+            placement: crate::frontmatter::KeyPlacement::End,
         }];
         assert_eq!(
             apply_note_edits(note, &edits).unwrap(),

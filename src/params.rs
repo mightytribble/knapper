@@ -393,8 +393,21 @@ pub struct Edit {
     pub section: Option<String>,
     /// The frontmatter property to edit. A property edit keeps the key
     /// where it is and in the list style the note already uses, and a list
-    /// with no items writes an empty list.
+    /// with no items writes an empty list. A key the note does not already
+    /// carry is appended at the end of the frontmatter, unless `after` or
+    /// `before` names where it goes (#113).
     pub property: Option<String>,
+    /// Place a property key the note does not already carry directly below
+    /// the key named here. It names one of the note's own frontmatter keys,
+    /// and a key the note does not carry is refused. A key the note already
+    /// has keeps the place the file gave it, so this is inert there and an
+    /// edit can be re-run (#113).
+    pub after: Option<String>,
+    /// Place a property key the note does not already carry directly above
+    /// the key named here, and above the comment line that introduces it.
+    /// It is the only way to name the top of the frontmatter. The rules are
+    /// `after`'s, and naming both is refused (#113).
+    pub before: Option<String>,
     /// The section's new heading text, when the edit renames it. It renames
     /// the section `section` names, so an edit that carries a heading and no
     /// section is refused, and `content` is optional beside it, because a
@@ -455,6 +468,10 @@ impl Edit {
             heading: self.heading.clone(),
             mode: self.mode.into(),
             content: content_of(self.content.as_ref())?,
+            placement: crate::frontmatter::KeyPlacement::new(
+                self.after.as_deref(),
+                self.before.as_deref(),
+            )?,
         })
     }
 }
@@ -493,6 +510,8 @@ pub struct CliEdit {
     pub section: Option<String>,
     pub property: Option<String>,
     pub heading: Option<String>,
+    pub after: Option<String>,
+    pub before: Option<String>,
     pub mode: EditMode,
     pub content: Vec<String>,
 }
@@ -519,6 +538,8 @@ impl Update {
             section,
             property,
             heading,
+            after,
+            before,
             mode,
             content,
         } = edit;
@@ -537,6 +558,8 @@ impl Update {
                 section,
                 property,
                 heading,
+                after,
+                before,
                 mode,
                 content,
             }],
@@ -573,6 +596,8 @@ impl Update {
             section,
             property,
             heading,
+            after,
+            before,
             mode,
             content,
         } = edit;
@@ -607,6 +632,8 @@ impl Update {
                 section,
                 property,
                 heading,
+                after,
+                before,
                 mode,
                 content,
             },
@@ -970,6 +997,8 @@ mod tests {
                 heading: None,
                 mode: EditMode::Replace,
                 content: vec!["Hello, world".into()],
+                after: None,
+                before: None,
             },
         );
         let edits = u.to_writer_edits().unwrap();
@@ -994,6 +1023,8 @@ mod tests {
                 heading: None,
                 mode: EditMode::Replace,
                 content: vec!["a".into(), "b".into()],
+                after: None,
+                before: None,
             },
         );
         let edits = u.to_writer_edits().unwrap();
@@ -1019,6 +1050,8 @@ mod tests {
                 heading: None,
                 mode: EditMode::Remove,
                 content: vec![],
+                after: None,
+                before: None,
             },
         );
         let edits = u.to_writer_edits().unwrap();
@@ -1044,6 +1077,8 @@ mod tests {
                 heading: None,
                 mode,
                 content,
+                after: None,
+                before: None,
             },
             edits.map(String::from),
             move || Ok(stdin),
@@ -1066,6 +1101,8 @@ mod tests {
                 heading: Some(heading.to_string()),
                 mode: EditMode::Replace,
                 content,
+                after: None,
+                before: None,
             },
             None,
             move || Ok(stdin),
@@ -1168,6 +1205,8 @@ mod tests {
                 heading: None,
                 mode: EditMode::Remove,
                 content: vec![],
+                after: None,
+                before: None,
             },
             None,
             unreadable,
@@ -1183,6 +1222,8 @@ mod tests {
                 heading: None,
                 mode: EditMode::Replace,
                 content: vec![],
+                after: None,
+                before: None,
             },
             Some(r#"[{"mode":"append","content":"x"}]"#.into()),
             unreadable,
@@ -1198,6 +1239,8 @@ mod tests {
                 heading: None,
                 mode: EditMode::Replace,
                 content: vec![],
+                after: None,
+                before: None,
             },
             Some("not json".into()),
             unreadable,
@@ -1216,10 +1259,32 @@ mod tests {
                 heading: None,
                 mode: EditMode::Replace,
                 content: None,
+                after: None,
+                before: None,
             }],
         };
         let err = u.to_writer_edits().unwrap_err();
         assert!(format!("{err}").contains("one of"));
+    }
+
+    /// Two anchors name two places, and the refusal has to reach the edit
+    /// list rather than living in the frontmatter module alone (#113).
+    #[test]
+    fn an_edit_naming_both_after_and_before_is_an_error() {
+        let u = Update {
+            file: "n.md".into(),
+            edits: vec![Edit {
+                section: None,
+                property: Some("ties".into()),
+                heading: None,
+                mode: EditMode::Replace,
+                content: None,
+                after: Some("name".into()),
+                before: Some("tags".into()),
+            }],
+        };
+        let err = u.to_writer_edits().unwrap_err();
+        assert!(format!("{err}").contains("not both"), "{err}");
     }
 
     #[test]
@@ -1232,6 +1297,8 @@ mod tests {
                 heading: None,
                 mode: EditMode::Append,
                 content: Some(serde_json::json!("line")),
+                after: None,
+                before: None,
             }],
         };
         let edits = u.to_writer_edits().unwrap();
@@ -1248,6 +1315,8 @@ mod tests {
                 heading: None,
                 mode: EditMode::Replace,
                 content: Some(serde_json::json!(["a", "b"])),
+                after: None,
+                before: None,
             }],
         };
         let edits = u.to_writer_edits().unwrap();

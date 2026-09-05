@@ -5,6 +5,10 @@ Links resolve against https://github.com/mightytribble/knapper.
 
 ## Unreleased
 
+### Added
+
+- A property edit can place a key the note does not already carry (#113). `after` and `before` name one of the note's own frontmatter keys, on all three surfaces and as `--after`/`--before` on the CLI. Without one, a new key is appended at the end of the frontmatter, which is what the tool description now says. A key the note already carries keeps its place, an anchor key the note does not carry is refused, and naming both is refused. ([`e89e1f0`](https://github.com/mightytribble/knapper/commit/e89e1f0))
+
 ### Fixed
 
 - A property edit keeps the quote character the note already uses (#112). A `replace` re-serialised every value of the key it named in single quotes, so a vault written with `"` — which is what Obsidian's own property writer emits — got a changed line for a value that had not changed, and its quoting drifted to mixed as keys were edited one at a time. A fresh value now takes the quote character the key's own values use, else the first one the block uses, else `"`. A value carrying a line break or a tab takes `"` whatever the key prefers, because single quotes cannot hold one: such a value was written single-quoted before and read back with the break folded to a space. ([`ffab383`](https://github.com/mightytribble/knapper/commit/ffab383))

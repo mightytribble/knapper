@@ -1304,6 +1304,7 @@ mod tests {
                 heading: None,
                 mode: crate::writer::EditMode::Append,
                 content: Some(crate::writer::EditContent::Text("the new line".into())),
+                placement: crate::frontmatter::KeyPlacement::End,
             }],
         };
         crate::writer::update_note(&store, root, &input).unwrap();
