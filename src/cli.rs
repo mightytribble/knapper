@@ -106,6 +106,18 @@ pub enum Command {
         /// rename does not restate the body (#97).
         #[arg(long, requires = "section")]
         heading: Option<String>,
+        /// Place a property key the note does not already carry directly
+        /// below the key named here. It names one of the note's own
+        /// frontmatter keys; a key the note already has keeps the place the
+        /// file gave it (#113).
+        #[arg(long, requires = "property", conflicts_with = "before")]
+        after: Option<String>,
+        /// Place a property key the note does not already carry directly
+        /// above the key named here, and above the comment line that
+        /// introduces it. It is the only way to name the top of the
+        /// frontmatter (#113).
+        #[arg(long, requires = "property")]
+        before: Option<String>,
         /// What the edit does to what it names. `remove` is for a property
         /// alone.
         #[arg(long, value_enum, default_value = "replace")]
@@ -117,7 +129,7 @@ pub enum Command {
         content: Vec<String>,
         /// A JSON array of edits, applied in one write. It replaces the flags
         /// above, which are the one-edit form of the same grammar (#62).
-        #[arg(long, conflicts_with_all = ["section", "property", "heading", "mode", "content"])]
+        #[arg(long, conflicts_with_all = ["section", "property", "heading", "after", "before", "mode", "content"])]
         edits: Option<String>,
     },
 

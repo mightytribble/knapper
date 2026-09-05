@@ -160,7 +160,7 @@ pub const CAPABILITIES: &[Capability] = &[
         cli: Presence::On,
         mcp: Presence::On,
         http: Http::Post,
-        // The four flags are the one-edit spelling of `edits`, which a command
+        // The flags are the one-edit spelling of `edits`, which a command
         // line cannot carry as a list. They are what `cli.rs` declares by hand,
         // so naming them here is what lets the parity test read `update` at all
         // (#62).
@@ -176,6 +176,14 @@ pub const CAPABILITIES: &[Capability] = &[
             (
                 "heading",
                 "the one edit's new heading for the section it renames; a command line carries no `edits` list",
+            ),
+            (
+                "after",
+                "where the one edit places a new property key; a command line carries no `edits` list",
+            ),
+            (
+                "before",
+                "where the one edit places a new property key; a command line carries no `edits` list",
             ),
             (
                 "mode",
