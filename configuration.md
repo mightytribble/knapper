@@ -72,9 +72,10 @@ intelligence = true
 [ranking]
 # mode = "sorted"              # "legacy" restores five-lane RRF
 # retrieval_width = 60         # rows each content lane fetches
-# candidates = 30              # size of the shortlist the scorer sorts
-# shortlist_cap = 3            # passages of one note a lane may contribute
-#                              # to that shortlist, 0 = unlimited
+# candidates = 32              # size of the shortlist the scorer sorts
+# shortlist_cap = 8            # passages of one note a lane may contribute
+#                              # to that shortlist, a quarter of the
+#                              # shortlist; 0 = unlimited
 # answer_floor = 0.30          # cross-encoder probability below which a
 #                              # result is not an answer; 0.0 keeps everything
 # per_note_cap = 0             # sections of one note in the results, 0 = no cap

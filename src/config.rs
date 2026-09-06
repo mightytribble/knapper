@@ -191,8 +191,20 @@ pub enum GroupBy {
 ///
 /// Three is enough for a rules page to answer with the spell, its prerequisite,
 /// and its counter, and few enough that a 33-section document cannot fill a page.
+///
+/// This is the **legacy** stage's cap, where a lane's rows are votes. The sorted
+/// stage's cap on the shortlist is [`default_shortlist_cap`], and the two are
+/// separate numbers because they answer separate questions.
 pub fn default_max_chunks_per_file() -> usize {
     3
+}
+
+/// Default ceiling on how many sections of one document may enter the shortlist.
+///
+/// A quarter of `candidates`, so no single note may take more than a quarter of
+/// what the model is shown. See [`RankingConfig::shortlist_cap`] for the sweep.
+pub fn default_shortlist_cap() -> usize {
+    8
 }
 
 /// Default ceiling on how much of one candidate the cross-encoder reads.
@@ -597,8 +609,23 @@ pub struct RankingConfig {
     /// **§8.6 specifies 64 and it was measured and rejected.** At 64 the
     /// assembled input doubles — 18k characters per query to 37k — and the
     /// tracked targets do not move, except probe 2's answer which is *worse* by
-    /// two ranks. Thirty is what the legacy stage showed the model, so the
-    /// ranking change costs nothing at the stage that dominates the query.
+    /// two ranks.
+    ///
+    /// **Thirty-two.** Thirty is what the legacy stage showed the model, so the
+    /// ranking change costs nothing at the stage that dominates the query, and
+    /// thirty-two makes [`RankingConfig::shortlist_cap`] a whole quarter of the
+    /// pool. The two content slots past thirty are not merely arithmetic: over
+    /// the eight scored positives they hold tier-1 coverage at 27 and take noise
+    /// from 25 to 22, because a note that answers gets more of itself into the
+    /// shortlist and the model ranks those rows above the noise they displace.
+    /// They cost about 8% of query wall time, and every negative's best score is
+    /// unmoved, N4, N10 and N11 to the digit.
+    ///
+    /// **This width is the gate that abstains.** `eval/probes.md` credits the
+    /// shortlist width, and not the ranking, with keeping N10's wrong answer
+    /// away from the model — at `candidates = 90` it reaches the model and
+    /// scores 97.87%. It stays out at 32. Read that row before widening this
+    /// further.
     pub candidates: usize,
     /// Slots reserved for graph candidates in reach order.
     ///
@@ -626,18 +653,33 @@ pub struct RankingConfig {
     /// **Unmeasured** — no probe covers the temporal lane. See
     /// [`crate::ranking::Reserves::temporal`].
     pub temporal_reserve: usize,
-    /// At most this many sections of one document may reach the model.
+    /// At most this many sections of one document may enter the shortlist.
     ///
     /// Bound what the model is *shown*, because it cannot rank what it never
-    /// saw; do not bound what it returns, because ranking is its job. The
-    /// default of 3 comes from #6, where a 33-section document took 33 of the
-    /// ranks its lane handed to RRF — under sorting there is no vote mechanic
-    /// and that reason is gone.
+    /// saw; do not bound what it returns, because ranking is its job. Under this
+    /// stage a lane's rows are not votes, so #6's reason for a tight cap — a
+    /// 33-section document taking 33 of the ranks its lane handed to RRF — does
+    /// not hold here. It still holds for [`Config::max_chunks_per_file`], which
+    /// is why the two are separate numbers.
     ///
-    /// **Swept: 32 leaves every probe's ranking unchanged** while letting 9–108
-    /// more chunks into the fused order, so the loose cap #30 argued for buys
-    /// nothing measurable here. Three stays, as the cheaper of two settings the
-    /// probes cannot tell apart.
+    /// **Eight, a quarter of `candidates`.** This cap decides how much of one
+    /// note may answer a question about that note, and the pool's probe for it
+    /// is P4 `Archdragon`, whose responsive set is ten sections of a single
+    /// 33-chunk file. Over the eight scored positives of `eval/probes.md`,
+    /// against a cap of three: tier-1 coverage 25 → 27, noise 26 → 22,
+    /// inversions 4 → 3, and every negative's best score unmoved — so the answer
+    /// floor does not move with it. P4 carries the whole gain, 5/10 → 8/10 with
+    /// its inversion cleared and its noise to zero. P2 pays for it, losing one
+    /// member past `top_n`.
+    ///
+    /// **Seven and thirty-two were both measured and are both worse.** Seven
+    /// takes P4 to 7/10. Thirty-two adds nothing to coverage over eight and
+    /// costs P3 a member.
+    ///
+    /// A tight cap also silences the semantic lane on rows it retrieved: 41 rows
+    /// of the twenty-query pool reach the results with `provenance.semantic`
+    /// false at a cap of three, having been dropped by the cap rather than by
+    /// the lane. That boolean is what an author reads to decide what to rewrite.
     pub shortlist_cap: usize,
     pub tiebreak: Tiebreak,
     /// The score below which a candidate is not an answer (#34).
@@ -716,10 +758,10 @@ impl Default for RankingConfig {
         Self {
             mode: RankingMode::default(),
             retrieval_width: default_retrieval_width(),
-            candidates: 30,
+            candidates: 32,
             graph_reserve: 8,
             temporal_reserve: 4,
-            shortlist_cap: default_max_chunks_per_file(),
+            shortlist_cap: default_shortlist_cap(),
             tiebreak: Tiebreak::default(),
             answer_floor: default_answer_floor(),
             per_note_cap: 0,
@@ -1709,7 +1751,27 @@ batch_size = 128
 
         let swept: Config = toml::from_str("[ranking]\nretrieval_width = 120\n").unwrap();
         assert_eq!(swept.ranking.retrieval_width, 120);
-        assert_eq!(swept.ranking.candidates, 30, "the other keys keep defaults");
+        assert_eq!(swept.ranking.candidates, 32, "the other keys keep defaults");
+    }
+
+    #[test]
+    fn the_shortlist_cap_is_measured_apart_from_the_legacy_vote_cap() {
+        // The two caps were one constant, and they answer different questions:
+        // the sorted stage bounds what the model is *shown*, the legacy stage
+        // bounds a lane's *votes*. Their measurements diverge (#6, and the
+        // shortlist-cap section of `eval/probes.md`).
+        let bare: Config = toml::from_str("").unwrap();
+        assert_eq!(bare.ranking.shortlist_cap, 8);
+        assert_eq!(bare.ranking.candidates, 32);
+        assert_eq!(bare.max_chunks_per_file, 3);
+
+        // Moving one leaves the other alone, which is what splitting them buys.
+        let swept: Config = toml::from_str("[ranking]\nshortlist_cap = 0\n").unwrap();
+        assert_eq!(swept.ranking.shortlist_cap, 0, "0 is unlimited");
+        assert_eq!(
+            swept.max_chunks_per_file, 3,
+            "the legacy cap is independent"
+        );
     }
 
     #[test]

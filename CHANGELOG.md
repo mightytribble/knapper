@@ -3,6 +3,12 @@
 Every entry below the upstream-lineage line names the commit it describes.
 Links resolve against https://github.com/mightytribble/knapper.
 
+## Unreleased
+
+### Changed
+
+- A search returns more of one note when the answer is spread across it. `[ranking] shortlist_cap` is 8 and `candidates` is 32, so up to eight sections of a note reach the scorer. Nothing re-indexes. `shortlist_cap = 3` restores the narrower behaviour. ([`66378e2`](https://github.com/mightytribble/knapper/commit/66378e2))
+
 ## 0.9.9 (2026-09-04)
 
 Two frontmatter-writing changes. A property edit keeps the quoting the note
