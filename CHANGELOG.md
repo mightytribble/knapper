@@ -3,6 +3,12 @@
 Every entry below the upstream-lineage line names the commit it describes.
 Links resolve against https://github.com/mightytribble/knapper.
 
+## Unreleased
+
+### Changed
+
+- A search may now return more of one note. `[ranking] shortlist_cap` is 8, and `candidates` is 32, so up to eight sections of a single note reach the scorer instead of three. A question whose answer is spread across one note — a creature, a location, a character — comes back more completely, and the results carry less unrelated material. Nothing re-indexes and nothing re-embeds; both keys are query-time. Set `shortlist_cap = 3` to restore the narrower behaviour. ([`66378e2`](https://github.com/mightytribble/knapper/commit/66378e2))
+
 ## 0.9.9 (2026-09-04)
 
 Two frontmatter-writing changes. A property edit keeps the quoting the note
