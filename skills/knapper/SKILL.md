@@ -70,6 +70,36 @@ tags: solo                             # after: both siblings gone, no longer a 
 Append and remove cannot make that mistake. If you do need replace, repeat
 `--content` once per value to keep the list a list.
 
+**A section is its subtree.** A section runs to the next heading at or above
+its own level, so `## Orientation` carries every `###` under it, and a
+`replace` writes over all of that:
+
+```
+## Orientation                                    # before
+Lead-in prose.
+### Cosplay
+### Olivia's Lab
+
+--section Orientation --mode replace --content "New lead-in."
+
+## Orientation                                    # after: both subsections gone
+New lead-in.
+```
+
+knapper refuses that write. A `replace` whose content restates none of the
+subsections the section owns is an error naming what would have gone. Pick the
+mode that says what you meant:
+
+- `--mode prepend` writes the lead-in above the subsections and touches
+  nothing else.
+- `--section Cosplay` edits one subsection on its own. A heading's own text
+  finds it at any depth; a `Parent > Child` path has to run from the note's
+  top heading down, and a partial one finds nothing.
+- `--mode remove` deletes a section — its heading line and everything under
+  it — and is the deliberate way to drop a subsection.
+- To rewrite the whole subtree, carry the child headings in the content. That
+  restates them, and the write goes through.
+
 Other rules worth knowing before a write:
 
 - Several changes to one note belong in a single `--edits` JSON array: one
@@ -77,10 +107,13 @@ Other rules worth knowing before a write:
 - A section edit's content is the body **below** the heading. Content opening
   with a heading at or above that section's own level is refused, because such
   a line ends the section rather than fills it.
+- `--mode append` on a parent section lands after its last subsection, not
+  after the lead-in prose. `prepend` is the mode that writes the lead-in.
 - Rename a section with `--heading`; `--content` is optional beside it. A name
   another section already holds is refused.
 - `read --section` returns the body alone and names the heading beside it, so
-  what a read returns is what an update takes back.
+  what a read returns is what an update takes back. The body is the subtree,
+  so read a section before you replace it.
 - `delete --mode soft` archives and keeps the note indexed; `hard` is
   permanent.
 

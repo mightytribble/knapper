@@ -30,10 +30,11 @@ pub struct CreateNoteInput {
     pub auto_link: Option<bool>,
 }
 
-/// How one edit changes what it addresses. `Remove` is only for a property:
-/// a section has no "remove" that is not a replace with nothing, so the body
-/// and section paths reject it (#62). The enum is fieldless, so it is `Copy`
-/// and an edit can hand its mode to a transform without a clone.
+/// How one edit changes what it addresses. `Remove` deletes what the edit
+/// names — a property key, or a section with its heading line and its
+/// subtree (#117) — and the body path rejects it, since a note with no body
+/// is a replace with nothing. The enum is fieldless, so it is `Copy` and an
+/// edit can hand its mode to a transform without a clone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditMode {
     Replace,
@@ -52,13 +53,15 @@ pub struct EditResult {
     pub stale_links: Vec<StaleLink>,
 }
 
-/// A note whose `[[This Note#Old Heading]]` link a rename left stale (#99).
+/// A note whose `[[This Note#Old Heading]]` link this write left stale (#99).
 ///
 /// A heading is an identifier: `read` addresses a section by it and the
-/// breadcrumbs `search` returns are keyed on it. A rename is the one edit that
+/// breadcrumbs `search` returns are keyed on it. A rename and a section
+/// `remove` are the edits that take a heading away, so they are the ones that
 /// can invalidate another note's reference to the note being edited, and
-/// nothing else reports it — the linked file still resolves, so the link is
-/// not unresolved and `health`'s broken-link report does not see it.
+/// nothing else reports it at the time of the write — the linked file still
+/// resolves, so the link is not unresolved. A `remove` reports the
+/// subsections it took as well as the section the caller named (#117).
 ///
 /// The rename is not undone and the other note is not written. Knowing is the
 /// whole of it; rewriting the link is a separate ask (#107).
@@ -643,6 +646,13 @@ pub fn create_note(
 /// - Replace: replace the entire section body with new content
 /// - Append: add new content at the end of the section body
 /// - Prepend: add new content at the start of the section body
+/// - Remove: delete the heading line and the body under it
+///
+/// A section is its subtree — it runs to the next heading at or above its own
+/// level — so every mode above reaches the subsections the section owns. A
+/// `Replace` carrying no heading of its own restates none of them and is
+/// refused, because it would delete them and report success (#116); `Prepend`
+/// is the mode that writes the lead-in prose above them.
 ///
 /// The blank line under the heading and the one before the next section are
 /// the note's, not the content's: blank lines at the edges of `content` are
@@ -662,6 +672,26 @@ pub fn apply_section_edit(
     let section = crate::markdown::find_section(content, heading)
         .ok_or_else(|| anyhow::anyhow!("section '{}' not found", heading))?;
 
+    // `remove` takes the heading line as well as the body, because that is
+    // what deleting a section means, and the section is its subtree the same
+    // way a replace's is. It reads no content, so it runs before the guards
+    // that read one (#117).
+    if mode == EditMode::Remove {
+        let lines = crate::markdown::lines_with_endings(content);
+        let head = lines[..section.heading.line].concat();
+        let tail = lines[section.body_end..].concat();
+        // The blank line above the section separated it from what came
+        // before, and once the section is gone it separates that from what
+        // follows. With nothing left to follow it is a trailing blank line,
+        // so it goes too and `keep_final_newline` gives the note its own
+        // last byte back.
+        let head = match tail.is_empty() {
+            true => head.trim_end_matches(['\n', '\r']),
+            false => head.as_str(),
+        };
+        return Ok(keep_final_newline(content, format!("{head}{tail}")));
+    }
+
     // Content that opens with a heading at or above the section's own level
     // is #96's mistake. Such a line ends the section rather than filling it,
     // so it cannot be body text — and it is exactly what a caller wrote back
@@ -677,6 +707,27 @@ pub fn apply_section_edit(
              rather than fills it. The content is the body alone; pass `heading` to rename \
              the section"
         );
+    }
+
+    // A section is its subtree, so a replace writes over the subsections the
+    // section owns as well as the lead-in prose above them. Content that
+    // carries no heading of its own restates none of those subsections, which
+    // is a caller writing the lead-in alone and deleting the rest without
+    // being told — the write reported success and named nothing it had
+    // removed (#116). A deliberate rewrite of the subtree carries the child
+    // headings and passes, and `remove` is the deliberate drop (#117).
+    if mode == EditMode::Replace {
+        let owned = owned_headings(content, &section);
+        if !owned.is_empty() && crate::markdown::headings_with_promotions(new).is_empty() {
+            let first = &owned[0];
+            let names = owned.join(", ");
+            bail!(
+                "a replace of section '{heading}' writes over the whole section, and this \
+                 content carries none of the subsections it owns ({names}). Use `prepend` \
+                 to write the lead-in above them, name a subsection as the section to edit \
+                 it alone (`{first}`), or `remove` one to drop it"
+            );
+        }
     }
 
     // Apply the edit based on mode.
@@ -729,7 +780,11 @@ pub fn apply_section_edit(
                 format!("{nl}{text}{nl}{}{old}", nl.repeat(trailing))
             }
         }
-        EditMode::Remove => bail!("Remove has no meaning for a section"),
+        // A remove returns above, before the modes that write a body. The
+        // arm is an error and not a panic, the way the other unreachable
+        // arms of this file are: nothing that writes a note's file panics on
+        // a state it does not expect.
+        EditMode::Remove => bail!("a remove of a section is applied before the body modes"),
     };
 
     // Reconstruct the file
@@ -862,6 +917,19 @@ fn opening_heading(text: &str) -> Option<crate::markdown::HeadingInfo> {
     crate::markdown::headings_with_promotions(text)
         .into_iter()
         .find(|h| h.line == first)
+}
+
+/// The sections a section owns: every heading inside its span, promoted bold
+/// lines included, in the order the note gives them.
+///
+/// These are what a replace of the section's body writes over, because a
+/// section runs to the next heading at or above its own level (#116).
+fn owned_headings(content: &str, section: &crate::markdown::Section) -> Vec<String> {
+    crate::markdown::headings_with_promotions(content)
+        .into_iter()
+        .filter(|h| h.line > section.heading.line && h.line < section.body_end)
+        .map(|h| h.text)
+        .collect()
 }
 
 /// Give `edited` the final newline `original` had, or take the one it did not.
@@ -1029,6 +1097,12 @@ pub fn apply_note_edits(content: &str, edits: &[NoteEdit]) -> Result<String> {
         if edit.placement != KeyPlacement::End && !matches!(edit.target, EditTarget::Property(_)) {
             bail!("`after` and `before` place a frontmatter key, so they need `property`");
         }
+        // A remove deletes the section, so a rename beside it names a section
+        // that is gone. Without this the edit renamed and kept the section,
+        // which is neither of the two things the caller asked for (#117).
+        if edit.mode == EditMode::Remove && edit.heading.is_some() {
+            bail!("an edit removes a section or renames it, and not both");
+        }
     }
 
     let mut text = content.to_string();
@@ -1066,15 +1140,17 @@ pub fn apply_note_edits(content: &str, edits: &[NoteEdit]) -> Result<String> {
                 rest = &rest[1..];
             }
             EditTarget::Section(heading) => {
-                if edit.mode == EditMode::Remove {
-                    bail!("Remove has no meaning for a section");
-                }
                 // A rename does not restate the body, so content is optional
                 // when the edit names a heading — and the body edit runs
                 // first, so both halves of one edit name the section by the
                 // name the note still holds (#97).
                 if edit.content.is_some() || edit.heading.is_none() {
-                    let new = text_of(edit)?;
+                    // `remove` deletes the section, so it reads no content
+                    // and needs none to be given (#117).
+                    let new = match edit.mode {
+                        EditMode::Remove => String::new(),
+                        _ => text_of(edit)?,
+                    };
                     text = apply_section_edit(&text, heading, &new, edit.mode)?;
                 }
                 if let Some(new_heading) = &edit.heading {
@@ -1098,16 +1174,39 @@ pub fn apply_note_edits(content: &str, edits: &[NoteEdit]) -> Result<String> {
 /// holds a wikilink edge to this note, deep or degraded. The headings are then
 /// matched on the text those notes actually wrote, because the edge itself
 /// does not keep it (#99).
-fn stale_links_for(store: &Store, file_id: i64, edits: &[NoteEdit]) -> Result<Vec<StaleLink>> {
-    let renamed: Vec<String> = edits
-        .iter()
-        .filter(|e| e.heading.is_some())
-        .filter_map(|e| match &e.target {
-            EditTarget::Section(old) => Some(crate::store::normalise_heading(old)),
-            _ => None,
-        })
-        .collect();
-    if renamed.is_empty() {
+///
+/// A rename takes away the heading it names. A section `remove` takes that
+/// heading and every subsection under it, so `content` is read too: the text
+/// is what says which subsections those are (#117).
+fn stale_links_for(
+    store: &Store,
+    file_id: i64,
+    edits: &[NoteEdit],
+    content: &str,
+) -> Result<Vec<StaleLink>> {
+    let mut gone: Vec<String> = Vec::new();
+    for edit in edits {
+        let EditTarget::Section(name) = &edit.target else {
+            continue;
+        };
+        if edit.heading.is_none() && edit.mode != EditMode::Remove {
+            continue;
+        }
+        gone.push(crate::store::normalise_heading(name));
+        // A remove takes the section's subsections with it, so a link that
+        // named one of those is stale the same way, and only the text says
+        // what they are (#117).
+        if edit.mode == EditMode::Remove
+            && let Some(section) = crate::markdown::find_section(content, name)
+        {
+            gone.extend(
+                owned_headings(content, &section)
+                    .iter()
+                    .map(|h| crate::store::normalise_heading(h)),
+            );
+        }
+    }
+    if gone.is_empty() {
         return Ok(Vec::new());
     }
     let sources: Vec<i64> = store
@@ -1118,7 +1217,7 @@ fn stale_links_for(store: &Store, file_id: i64, edits: &[NoteEdit]) -> Result<Ve
     Ok(crate::graph::deep_links_from(store, &sources)?
         .into_iter()
         .filter(|link| link.target_id == file_id)
-        .filter(|link| renamed.contains(&crate::store::normalise_heading(&link.heading)))
+        .filter(|link| gone.contains(&crate::store::normalise_heading(&link.heading)))
         .map(|link| StaleLink {
             source: link.source,
             heading: link.heading,
@@ -1155,18 +1254,22 @@ pub fn update_note(store: &Store, vault_path: &Path, input: &UpdateInput) -> Res
         );
     }
 
-    // Step 3: What a rename is about to leave stale, read before the write
-    let stale_links = stale_links_for(store, file_record.id, &input.edits)?;
-
-    // Step 4: Apply every edit to the text the file holds
+    // Step 3: The text the file holds, which the stale-link lookup reads as
+    // well as the edits do — a remove takes the section's subsections with
+    // it, and only the text says what those are (#117)
     let content = std::fs::read_to_string(&full_path)?;
+
+    // Step 4: What the write is about to leave stale, read before the write
+    let stale_links = stale_links_for(store, file_record.id, &input.edits, &content)?;
+
+    // Step 5: Apply every edit to that text
     let new_content = apply_note_edits(&content, &input.edits)
         .map_err(|e| anyhow::anyhow!("{e} in {}", input.file))?;
 
-    // Step 5: Write atomically — once
+    // Step 6: Write atomically — once
     atomic_write(&full_path, &new_content, true)?;
 
-    // Step 6: Update the store's content hash, mtime and tag rows
+    // Step 7: Update the store's content hash, mtime and tag rows
     let content_hash = compute_content_hash(&new_content);
     let mtime = file_mtime(&full_path)?;
     let docid = file_record
@@ -1716,6 +1819,96 @@ mod tests {
             apply_section_edit(doc, "Alpha", "### Detail\n\nMore.", EditMode::Replace).unwrap();
         assert!(out.contains("### Detail"));
         assert!(out.contains("More."));
+    }
+
+    /// `remove` on a section takes the heading line with the body, because
+    /// that is what deleting a section means. The mode was for a property
+    /// alone before this, so the only route to a deliberate drop was a
+    /// replace on the parent that left the section out — the silent wipe of
+    /// #116 (#117).
+    #[test]
+    fn a_section_remove_takes_the_heading_line_with_the_body() {
+        let doc = "# Note\n\n## Alpha\n\nAlpha body.\n\n## Beta\n\nBeta body.\n";
+        let out = apply_section_edit(doc, "Alpha", "", EditMode::Remove).unwrap();
+        assert_eq!(out, "# Note\n\n## Beta\n\nBeta body.\n");
+    }
+
+    /// The blank line above a removed section separated it from what came
+    /// before it, and it belongs to the section that follows. With nothing
+    /// left to follow, it is a trailing blank line and goes too (#117).
+    #[test]
+    fn removing_the_last_section_leaves_no_trailing_blank_line() {
+        let doc = "# Note\n\n## Alpha\n\nAlpha body.\n";
+        let out = apply_section_edit(doc, "Alpha", "", EditMode::Remove).unwrap();
+        assert_eq!(out, "# Note\n");
+    }
+
+    /// A section is its subtree on a remove the same way it is on a replace,
+    /// so removing a parent takes its children with it (#116, #117).
+    #[test]
+    fn a_section_remove_takes_the_subsections_the_section_owns() {
+        let doc = "## Alpha\n\nLead.\n\n### One\n\nA.\n\n### Two\n\nB.\n\n## Beta\n\nEnd.\n";
+        let out = apply_section_edit(doc, "Alpha", "", EditMode::Remove).unwrap();
+        assert_eq!(out, "## Beta\n\nEnd.\n");
+    }
+
+    /// A replace on a section that owns subsections, carrying content that
+    /// restates none of them, deletes them and reports success. The caller
+    /// meant the lead-in prose under the heading, so the write is refused and
+    /// the message names what would have gone (#116).
+    #[test]
+    fn a_section_replace_refuses_to_drop_the_subsections_its_content_omits() {
+        let doc = "## Orientation\n\nLead.\n\n### Cosplay\n\nA.\n\n### Lab\n\nB.\n";
+        let err = apply_section_edit(doc, "Orientation", "New lead.", EditMode::Replace)
+            .expect_err("a replace that drops subsections is refused");
+        let msg = format!("{err}");
+        assert!(msg.contains("Cosplay"), "{msg}");
+        assert!(msg.contains("Lab"), "{msg}");
+        // The message names the routes that do what the caller meant, and a
+        // caller that reads it acts on those and not on a guess.
+        assert!(msg.contains("prepend"), "{msg}");
+        assert!(msg.contains("remove"), "{msg}");
+    }
+
+    /// Content that carries a child heading is a deliberate rewrite of the
+    /// subtree, so it passes. The guard reads the content and not the
+    /// caller's intent, and this is the shape that states the intent (#116).
+    #[test]
+    fn a_section_replace_that_restates_a_subsection_is_written() {
+        let doc = "## Orientation\n\nLead.\n\n### Cosplay\n\nA.\n";
+        let out = apply_section_edit(
+            doc,
+            "Orientation",
+            "New lead.\n\n### Cosplay\n\nRewritten.",
+            EditMode::Replace,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "## Orientation\n\nNew lead.\n\n### Cosplay\n\nRewritten.\n"
+        );
+    }
+
+    /// `prepend` writes the lead-in above the subsections and deletes
+    /// nothing, so it is the route #116's message names and it is not
+    /// guarded (#116).
+    #[test]
+    fn a_prepend_to_a_parent_section_leaves_its_subsections_alone() {
+        let doc = "## Orientation\n\nLead.\n\n### Cosplay\n\nA.\n";
+        let out = apply_section_edit(doc, "Orientation", "New lead.", EditMode::Prepend).unwrap();
+        assert_eq!(
+            out,
+            "## Orientation\n\nNew lead.\nLead.\n\n### Cosplay\n\nA.\n"
+        );
+    }
+
+    /// A promoted bold line is a section, so it is one a remove deletes, and
+    /// the ATX heading above it is not its parent to take (#44, #117).
+    #[test]
+    fn a_promoted_section_remove_takes_the_bold_line_with_the_body() {
+        let doc = "## Stat Block\n\n**Spells**\n\nFireball\n\n**Gear**\n\nRope\n";
+        let out = apply_section_edit(doc, "Spells", "", EditMode::Remove).unwrap();
+        assert_eq!(out, "## Stat Block\n\n**Gear**\n\nRope\n");
     }
 
     /// A promoted bold line is ended by any heading, so content that opens
@@ -3112,6 +3305,54 @@ mod tests {
         }
     }
 
+    /// A section `remove` reaches the file through the whole pipeline: the
+    /// heading and its body go, the rest of the note stays, and no surface
+    /// between the caller and `apply_section_edit` refuses the mode (#117).
+    #[test]
+    fn a_section_remove_reaches_the_file_and_takes_the_heading_with_it() {
+        let (_tmp, store, vault) =
+            indexed_note("# Person\n\n## Interactions\n\nOld entry\n\n## Links\n\nSome links\n");
+        update_note(
+            &store,
+            &vault,
+            &one_edit(
+                EditTarget::Section("Interactions".into()),
+                EditMode::Remove,
+                None,
+            ),
+        )
+        .unwrap();
+
+        let out = std::fs::read_to_string(vault.join("note.md")).unwrap();
+        assert_eq!(out, "# Person\n\n## Links\n\nSome links\n");
+    }
+
+    /// `remove` deletes the section, so a rename beside it names a section
+    /// that is gone. The pair is refused where the edit is read, and not left
+    /// to surface as a lookup failure the caller has to work back from (#117).
+    #[test]
+    fn a_section_edit_that_removes_and_renames_is_refused() {
+        let (_tmp, store, vault) =
+            indexed_note("# Person\n\n## Interactions\n\nOld entry\n\n## Links\n\nSome links\n");
+        let input = UpdateInput {
+            file: "note.md".into(),
+            edits: vec![NoteEdit {
+                target: EditTarget::Section("Interactions".into()),
+                heading: Some("Contacts".into()),
+                mode: EditMode::Remove,
+                content: None,
+                placement: crate::frontmatter::KeyPlacement::End,
+            }],
+        };
+        let err =
+            update_note(&store, &vault, &input).expect_err("a remove that also renames is refused");
+        let msg = format!("{err}");
+        assert!(msg.contains("removes"), "{msg}");
+
+        let out = std::fs::read_to_string(vault.join("note.md")).unwrap();
+        assert!(out.contains("## Interactions"), "{out}");
+    }
+
     /// Ported from `test_edit_note_file_not_found` (#62).
     #[test]
     fn an_update_of_a_note_the_store_does_not_hold_is_an_error() {
@@ -3392,6 +3633,93 @@ mod tests {
             vec![StaleLink {
                 source: "Trade.md".into(),
                 heading: "Norlund to Westport via Bend".into(),
+            }]
+        );
+    }
+
+    /// A remove takes a heading away as surely as a rename does, so it leaves
+    /// the same inbound `[[Note#Heading]]` links naming a heading that is
+    /// gone, and it reports them the same way (#99, #117).
+    #[test]
+    fn a_section_remove_names_the_notes_whose_links_it_left_stale() {
+        let (_tmp, store, vault) = setup_vault();
+        std::fs::write(
+            vault.join("Roads.md"),
+            "# Roads\n\n## Norlund to Westport via Bend\n\nThe northern leg.\n\n## Notes\n\nEnd.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            vault.join("Trade.md"),
+            "# Trade\n\n## Legs\n\nSee [[Roads#Norlund to Westport via Bend]].\n",
+        )
+        .unwrap();
+        index_vault(&store, &vault);
+
+        let result = update_note(
+            &store,
+            &vault,
+            &UpdateInput {
+                file: "Roads.md".into(),
+                edits: vec![NoteEdit {
+                    target: EditTarget::Section("Norlund to Westport via Bend".into()),
+                    heading: None,
+                    mode: EditMode::Remove,
+                    content: None,
+                    placement: crate::frontmatter::KeyPlacement::End,
+                }],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.stale_links,
+            vec![StaleLink {
+                source: "Trade.md".into(),
+                heading: "Norlund to Westport via Bend".into(),
+            }]
+        );
+    }
+
+    /// A remove takes the section's subsections with it, so the links that
+    /// named one of those are stale too. The result would otherwise name the
+    /// heading the caller typed and stay quiet about the rest, which is the
+    /// silence #116 is about (#99, #117).
+    #[test]
+    fn a_section_remove_names_the_links_left_stale_by_the_subsections_it_took() {
+        let (_tmp, store, vault) = setup_vault();
+        std::fs::write(
+            vault.join("Roads.md"),
+            "# Roads\n\n## Northern\n\nLead.\n\n### Bend leg\n\nThe old route.\n\n## Notes\n\nEnd.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            vault.join("Trade.md"),
+            "# Trade\n\n## Legs\n\nSee [[Roads#Bend leg]].\n",
+        )
+        .unwrap();
+        index_vault(&store, &vault);
+
+        let result = update_note(
+            &store,
+            &vault,
+            &UpdateInput {
+                file: "Roads.md".into(),
+                edits: vec![NoteEdit {
+                    target: EditTarget::Section("Northern".into()),
+                    heading: None,
+                    mode: EditMode::Remove,
+                    content: None,
+                    placement: crate::frontmatter::KeyPlacement::End,
+                }],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.stale_links,
+            vec![StaleLink {
+                source: "Trade.md".into(),
+                heading: "Bend leg".into(),
             }]
         );
     }
