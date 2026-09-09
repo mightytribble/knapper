@@ -125,6 +125,11 @@ pub struct Read {
     /// A section read narrows `content` to that section's body. The heading
     /// comes back beside it, in the `section` object with the level and the
     /// span, so what a read returns is what an `update` takes back (#96).
+    ///
+    /// A section is its subtree: it runs to the next heading at or above its
+    /// own level, so a `##` carries the `###` sections below it. Read one
+    /// before a `replace` of it, because the replace writes over all of that
+    /// (#116).
     #[arg(long)]
     pub section: Option<String>,
     /// Return the note's metadata — its frontmatter, its inbound and outbound
@@ -390,6 +395,12 @@ impl From<EditMode> for crate::writer::EditMode {
 pub struct Edit {
     /// The section to edit: a heading's own text, or its full path from the
     /// note's top heading down, joined with ` > ` (#69).
+    ///
+    /// A section is its subtree, so an edit of a `##` reaches the `###`
+    /// sections below it: a `replace` writes over them, an `append` lands
+    /// after the last of them, and a `remove` takes them. `prepend` is the
+    /// one mode that writes the lead-in prose alone. A `replace` whose
+    /// content restates none of the subsections is refused (#116).
     pub section: Option<String>,
     /// The frontmatter property to edit. A property edit keeps the key
     /// where it is and in the list style the note already uses, and a list
@@ -1191,8 +1202,9 @@ mod tests {
         );
     }
 
-    /// A `remove` of a property needs no content, and `--edits` carries its
-    /// own, so neither reads stdin (#62).
+    /// A `remove` needs no content — of a property, and of a section, which
+    /// it deletes outright (#117) — and `--edits` carries its own, so none of
+    /// the three reads stdin (#62).
     #[test]
     fn the_forms_that_carry_their_own_content_do_not_read_stdin() {
         let unreadable = || anyhow::bail!("stdin must not be read");
@@ -1202,6 +1214,23 @@ mod tests {
             CliEdit {
                 section: None,
                 property: Some("status".into()),
+                heading: None,
+                mode: EditMode::Remove,
+                content: vec![],
+                after: None,
+                before: None,
+            },
+            None,
+            unreadable,
+        )
+        .unwrap();
+        assert!(u.to_writer_edits().unwrap()[0].content.is_none());
+
+        let u = Update::from_cli(
+            "n.md".into(),
+            CliEdit {
+                section: Some("Overview".into()),
+                property: None,
                 heading: None,
                 mode: EditMode::Remove,
                 content: vec![],

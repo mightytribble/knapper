@@ -219,7 +219,7 @@ impl KnapperServer {
 
     #[tool(
         name = "read",
-        description = "Read a note's content: the whole note's body, or one section's body with `section`, which carries the section's `heading` and `level` beside the content rather than in it. What this returns is what `update` takes back: a body edit or a section `replace` handed this content writes the file it came from. With `metadata: true` it returns the note's frontmatter, inbound and outbound links, and size instead — which cannot be combined with `section`. Accepts file path, basename, or #docid."
+        description = "Read a note's content: the whole note's body, or one section's body with `section`, which carries the section's `heading` and `level` beside the content rather than in it. A section is its subtree — it runs to the next heading at or above its own level — so a `##` comes back with the `###` sections below it. What this returns is what `update` takes back: a body edit or a section `replace` handed this content writes the file it came from. With `metadata: true` it returns the note's frontmatter, inbound and outbound links, and size instead — which cannot be combined with `section`. Accepts file path, basename, or #docid."
     )]
     async fn read(
         &self,
@@ -380,9 +380,11 @@ impl KnapperServer {
         name = "update",
         description = "Change an existing note. Takes a list of edits and applies them in order, in one write: one conflict check, one file write. \
              Each edit names its target. `section` is one heading. `property` is one frontmatter key. An edit that names neither targets the note's body, and an edit that names both is an error. \
-             `mode` is `replace`, `append`, `prepend` or `remove`. `remove` is for a property alone. \
+             `mode` is `replace`, `append`, `prepend` or `remove`. `remove` deletes a property key, or a section with its heading line and everything under it. \
              `content` is a string, or a list of strings to set a list-valued property such as tags or aliases. A body edit and a section edit take a string. \
              A section edit's content is the body **below** the heading: content that opens with a heading at or above the section's own level is refused, because such a line ends the section rather than fills it. \
+             A section is its subtree, so an edit of a `##` reaches the `###` sections below it: a `replace` writes over them, an `append` lands after the last of them, and `prepend` is the one mode that writes the lead-in prose alone. \
+             A `replace` whose content restates none of the subsections the section owns is refused, because it would delete them. Read the section first, or name a subsection as the `section` to edit it alone, or `remove` one to drop it. \
              `heading` renames the section `section` names, and it is the heading's text — the note keeps its markup, so a `##` stays a `##`. `content` is optional beside it, since a rename does not restate the body. A name another section of the note already holds is refused. \
              A body edit always keeps the note's frontmatter: content that starts with its own `---` block gives the note two of them. Change the frontmatter with `property` edits in the same list. \
              Three things differ from the calls this replaces. A note changed outside knapper and not yet re-indexed fails with an mtime conflict. \

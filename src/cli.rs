@@ -118,8 +118,8 @@ pub enum Command {
         /// frontmatter (#113).
         #[arg(long, requires = "property")]
         before: Option<String>,
-        /// What the edit does to what it names. `remove` is for a property
-        /// alone.
+        /// What the edit does to what it names. `remove` deletes a property
+        /// key, or a section with its heading and its subsections (#117).
         #[arg(long, value_enum, default_value = "replace")]
         mode: crate::params::EditMode,
         /// The text to write. It is taken as written, commas included. Repeat

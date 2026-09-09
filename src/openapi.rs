@@ -297,7 +297,7 @@ fn build_update() -> serde_json::Value {
                                     "section": { "type": "string", "description": "Heading of the section to edit. Omit this and property to edit the body" },
                                     "property": { "type": "string", "description": "Frontmatter property to edit. Naming a section as well is an error" },
                                     "heading": { "type": "string", "description": "New heading text for the section this edit names, which renames it. The note keeps the heading's markup, content is optional beside it, and a name another section already holds is refused" },
-                                    "mode": { "type": "string", "enum": ["replace", "prepend", "append", "remove"], "description": "What the edit does. remove is for a property alone" },
+                                    "mode": { "type": "string", "enum": ["replace", "prepend", "append", "remove"], "description": "What the edit does. remove deletes a property key, or a section with its heading and its subsections" },
                                     "content": {
                                         "description": "A string, or a list of strings to set a list-valued property",
                                         "oneOf": [
