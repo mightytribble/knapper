@@ -5,6 +5,15 @@ Links resolve against https://github.com/mightytribble/knapper.
 
 ## Unreleased
 
+### Added
+
+- `update --mode remove` deletes a section (#117). It takes the heading line and everything under it, and reads no content. Deleting a section had no other route before this. ([`5fcff95`](https://github.com/mightytribble/knapper/commit/5fcff95))
+
+### Fixed
+
+- A section `replace` no longer deletes the subsections the section owns (#116). A section runs to the next heading at or above its own level, so a `replace` on a `##` wrote over every `###` under it — a caller writing the lead-in prose alone lost the rest, and the write reported success. Content that carries none of those subsections is now refused, with a message naming them. Use `prepend` for the lead-in, name a subsection to edit it alone, or `remove` one to drop it. Content that carries the child headings is a deliberate rewrite and still goes through. ([`5fcff95`](https://github.com/mightytribble/knapper/commit/5fcff95))
+- A section `remove` names the notes whose `[[Note#Heading]]` links it left stale, the subsections it took included. ([`5fcff95`](https://github.com/mightytribble/knapper/commit/5fcff95))
+
 ### Changed
 
 - A search returns more of one note when the answer is spread across it. `[ranking] shortlist_cap` is 8 and `candidates` is 32, so up to eight sections of a note reach the scorer. Nothing re-indexes. `shortlist_cap = 3` restores the narrower behaviour. ([`66378e2`](https://github.com/mightytribble/knapper/commit/66378e2))
