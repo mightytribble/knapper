@@ -77,8 +77,8 @@ its own level, so `## Orientation` carries every `###` under it, and a
 ```
 ## Orientation                                    # before
 Lead-in prose.
-### Cosplay
-### Olivia's Lab
+### Subsection 1
+### Subsection 2
 
 --section Orientation --mode replace --content "New lead-in."
 
@@ -92,9 +92,9 @@ mode that says what you meant:
 
 - `--mode prepend` writes the lead-in above the subsections and touches
   nothing else.
-- `--section Cosplay` edits one subsection on its own. A heading's own text
-  finds it at any depth; a `Parent > Child` path has to run from the note's
-  top heading down, and a partial one finds nothing.
+- `--section "Subsection 1"` edits one subsection on its own. A heading's own
+  text finds it at any depth; a `Parent > Child` path has to run from the
+  note's top heading down, and a partial one finds nothing.
 - `--mode remove` deletes a section — its heading line and everything under
   it — and is the deliberate way to drop a subsection.
 - To rewrite the whole subtree, carry the child headings in the content. That

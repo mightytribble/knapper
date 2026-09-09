@@ -1229,7 +1229,7 @@ mod tests {
         let u = Update::from_cli(
             "n.md".into(),
             CliEdit {
-                section: Some("Orientation".into()),
+                section: Some("Overview".into()),
                 property: None,
                 heading: None,
                 mode: EditMode::Remove,

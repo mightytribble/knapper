@@ -1858,12 +1858,12 @@ mod tests {
     /// the message names what would have gone (#116).
     #[test]
     fn a_section_replace_refuses_to_drop_the_subsections_its_content_omits() {
-        let doc = "## Orientation\n\nLead.\n\n### Cosplay\n\nA.\n\n### Lab\n\nB.\n";
-        let err = apply_section_edit(doc, "Orientation", "New lead.", EditMode::Replace)
+        let doc = "## Overview\n\nLead.\n\n### Alpha\n\nA.\n\n### Beta\n\nB.\n";
+        let err = apply_section_edit(doc, "Overview", "New lead.", EditMode::Replace)
             .expect_err("a replace that drops subsections is refused");
         let msg = format!("{err}");
-        assert!(msg.contains("Cosplay"), "{msg}");
-        assert!(msg.contains("Lab"), "{msg}");
+        assert!(msg.contains("Alpha"), "{msg}");
+        assert!(msg.contains("Beta"), "{msg}");
         // The message names the routes that do what the caller meant, and a
         // caller that reads it acts on those and not on a guess.
         assert!(msg.contains("prepend"), "{msg}");
@@ -1875,18 +1875,15 @@ mod tests {
     /// caller's intent, and this is the shape that states the intent (#116).
     #[test]
     fn a_section_replace_that_restates_a_subsection_is_written() {
-        let doc = "## Orientation\n\nLead.\n\n### Cosplay\n\nA.\n";
+        let doc = "## Overview\n\nLead.\n\n### Alpha\n\nA.\n";
         let out = apply_section_edit(
             doc,
-            "Orientation",
-            "New lead.\n\n### Cosplay\n\nRewritten.",
+            "Overview",
+            "New lead.\n\n### Alpha\n\nRewritten.",
             EditMode::Replace,
         )
         .unwrap();
-        assert_eq!(
-            out,
-            "## Orientation\n\nNew lead.\n\n### Cosplay\n\nRewritten.\n"
-        );
+        assert_eq!(out, "## Overview\n\nNew lead.\n\n### Alpha\n\nRewritten.\n");
     }
 
     /// `prepend` writes the lead-in above the subsections and deletes
@@ -1894,12 +1891,9 @@ mod tests {
     /// guarded (#116).
     #[test]
     fn a_prepend_to_a_parent_section_leaves_its_subsections_alone() {
-        let doc = "## Orientation\n\nLead.\n\n### Cosplay\n\nA.\n";
-        let out = apply_section_edit(doc, "Orientation", "New lead.", EditMode::Prepend).unwrap();
-        assert_eq!(
-            out,
-            "## Orientation\n\nNew lead.\nLead.\n\n### Cosplay\n\nA.\n"
-        );
+        let doc = "## Overview\n\nLead.\n\n### Alpha\n\nA.\n";
+        let out = apply_section_edit(doc, "Overview", "New lead.", EditMode::Prepend).unwrap();
+        assert_eq!(out, "## Overview\n\nNew lead.\nLead.\n\n### Alpha\n\nA.\n");
     }
 
     /// A promoted bold line is a section, so it is one a remove deletes, and
