@@ -7,6 +7,7 @@
 //! capped. It is for verification and maintenance — "prove nothing still says
 //! X" — and not for discovery, which is what `search` is for.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 
 /// One chunk's text, with what addresses it.
@@ -39,9 +40,30 @@ impl Query {
         }
     }
 
-    /// Whether the haystack holds the pattern. The pattern is a literal, so
-    /// `.` and `*` are themselves and nothing else.
+    /// Whether the haystack holds the pattern, as it is written or as it is
+    /// read. The pattern is a literal, so `.` and `*` are themselves and
+    /// nothing else.
+    ///
+    /// A wikilink is markup the reader of a note never sees, so a phrase that
+    /// spans one is absent from the raw line and present in the note: the
+    /// line `the [[style-guide|Style Guide]] review group` holds "Style Guide
+    /// review group" for every reader and for no substring search. Both readings are compared,
+    /// so neither the phrase nor the markup itself can be missed, and
+    /// `notes: 0` says the pattern is absent from both (#118).
     fn matches(&self, haystack: &str) -> bool {
+        if self.holds(haystack) {
+            return true;
+        }
+        match crate::graph::render_wikilinks(haystack) {
+            // A line with no link to render reads as it is written, so the
+            // comparison above was the whole of it.
+            Cow::Borrowed(_) => false,
+            Cow::Owned(rendered) => self.holds(&rendered),
+        }
+    }
+
+    /// One comparison, against one reading of the line.
+    fn holds(&self, haystack: &str) -> bool {
         if self.case_sensitive {
             haystack.contains(&self.pattern)
         } else {
@@ -515,5 +537,99 @@ mod tests {
         assert_eq!(report.notes, 0);
         assert_eq!(report.lines, 0);
         assert!(report.hits.is_empty());
+    }
+
+    const ALIASED: &str = "She joined the [[style-guide|Style Guide]] review group in March.";
+
+    #[test]
+    fn a_phrase_spanning_a_link_matches_the_text_a_reader_sees() {
+        // The note reads "joined the Style Guide review group"; the link
+        // markup sits inside the phrase (#118).
+        let report = scan(
+            vec![row("notes/team.md", None, ALIASED)],
+            "Style Guide review group",
+            false,
+        );
+
+        assert_eq!(report.notes, 1);
+        assert_eq!(report.lines, 1);
+    }
+
+    #[test]
+    fn the_reported_line_is_the_note_as_it_was_written() {
+        // The comparison renders the link; the hit does not, because
+        // `heading_path` and the raw line are what `update` takes back.
+        let report = scan(
+            vec![row("notes/team.md", None, ALIASED)],
+            "Style Guide review group",
+            false,
+        );
+
+        assert_eq!(report.hits[0].line, ALIASED);
+    }
+
+    #[test]
+    fn the_link_markup_itself_still_matches() {
+        // Link maintenance asks for the markup — "what still points at
+        // style-guide" — and that question survives the rendering (#118).
+        let report = scan(
+            vec![row("notes/team.md", None, ALIASED)],
+            "[[style-guide|",
+            false,
+        );
+
+        assert_eq!(report.notes, 1);
+    }
+
+    #[test]
+    fn a_plain_link_matches_the_note_it_names() {
+        let report = scan(
+            vec![row(
+                "notes/rota.md",
+                None,
+                "The rota lives in [[the-annex]] now.",
+            )],
+            "in the-annex now",
+            false,
+        );
+
+        assert_eq!(report.notes, 1);
+    }
+
+    #[test]
+    fn a_display_text_comparison_folds_case_like_any_other() {
+        let report = scan(
+            vec![row("notes/team.md", None, ALIASED)],
+            "style guide review group",
+            false,
+        );
+
+        assert_eq!(report.notes, 1);
+    }
+
+    #[test]
+    fn a_case_sensitive_pattern_compares_the_display_text_exactly() {
+        let report = scan(
+            vec![row("notes/team.md", None, ALIASED)],
+            "style guide review group",
+            true,
+        );
+
+        assert_eq!(report.notes, 0);
+    }
+
+    #[test]
+    fn a_line_holding_the_pattern_in_both_forms_is_one_line() {
+        // "style guide" is in the markup and in the display text both. The
+        // line is one line of the note, so the counts say one.
+        let report = scan(
+            vec![row("notes/team.md", None, ALIASED)],
+            "style guide",
+            false,
+        );
+
+        assert_eq!(report.notes, 1);
+        assert_eq!(report.lines, 1);
+        assert_eq!(report.hits.len(), 1);
     }
 }

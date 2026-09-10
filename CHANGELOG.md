@@ -11,6 +11,8 @@ Links resolve against https://github.com/mightytribble/knapper.
 
 ### Fixed
 
+- `match` finds a phrase that spans a wikilink (#118). A wikilink is compared as its display text as well as its markup, so `match "Style Guide review"` finds the line written `the [[style-guide|Style Guide]] review` — it answered `No note holds "…"` before, which is the one answer this capability exists to be trusted on. Searching for the markup itself still works, and the reported line is still the note as written. ([`236b70b`](https://github.com/mightytribble/knapper/commit/236b70b))
+
 - A section `replace` no longer deletes the subsections the section owns (#116). A section runs to the next heading at or above its own level, so a `replace` on a `##` wrote over every `###` under it — a caller writing the lead-in prose alone lost the rest, and the write reported success. Content that carries none of those subsections is now refused, with a message naming them. Use `prepend` for the lead-in, name a subsection to edit it alone, or `remove` one to drop it. Content that carries the child headings is a deliberate rewrite and still goes through. ([`5fcff95`](https://github.com/mightytribble/knapper/commit/5fcff95))
 - A section `remove` names the notes whose `[[Note#Heading]]` links it left stale, the subsections it took included. ([`5fcff95`](https://github.com/mightytribble/knapper/commit/5fcff95))
 

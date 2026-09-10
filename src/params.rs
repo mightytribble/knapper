@@ -212,7 +212,8 @@ pub struct List {
 #[derive(Debug, Args, Deserialize, JsonSchema)]
 pub struct Match {
     /// The literal string to look for. It is text and not a pattern: `.`,
-    /// `*` and `[` are themselves.
+    /// `*` and `[` are themselves. A wikilink is compared as its display
+    /// text as well as its markup, so a phrase that spans one is found.
     pub pattern: String,
     /// Compare the pattern exactly. The default folds case, which is what
     /// the keyword index does.

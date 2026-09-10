@@ -176,6 +176,11 @@ The counts come back whole even when `--limit` shortens the listed lines. It
 reads the indexed note bodies, so it does not see frontmatter, and it will
 not tell you what a note is *about* — that is what `search` is for.
 
+A wikilink is compared as its display text as well as its markup, so
+`Style Guide review` finds the line written `the [[style-guide|Style
+Guide]] review` — and `[[style-guide|` still finds the link itself, which is
+the query link maintenance asks. The line the hit reports is the note as written.
+
 ## What stops an agent from mangling my notes?
 
 An agent edits by naming a section, not by rewriting a file. `read` returns a

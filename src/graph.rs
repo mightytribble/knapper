@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
@@ -71,6 +72,58 @@ pub fn extract_wikilink_targets(text: &str) -> Vec<String> {
         .map(|l| l.target)
         .filter(|t| seen.insert(t.clone()))
         .collect()
+}
+
+/// The text a reader sees, with every wikilink rendered as its display text.
+///
+/// `[[target|display]]` reads as `display` and `[[target]]` as `target`, so a
+/// phrase that spans a link — "the Style Guide review group", written
+/// `the [[style-guide|Style Guide]] review group` — is one string here and not
+/// three. It is
+/// what `match` compares against beside the raw line (#118).
+pub fn render_wikilinks(text: &str) -> Cow<'_, str> {
+    if !text.contains("[[") {
+        return Cow::Borrowed(text);
+    }
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    let mut i = 0;
+
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'[' && bytes[i + 1] == b'[' {
+            // A reader of an embed sees the note it transcludes, not the
+            // target's name, so there is no display text to write in its
+            // place. `extract_wikilinks` skips one for its own reasons.
+            let is_embed = i > 0 && bytes[i - 1] == b'!';
+            if let Some(rest) = text.get(i + 2..)
+                && let Some(close) = rest.find("]]")
+            {
+                let inner = &rest[..close];
+                if !is_embed && !inner.is_empty() && !inner.contains('\n') {
+                    out.push_str(&text[copied..i]);
+                    out.push_str(link_display(inner));
+                    i += 2 + close + 2;
+                    copied = i;
+                    continue;
+                }
+                i += 2 + close + 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
+
+    out.push_str(&text[copied..]);
+    Cow::Owned(out)
+}
+
+/// What one link's inner text reads as: the alias, or the address it names.
+fn link_display(inner: &str) -> &str {
+    match inner.split_once('|') {
+        Some((_, display)) => display.trim(),
+        None => inner.trim(),
+    }
 }
 
 /// Resolve a wikilink target name to a file ID in the store.
@@ -475,6 +528,68 @@ mod tests {
         assert!(targets.contains(&"Note One".to_string()));
         assert!(targets.contains(&"Note Two".to_string()));
         assert_eq!(targets.len(), 2); // deduplicated
+    }
+
+    #[test]
+    fn an_aliased_link_reads_as_its_alias() {
+        assert_eq!(
+            render_wikilinks("joined the [[style-guide|Style Guide]] review group"),
+            "joined the Style Guide review group"
+        );
+    }
+
+    #[test]
+    fn a_plain_link_reads_as_the_note_it_names() {
+        assert_eq!(
+            render_wikilinks("the rota lives in [[the-annex]]"),
+            "the rota lives in the-annex"
+        );
+    }
+
+    #[test]
+    fn a_line_with_no_link_is_the_line_itself() {
+        let line = "the rota lives in the annex";
+        assert!(matches!(render_wikilinks(line), Cow::Borrowed(_)));
+        assert_eq!(render_wikilinks(line), line);
+    }
+
+    #[test]
+    fn a_link_naming_a_heading_reads_as_the_address_it_wrote() {
+        // Obsidian draws a separator here that the vault text does not hold.
+        // The address as written is what a search for it would be typed as,
+        // and the raw comparison beside this one still holds the markup.
+        assert_eq!(
+            render_wikilinks("see [[handbook#Onboarding]] for the rest"),
+            "see handbook#Onboarding for the rest"
+        );
+    }
+
+    #[test]
+    fn an_escaped_pipe_in_a_table_is_still_the_alias_separator() {
+        // Obsidian escapes the alias pipe inside a table cell.
+        assert_eq!(
+            render_wikilinks(r"| [[style-guide\|Style Guide]] | 2024 |"),
+            "| Style Guide | 2024 |"
+        );
+    }
+
+    #[test]
+    fn an_embed_is_left_as_it_was_written() {
+        // A reader of an embed sees the note it transcludes, which is not the
+        // target's name — so rendering one would invent text the page has
+        // nowhere. `extract_wikilinks` skips embeds for its own reasons.
+        assert_eq!(
+            render_wikilinks("![[floor-plan.png]]"),
+            "![[floor-plan.png]]"
+        );
+    }
+
+    #[test]
+    fn an_unclosed_link_is_left_as_it_was_written() {
+        assert_eq!(
+            render_wikilinks("the rota lives in [[the-annex"),
+            "the rota lives in [[the-annex"
+        );
     }
 
     #[test]

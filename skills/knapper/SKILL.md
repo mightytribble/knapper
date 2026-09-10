@@ -35,7 +35,9 @@ contract: one literal pattern, exhaustive over every note in scope, unranked,
 so `No note holds "…"` is a reliable answer. Reach for `match` to confirm an
 edit took, or to find what still carries an old form. It reads indexed note
 bodies, so it does not see frontmatter, and it will not tell you what a note
-is about.
+is about. A wikilink is compared as its display text as well as its markup,
+so `Style Guide review` finds `[[style-guide|Style Guide]] review` and
+`[[style-guide|` finds the link itself.
 
 `list` has no default cap and answers in path order, so it is the call for
 "all of them". `search` is the call for "the good ones".
