@@ -3,16 +3,24 @@
 Every entry below the upstream-lineage line names the commit it describes.
 Links resolve against https://github.com/mightytribble/knapper.
 
-## Unreleased
+## 0.9.10 (2026-09-10)
+
+An MCP result is smaller. The framing is compact, a tag carries its display
+form only where it differs from its path, and a search answer holds each
+note's properties once. `list` gains a links-in ranking, and a section can be
+removed as well as replaced.
+
+Response shapes change on MCP and HTTP. Nothing re-indexes and nothing
+re-embeds on the upgrade.
 
 ### Added
 
-- `list --sort links-in` ranks notes by how many other notes link to them (#121), so finding a vault's hubs no longer means listing every note and sorting them yourself. `links-in-asc` ranks the least-linked first. ([`a212c2f`](https://github.com/mightytribble/knapper/commit/a212c2f))
+- `list --sort links-in` ranks notes by how many other notes link to them (#121). `links-in-asc` ranks the least-linked first. ([`a212c2f`](https://github.com/mightytribble/knapper/commit/a212c2f))
 - `update --mode remove` can now delete a section (#117). It takes the heading line and everything under it, and reads no content.  ([`5fcff95`](https://github.com/mightytribble/knapper/commit/5fcff95))
 
 ### Fixed
 
-- A piped command ends quietly when the reader closes early, rather than printing a panic and exiting 101 (#128). `knapper tags | head -3` was the case; the longer the listing, the more reliably it happened. ([`ea16760`](https://github.com/mightytribble/knapper/commit/ea16760))
+- A piped command ends quietly when the reader closes early, rather than printing a panic and exiting 101 (#128). `knapper tags | head -3` was the case. ([`ea16760`](https://github.com/mightytribble/knapper/commit/ea16760))
 - `search --explain` now travels as an `explain` key in the search envelope on MCP and HTTP; the CLI still prints it after the results. ([`2d80f39`](https://github.com/mightytribble/knapper/commit/2d80f39))
 - `match` finds a phrase that spans a wikilink (#118). Searching for the markup itself still works, and the reported line is still the note as written. ([`236b70b`](https://github.com/mightytribble/knapper/commit/236b70b))
 - A section `replace` no longer deletes the subsections the section owns (#116). Content that carries the child headings is a deliberate rewrite and still goes through. ([`5fcff95`](https://github.com/mightytribble/knapper/commit/5fcff95))
@@ -20,7 +28,7 @@ Links resolve against https://github.com/mightytribble/knapper.
 
 ### Changed
 
-- An MCP tool result travels as compact JSON in place of an indented rendering (#127). On a 222-tag vocabulary that is a third of the characters and half the tokens. The CLI's own `--json` output is unchanged.
+- An MCP tool result travels as compact JSON in place of an indented rendering (#127). On a 222-tag vocabulary that is a third of the characters and half the tokens. The CLI's own `--json` output is unchanged. ([`9947c82`](https://github.com/mightytribble/knapper/commit/9947c82))
 - `tags` returns `display` only where the vault spells a tag differently from its path (#120). A vault that never capitalises a tag now carries the field on no row, which is about a third of the listing. A client reading `display` reads `display ?? path`. ([`ae21961`](https://github.com/mightytribble/knapper/commit/ae21961))
 - `list` answers `indexed_at` as a timestamp — `2026-09-10T04:19:05Z` — in place of a bare epoch in a string (#121). ([`67eccb6`](https://github.com/mightytribble/knapper/commit/67eccb6))
 - `list` answers `links_in` in place of `edge_count` (#121). It counts the distinct notes that link to a note, over the whole vault; `edge_count` counted link occurrences both ways, so a note named from eight sections of one note scored eight. ([`a212c2f`](https://github.com/mightytribble/knapper/commit/a212c2f))
