@@ -86,8 +86,12 @@ fn mcp_err(e: &anyhow::Error) -> McpError {
     )
 }
 
+/// Every tool but `search` answers through here, and the text block is what
+/// the model reads (#124), so the JSON is compact: indentation is tokens the
+/// caller pays for and no reader of this channel is human (#127). The CLI
+/// pretty-prints its own `--json`, where a person reads it.
 fn to_json_result<T: serde::Serialize>(value: &T) -> Result<CallToolResult, McpError> {
-    let json = serde_json::to_string_pretty(value).map_err(|e| {
+    let json = serde_json::to_string(value).map_err(|e| {
         McpError::new(
             rmcp::model::ErrorCode::INTERNAL_ERROR,
             e.to_string(),
@@ -1730,6 +1734,31 @@ mod tests {
             rows.len() > 3,
             "the corpus holds more than three answers, got {rows:?}"
         );
+    }
+
+    /// The text block is what the model reads from every tool but `search`
+    /// (#124 measured 2179 of them), so the framing is tokens the caller pays
+    /// for (#127). A newline can only come from the framing: one inside note
+    /// text is escaped as `\n` within a JSON string.
+    #[tokio::test]
+    async fn a_json_result_is_framed_without_indentation() {
+        let (_tmp, server) = indexed_server(crate::config::GroupBy::Chunk);
+
+        let result = server.vault_map().await.unwrap();
+        let text = &result
+            .content
+            .first()
+            .expect("a content block")
+            .as_text()
+            .expect("a text block")
+            .text;
+
+        assert!(
+            !text.contains('\n'),
+            "indentation the model pays for: {text}"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert!(parsed.get("folders").is_some(), "got {parsed}");
     }
 
     /// The MCP contract (#35): `structuredContent` carries `blocks`/`overflow`,
