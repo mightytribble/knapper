@@ -7,6 +7,7 @@ Links resolve against https://github.com/mightytribble/knapper.
 
 ### Added
 
+- `list --sort links-in` ranks notes by how many other notes link to them (#121), so finding a vault's hubs no longer means listing every note and sorting them yourself. `links-in-asc` ranks the least-linked first. ([`a212c2f`](https://github.com/mightytribble/knapper/commit/a212c2f))
 - `update --mode remove` can now delete a section (#117). It takes the heading line and everything under it, and reads no content.  ([`5fcff95`](https://github.com/mightytribble/knapper/commit/5fcff95))
 
 ### Fixed
@@ -18,6 +19,7 @@ Links resolve against https://github.com/mightytribble/knapper.
 
 ### Changed
 
+- `list` answers `links_in` in place of `edge_count` (#121). It counts the distinct notes that link to a note, over the whole vault; `edge_count` counted link occurrences both ways, so a note named from eight sections of one note scored eight. ([`a212c2f`](https://github.com/mightytribble/knapper/commit/a212c2f))
 - A search answer no longer repeats a note's frontmatter on every section it returns (#119). This changes the JSON that `search` returns on all three surfaces; the text rendering is unchanged. ([`2789a92`](https://github.com/mightytribble/knapper/commit/2789a92))
 - A search returns more of one note when the answer is spread across it. `[ranking] shortlist_cap` is 8 and `candidates` is 32, so up to eight sections of a note reach the scorer. ([`66378e2`](https://github.com/mightytribble/knapper/commit/66378e2))
 
