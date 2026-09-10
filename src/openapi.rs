@@ -123,7 +123,7 @@ fn build_match() -> serde_json::Value {
                     }
                 }}}
             },
-            "responses": { "200": { "description": "{pattern, notes (how many notes hold it — 0 means nothing in scope says it), lines (distinct matched lines across every note), hits (the matched lines, capped by limit, each {file, heading_path, line})}. The scan is exhaustive and unranked over the indexed note bodies, so it does not read frontmatter." } }
+            "responses": { "200": { "description": "{pattern, notes (how many notes hold it — 0 means nothing in scope says it), lines (distinct matched lines across every note), hits (the matched lines, capped by limit, each {file, heading_path, line})}. The scan is exhaustive and unranked over the indexed note bodies, so it does not read frontmatter. A wikilink is compared as its display text as well as its markup, so a phrase spanning one is found; the reported line is the note as written." } }
         }
     })
 }
