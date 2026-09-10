@@ -18,6 +18,8 @@ Links resolve against https://github.com/mightytribble/knapper.
 
 ### Changed
 
+- A search answer no longer repeats a note's frontmatter on every section it returns (#119). The properties of each answering note now sit once in `notes`, keyed by path, and a value carries its own JSON type — a number is a number, a checkbox a bool, a wikilink `{link, path}` with the note it resolves to, and a name the note carries more than once an array. Each result names the lanes that found it in `lanes` (`semantic`, `keyword`, `linked`) in place of the four-field `provenance` object. A five-result answer over two notes is 14% smaller, with the text unchanged. This changes the JSON that `search` returns on all three surfaces; the text rendering is unchanged. (COMMIT_SHA)
+
 - A search returns more of one note when the answer is spread across it. `[ranking] shortlist_cap` is 8 and `candidates` is 32, so up to eight sections of a note reach the scorer. Nothing re-indexes. `shortlist_cap = 3` restores the narrower behaviour. ([`66378e2`](https://github.com/mightytribble/knapper/commit/66378e2))
 
 ## 0.9.9 (2026-09-04)
