@@ -19,6 +19,7 @@ Links resolve against https://github.com/mightytribble/knapper.
 
 ### Changed
 
+- `list` answers `indexed_at` as a timestamp — `2026-09-10T04:19:05Z` — in place of a bare epoch in a string (#121). ([`67eccb6`](https://github.com/mightytribble/knapper/commit/67eccb6))
 - `list` answers `links_in` in place of `edge_count` (#121). It counts the distinct notes that link to a note, over the whole vault; `edge_count` counted link occurrences both ways, so a note named from eight sections of one note scored eight. ([`a212c2f`](https://github.com/mightytribble/knapper/commit/a212c2f))
 - A search answer no longer repeats a note's frontmatter on every section it returns (#119). This changes the JSON that `search` returns on all three surfaces; the text rendering is unchanged. ([`2789a92`](https://github.com/mightytribble/knapper/commit/2789a92))
 - A search returns more of one note when the answer is spread across it. `[ranking] shortlist_cap` is 8 and `candidates` is 32, so up to eight sections of a note reach the scorer. ([`66378e2`](https://github.com/mightytribble/knapper/commit/66378e2))
