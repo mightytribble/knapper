@@ -141,6 +141,29 @@ enabled = false
 # intercept = -8.762
 # floor = 0.75                 # probability below which a result is dropped
 
+# What a search answer carries. Both keys are query-time.
+# [output]
+# budget_tokens = 8192         # token budget for the text a search returns.
+#                              # The fill is greedy in rank order and the
+#                              # first result always goes in; what does not
+#                              # fit is listed in `overflow` as a summary,
+#                              # and a warning names the budget as what
+#                              # shortened the answer. Per call it is
+#                              # `--tokens` on the CLI and `budget_tokens` on
+#                              # MCP and HTTP, and `--full` ignores it.
+# emit_text_rendering = true   # whether an MCP search result carries the
+#                              # text rendering beside the structured
+#                              # envelope. The CLI renders text
+#                              # unconditionally and HTTP answers with the
+#                              # envelope alone, so this key reaches neither.
+#                              # A host that reads `structuredContent`
+#                              # ignores the second block — Claude Code
+#                              # discards it — and false stops knapper
+#                              # building and sending it. A client that reads
+#                              # content blocks and not `structuredContent`
+#                              # needs it true: with it false, that client is
+#                              # shown nothing.
+
 # The file watcher behind `knapper serve`.
 # [watcher]
 # backend = "auto"             # "native" (inotify/FSEvents) or "poll".
