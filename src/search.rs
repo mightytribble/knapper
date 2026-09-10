@@ -1664,8 +1664,8 @@ pub fn run_search(
 ///
 /// It reads the retrieval trace and the fused lanes, which no caller of the
 /// pipeline holds by any other route, so the one composition serves all three
-/// surfaces: the CLI prints it, MCP sends it as a second content block and the
-/// HTTP envelope carries it in `explain` (#62). It is built only when the
+/// surfaces: the CLI prints it after the rendered results, and the MCP and
+/// HTTP envelopes carry it in `explain` (#62, #126). It is built only when the
 /// caller asks for it, because an agent that did not ask must not read past it.
 pub fn explain_report(output: &SearchOutput, top_n: usize) -> String {
     let mut out = format_retrieval(&output.retrieval, &output.fts_columns);
