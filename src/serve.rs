@@ -243,7 +243,7 @@ impl KnapperServer {
 
     #[tool(
         name = "list",
-        description = "List notes filtered by scope operators (all/any/none). A term is a tag path, or a directory path when it starts with `/`; a trailing `/` matches the tag's descendants or the directory's subtree. Returns every note the scope admits, in path order, with paths, docids, tags and edge counts — and with `detailed`, each note's heading outline."
+        description = "List notes, filtered by scope operators (all/any/none) or with no filter at all to enumerate the whole vault. A term is a tag path, or a directory path when it starts with `/`; a trailing `/` matches the tag's descendants or the directory's subtree. Returns every note the scope admits, in path order, with paths, docids, tags and edge counts — and with `detailed`, each note's heading outline."
     )]
     async fn list(
         &self,
