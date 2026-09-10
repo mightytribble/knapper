@@ -303,8 +303,20 @@ pub struct IdentityFact {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TagCount {
     pub path: String,
-    pub display: String,
+    /// The vault's own spelling, and absent when that is the path itself
+    /// (#120). A vault that never capitalises a tag carries the field on no
+    /// row. Read it through [`TagCount::as_written`], which answers either way.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display: Option<String>,
     pub note_count: usize,
+}
+
+impl TagCount {
+    /// The tag as the vault wrote it: the display form where there is one,
+    /// else the path, which is what the vault wrote.
+    pub fn as_written(&self) -> &str {
+        self.display.as_deref().unwrap_or(&self.path)
+    }
 }
 
 /// A property row as it is written (#66). One argument rather than five.
@@ -2236,9 +2248,12 @@ impl Store {
               GROUP BY t.id ORDER BY t.path"
         ))?;
         let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |row| {
+            let path: String = row.get(0)?;
+            let display: String = row.get(1)?;
             Ok(TagCount {
-                path: row.get(0)?,
-                display: row.get(1)?,
+                // The display form earns a field only where it differs (#120).
+                display: (display != path).then_some(display),
+                path,
                 note_count: row.get::<_, i64>(2)? as usize,
             })
         })?;
@@ -7052,9 +7067,66 @@ mod tests {
         let rows = store
             .tags_under(Some(&crate::tags::parse_term("type/").unwrap()))
             .unwrap();
-        let displays: Vec<String> = rows.into_iter().map(|t| t.display).collect();
+        let displays: Vec<String> = rows.iter().map(|t| t.as_written().to_string()).collect();
         // The vault's own spelling comes back, not the folded path.
         assert_eq!(displays, vec!["Type", "Type/Undead"]);
+    }
+
+    /// One tag the vault capitalises and one it does not.
+    fn mixed_case_fixture() -> Store {
+        let store = Store::open_memory().unwrap();
+        let one = store
+            .insert_file("one.md", "h", 1, "d000001", None, None)
+            .unwrap();
+        store
+            .reconcile_file_tags(
+                one,
+                &[
+                    crate::tags::Tag {
+                        path: "type/undead".into(),
+                        display: "Type/Undead".into(),
+                    },
+                    crate::tags::Tag {
+                        path: "active-threat".into(),
+                        display: "active-threat".into(),
+                    },
+                ],
+            )
+            .unwrap();
+        store
+    }
+
+    #[test]
+    fn a_tag_the_vault_spells_as_its_path_holds_no_separate_display_form() {
+        let store = mixed_case_fixture();
+        let rows = store.tags_under(None).unwrap();
+        let forms: Vec<(&str, Option<&str>)> = rows
+            .iter()
+            .map(|t| (t.path.as_str(), t.display.as_deref()))
+            .collect();
+        assert_eq!(
+            forms,
+            vec![
+                ("active-threat", None),
+                ("type/undead", Some("Type/Undead"))
+            ]
+        );
+        // A caller asking for the spelling gets one either way.
+        assert_eq!(rows[0].as_written(), "active-threat");
+        assert_eq!(rows[1].as_written(), "Type/Undead");
+    }
+
+    #[test]
+    fn a_serialised_row_carries_display_only_where_it_differs_from_the_path() {
+        let store = mixed_case_fixture();
+        let rows = store.tags_under(None).unwrap();
+        let json = serde_json::to_value(&rows).unwrap();
+        assert!(
+            json[0].get("display").is_none(),
+            "a tag written as its path pays for no display field: {}",
+            json[0]
+        );
+        assert_eq!(json[1]["display"], "Type/Undead");
     }
 
     #[test]
