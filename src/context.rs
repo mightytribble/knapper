@@ -115,6 +115,7 @@ pub struct NoteListItem {
     pub path: String,
     pub docid: Option<String>,
     pub tags: Vec<String>,
+    /// When this note was last indexed, as `YYYY-MM-DDTHH:MM:SSZ` (#121).
     pub indexed_at: String,
     /// How many distinct notes link to this note (#121). A note named from
     /// eight sections of one note counts one, and a link written in
@@ -401,6 +402,32 @@ fn matched_properties(
     )?))
 }
 
+/// The stored `indexed_at` as a timestamp a reader does not have to convert
+/// (#121).
+///
+/// The column holds epoch seconds as text: `health` parses it back with
+/// `parse::<u64>()` for index age and `list_recent` orders on it as text, so
+/// the conversion belongs on the way out and not in the column. A value that
+/// is not a number is passed through as it stands, so a row this cannot read
+/// is reported rather than dropped.
+fn indexed_at_iso(stored: &str) -> String {
+    let Ok(seconds) = stored.parse::<i64>() else {
+        return stored.to_string();
+    };
+    let Ok(dt) = time::OffsetDateTime::from_unix_timestamp(seconds) else {
+        return stored.to_string();
+    };
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        dt.year(),
+        dt.month() as u8,
+        dt.day(),
+        dt.hour(),
+        dt.minute(),
+        dt.second(),
+    )
+}
+
 /// The notes a scope admits, in the order `order` names (#68, #121). A
 /// caller's directory filter is a scope term, which is a case-sensitive range
 /// and not a `LIKE`.
@@ -432,7 +459,7 @@ pub fn context_list(
             path: f.path,
             docid: f.docid,
             tags: f.tags,
-            indexed_at: f.indexed_at,
+            indexed_at: indexed_at_iso(&f.indexed_at),
             links_in,
             headings,
             properties,
@@ -491,6 +518,18 @@ mod tests {
     use crate::docid::generate_docid;
     use crate::store::{DOC_LEVEL, Store};
     use tempfile::TempDir;
+
+    #[test]
+    fn an_indexed_at_reads_as_a_timestamp_and_not_an_epoch() {
+        assert_eq!(indexed_at_iso("1789013945"), "2026-09-10T04:19:05Z");
+    }
+
+    #[test]
+    fn an_indexed_at_this_cannot_read_is_passed_through() {
+        // Whatever the column holds reaches the caller. A row this drops is a
+        // row a caller cannot tell from a note that was never indexed.
+        assert_eq!(indexed_at_iso("not a number"), "not a number");
+    }
 
     /// A tag whose display form is its path.
     fn tag(path: &str) -> crate::tags::Tag {
