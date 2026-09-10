@@ -22,14 +22,11 @@ pub struct Block {
     pub id: String,
     pub path: String,
     pub heading_path: String,
-    pub provenance: Provenance,
+    /// Which lanes account for this result (#119).
+    pub lanes: Vec<Lane>,
     pub text: String,
     pub untrusted_content: bool,
     pub truncated: bool,
-    /// The parent note's frontmatter properties. Omitted when empty, so a
-    /// vault with no custom properties renders as before (#66).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub properties: Vec<crate::store::PropertyRow>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub score: Option<f64>,
 }
@@ -40,7 +37,8 @@ pub struct Summary {
     pub id: String,
     pub path: String,
     pub heading_path: String,
-    pub provenance: Provenance,
+    /// Which lanes account for this result (#119).
+    pub lanes: Vec<Lane>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub score: Option<f64>,
 }
@@ -51,8 +49,69 @@ pub struct SearchEnvelope {
     pub status: SearchStatus,
     pub degraded: bool,
     pub warnings: Vec<String>,
+    /// Each note a block came from, keyed by path, with that note's
+    /// frontmatter properties (#119).
+    ///
+    /// The rows sat on every block before, so a note that answered with four
+    /// of its sections carried four identical copies. Omitted when no
+    /// included note carries a property, so a vault with no custom properties
+    /// renders as it did before (#66).
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub notes: std::collections::BTreeMap<String, NoteProperties>,
     pub blocks: Vec<Block>,
     pub overflow: Vec<Summary>,
+}
+
+/// One note's frontmatter properties, by name (#119).
+pub type NoteProperties = std::collections::BTreeMap<String, PropertyValue>;
+
+/// One property value, under its own JSON type (#119).
+///
+/// `store::PropertyRow` carries every value as a `String` with a separate
+/// `kind`, so the row's text alone cannot tell the number `5` from the text
+/// `"5"`, or a link from the words it is written with. The kind decides the
+/// type here instead, which is what lets the rows collapse to a name-keyed
+/// map without losing what they hold.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(untagged)]
+pub enum PropertyValue {
+    /// A key the note declares with no value.
+    Empty,
+    Checkbox(bool),
+    Number(serde_json::Number),
+    /// A wikilink, and the note it resolves to when it resolves at all.
+    Link {
+        /// The target as the note writes it, with `#Heading` and `|Display`
+        /// dropped.
+        link: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+    },
+    Text(String),
+    /// Every value of a name the note carries more than once. A YAML list
+    /// writes one row per element, so the name is not unique in the rows.
+    List(Vec<PropertyValue>),
+}
+
+impl PropertyValue {
+    /// The row under its kind's own type. A `number` that does not parse
+    /// stays text, so a malformed row is reported rather than dropped.
+    fn from_row(r: &crate::store::PropertyRow) -> PropertyValue {
+        use crate::properties::Kind;
+        match r.kind {
+            Kind::Empty => PropertyValue::Empty,
+            Kind::Checkbox => PropertyValue::Checkbox(r.value == "true"),
+            Kind::Number => match r.value.parse::<serde_json::Number>() {
+                Ok(n) => PropertyValue::Number(n),
+                Err(_) => PropertyValue::Text(r.value.clone()),
+            },
+            Kind::Link => PropertyValue::Link {
+                link: r.value.clone(),
+                path: r.target_path.clone(),
+            },
+            Kind::Text => PropertyValue::Text(r.value.clone()),
+        }
+    }
 }
 
 /// The knobs `assemble` reads; everything else about a search stays in
@@ -80,7 +139,50 @@ pub struct Provenance {
     pub linked_from: Vec<String>,
 }
 
+/// One retrieval lane, named on the wire the way the text rendering names it
+/// (#119).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Lane {
+    Semantic,
+    Keyword,
+    /// The graph lane. `linked` is the word the text rendering has always
+    /// used for it.
+    Linked,
+}
+
+impl Lane {
+    fn label(self) -> &'static str {
+        match self {
+            Lane::Semantic => "semantic",
+            Lane::Keyword => "keyword",
+            Lane::Linked => "linked",
+        }
+    }
+}
+
 impl Provenance {
+    /// The lanes that fired, in the text rendering's order (#119).
+    ///
+    /// Three booleans and an empty `linked_from` cost a caller more than they
+    /// tell it, so the wire carries the lanes that fired and nothing about
+    /// the ones that did not. `linked_from` reaches no surface until the
+    /// graph lane attributes its seeds (#74); `Provenance` keeps the field so
+    /// that `coalesce` still merges it.
+    pub fn lanes(&self) -> Vec<Lane> {
+        let mut out = Vec::new();
+        if self.semantic {
+            out.push(Lane::Semantic);
+        }
+        if self.keyword {
+            out.push(Lane::Keyword);
+        }
+        if self.graph {
+            out.push(Lane::Linked);
+        }
+        out
+    }
+
     /// Derive provenance from the fused lane contributions and a graph flag the
     /// caller computed from `admitted_by` / `graph_rank`.
     pub fn derive(lanes: &[LaneContribution], graph: bool) -> Provenance {
@@ -113,7 +215,7 @@ fn summary_of(r: &InternalSearchResult) -> Summary {
         id: result_id(r),
         path: r.file_path.clone(),
         heading_path: r.heading_path.clone(),
-        provenance: r.provenance.clone(),
+        lanes: r.provenance.lanes(),
         score: None,
     }
 }
@@ -123,11 +225,10 @@ fn block_of(r: &InternalSearchResult) -> Block {
         id: result_id(r),
         path: r.file_path.clone(),
         heading_path: r.heading_path.clone(),
-        provenance: r.provenance.clone(),
+        lanes: r.provenance.lanes(),
         text: r.text.clone(),
         untrusted_content: true,
         truncated: r.truncated,
-        properties: r.properties.clone(),
         score: None,
     }
 }
@@ -144,6 +245,7 @@ pub fn assemble(results: &[InternalSearchResult], p: AssembleParams) -> SearchEn
             status: SearchStatus::NoResults,
             degraded: p.degraded,
             warnings: Vec::new(),
+            notes: Default::default(),
             blocks: Vec::new(),
             overflow: Vec::new(),
         };
@@ -178,6 +280,7 @@ pub fn assemble(results: &[InternalSearchResult], p: AssembleParams) -> SearchEn
             status: SearchStatus::Ok,
             degraded: p.degraded,
             warnings: Vec::new(),
+            notes: Default::default(),
             blocks,
             overflow,
         };
@@ -215,31 +318,58 @@ pub fn assemble(results: &[InternalSearchResult], p: AssembleParams) -> SearchEn
         ));
     }
 
+    // One entry per note the included blocks came from, however many of its
+    // sections answered (#119).
+    let mut notes: std::collections::BTreeMap<String, NoteProperties> = Default::default();
+    for r in &capped {
+        if r.properties.is_empty() || notes.contains_key(&r.file_path) {
+            continue;
+        }
+        notes.insert(r.file_path.clone(), note_properties(&r.properties));
+    }
+
     SearchEnvelope {
         status: SearchStatus::Ok,
         degraded: p.degraded,
         warnings,
+        notes,
         blocks,
         overflow,
     }
 }
 
-fn provenance_label(p: &Provenance) -> String {
-    let mut parts = Vec::new();
-    if p.semantic {
-        parts.push("semantic");
+/// One note's property rows as a map from name to value (#119).
+fn note_properties(rows: &[crate::store::PropertyRow]) -> NoteProperties {
+    let mut out = NoteProperties::new();
+    for r in rows {
+        let v = PropertyValue::from_row(r);
+        match out.entry(r.name.clone()) {
+            std::collections::btree_map::Entry::Vacant(e) => {
+                e.insert(v);
+            }
+            // A YAML list writes one row per element, so a second row under
+            // one name widens the value rather than replacing it (#119).
+            std::collections::btree_map::Entry::Occupied(mut e) => match e.get_mut() {
+                PropertyValue::List(items) => items.push(v),
+                held => {
+                    let first = std::mem::replace(held, PropertyValue::Empty);
+                    *held = PropertyValue::List(vec![first, v]);
+                }
+            },
+        }
     }
-    if p.keyword {
-        parts.push("keyword");
+    out
+}
+
+fn provenance_label(lanes: &[Lane]) -> String {
+    if lanes.is_empty() {
+        return "none".to_string();
     }
-    if p.graph {
-        parts.push("linked");
-    }
-    if parts.is_empty() {
-        "none".to_string()
-    } else {
-        parts.join("+")
-    }
+    lanes
+        .iter()
+        .map(|l| l.label())
+        .collect::<Vec<_>>()
+        .join("+")
 }
 
 /// Fill each row's `score` from the matching result's confidence — `--scores`
@@ -278,7 +408,7 @@ pub fn render_text(env: &SearchEnvelope, scores: bool) -> String {
             "--- [{}]{pct} {} (matched: {})\n",
             b.id,
             b.heading_path,
-            provenance_label(&b.provenance)
+            provenance_label(&b.lanes)
         ));
         if b.truncated {
             out.push_str("(truncated)\n");
@@ -301,7 +431,7 @@ pub fn render_text(env: &SearchEnvelope, scores: bool) -> String {
             "Not included (lower relevance): [{}]{pct} {} (matched: {})\n",
             s.id,
             s.heading_path,
-            provenance_label(&s.provenance)
+            provenance_label(&s.lanes)
         ));
     }
     out
@@ -482,11 +612,7 @@ mod assemble_tests {
         assert_eq!(block_json["text"], "x".repeat(80 * 3));
         assert_eq!(block_json["untrusted_content"], true);
         assert_eq!(block_json["truncated"], false);
-        let prov = &block_json["provenance"];
-        assert_eq!(prov["keyword"], true);
-        assert_eq!(prov["semantic"], false);
-        assert_eq!(prov["graph"], false);
-        assert_eq!(prov["linked_from"], serde_json::json!([]));
+        assert_eq!(block_json["lanes"], serde_json::json!(["keyword"]));
         // No score requested: the field is absent from the wire, not null.
         assert!(!block_json.as_object().unwrap().contains_key("score"));
 
@@ -502,30 +628,178 @@ mod assemble_tests {
     }
 
     #[test]
-    fn a_block_carries_its_notes_properties_and_omits_an_empty_list() {
-        let mut r = result(0, 10);
-        r.properties = vec![crate::store::PropertyRow {
+    fn a_lanes_wire_name_and_its_text_label_are_the_same_word() {
+        // The JSON name comes from serde and the text rendering's from
+        // `label`, so the two can drift apart on a rename.
+        for l in [Lane::Semantic, Lane::Keyword, Lane::Linked] {
+            assert_eq!(serde_json::to_value(l).unwrap(), l.label());
+        }
+    }
+
+    #[test]
+    fn a_row_names_the_lanes_that_fired_and_no_others() {
+        // `linked_from` has shipped permanently empty since #35, and three
+        // false flags say nothing a caller can act on (#119).
+        let mut r = result(1, 10);
+        r.provenance = Provenance {
+            keyword: true,
+            semantic: true,
+            graph: false,
+            linked_from: vec![],
+        };
+        let env = assemble(&[r], params(10_000));
+        let json = serde_json::to_value(&env).unwrap();
+        assert_eq!(
+            json["blocks"][0]["lanes"],
+            serde_json::json!(["semantic", "keyword"])
+        );
+        let block = json["blocks"][0].as_object().unwrap();
+        assert!(!block.contains_key("provenance"));
+        assert!(!block.contains_key("linked_from"));
+    }
+
+    #[test]
+    fn an_overflow_row_names_its_lanes_the_same_way() {
+        let mut r = result(1, 10);
+        r.provenance = Provenance {
+            keyword: false,
+            semantic: false,
+            graph: true,
+            linked_from: vec![],
+        };
+        let env = assemble(
+            &[r],
+            AssembleParams {
+                budget_tokens: 10_000,
+                full: false,
+                summaries: true,
+                degraded: false,
+                per_note_cap: 0,
+            },
+        );
+        let json = serde_json::to_value(&env).unwrap();
+        assert_eq!(json["overflow"][0]["lanes"], serde_json::json!(["linked"]));
+    }
+
+    fn prop(name: &str, value: &str, kind: crate::properties::Kind) -> crate::store::PropertyRow {
+        crate::store::PropertyRow {
             chunk_seq: crate::store::DOC_LEVEL,
             heading_path: None,
-            name: "status".into(),
-            value: "draft".into(),
-            kind: crate::properties::Kind::Text,
+            name: name.into(),
+            value: value.into(),
+            kind,
             target_path: None,
-        }];
-        let p = || AssembleParams {
-            budget_tokens: 10_000,
-            full: false,
-            summaries: false,
-            degraded: false,
-            per_note_cap: 0,
-        };
-        let env = assemble(&[r.clone()], p());
+        }
+    }
+
+    #[test]
+    fn two_blocks_of_one_note_share_one_notes_entry() {
+        // Item 1 of #119: the duplication this removes is the whole point —
+        // four chunks of one note carried four identical property copies.
+        use crate::properties::Kind;
+        let mut a = result(1, 10);
+        let mut b = result(2, 10);
+        b.file_path = a.file_path.clone();
+        let rows = vec![prop("status", "draft", Kind::Text)];
+        a.properties = rows.clone();
+        b.properties = rows;
+        let env = assemble(&[a, b], params(10_000));
         let json = serde_json::to_value(&env).unwrap();
-        assert_eq!(json["blocks"][0]["properties"][0]["name"], "status");
+        assert_eq!(json["notes"]["n1.md"]["status"], "draft");
+        assert_eq!(json["notes"].as_object().unwrap().len(), 1);
+        // The rows no longer ride on the block.
+        assert!(
+            !json["blocks"][0]
+                .as_object()
+                .unwrap()
+                .contains_key("properties")
+        );
+    }
+
+    fn link_prop(name: &str, value: &str, target: Option<&str>) -> crate::store::PropertyRow {
+        let mut r = prop(name, value, crate::properties::Kind::Link);
+        r.target_path = target.map(str::to_string);
+        r
+    }
+
+    #[test]
+    fn a_link_carries_the_note_it_resolves_to() {
+        // The resolved path is the addressable half: it is what a caller can
+        // hand to `read` without another lookup (#119).
+        let mut r = result(1, 10);
+        r.properties = vec![link_prop(
+            "part_of",
+            "Volgard",
+            Some("locations/Volgard.md"),
+        )];
+        let env = assemble(&[r], params(10_000));
+        let n = &serde_json::to_value(&env).unwrap()["notes"]["n1.md"];
+        assert_eq!(n["part_of"]["link"], "Volgard");
+        assert_eq!(n["part_of"]["path"], "locations/Volgard.md");
+    }
+
+    #[test]
+    fn a_link_that_resolves_to_nothing_carries_no_path() {
+        let mut r = result(1, 10);
+        r.properties = vec![link_prop("part_of", "Nowhere", None)];
+        let env = assemble(&[r], params(10_000));
+        let n = &serde_json::to_value(&env).unwrap()["notes"]["n1.md"];
+        assert_eq!(n["part_of"]["link"], "Nowhere");
+        assert!(!n["part_of"].as_object().unwrap().contains_key("path"));
+    }
+
+    #[test]
+    fn a_name_the_note_carries_twice_becomes_an_array() {
+        // A YAML list writes one row per element (`properties.rs`), so a
+        // name-keyed map has to hold both or silently drop one (#119).
+        use crate::properties::Kind;
+        let mut r = result(1, 10);
+        r.properties = vec![
+            prop("realm", "Skaldi", Kind::Text),
+            prop("realm", "Volgard", Kind::Text),
+            prop("status", "draft", Kind::Text),
+        ];
+        let env = assemble(&[r], params(10_000));
+        let n = &serde_json::to_value(&env).unwrap()["notes"]["n1.md"];
+        assert_eq!(n["realm"], serde_json::json!(["Skaldi", "Volgard"]));
+        // A name carried once stays a scalar.
+        assert_eq!(n["status"], "draft");
+    }
+
+    #[test]
+    fn a_scalar_property_keeps_its_own_json_type() {
+        // `PropertyRow.value` is always a String, so `kind` is the only thing
+        // that separates the number 5 from the text "5" (#119).
+        use crate::properties::Kind;
+        let mut r = result(1, 10);
+        r.properties = vec![
+            prop("level", "5", Kind::Number),
+            prop("rating", "4.5", Kind::Number),
+            prop("done", "true", Kind::Checkbox),
+            prop("note", "5", Kind::Text),
+            prop("blank", "", Kind::Empty),
+        ];
+        let env = assemble(&[r], params(10_000));
+        let n = &serde_json::to_value(&env).unwrap()["notes"]["n1.md"];
+        assert_eq!(n["level"], 5);
+        assert_eq!(n["rating"], 4.5);
+        assert_eq!(n["done"], true);
+        assert_eq!(n["note"], "5");
+        assert!(n["blank"].is_null());
+    }
+
+    #[test]
+    fn the_sidecar_carries_a_notes_properties_and_is_absent_when_none_does() {
+        use crate::properties::Kind;
+        let mut r = result(1, 10);
+        r.properties = vec![prop("status", "draft", Kind::Text)];
+        let env = assemble(&[r.clone()], params(10_000));
+        let json = serde_json::to_value(&env).unwrap();
+        assert_eq!(json["notes"]["n1.md"]["status"], "draft");
         r.properties.clear();
-        let env = assemble(&[r], p());
+        let env = assemble(&[r], params(10_000));
         let json = serde_json::to_string(&env).unwrap();
-        assert!(!json.contains("\"properties\""), "{json}");
+        assert!(!json.contains("\"notes\""), "{json}");
     }
 }
 
@@ -589,20 +863,21 @@ mod render_tests {
             status: SearchStatus::Ok,
             degraded: false,
             warnings: vec![],
+            notes: Default::default(),
             blocks: vec![Block {
                 id: "abc#0".into(),
                 path: "n.md".into(),
                 heading_path: "n.md > H".into(),
-                provenance: Provenance {
+                lanes: Provenance {
                     keyword: true,
                     semantic: true,
                     graph: false,
                     linked_from: vec![],
-                },
+                }
+                .lanes(),
                 text: "body".into(),
                 untrusted_content: true,
                 truncated: false,
-                properties: Vec::new(),
                 score: None,
             }],
             overflow: vec![],
@@ -619,17 +894,19 @@ mod render_tests {
             status: SearchStatus::Ok,
             degraded: false,
             warnings: vec!["1 result held back by the token budget".to_string()],
+            notes: Default::default(),
             blocks: vec![],
             overflow: vec![Summary {
                 id: "000002#2".into(),
                 path: "b.md".into(),
                 heading_path: "b.md > B".into(),
-                provenance: Provenance {
+                lanes: Provenance {
                     keyword: true,
                     semantic: false,
                     graph: false,
                     linked_from: vec![],
-                },
+                }
+                .lanes(),
                 score: None,
             }],
         };
@@ -649,6 +926,7 @@ mod render_tests {
             status: SearchStatus::NoResults,
             degraded: false,
             warnings: vec![],
+            notes: Default::default(),
             blocks: vec![],
             overflow: vec![],
         };
@@ -664,20 +942,21 @@ mod render_tests {
             status: SearchStatus::Ok,
             degraded: false,
             warnings: vec![],
+            notes: Default::default(),
             blocks: vec![Block {
                 id: "abc#0".into(),
                 path: "n.md".into(),
                 heading_path: "n.md > H".into(),
-                provenance: Provenance {
+                lanes: Provenance {
                     keyword: true,
                     semantic: true,
                     graph: false,
                     linked_from: vec![],
-                },
+                }
+                .lanes(),
                 text: "body".into(),
                 untrusted_content: true,
                 truncated: false,
-                properties: Vec::new(),
                 score: Some(83.0),
             }],
             overflow: vec![],
@@ -692,6 +971,7 @@ mod render_tests {
             status: SearchStatus::Ok,
             degraded: true,
             warnings: vec![],
+            notes: Default::default(),
             blocks: vec![],
             overflow: vec![],
         };
