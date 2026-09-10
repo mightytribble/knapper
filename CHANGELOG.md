@@ -19,6 +19,7 @@ Links resolve against https://github.com/mightytribble/knapper.
 
 ### Changed
 
+- `tags` returns `display` only where the vault spells a tag differently from its path (#120). A vault that never capitalises a tag now carries the field on no row, which is about a third of the listing. A client reading `display` reads `display ?? path`. ([`ae21961`](https://github.com/mightytribble/knapper/commit/ae21961))
 - `list` answers `indexed_at` as a timestamp — `2026-09-10T04:19:05Z` — in place of a bare epoch in a string (#121). ([`67eccb6`](https://github.com/mightytribble/knapper/commit/67eccb6))
 - `list` answers `links_in` in place of `edge_count` (#121). It counts the distinct notes that link to a note, over the whole vault; `edge_count` counted link occurrences both ways, so a note named from eight sections of one note scored eight. ([`a212c2f`](https://github.com/mightytribble/knapper/commit/a212c2f))
 - A search answer no longer repeats a note's frontmatter on every section it returns (#119). This changes the JSON that `search` returns on all three surfaces; the text rendering is unchanged. ([`2789a92`](https://github.com/mightytribble/knapper/commit/2789a92))
