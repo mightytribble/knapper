@@ -186,7 +186,7 @@ fn build_tags() -> serde_json::Value {
             "parameters": [
                 { "name": "under", "in": "query", "required": false, "description": "One tag term; the rows returned are that tag and its descendants. Omit for the whole vocabulary", "schema": { "type": "string" } }
             ],
-            "responses": { "200": { "description": "Array of tag rows: path, display, note_count" } }
+            "responses": { "200": { "description": "Array of tag rows: path, note_count, and display where the vault spells the tag differently from its path" } }
         }
     })
 }

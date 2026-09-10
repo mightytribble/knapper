@@ -454,7 +454,7 @@ async fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&rows)?);
             } else {
                 for row in &rows {
-                    println!("{} ({})", row.display, row.note_count);
+                    println!("{} ({})", row.as_written(), row.note_count);
                 }
             }
         }
