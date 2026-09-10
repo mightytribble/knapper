@@ -201,12 +201,45 @@ pub struct List {
     #[arg(long)]
     #[serde(default)]
     pub limit: Option<usize>,
+    /// The order notes come back in. `path` is the vault's own order.
+    /// `links_in` ranks the notes the vault points at most, which is the
+    /// question a caller with no note name has; `links_in_asc` ranks the
+    /// least-linked first. The ranking runs over the whole listing, so it
+    /// composes with `limit` (#121).
+    #[arg(long, value_enum, default_value_t = Sort::Path)]
+    #[serde(default)]
+    pub sort: Sort,
     /// Answer each note's heading outline beneath its path. It reads every
     /// listed note from disk, because the index does not hold the outline;
     /// an undetailed listing touches no file (#68).
     #[arg(long)]
     #[serde(default)]
     pub detailed: bool,
+}
+
+/// The order a listing comes back in (#121). An enum and not a string, so a
+/// wrong spelling is refused at the boundary and the legal values reach an
+/// MCP client and the OpenAPI spec (#62).
+///
+/// Each surface spells a value its own way, as it does a capability's name:
+/// the CLI takes `links-in`, the servers `links_in`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, JsonSchema, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum Sort {
+    #[default]
+    Path,
+    LinksIn,
+    LinksInAsc,
+}
+
+impl From<Sort> for crate::store::ListOrder {
+    fn from(sort: Sort) -> Self {
+        match sort {
+            Sort::Path => crate::store::ListOrder::Path,
+            Sort::LinksIn => crate::store::ListOrder::LinksInDesc,
+            Sort::LinksInAsc => crate::store::ListOrder::LinksInAsc,
+        }
+    }
 }
 
 #[derive(Debug, Args, Deserialize, JsonSchema)]

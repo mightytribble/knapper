@@ -546,6 +546,7 @@ async fn handle_list(
         &filter,
         params.created_by.as_deref(),
         params.limit,
+        params.sort.into(),
         params.detailed,
     )
     .map_err(|e| {

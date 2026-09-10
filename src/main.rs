@@ -412,6 +412,7 @@ async fn main() -> Result<()> {
                 &filter,
                 args.created_by.as_deref(),
                 args.limit,
+                args.sort.into(),
                 args.detailed,
             )?;
             if cli.json {

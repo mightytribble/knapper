@@ -116,7 +116,11 @@ pub struct NoteListItem {
     pub docid: Option<String>,
     pub tags: Vec<String>,
     pub indexed_at: String,
-    pub edge_count: usize,
+    /// How many distinct notes link to this note (#121). A note named from
+    /// eight sections of one note counts one, and a link written in
+    /// frontmatter counts like any other. The number is over the whole vault,
+    /// not over the scope this listing names.
+    pub links_in: usize,
     /// The note's headings, ATX and promoted bold lines alike, when the
     /// caller asked for them. Absent otherwise, so an undetailed listing
     /// serialises as it did before this field existed (#68, #69).
@@ -397,8 +401,9 @@ fn matched_properties(
     )?))
 }
 
-/// The notes a scope admits, in path order (#68). A caller's directory
-/// filter is a scope term, which is a case-sensitive range and not a `LIKE`.
+/// The notes a scope admits, in the order `order` names (#68, #121). A
+/// caller's directory filter is a scope term, which is a case-sensitive range
+/// and not a `LIKE`.
 ///
 /// `detailed` costs one file read per listed note, and only then; an
 /// undetailed listing touches no file.
@@ -407,18 +412,18 @@ pub fn context_list(
     tags: &crate::tags::Scope,
     created_by: Option<&str>,
     limit: Option<usize>,
+    order: crate::store::ListOrder,
     detailed: bool,
 ) -> Result<Vec<NoteListItem>> {
-    let files = params.store.list_files(tags, created_by, limit)?;
-    let file_ids: Vec<i64> = files.iter().map(|f| f.id).collect();
-    let edge_counts = params
+    // The count comes back with the row rather than from a second query, so
+    // the number a listing reports is the number it was ranked by (#121).
+    let files = params
         .store
-        .edge_counts_for_files(&file_ids)
-        .unwrap_or_default();
+        .list_files_with_links_in(tags, created_by, limit, order)?;
+    let file_ids: Vec<i64> = files.iter().map(|(f, _)| f.id).collect();
     let mut matched = matched_properties(params, tags, &file_ids)?;
     let mut items = Vec::new();
-    for f in files {
-        let edge_count = edge_counts.get(&f.id).copied().unwrap_or(0);
+    for (f, links_in) in files {
         let headings = detailed.then(|| outline(params.vault_path, &f.path));
         let properties = matched
             .as_mut()
@@ -428,7 +433,7 @@ pub fn context_list(
             docid: f.docid,
             tags: f.tags,
             indexed_at: f.indexed_at,
-            edge_count,
+            links_in,
             headings,
             properties,
         });
@@ -692,6 +697,7 @@ mod tests {
             &crate::tags::Scope::default(),
             None,
             Some(20),
+            crate::store::ListOrder::Path,
             false,
         )
         .unwrap();
@@ -711,6 +717,7 @@ mod tests {
             &crate::tags::Scope::parse(&["rust".into()], &[], &[]).unwrap(),
             None,
             Some(20),
+            crate::store::ListOrder::Path,
             false,
         )
         .unwrap();
@@ -747,6 +754,7 @@ mod tests {
             &crate::tags::Scope::parse(&["type/undead".into(), "/lore/".into()], &[], &[]).unwrap(),
             None,
             None,
+            crate::store::ListOrder::Path,
             false,
         )
         .unwrap();
@@ -768,8 +776,15 @@ mod tests {
             vault_path: &root,
             profile: None,
         };
-        let items =
-            context_list(&params, &crate::tags::Scope::default(), None, None, true).unwrap();
+        let items = context_list(
+            &params,
+            &crate::tags::Scope::default(),
+            None,
+            None,
+            crate::store::ListOrder::Path,
+            true,
+        )
+        .unwrap();
         items
             .into_iter()
             .next()
@@ -897,8 +912,15 @@ mod tests {
             vault_path: &root,
             profile: None,
         };
-        let items =
-            context_list(&params, &crate::tags::Scope::default(), None, None, true).unwrap();
+        let items = context_list(
+            &params,
+            &crate::tags::Scope::default(),
+            None,
+            None,
+            crate::store::ListOrder::Path,
+            true,
+        )
+        .unwrap();
         assert_eq!(items.len(), 1);
         assert!(
             items[0]
@@ -920,8 +942,15 @@ mod tests {
             vault_path: &root,
             profile: None,
         };
-        let items =
-            context_list(&params, &crate::tags::Scope::default(), None, None, false).unwrap();
+        let items = context_list(
+            &params,
+            &crate::tags::Scope::default(),
+            None,
+            None,
+            crate::store::ListOrder::Path,
+            false,
+        )
+        .unwrap();
         let json = serde_json::to_string(&items).unwrap();
         assert!(!json.contains("headings"), "{json}");
     }
@@ -1263,7 +1292,15 @@ mod tests {
         let scope = crate::tags::Scope::default()
             .with_filters(Some("employer"), Some("acme"), None)
             .unwrap();
-        let items = context_list(&params, &scope, None, None, false).unwrap();
+        let items = context_list(
+            &params,
+            &scope,
+            None,
+            None,
+            crate::store::ListOrder::Path,
+            false,
+        )
+        .unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].path, "ada.md");
         let rows = items[0].properties.as_ref().unwrap();
@@ -1285,7 +1322,15 @@ mod tests {
         let scope = crate::tags::Scope::default()
             .with_filters(Some("mentor"), None, Some("ada"))
             .unwrap();
-        let items = context_list(&params, &scope, None, None, false).unwrap();
+        let items = context_list(
+            &params,
+            &scope,
+            None,
+            None,
+            crate::store::ListOrder::Path,
+            false,
+        )
+        .unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].path, "bob.md");
         assert!(
@@ -1305,8 +1350,15 @@ mod tests {
             vault_path: &root,
             profile: None,
         };
-        let plain =
-            context_list(&params, &crate::tags::Scope::default(), None, None, false).unwrap();
+        let plain = context_list(
+            &params,
+            &crate::tags::Scope::default(),
+            None,
+            None,
+            crate::store::ListOrder::Path,
+            false,
+        )
+        .unwrap();
         assert!(plain.iter().all(|i| i.properties.is_none()));
         let json = serde_json::to_string(&plain).unwrap();
         assert!(!json.contains("\"properties\""), "{json}");
@@ -1314,7 +1366,15 @@ mod tests {
         let scope = crate::tags::Scope::default()
             .with_filters(Some("status=draft"), None, None)
             .unwrap();
-        let items = context_list(&params, &scope, None, None, false).unwrap();
+        let items = context_list(
+            &params,
+            &scope,
+            None,
+            None,
+            crate::store::ListOrder::Path,
+            false,
+        )
+        .unwrap();
         assert_eq!(items.len(), 1);
         let rows = items[0].properties.as_ref().unwrap();
         assert_eq!(
