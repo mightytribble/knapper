@@ -25,6 +25,7 @@ pub mod onboarding;
 pub mod openapi;
 pub mod packaging;
 pub mod params;
+pub mod pipe;
 pub mod placement;
 pub mod prefix;
 pub mod profile;
