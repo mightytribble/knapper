@@ -170,9 +170,10 @@ fn build_list() -> serde_json::Value {
                 { "name": "linked_from", "in": "query", "required": false, "description": "The notes this note links to, named the way a wikilink names it. With property, only links filed under that property count. An unknown note is a 400 naming the nearest one", "schema": { "type": "string" } },
                 { "name": "created_by", "in": "query", "required": false, "description": "Agent filter", "schema": { "type": "string" } },
                 { "name": "limit", "in": "query", "required": false, "description": "Maximum notes to answer. Absent, every note the scope admits", "schema": { "type": "integer" } },
+                { "name": "sort", "in": "query", "required": false, "description": "Order of the answer: path (default) is the vault's own order, links_in ranks the notes the most other notes link to, links_in_asc the fewest. The ranking runs over the whole listing, so it composes with limit", "schema": { "type": "string", "enum": ["path", "links_in", "links_in_asc"] } },
                 { "name": "detailed", "in": "query", "required": false, "description": "detailed=true answers each note's heading outline beside its path. The value is required; a bare `detailed` does not parse", "schema": { "type": "boolean" } }
             ],
-            "responses": { "200": { "description": "Array of note summaries. Under a property filter each note also carries properties, the rows that term matched — narrowed to the links that name the note when links_to is set beside it, and omitted under linked_from, where the matched row belongs to the naming note" } }
+            "responses": { "200": { "description": "Array of note summaries, each with links_in, the number of distinct notes that link to it counted over the whole vault. Under a property filter each note also carries properties, the rows that term matched — narrowed to the links that name the note when links_to is set beside it, and omitted under linked_from, where the matched row belongs to the naming note" } }
         }
     })
 }

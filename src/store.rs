@@ -3,6 +3,19 @@ use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::HashSet;
 use std::path::Path;
 
+/// How a listing is ordered (#121).
+///
+/// `Path` is the vault's own order, which is what a caller reading one folder
+/// wants. The two link orders answer the question a caller with no note name
+/// has — what this vault is built around — and its opposite.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ListOrder {
+    #[default]
+    Path,
+    LinksInDesc,
+    LinksInAsc,
+}
+
 /// A record representing an indexed file.
 #[derive(Debug, Clone)]
 pub struct FileRecord {
@@ -2003,13 +2016,47 @@ impl Store {
         created_by: Option<&str>,
         limit: Option<usize>,
     ) -> Result<Vec<FileRecord>> {
+        Ok(self
+            .list_files_with_links_in(tags, created_by, limit, ListOrder::Path)?
+            .into_iter()
+            .map(|(file, _)| file)
+            .collect())
+    }
+
+    /// The notes a scope admits, each with the number of distinct notes that
+    /// link to it, in the order `order` names (#121).
+    ///
+    /// Two things about the count, both of them the point:
+    ///
+    /// - It is `COUNT(DISTINCT from_file)` and not `COUNT(*)`. `edges` holds
+    ///   one row per (source chunk, target chunk) pair, so a note named from
+    ///   eight sections of one note is one link in and not eight. Ranking on
+    ///   the row count ranks by how wordy a note's neighbours are.
+    /// - It is over the whole vault and not over the scope. A note listed
+    ///   from one folder still counts the notes that name it from anywhere,
+    ///   so a folder listing does not report every note in it as isolated.
+    ///
+    /// The ordering runs in SQL, before the limit: a limit applied first
+    /// would rank the first N notes by path rather than the vault.
+    pub fn list_files_with_links_in(
+        &self,
+        tags: &crate::tags::Scope,
+        created_by: Option<&str>,
+        limit: Option<usize>,
+        order: ListOrder,
+    ) -> Result<Vec<(FileRecord, usize)>> {
         // `none` is not checked: excluding a tag no note carries is a no-op.
         let checked: Vec<&crate::tags::ScopeTerm> =
             tags.all.iter().chain(tags.any.iter()).collect();
         crate::tags::check_terms(&self.conn, &checked)?;
         let links = self.resolve_scope_links(tags)?;
 
-        let mut sql = format!("SELECT {FILE_COLUMNS} FROM files f WHERE 1=1");
+        let mut sql = format!(
+            "SELECT {FILE_COLUMNS}, \
+             (SELECT COUNT(DISTINCT e.from_file) FROM edges e WHERE e.to_file = f.id) \
+               AS links_in \
+             FROM files f WHERE 1=1"
+        );
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         let (tag_sql, tag_args) = scope_clauses(tags, &links);
         sql.push_str(&tag_sql);
@@ -2018,17 +2065,22 @@ impl Store {
             sql.push_str(" AND f.created_by = ?");
             param_values.push(Box::new(cb.to_string()));
         }
-        sql.push_str(" ORDER BY f.path");
+        // `f.path` is the tie-break under either ranking, so two notes with
+        // the same number of links in come back in the same order every call.
+        sql.push_str(match order {
+            ListOrder::Path => " ORDER BY f.path",
+            ListOrder::LinksInDesc => " ORDER BY links_in DESC, f.path",
+            ListOrder::LinksInAsc => " ORDER BY links_in ASC, f.path",
+        });
         if let Some(limit) = limit {
             sql.push_str(" LIMIT ?");
             param_values.push(Box::new(limit as i64));
         }
 
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(
-            rusqlite::params_from_iter(param_values.iter()),
-            file_from_row,
-        )?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(param_values.iter()), |row| {
+            Ok((file_from_row(row)?, row.get::<_, i64>(9)? as usize))
+        })?;
         let mut results = Vec::new();
         for row in rows {
             results.push(row?);
@@ -4691,6 +4743,156 @@ mod tests {
             .unwrap();
         assert_eq!(store.edge_count_for_file(f1).unwrap(), 2);
         assert_eq!(store.edge_count_for_file(f2).unwrap(), 2);
+    }
+
+    #[test]
+    fn links_in_counts_notes_and_not_the_sections_they_link_from() {
+        let store = Store::open_memory().unwrap();
+        let hub = store
+            .insert_file("hub.md", "h", 100, "hub1", None, None)
+            .unwrap();
+        let wordy = store
+            .insert_file("wordy.md", "h", 100, "wo1", None, None)
+            .unwrap();
+        let terse = store
+            .insert_file("terse.md", "h", 100, "te1", None, None)
+            .unwrap();
+        // `wordy` names the hub from three of its sections; `terse` from one.
+        // That is four edge rows and two notes linking in.
+        for seq in 0..3 {
+            store
+                .insert_edge(wordy, seq, hub, DOC_LEVEL, "wikilink")
+                .unwrap();
+        }
+        store
+            .insert_edge(terse, 0, hub, DOC_LEVEL, "wikilink")
+            .unwrap();
+        assert_eq!(store.edge_count_for_file(hub).unwrap(), 4);
+
+        let rows = store
+            .list_files_with_links_in(
+                &crate::tags::Scope::default(),
+                None,
+                None,
+                ListOrder::LinksInDesc,
+            )
+            .unwrap();
+        let hub_row = rows.iter().find(|(f, _)| f.path == "hub.md").unwrap();
+        assert_eq!(hub_row.1, 2, "two notes link in, from four sections");
+    }
+
+    #[test]
+    fn a_links_in_ranking_ranks_the_vault_and_not_the_first_page_of_it() {
+        let store = Store::open_memory().unwrap();
+        // The hub sorts last by path, so a limit applied before the ranking
+        // would never reach it.
+        let hub = store
+            .insert_file("zeta.md", "h", 100, "z1", None, None)
+            .unwrap();
+        for (i, name) in ["alpha.md", "beta.md", "gamma.md"].iter().enumerate() {
+            let f = store
+                .insert_file(name, "h", 100, &format!("f{i}"), None, None)
+                .unwrap();
+            store.insert_edge(f, 0, hub, DOC_LEVEL, "wikilink").unwrap();
+        }
+
+        let top = store
+            .list_files_with_links_in(
+                &crate::tags::Scope::default(),
+                None,
+                Some(1),
+                ListOrder::LinksInDesc,
+            )
+            .unwrap();
+        assert_eq!(top.len(), 1);
+        assert_eq!(top[0].0.path, "zeta.md");
+        assert_eq!(top[0].1, 3);
+    }
+
+    #[test]
+    fn links_in_counts_the_notes_that_name_it_from_outside_the_scope() {
+        let store = Store::open_memory().unwrap();
+        let inside = store
+            .insert_file("lore/hub.md", "h", 100, "in1", None, None)
+            .unwrap();
+        let outside = store
+            .insert_file("npcs/caller.md", "h", 100, "ou1", None, None)
+            .unwrap();
+        store
+            .insert_edge(outside, 0, inside, DOC_LEVEL, "wikilink")
+            .unwrap();
+
+        let rows = store
+            .list_files_with_links_in(
+                &crate::tags::Scope::parse(&["/lore/".to_string()], &[], &[]).unwrap(),
+                None,
+                None,
+                ListOrder::LinksInDesc,
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1, "the scope admits the one note");
+        assert_eq!(
+            rows[0].1, 1,
+            "a note the scope excludes still counts as a link in"
+        );
+    }
+
+    #[test]
+    fn notes_with_the_same_links_in_come_back_in_path_order() {
+        let store = Store::open_memory().unwrap();
+        let caller = store
+            .insert_file("caller.md", "h", 100, "c1", None, None)
+            .unwrap();
+        let b = store
+            .insert_file("b.md", "h", 100, "b1", None, None)
+            .unwrap();
+        let a = store
+            .insert_file("a.md", "h", 100, "a1", None, None)
+            .unwrap();
+        store
+            .insert_edge(caller, 0, b, DOC_LEVEL, "wikilink")
+            .unwrap();
+        store
+            .insert_edge(caller, 0, a, DOC_LEVEL, "wikilink")
+            .unwrap();
+
+        let rows = store
+            .list_files_with_links_in(
+                &crate::tags::Scope::default(),
+                None,
+                None,
+                ListOrder::LinksInDesc,
+            )
+            .unwrap();
+        let ranked: Vec<&str> = rows.iter().map(|(f, _)| f.path.as_str()).collect();
+        assert_eq!(ranked, vec!["a.md", "b.md", "caller.md"]);
+    }
+
+    #[test]
+    fn the_ascending_ranking_starts_at_the_note_fewest_others_name() {
+        let store = Store::open_memory().unwrap();
+        let hub = store
+            .insert_file("hub.md", "h", 100, "h1", None, None)
+            .unwrap();
+        let lonely = store
+            .insert_file("lonely.md", "h", 100, "l1", None, None)
+            .unwrap();
+        store
+            .insert_edge(lonely, 0, hub, DOC_LEVEL, "wikilink")
+            .unwrap();
+
+        let rows = store
+            .list_files_with_links_in(
+                &crate::tags::Scope::default(),
+                None,
+                None,
+                ListOrder::LinksInAsc,
+            )
+            .unwrap();
+        assert_eq!(rows[0].0.path, "lonely.md");
+        assert_eq!(rows[0].1, 0);
+        assert_eq!(rows[1].0.path, "hub.md");
+        assert_eq!(rows[1].1, 1);
     }
 
     #[test]
