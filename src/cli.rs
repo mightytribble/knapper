@@ -69,7 +69,7 @@ pub enum Command {
     /// metadata with `--metadata`.
     Read(crate::params::Read),
 
-    /// List notes by metadata filters.
+    /// List notes by metadata filters, or with no filter at all to enumerate the whole vault.
     List(crate::params::List),
 
     /// List the vault's tag vocabulary.
