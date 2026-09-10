@@ -60,6 +60,14 @@ pub struct SearchEnvelope {
     pub notes: std::collections::BTreeMap<String, NoteProperties>,
     pub blocks: Vec<Block>,
     pub overflow: Vec<Summary>,
+    /// The per-lane score breakdown, when the caller asked for it (#126).
+    ///
+    /// A client that reads `structuredContent` discards the text content
+    /// blocks beside it, so a report sent as one reaches nothing. It travels
+    /// in the envelope for that reason, and is absent for a caller that did
+    /// not ask.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub explain: Option<String>,
 }
 
 /// One note's frontmatter properties, by name (#119).
@@ -248,6 +256,7 @@ pub fn assemble(results: &[InternalSearchResult], p: AssembleParams) -> SearchEn
             notes: Default::default(),
             blocks: Vec::new(),
             overflow: Vec::new(),
+            explain: None,
         };
     }
 
@@ -283,6 +292,7 @@ pub fn assemble(results: &[InternalSearchResult], p: AssembleParams) -> SearchEn
             notes: Default::default(),
             blocks,
             overflow,
+            explain: None,
         };
     }
 
@@ -335,6 +345,7 @@ pub fn assemble(results: &[InternalSearchResult], p: AssembleParams) -> SearchEn
         notes,
         blocks,
         overflow,
+        explain: None,
     }
 }
 
@@ -370,6 +381,11 @@ fn provenance_label(lanes: &[Lane]) -> String {
         .map(|l| l.label())
         .collect::<Vec<_>>()
         .join("+")
+}
+
+/// Carry the per-lane report in the envelope — `--explain` only (#126).
+pub fn apply_explain(env: &mut SearchEnvelope, report: String) {
+    env.explain = Some(report);
 }
 
 /// Fill each row's `score` from the matching result's confidence — `--scores`
@@ -881,6 +897,7 @@ mod render_tests {
                 score: None,
             }],
             overflow: vec![],
+            explain: None,
         };
         let out = render_text(&env, false);
         assert!(out.contains("[abc#0]"));
@@ -909,6 +926,7 @@ mod render_tests {
                 .lanes(),
                 score: None,
             }],
+            explain: None,
         };
         let text = render_text(&env, false);
         let reason = text
@@ -929,6 +947,7 @@ mod render_tests {
             notes: Default::default(),
             blocks: vec![],
             overflow: vec![],
+            explain: None,
         };
         assert_eq!(
             render_text(&env, false).trim(),
@@ -960,6 +979,7 @@ mod render_tests {
                 score: Some(83.0),
             }],
             overflow: vec![],
+            explain: None,
         };
         assert!(render_text(&env, true).contains("[83%]"));
         assert!(!render_text(&env, false).contains('%'));
@@ -974,6 +994,7 @@ mod render_tests {
             notes: Default::default(),
             blocks: vec![],
             overflow: vec![],
+            explain: None,
         };
         assert!(
             render_text(&env, false).contains("(degraded ordering: no cross-encoder available)")

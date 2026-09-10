@@ -190,6 +190,15 @@ impl KnapperServer {
         if params.0.scores {
             crate::packaging::apply_scores(&mut env, &output.results);
         }
+        // The per-lane detail rides in the envelope, the way the HTTP body
+        // carries it and the CLI prints it after the results. A client that
+        // reads `structuredContent` discards the text content blocks beside
+        // it, so a second block reaches nothing (#62, #126). It is absent
+        // unless the caller asked, because an agent that did not ask must not
+        // have to read past it.
+        if params.0.explain {
+            crate::packaging::apply_explain(&mut env, search::explain_report(&output, top_n));
+        }
         let value = serde_json::to_value(&env).map_err(|e| mcp_err(&anyhow::anyhow!(e)))?;
 
         // The text rendering is a convenience for a client that reads content
@@ -205,15 +214,6 @@ impl KnapperServer {
 
         let mut result = CallToolResult::success(content);
         result.structured_content = Some(value);
-        // The per-lane detail is a second content block, the way the CLI
-        // prints it after the results and the HTTP envelope carries it in
-        // `explain`. It is absent unless the caller asked, because an agent
-        // that did not ask must not have to read past it (#62).
-        if params.0.explain {
-            result
-                .content
-                .push(ContentBlock::text(search::explain_report(&output, top_n)));
-        }
         Ok(result)
     }
 
@@ -1597,30 +1597,35 @@ mod tests {
         assert!(sections_of_the_abjuration_note(&rows) > 1, "got {rows:?}");
     }
 
+    /// The detail has to ride the channel the client reads. A client that
+    /// takes `structuredContent` discards every text content block beside it,
+    /// so a report sent as a second block reaches nothing (#126).
     #[tokio::test]
-    async fn the_per_lane_detail_is_the_content_block_the_call_asked_for() {
-        // MCP carries the detail the way it carries the answer-floor message:
-        // a second content block, which leaves the JSON a client parses
-        // untouched. A caller that did not ask gets one block only (#62).
+    async fn the_per_lane_detail_rides_in_the_structured_envelope() {
         let (_tmp, server) = indexed_server(crate::config::GroupBy::Chunk);
 
         let plain = server
             .search(super::Parameters(search_params(None, false)))
             .await
             .unwrap();
-        assert_eq!(plain.content.len(), 1);
+        let plain_env = envelope(&plain);
+        assert!(plain_env.get("explain").is_none(), "got {plain_env}");
 
         let explained = server
             .search(super::Parameters(search_params(None, true)))
             .await
             .unwrap();
-        assert_eq!(explained.content.len(), 2);
+        let env = envelope(&explained);
         assert!(
-            explained.content[1]
-                .as_text()
-                .unwrap()
-                .text
-                .contains("--- Query run ---")
+            env["explain"]
+                .as_str()
+                .is_some_and(|t| t.contains("--- Query run ---")),
+            "got {env}"
+        );
+        assert_eq!(
+            explained.content.len(),
+            plain.content.len(),
+            "the report must not also ride a content block a client will drop"
         );
     }
 

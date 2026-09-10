@@ -475,15 +475,14 @@ async fn handle_search(
     if body.scores {
         crate::packaging::apply_scores(&mut env, &output.results);
     }
-    let mut value =
-        serde_json::to_value(&env).map_err(|e| ApiError::internal(&format!("{e:#}")))?;
-    // The per-lane detail rides beside the envelope, the way the CLI prints
-    // it after the rendered results and MCP sends it as a second content
-    // block. It is present only when the caller asked, because an agent
-    // that did not ask must not have to read past it (#62).
+    // The per-lane detail rides in the envelope, the same field MCP answers
+    // with and the CLI prints after the rendered results. It is present only
+    // when the caller asked, because an agent that did not ask must not have
+    // to read past it (#62, #126).
     if body.explain {
-        value["explain"] = serde_json::Value::String(search::explain_report(&output, top_n));
+        crate::packaging::apply_explain(&mut env, search::explain_report(&output, top_n));
     }
+    let value = serde_json::to_value(&env).map_err(|e| ApiError::internal(&format!("{e:#}")))?;
     Ok(Json(value))
 }
 
