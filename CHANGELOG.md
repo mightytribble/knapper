@@ -20,6 +20,7 @@ Links resolve against https://github.com/mightytribble/knapper.
 
 ### Changed
 
+- An MCP tool result travels as compact JSON in place of an indented rendering (#127). On a 222-tag vocabulary that is a third of the characters and half the tokens. The CLI's own `--json` output is unchanged.
 - `tags` returns `display` only where the vault spells a tag differently from its path (#120). A vault that never capitalises a tag now carries the field on no row, which is about a third of the listing. A client reading `display` reads `display ?? path`. ([`ae21961`](https://github.com/mightytribble/knapper/commit/ae21961))
 - `list` answers `indexed_at` as a timestamp — `2026-09-10T04:19:05Z` — in place of a bare epoch in a string (#121). ([`67eccb6`](https://github.com/mightytribble/knapper/commit/67eccb6))
 - `list` answers `links_in` in place of `edge_count` (#121). It counts the distinct notes that link to a note, over the whole vault; `edge_count` counted link occurrences both ways, so a note named from eight sections of one note scored eight. ([`a212c2f`](https://github.com/mightytribble/knapper/commit/a212c2f))
