@@ -12,6 +12,7 @@ Links resolve against https://github.com/mightytribble/knapper.
 
 ### Fixed
 
+- A piped command ends quietly when the reader closes early, rather than printing a panic and exiting 101 (#128). `knapper tags | head -3` was the case; the longer the listing, the more reliably it happened. ([`ea16760`](https://github.com/mightytribble/knapper/commit/ea16760))
 - `search --explain` now travels as an `explain` key in the search envelope on MCP and HTTP; the CLI still prints it after the results. ([`2d80f39`](https://github.com/mightytribble/knapper/commit/2d80f39))
 - `match` finds a phrase that spans a wikilink (#118). Searching for the markup itself still works, and the reported line is still the note as written. ([`236b70b`](https://github.com/mightytribble/knapper/commit/236b70b))
 - A section `replace` no longer deletes the subsections the section owns (#116). Content that carries the child headings is a deliberate rewrite and still goes through. ([`5fcff95`](https://github.com/mightytribble/knapper/commit/5fcff95))
