@@ -161,6 +161,9 @@ fn content_or_stdin(content: Option<String>) -> Result<String> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Before clap, which prints `--help` and `--version` to stdout (#128).
+    knapper::pipe::restore_default_sigpipe();
+
     let cli = Cli::parse();
 
     // A `--data-dir` flag sets the override before any `data_dir()` read, so
