@@ -3,6 +3,12 @@
 Every entry below the upstream-lineage line names the commit it describes.
 Links resolve against https://github.com/mightytribble/knapper.
 
+## Unreleased
+
+### Added
+
+- `match --word` counts a hit only where the pattern stands as its own word (#129). `art` no longer answers on `earth`, `quarters` or `apartment`; `DNA --word` still finds `DNA-based` and `DNA's`. Off by default, and `word` on MCP and HTTP. ([`6b7e715`](https://github.com/mightytribble/knapper/commit/6b7e715))
+
 ## 0.9.10 (2026-09-10)
 
 An MCP result is smaller. The framing is compact, a tag carries its display
