@@ -5,8 +5,13 @@ Links resolve against https://github.com/mightytribble/knapper.
 
 ## Unreleased
 
+### Changed
+
+- `read --metadata` is now `read --include metadata`, and `metadata: true` on MCP and HTTP is `include: "metadata"` (#130). The boolean is gone rather than deprecated: four modes do not fit one flag, and a stale caller fails loudly instead of silently reading the default mode. ([`827c8a0`](https://github.com/mightytribble/knapper/commit/827c8a0))
+
 ### Added
 
+- `read --include` chooses what a read answers: `content` (the default, unchanged), `frontmatter` for the note's YAML alone, `all` for the prose and the YAML in one call, and `metadata` for what `--metadata` used to return (#130). `frontmatter` and `all` carry no link graph, so a note's properties no longer cost a whole metadata read; `all` combines with `--section`. ([`827c8a0`](https://github.com/mightytribble/knapper/commit/827c8a0))
 - `match --word` counts a hit only where the pattern stands as its own word (#129). `art` no longer answers on `earth`, `quarters` or `apartment`; `DNA --word` still finds `DNA-based` and `DNA's`. Off by default, and `word` on MCP and HTTP. ([`6b7e715`](https://github.com/mightytribble/knapper/commit/6b7e715))
 
 ## 0.9.10 (2026-09-10)

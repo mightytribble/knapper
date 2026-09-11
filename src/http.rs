@@ -499,17 +499,18 @@ async fn handle_read(
         profile: state.profile.as_ref().as_ref(),
     };
     let result =
-        context::context_read(&ctx, &p.file, p.section.as_deref(), p.metadata).map_err(|e| {
-            // A file or a section the vault does not hold, or `--section` with
-            // `--metadata`, is the caller's own input naming nothing or asking two
-            // things at once, not a server fault — the rule `handle_search` and
+        context::context_read(&ctx, &p.file, p.section.as_deref(), p.include).map_err(|e| {
+            // A file or a section the vault does not hold, or a `section`
+            // beside an `include` mode that answers the whole note, is the
+            // caller's own input naming nothing or asking two things at once,
+            // not a server fault — the rule `handle_search` and
             // `handle_list` already follow (#60). The message text is the cheapest
             // honest signal `context_read` gives a caller this far from the error's
             // construction.
             let message = e.to_string();
             if message.starts_with("Section not found")
                 || message.starts_with("File not found")
-                || message.starts_with("--section and --metadata")
+                || message.starts_with("--section cannot be combined")
             {
                 ApiError::bad_request(&format!("{e:#}"))
             } else {
