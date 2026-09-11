@@ -140,6 +140,15 @@ pub struct NoteListItem {
     /// frontmatter counts like any other. The number is over the whole vault,
     /// not over the scope this listing names.
     pub links_in: usize,
+    /// How many chunks the note is indexed as, and so how many distinct units
+    /// `search` can answer it with (#131). It is not a size: a note of four
+    /// chunks may hold 300 tokens or 3000.
+    pub chunk_count: usize,
+    /// The note's indexed size in tokens, summed over its chunks (#131).
+    /// Read beside `links_in`: a note many others point at that holds little
+    /// is the one to write, and a long note of few chunks is the one to
+    /// section. `store::ListRow` states what the number counts.
+    pub token_count: usize,
     /// The note's headings, ATX and promoted bold lines alike, when the
     /// caller asked for them. Absent otherwise, so an undetailed listing
     /// serialises as it did before this field existed (#68, #69).
@@ -514,10 +523,11 @@ pub fn context_list(
     let files = params
         .store
         .list_files_with_links_in(tags, created_by, limit, order)?;
-    let file_ids: Vec<i64> = files.iter().map(|(f, _)| f.id).collect();
+    let file_ids: Vec<i64> = files.iter().map(|r| r.file.id).collect();
     let mut matched = matched_properties(params, tags, &file_ids)?;
     let mut items = Vec::new();
-    for (f, links_in) in files {
+    for row in files {
+        let f = row.file;
         let headings = detailed.then(|| outline(params.vault_path, &f.path));
         let properties = matched
             .as_mut()
@@ -527,7 +537,9 @@ pub fn context_list(
             docid: f.docid,
             tags: f.tags,
             indexed_at: indexed_at_iso(&f.indexed_at),
-            links_in,
+            links_in: row.links_in,
+            chunk_count: row.chunk_count,
+            token_count: row.token_count,
             headings,
             properties,
         });
@@ -957,6 +969,48 @@ mod tests {
         let fm =
             frontmatter_of(context_read(&params, "ghost.md", None, Include::Frontmatter).unwrap());
         assert_eq!(fm.frontmatter, "");
+    }
+
+    /// Both size numbers reach the surface beside `links_in`, so a caller can
+    /// weigh what points at a note against what the note holds — in one call
+    /// and with no client-side join (#131).
+    #[test]
+    fn a_listing_carries_each_notes_size_beside_its_links_in() {
+        let (_tmp, store, root) = setup_vault();
+        let note = store.get_file("note.md").unwrap().unwrap().id;
+        for (seq, tokens) in [(0i64, 120i64), (1, 80)] {
+            store
+                .insert_chunk(&crate::store::NewChunk {
+                    file_id: note,
+                    seq,
+                    text: "body",
+                    vector_id: seq as u64 + 1,
+                    token_count: tokens,
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        let params = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+        let items = context_list(
+            &params,
+            &crate::tags::Scope::default(),
+            None,
+            None,
+            crate::store::ListOrder::Path,
+            false,
+        )
+        .unwrap();
+        let listed = items.iter().find(|i| i.path == "note.md").unwrap();
+        assert_eq!(listed.chunk_count, 2);
+        assert_eq!(listed.token_count, 200);
+        // The note with no chunks still reports a size, and it is zero.
+        let other = items.iter().find(|i| i.path == "other.md").unwrap();
+        assert_eq!(other.chunk_count, 0);
+        assert_eq!(other.token_count, 0);
     }
 
     #[test]
