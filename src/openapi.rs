@@ -72,7 +72,7 @@ fn build_search() -> serde_json::Value {
     serde_json::json!({
         "post": {
             "operationId": "searchVault",
-            "summary": "Hybrid semantic + full-text search across the vault.",
+            "summary": "Hybrid semantic + full-text search across the vault. A query pairs with a filter: {\"query\": \"the disagreement over the schedule\", \"links_to\": \"project-atlas\"} cuts the pool to the notes linking that note and ranks the query inside them, which is how to ask about two notes at once. The scope resolves before anything is embedded, so the filter runs first and the ranking runs inside it.",
             "requestBody": {
                 "required": true,
                 "content": { "application/json": { "schema": {

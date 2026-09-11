@@ -7,12 +7,12 @@ Links resolve against https://github.com/mightytribble/knapper.
 
 ### Changed
 
+- The MCP orientation now says that `search` takes the graph filters, and that the filter runs before the ranking (#136). It assigned filtering to `list` alone, so link-shaped questions went to the tool that cannot rank; pairing a query with `links_to` is what answers a question about two notes at once, because a neighbourhood on its own is usually a roster. The `search` tool description carries a worked two-field example. (COMMIT)
 - `read --metadata` is now `read --include metadata`, and `metadata: true` on MCP and HTTP is `include: "metadata"` (#130). The boolean is gone rather than deprecated: four modes do not fit one flag, and a stale caller fails loudly instead of silently reading the default mode. ([`827c8a0`](https://github.com/mightytribble/knapper/commit/827c8a0))
 
 ### Added
 
 - `list` now answers each note's `chunk_count` and `token_count` beside `links_in` (#131). Read against each other they find the load-bearing but underwritten note — many others point at it and it holds almost nothing — which took a full enumeration and a client-side join before. Both numbers come from the index, so an undetailed listing still opens no file. ([`9e03336`](https://github.com/mightytribble/knapper/commit/9e03336))
-
 - A search that answers nothing now names what the answer floor rejected (#133). `less_relevant` lists them with their scores and `answer_floor`, the floor they missed, so "the vault holds nothing like this" reads differently from "the floor took what nearly answered". The rows carry no text and take only the slots `top_n` had left after the answers, so a search that answered in full is unchanged. `status` is still `no_results`. `[output] show_less_relevant = false` turns it off. ([`40cd2a8`](https://github.com/mightytribble/knapper/commit/40cd2a8))
 - `read --include` chooses what a read answers: `content` (the default, unchanged), `frontmatter` for the note's YAML alone, `all` for the prose and the YAML in one call, and `metadata` for what `--metadata` used to return (#130). `frontmatter` and `all` carry no link graph, so a note's properties no longer cost a whole metadata read; `all` combines with `--section`. ([`827c8a0`](https://github.com/mightytribble/knapper/commit/827c8a0))
 - `match --word` counts a hit only where the pattern stands as its own word (#129). `art` no longer answers on `earth`, `quarters` or `apartment`; `DNA --word` still finds `DNA-based` and `DNA's`. Off by default, and `word` on MCP and HTTP. ([`6b7e715`](https://github.com/mightytribble/knapper/commit/6b7e715))

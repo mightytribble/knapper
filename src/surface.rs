@@ -711,6 +711,47 @@ mod tests {
         }
     }
 
+    /// A filter two tools share is a composition nothing else will teach: the
+    /// caller forms the intent to combine two fields before it reads either
+    /// field's schema, and the orientation is what it reads first. It
+    /// described filtering as `list`'s alone, so link-shaped questions routed
+    /// to the tool that cannot rank (#136).
+    ///
+    /// The tools are read from the schemas and not from a written list, for
+    /// the reason #110 gives: a sentence naming tools drifts where a
+    /// parameter cannot, and a third tool that gains the filter would leave
+    /// this sentence quietly wrong.
+    #[test]
+    fn the_orientation_names_every_tool_that_takes_a_graph_filter() {
+        let text = crate::serve::instructions();
+        let sentence = text
+            .split_inclusive('.')
+            .find(|s| s.contains("links_to"))
+            .expect("the orientation never mentions `links_to`");
+
+        let mut named = 0;
+        for tool in crate::serve::KnapperServer::tool_router().list_all() {
+            let takes_filter = tool
+                .input_schema
+                .get("properties")
+                .and_then(|p| p.as_object())
+                .is_some_and(|o| o.contains_key("links_to"));
+            if !takes_filter {
+                continue;
+            }
+            assert!(
+                sentence.contains(tool.name.as_ref()),
+                "`{}` takes `links_to` and the orientation's graph-filter sentence does not name it: {sentence}",
+                tool.name
+            );
+            named += 1;
+        }
+        assert!(
+            named >= 2,
+            "the sentence earns its place by naming a composition, so at least two tools take the filter"
+        );
+    }
+
     /// `serve::ORIENTATION` is the prose half of the table, so it answers to
     /// the same parity the three registrations answer to: it describes every
     /// tool the MCP server registers, describes each one once, and describes
