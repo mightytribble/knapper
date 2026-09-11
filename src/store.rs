@@ -16,6 +16,32 @@ pub enum ListOrder {
     LinksInAsc,
 }
 
+/// One row of a listing: the note, and the three numbers the index can answer
+/// about it without opening the file (#121, #131).
+///
+/// The sizes ride beside `links_in` because the question they answer is the
+/// pair: a note fifteen others point at, holding almost nothing, is a promise
+/// the vault cannot pay. Neither number finds that alone — hubs are usually
+/// fine and most stubs are proportionate. Only the mismatch is a finding, and
+/// the ratio is the caller's arithmetic over the row.
+#[derive(Debug, Clone)]
+pub struct ListRow {
+    pub file: FileRecord,
+    /// How many distinct notes link to this note, over the whole vault.
+    pub links_in: usize,
+    /// How many chunks the note is indexed as — how many distinct units
+    /// `search` can return it as. Not a size: chunk token counts run from
+    /// tens to hundreds, so four chunks says nothing about how much is there.
+    pub chunk_count: usize,
+    /// The note's indexed size, as the sum of its chunks' token counts. It is
+    /// what the embedder counted over `chunks.text`, so it measures what the
+    /// index holds rather than what the file holds: where a section ran past
+    /// the model's input wall, `split_oversized_chunks` repeats
+    /// `chunker::OVERLAP_TOKENS` at the head of each piece and the sum counts
+    /// those tokens twice. Zero for a note with no chunks.
+    pub token_count: usize,
+}
+
 /// A record representing an indexed file.
 #[derive(Debug, Clone)]
 pub struct FileRecord {
@@ -2031,7 +2057,7 @@ impl Store {
         Ok(self
             .list_files_with_links_in(tags, created_by, limit, ListOrder::Path)?
             .into_iter()
-            .map(|(file, _)| file)
+            .map(|row| row.file)
             .collect())
     }
 
@@ -2056,7 +2082,7 @@ impl Store {
         created_by: Option<&str>,
         limit: Option<usize>,
         order: ListOrder,
-    ) -> Result<Vec<(FileRecord, usize)>> {
+    ) -> Result<Vec<ListRow>> {
         // `none` is not checked: excluding a tag no note carries is a no-op.
         let checked: Vec<&crate::tags::ScopeTerm> =
             tags.all.iter().chain(tags.any.iter()).collect();
@@ -2066,7 +2092,11 @@ impl Store {
         let mut sql = format!(
             "SELECT {FILE_COLUMNS}, \
              (SELECT COUNT(DISTINCT e.from_file) FROM edges e WHERE e.to_file = f.id) \
-               AS links_in \
+               AS links_in, \
+             (SELECT COUNT(*) FROM chunks c WHERE c.file_id = f.id) \
+               AS chunk_count, \
+             (SELECT COALESCE(SUM(c.token_count), 0) FROM chunks c WHERE c.file_id = f.id) \
+               AS token_count \
              FROM files f WHERE 1=1"
         );
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -2091,7 +2121,12 @@ impl Store {
 
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(param_values.iter()), |row| {
-            Ok((file_from_row(row)?, row.get::<_, i64>(9)? as usize))
+            Ok(ListRow {
+                file: file_from_row(row)?,
+                links_in: row.get::<_, i64>(9)? as usize,
+                chunk_count: row.get::<_, i64>(10)? as usize,
+                token_count: row.get::<_, i64>(11)? as usize,
+            })
         })?;
         let mut results = Vec::new();
         for row in rows {
@@ -4792,8 +4827,8 @@ mod tests {
                 ListOrder::LinksInDesc,
             )
             .unwrap();
-        let hub_row = rows.iter().find(|(f, _)| f.path == "hub.md").unwrap();
-        assert_eq!(hub_row.1, 2, "two notes link in, from four sections");
+        let hub_row = rows.iter().find(|r| r.file.path == "hub.md").unwrap();
+        assert_eq!(hub_row.links_in, 2, "two notes link in, from four sections");
     }
 
     #[test]
@@ -4820,8 +4855,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(top.len(), 1);
-        assert_eq!(top[0].0.path, "zeta.md");
-        assert_eq!(top[0].1, 3);
+        assert_eq!(top[0].file.path, "zeta.md");
+        assert_eq!(top[0].links_in, 3);
     }
 
     #[test]
@@ -4847,7 +4882,7 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 1, "the scope admits the one note");
         assert_eq!(
-            rows[0].1, 1,
+            rows[0].links_in, 1,
             "a note the scope excludes still counts as a link in"
         );
     }
@@ -4879,7 +4914,7 @@ mod tests {
                 ListOrder::LinksInDesc,
             )
             .unwrap();
-        let ranked: Vec<&str> = rows.iter().map(|(f, _)| f.path.as_str()).collect();
+        let ranked: Vec<&str> = rows.iter().map(|r| r.file.path.as_str()).collect();
         assert_eq!(ranked, vec!["a.md", "b.md", "caller.md"]);
     }
 
@@ -4904,10 +4939,74 @@ mod tests {
                 ListOrder::LinksInAsc,
             )
             .unwrap();
-        assert_eq!(rows[0].0.path, "lonely.md");
-        assert_eq!(rows[0].1, 0);
-        assert_eq!(rows[1].0.path, "hub.md");
-        assert_eq!(rows[1].1, 1);
+        assert_eq!(rows[0].file.path, "lonely.md");
+        assert_eq!(rows[0].links_in, 0);
+        assert_eq!(rows[1].file.path, "hub.md");
+        assert_eq!(rows[1].links_in, 1);
+    }
+
+    #[test]
+    fn a_listing_answers_each_notes_own_chunk_count_and_token_total() {
+        let store = Store::open_memory().unwrap();
+        let long = store
+            .insert_file("long.md", "h", 100, "lo1", None, None)
+            .unwrap();
+        let short = store
+            .insert_file("short.md", "h", 100, "sh1", None, None)
+            .unwrap();
+        for (seq, tokens) in [(0i64, 100i64), (1, 200), (2, 300)] {
+            store
+                .insert_chunk(&NewChunk {
+                    file_id: long,
+                    seq,
+                    text: "body",
+                    vector_id: seq as u64 + 1,
+                    token_count: tokens,
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        store
+            .insert_chunk(&NewChunk {
+                file_id: short,
+                seq: 0,
+                text: "body",
+                vector_id: 10,
+                token_count: 40,
+                ..Default::default()
+            })
+            .unwrap();
+
+        let rows = store
+            .list_files_with_links_in(&crate::tags::Scope::default(), None, None, ListOrder::Path)
+            .unwrap();
+        let long_row = rows.iter().find(|r| r.file.path == "long.md").unwrap();
+        assert_eq!(long_row.chunk_count, 3);
+        assert_eq!(
+            long_row.token_count, 600,
+            "the note's own chunks, summed, and not the vault's"
+        );
+        let short_row = rows.iter().find(|r| r.file.path == "short.md").unwrap();
+        assert_eq!(short_row.chunk_count, 1);
+        assert_eq!(short_row.token_count, 40);
+    }
+
+    /// `SUM` over no rows is NULL, so a note the chunker produced nothing for
+    /// — frontmatter and no body — would fail the row read rather than report
+    /// its size. `index_file` inserts the `files` row before it loops over the
+    /// chunks, so such a note is reachable (#131).
+    #[test]
+    fn a_note_with_no_chunks_answers_a_zero_size_and_not_a_null() {
+        let store = Store::open_memory().unwrap();
+        store
+            .insert_file("empty.md", "h", 100, "em1", None, None)
+            .unwrap();
+
+        let rows = store
+            .list_files_with_links_in(&crate::tags::Scope::default(), None, None, ListOrder::Path)
+            .unwrap();
+        assert_eq!(rows[0].chunk_count, 0);
+        assert_eq!(rows[0].token_count, 0);
     }
 
     #[test]
