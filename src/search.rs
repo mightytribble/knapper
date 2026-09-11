@@ -55,6 +55,16 @@ pub struct SearchOutput {
     /// Printed by `--explain` because the weights are a measurement input that
     /// leaves no other trace in the output.
     pub fts_columns: Vec<(&'static str, f64)>,
+    /// The candidates the answer floor rejected, ranked and cut to the rows
+    /// the reply can hold (#133).
+    ///
+    /// They are read from the store the same way an answer is, so the cut
+    /// happens before the read and not after: `top_n` bounds it, which is at
+    /// most a handful of rows and never the whole candidate pool.
+    pub less_relevant: Vec<InternalSearchResult>,
+    /// The floor those candidates failed to clear, on the scorer's own 0-1
+    /// scale (#133). `None` when nothing is reported.
+    pub answer_floor: Option<f64>,
 }
 
 /// The tag scope a query ran under (#60).
@@ -129,6 +139,12 @@ pub struct SearchConfig<'a> {
     /// Calibrated score fusion for the model-free sorted stage
     /// (docs/specs/2026-08-30-calibrated-fusion-design.md).
     pub calibrated: crate::config::CalibratedConfig,
+    /// Whether the candidates the answer floor rejected are reported (#133).
+    ///
+    /// An output concern read here because the cost is a pipeline one: off,
+    /// the rejected candidates are never read from the store, so the query
+    /// is byte-for-byte and cost-for-cost what it was before #133.
+    pub show_less_relevant: bool,
 }
 
 impl<'a> SearchConfig<'a> {
@@ -146,6 +162,7 @@ impl<'a> SearchConfig<'a> {
             fts: config.fts,
             scope: crate::tags::Scope::default(),
             calibrated: config.calibrated.clone(),
+            show_less_relevant: config.output.show_less_relevant,
         }
     }
 }
@@ -307,6 +324,10 @@ pub fn search_with_intelligence(
             results: Vec::new(),
             fused: Vec::new(),
             degraded: false,
+            // A scope no note satisfies never reaches a scorer, so there is
+            // no floor and nothing it rejected (#133).
+            less_relevant: Vec::new(),
+            answer_floor: None,
             retrieval: RetrievalTrace {
                 query: query.to_string(),
                 fts_expr: crate::fts::any_term_expr(query),
@@ -561,7 +582,7 @@ pub fn search_with_intelligence(
     // fallback for a *configured* model that fails at call time (§7.3), and a
     // deliberate configuration is not that.
     if enters_sorted {
-        let (final_fused, degraded, calibrated) = sorted_stage(
+        let sorted = sorted_stage(
             query,
             &query_vec,
             config,
@@ -572,7 +593,9 @@ pub fn search_with_intelligence(
             date_range,
             RRF_K,
         );
-        trace.calibrated = calibrated;
+        let (final_fused, degraded) = (sorted.fused, sorted.degraded);
+        let (rejected, answer_floor) = (sorted.rejected, sorted.floor);
+        trace.calibrated = sorted.trace;
 
         // No limit on the results by default. Limit what the model reads, not
         // what it returns: if one document holds the ten best sections, then ten
@@ -602,6 +625,8 @@ pub fn search_with_intelligence(
             degraded,
             trace,
             config.fts.columns(),
+            rejected,
+            answer_floor,
         ));
     }
 
@@ -755,6 +780,9 @@ pub fn search_with_intelligence(
         false,
         trace,
         config.fts.columns(),
+        // The legacy stage runs no answer floor, so it rejects nothing (#133).
+        Vec::new(),
+        None,
     ))
 }
 
@@ -784,12 +812,15 @@ fn model_score(result: &FusedResult) -> Option<f64> {
 /// whether the cross-encoder is present or absent. `fused` stays per-chunk.
 /// It is the `--explain` record of the fusion step. It is not the presented
 /// result.
+#[allow(clippy::too_many_arguments)]
 fn finalize_search_output(
     present: Presentation<'_, impl Fn(&FusedResult) -> f64>,
     fused: Vec<FusedResult>,
     degraded: bool,
     trace: RetrievalTrace,
     fts_columns: Vec<(&'static str, f64)>,
+    rejected: Vec<FusedResult>,
+    answer_floor: Option<f64>,
 ) -> SearchOutput {
     let top_n = present.top_n;
     let coalesce = present.coalesce;
@@ -824,12 +855,24 @@ fn finalize_search_output(
         }
         Err(e) => tracing::warn!("search hits carry no properties: {e:#}"),
     }
+    // The rejected candidates take the slots the answers left, and the cut
+    // runs before the store read rather than after it: `top_n` is a handful
+    // of rows, and the pool the floor rejected can be the whole thirty-two
+    // (#133). A search that answered in full reads nothing extra at all.
+    let free = present.top_n.saturating_sub(results.len());
+    let less_relevant: Vec<InternalSearchResult> = rejected
+        .iter()
+        .take(free)
+        .map(|f| build_result(present.store, f, present.rerank, (present.score)(f)))
+        .collect();
     SearchOutput {
         results,
         fused,
         degraded,
         retrieval: trace,
         fts_columns,
+        answer_floor: answer_floor.filter(|_| !less_relevant.is_empty()),
+        less_relevant,
     }
 }
 
@@ -974,7 +1017,7 @@ fn sorted_stage(
     weights: &crate::config::LaneWeights,
     date_range: Option<(i64, i64)>,
     rrf_k: usize,
-) -> (Vec<FusedResult>, bool, Option<CalibratedTrace>) {
+) -> Sorted {
     // Two lanes, not three. The graph is a candidate generator and not a
     // scorer (§3), so it no longer votes here — `weights.graph` is read by the
     // legacy stage and by nothing else.
@@ -1097,7 +1140,16 @@ fn sorted_stage(
         let ordered = ranking::degraded_interleave(pool);
         let mut results = ranking::into_fused(ordered, "rerank");
         ranking::degraded_confidence(&mut results);
-        return (results, true, None);
+        // No scorer ran, so there is no probability and no floor. Reporting
+        // an empty `less_relevant` here would be misleading rather than
+        // informative — the rule `scores` already follows on a degraded row.
+        return Sorted {
+            fused: results,
+            degraded: true,
+            trace: None,
+            rejected: Vec::new(),
+            floor: None,
+        };
     }
 
     ranking::sort_by_rerank(&mut pool, config.ranking.tiebreak);
@@ -1117,7 +1169,8 @@ fn sorted_stage(
         config.ranking.answer_floor
     };
     let supported = pool.len();
-    let dropped = ranking::apply_answer_floor(&mut pool, floor);
+    let rejected = ranking::split_at_answer_floor(&mut pool, floor);
+    let dropped = rejected.len();
     if dropped > 0 {
         // The cost per query. The fit uses the best score of each query, and
         // the floor applies to a whole list, so how much of the list it removes
@@ -1156,11 +1209,38 @@ fn sorted_stage(
     } else {
         "rerank"
     };
-    (
-        ranking::into_fused(pool, sort_lane),
-        false,
-        calibrated_trace,
-    )
+    // What the floor rejected, ranked, for the caller to weigh itself (#133).
+    // Off, nothing is carried and nothing downstream reads the store for it.
+    let rejected = if config.show_less_relevant && !rejected.is_empty() {
+        ranking::into_fused(rejected, sort_lane)
+    } else {
+        Vec::new()
+    };
+    let reported_floor = (!rejected.is_empty()).then_some(floor);
+    Sorted {
+        fused: ranking::into_fused(pool, sort_lane),
+        degraded: false,
+        trace: calibrated_trace,
+        rejected,
+        floor: reported_floor,
+    }
+}
+
+/// What the sorted stage produced (#133).
+///
+/// The rejected candidates ride beside the answers rather than in them: they
+/// are not results, and a caller that reads `fused` alone sees exactly what
+/// it saw before the floor started reporting.
+struct Sorted {
+    fused: Vec<FusedResult>,
+    degraded: bool,
+    trace: Option<CalibratedTrace>,
+    /// Ranked, below the floor. Empty on a degraded order, which has no
+    /// score to reject on, and when `show_less_relevant` is off.
+    rejected: Vec<FusedResult>,
+    /// The floor `rejected` failed to clear, on the scorer's own 0-1 scale.
+    /// `None` when nothing is reported, so the number never travels alone.
+    floor: Option<f64>,
 }
 
 /// Compute the calibrated probability for every pool candidate and store it in
@@ -1635,6 +1715,9 @@ pub fn run_search(
             summaries,
             degraded: output.degraded,
             per_note_cap: config.ranking.per_note_cap,
+            top_n,
+            less_relevant: &output.less_relevant,
+            answer_floor: output.answer_floor,
         },
     );
     // A number invites a caller to trust it as ground truth rather than as a
@@ -2163,6 +2246,7 @@ mod tests {
                 enabled: false,
                 ..Default::default()
             },
+            show_less_relevant: true,
         };
         search_with_intelligence(query, top_n, embedder, &mut config).unwrap()
     }
@@ -2340,6 +2424,7 @@ A warding effect that ends an ongoing spell.              It reaches an effect a
                 group_by: GroupBy::Chunk,
                 ranking: sorted_config(crate::config::RankingConfig::default()),
                 calibrated: crate::config::CalibratedConfig::default(),
+                show_less_relevant: true,
             };
             search_with_intelligence("warding", top_n, &mut embedder, &mut config).unwrap()
         };
@@ -2460,6 +2545,7 @@ A warding effect that ends an ongoing spell.              It reaches an effect a
                 enabled: false,
                 ..Default::default()
             },
+            show_less_relevant: true,
         };
         let out = search_with_intelligence("warding", 10, &mut embedder, &mut config).unwrap();
         let top = out.results.first().expect("a hit");
@@ -2501,6 +2587,7 @@ A warding effect that ends an ongoing spell.              It reaches an effect a
                 enabled: false,
                 ..Default::default()
             },
+            show_less_relevant: true,
         };
         let out = search_with_intelligence("warding", 10, &mut embedder, &mut config).unwrap();
         let warding: Vec<&InternalSearchResult> = out
@@ -2544,6 +2631,7 @@ A warding effect that ends an ongoing spell.              It reaches an effect a
                 enabled: false,
                 ..Default::default()
             },
+            show_less_relevant: true,
         };
         let out = search_with_intelligence("warding", 10, &mut embedder, &mut config).unwrap();
         let count = out
@@ -2578,6 +2666,7 @@ A warding effect that ends an ongoing spell.              It reaches an effect a
                     enabled: false,
                     ..Default::default()
                 },
+                show_less_relevant: true,
             };
             let out = search_with_intelligence("warding", 20, embedder, &mut config).unwrap();
             out.results.first().map(|r| r.score)
@@ -2618,6 +2707,7 @@ A warding effect that ends an ongoing spell.              It reaches an effect a
                     enabled: false,
                     ..Default::default()
                 },
+                show_less_relevant: true,
             };
             search_with_intelligence("warding", 10, embedder, &mut config)
                 .unwrap()
@@ -2681,6 +2771,7 @@ A warding effect that ends an ongoing spell.              It reaches an effect a
                     enabled: false,
                     ..Default::default()
                 },
+                show_less_relevant: true,
             };
             let out = search_with_intelligence("warding", 20, embedder, &mut config).unwrap();
             out.results
@@ -2771,6 +2862,7 @@ A warding effect that ends an ongoing spell.              It reaches an effect a
                 enabled: false,
                 ..Default::default()
             },
+            show_less_relevant: true,
         };
         search_with_intelligence(query, top_n, embedder, &mut config).unwrap()
     }
@@ -3225,6 +3317,7 @@ A warding effect that ends an ongoing spell.              It reaches an effect a
                     enabled: false,
                     ..Default::default()
                 },
+                show_less_relevant: true,
             };
             search_with_intelligence(query, 10, embedder, &mut config).unwrap();
         }
@@ -3361,6 +3454,7 @@ A warding effect that ends an ongoing spell.              It reaches an effect a
                 enabled: false,
                 ..Default::default()
             },
+            show_less_relevant: true,
         };
         search_with_intelligence(query, 20, embedder, &mut config).unwrap()
     }
@@ -3556,6 +3650,7 @@ A warding effect that ends an ongoing spell.              It reaches an effect a
                     enabled: false,
                     ..Default::default()
                 },
+                show_less_relevant: true,
             };
             let output =
                 search_with_intelligence("warding", 10, &mut embedder, &mut config).unwrap();
@@ -3599,6 +3694,7 @@ A warding effect that ends an ongoing spell.              It reaches an effect a
                     enabled: false,
                     ..Default::default()
                 },
+                show_less_relevant: true,
             };
             let output =
                 search_with_intelligence("warding", 10, &mut embedder, &mut config).unwrap();
@@ -3693,6 +3789,7 @@ A warding effect that ends an ongoing spell.              It reaches an effect a
                     enabled: false,
                     ..Default::default()
                 },
+                show_less_relevant: true,
             };
             let output = search_with_intelligence("warding", 20, embedder, &mut config).unwrap();
             output
@@ -3764,6 +3861,7 @@ A warding effect that ends an ongoing spell.              It reaches an effect a
                     enabled: false,
                     ..Default::default()
                 },
+                show_less_relevant: true,
             };
             search_with_intelligence("warding", 20, embedder, &mut config)
                 .unwrap()
@@ -3789,6 +3887,9 @@ A warding effect that ends an ongoing spell.              It reaches an effect a
                 summaries: false,
                 degraded: false,
                 per_note_cap: 0,
+                top_n: 5,
+                less_relevant: &[],
+                answer_floor: None,
             },
         );
         assert_eq!(env.status, crate::packaging::SearchStatus::NoResults);
@@ -3799,6 +3900,117 @@ A warding effect that ends an ongoing spell.              It reaches an effect a
 
         let ungated = results_at(0.0, &mut embedder);
         assert!(!ungated.is_empty(), "the control removed a result");
+    }
+
+    /// #133: the candidates the floor rejected leave the pipeline ranked,
+    /// with the floor that rejected them, so the caller can tell "the vault
+    /// holds nothing like this" from "the floor took what nearly answered".
+    #[test]
+    fn the_floor_reports_what_it_rejected() {
+        let (_tmp, store, mut embedder) = vault_with_one_deep_document_and_a_linked_neighbour();
+        let mut reranker = CountingReranker::new();
+        let mut config = SearchConfig {
+            fts: crate::config::FtsConfig::default(),
+            scope: crate::tags::Scope::default(),
+            reranker: Some(&mut reranker),
+            store: &store,
+            rerank_candidates: 30,
+            lane_weights: crate::config::LaneWeights::default(),
+            rerank: crate::config::RerankConfig::default(),
+            max_chunks_per_file: 3,
+            group_by: GroupBy::Chunk,
+            show_less_relevant: true,
+            ranking: crate::config::RankingConfig {
+                mode: crate::config::RankingMode::Sorted,
+                answer_floor: 1.01,
+                ..Default::default()
+            },
+            calibrated: crate::config::CalibratedConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        };
+        let output = search_with_intelligence("warding", 5, &mut embedder, &mut config).unwrap();
+
+        assert!(output.results.is_empty(), "the floor kept an answer");
+        assert!(
+            !output.less_relevant.is_empty(),
+            "the floor rejected candidates and reported none of them"
+        );
+        assert_eq!(output.answer_floor, Some(1.01));
+        // Ranked, and never more than the slots the reply has.
+        assert!(output.less_relevant.len() <= 5);
+        let scores: Vec<f64> = output.less_relevant.iter().map(|r| r.confidence).collect();
+        assert!(
+            scores.windows(2).all(|w| w[0] >= w[1]),
+            "rejected candidates are not in rank order: {scores:?}"
+        );
+    }
+
+    /// The floor that rejected nothing reports nothing, so a query that
+    /// answered in full renders exactly as it did before #133.
+    #[test]
+    fn a_floor_that_rejected_nothing_reports_nothing() {
+        let (_tmp, store, mut embedder) = vault_with_one_deep_document_and_a_linked_neighbour();
+        let mut reranker = CountingReranker::new();
+        let mut config = SearchConfig {
+            fts: crate::config::FtsConfig::default(),
+            scope: crate::tags::Scope::default(),
+            reranker: Some(&mut reranker),
+            store: &store,
+            rerank_candidates: 30,
+            lane_weights: crate::config::LaneWeights::default(),
+            rerank: crate::config::RerankConfig::default(),
+            max_chunks_per_file: 3,
+            group_by: GroupBy::Chunk,
+            show_less_relevant: true,
+            ranking: crate::config::RankingConfig {
+                mode: crate::config::RankingMode::Sorted,
+                answer_floor: 0.0,
+                ..Default::default()
+            },
+            calibrated: crate::config::CalibratedConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        };
+        let output = search_with_intelligence("warding", 5, &mut embedder, &mut config).unwrap();
+
+        assert!(!output.results.is_empty(), "the control removed a result");
+        assert!(output.less_relevant.is_empty());
+    }
+
+    /// `[output] show_less_relevant = false` pays nothing: no hydration and
+    /// no rows, whatever the floor rejected (#133).
+    #[test]
+    fn show_less_relevant_off_reports_nothing() {
+        let (_tmp, store, mut embedder) = vault_with_one_deep_document_and_a_linked_neighbour();
+        let mut reranker = CountingReranker::new();
+        let mut config = SearchConfig {
+            fts: crate::config::FtsConfig::default(),
+            scope: crate::tags::Scope::default(),
+            reranker: Some(&mut reranker),
+            store: &store,
+            rerank_candidates: 30,
+            lane_weights: crate::config::LaneWeights::default(),
+            rerank: crate::config::RerankConfig::default(),
+            max_chunks_per_file: 3,
+            group_by: GroupBy::Chunk,
+            show_less_relevant: false,
+            ranking: crate::config::RankingConfig {
+                mode: crate::config::RankingMode::Sorted,
+                answer_floor: 1.01,
+                ..Default::default()
+            },
+            calibrated: crate::config::CalibratedConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        };
+        let output = search_with_intelligence("warding", 5, &mut embedder, &mut config).unwrap();
+
+        assert!(output.less_relevant.is_empty());
+        assert_eq!(output.answer_floor, None);
     }
 
     /// The results limit that §9.1 wants and #30 does not, shipped as a key with
@@ -3833,6 +4045,7 @@ A warding effect that ends an ongoing spell.              It reaches an effect a
                     enabled: false,
                     ..Default::default()
                 },
+                show_less_relevant: true,
             };
             search_with_intelligence("warding", 20, embedder, &mut config)
                 .unwrap()
@@ -3882,6 +4095,7 @@ A warding effect that ends an ongoing spell.              It reaches an effect a
                     enabled: false,
                     ..Default::default()
                 },
+                show_less_relevant: true,
             };
             search_with_intelligence("warding", 10, &mut embedder, &mut config).unwrap();
         }
@@ -3946,6 +4160,7 @@ A warding effect that ends an ongoing spell.              It reaches an effect a
                 enabled: false,
                 ..Default::default()
             },
+            show_less_relevant: true,
         };
         let output = search_with_intelligence("warding", 10, &mut embedder, &mut config).unwrap();
 
@@ -3981,6 +4196,7 @@ A warding effect that ends an ongoing spell.              It reaches an effect a
                 enabled: false,
                 ..Default::default()
             },
+            show_less_relevant: true,
         };
         let output = search_with_intelligence("warding", 20, &mut embedder, &mut config).unwrap();
 
@@ -4025,6 +4241,7 @@ A warding effect that ends an ongoing spell.              It reaches an effect a
                 ..Default::default()
             }),
             calibrated,
+            show_less_relevant: true,
         };
         search_with_intelligence(query, 20, embedder, &mut config).unwrap()
     }
@@ -4185,6 +4402,7 @@ A warding effect that ends an ongoing spell.              It reaches an effect a
                     ..Default::default()
                 }),
                 calibrated,
+                show_less_relevant: true,
             };
             search_with_intelligence("warding", 20, embedder, &mut config).unwrap()
         };
@@ -4247,6 +4465,7 @@ A warding effect that ends an ongoing spell.              It reaches an effect a
                     ..Default::default()
                 },
                 calibrated,
+                show_less_relevant: true,
             };
             search_with_intelligence("warding", 20, embedder, &mut config).unwrap()
         };
@@ -4419,6 +4638,7 @@ A warding effect that ends an ongoing spell.              It reaches an effect a
                 enabled: false,
                 ..Default::default()
             },
+            show_less_relevant: true,
         };
         let reranked_out =
             search_with_intelligence("warding", 20, &mut embedder, &mut config).unwrap();
@@ -4451,6 +4671,7 @@ A warding effect that ends an ongoing spell.              It reaches an effect a
                 enabled: false,
                 ..Default::default()
             },
+            show_less_relevant: true,
         };
         let output = search_with_intelligence("warding", 10, &mut embedder, &mut config).unwrap();
 
@@ -4484,6 +4705,7 @@ A warding effect that ends an ongoing spell.              It reaches an effect a
                 enabled: false,
                 ..Default::default()
             },
+            show_less_relevant: true,
         };
         let output = search_with_intelligence("warding", 10, &mut embedder, &mut config).unwrap();
 

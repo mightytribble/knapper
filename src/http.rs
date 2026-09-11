@@ -442,6 +442,7 @@ async fn handle_search(
         fts: state.fts,
         scope,
         calibrated: state.calibrated.clone(),
+        show_less_relevant: state.output.show_less_relevant,
     };
 
     let output = search::search_with_intelligence(&body.query, top_n, &mut *embedder, &mut config)
@@ -468,6 +469,9 @@ async fn handle_search(
             summaries: body.summaries,
             degraded: output.degraded,
             per_note_cap: state.ranking.per_note_cap,
+            top_n,
+            less_relevant: &output.less_relevant,
+            answer_floor: output.answer_floor,
         },
     );
     // A number invites a caller to trust it as ground truth rather than as a
@@ -2280,6 +2284,29 @@ mod tests {
         state.store = Arc::new(Mutex::new(store));
         state.embedder = Arc::new(Mutex::new(Box::new(embedder) as Box<dyn EmbedModel + Send>));
         (tmp, state)
+    }
+
+    /// #133 reaches HTTP: a query the floor emptied names what it rejected,
+    /// with the floor beside it, and the status does not move.
+    #[tokio::test]
+    async fn a_floored_search_names_what_it_rejected() {
+        let (_tmp, mut state) = state_over_five_answering_notes();
+        // No cross-encoder here, so the sorted stage needs `[calibrated]
+        // enabled` to run and the logistic's own floor is what applies.
+        state.calibrated.enabled = true;
+        state.calibrated.floor = 1.01;
+
+        let (status, body) = post_json(state, "/api/search", r#"{"query":"warding"}"#).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "no_results", "got {body}");
+        let rows = body["less_relevant"].as_array().expect("got {body}");
+        assert!(!rows.is_empty(), "got {body}");
+        assert!(
+            rows.iter().all(|r| r.get("score").is_some()),
+            "a rejected row carries its score without being asked, got {body}"
+        );
+        assert_eq!(body["answer_floor"], 101.0, "got {body}");
     }
 
     /// R21 (#62): the number of results a call that names no `top_n` gets is

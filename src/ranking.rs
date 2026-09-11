@@ -306,12 +306,31 @@ pub const NO_RELEVANT_CONTENT: &str = "No relevant content found for this query 
 /// of each query, and the floor applies to a whole list, so this count is what
 /// shows the cost on a query that does have an answer.
 pub fn apply_answer_floor(pool: &mut Vec<Candidate>, floor: f64) -> usize {
+    split_at_answer_floor(pool, floor).len()
+}
+
+/// The same cut, with the rejected candidates handed back in rank order
+/// instead of counted (#133).
+///
+/// One rule and not two: `apply_answer_floor` is this function's count, so a
+/// candidate cannot be an answer to the floor and a reject to the report.
+/// The pool is ordered when this runs, so the returned candidates are ranked
+/// and each still carries the score it was rejected for.
+pub fn split_at_answer_floor(pool: &mut Vec<Candidate>, floor: f64) -> Vec<Candidate> {
     if floor <= 0.0 {
-        return 0;
+        return Vec::new();
     }
-    let before = pool.len();
-    pool.retain(|c| c.rerank_score.is_none_or(|score| score >= floor));
-    before - pool.len()
+    let mut kept = Vec::with_capacity(pool.len());
+    let mut rejected = Vec::new();
+    for c in pool.drain(..) {
+        if c.rerank_score.is_none_or(|score| score >= floor) {
+            kept.push(c);
+        } else {
+            rejected.push(c);
+        }
+    }
+    *pool = kept;
+    rejected
 }
 
 /// The documented fallback for a *configured* cross-encoder that fails at call
