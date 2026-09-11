@@ -253,6 +253,17 @@ pub struct Match {
     #[arg(long)]
     #[serde(default)]
     pub case_sensitive: bool,
+    /// Count a hit only where the pattern stands as its own word: the
+    /// character before it and the character after it are not letters,
+    /// digits or underscores. `DNA` then answers `DNA`, `DNA-based` and
+    /// `DNA's`, and not `kidnapped`, `mRNA` or `DNA2`. An edge the pattern
+    /// itself spells with punctuation is not tested, so `"(DNA)"` stays
+    /// matchable. A script that does not space its words — Han, Kana —
+    /// makes every neighbour a word character, so the flag rejects nearly
+    /// every hit there.
+    #[arg(long)]
+    #[serde(default)]
+    pub word: bool,
     /// An alias of `all`. A term starting with `/` is a directory path from
     /// the vault root instead of a tag, case-sensitive; a trailing `/`
     /// scopes to its subtree.

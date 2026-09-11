@@ -27,6 +27,7 @@ pub struct ChunkRow {
 pub struct Query {
     pattern: String,
     case_sensitive: bool,
+    word: bool,
     /// The pattern folded once, for the insensitive comparison.
     folded: String,
 }
@@ -36,8 +37,16 @@ impl Query {
         Query {
             pattern: pattern.to_string(),
             case_sensitive,
+            word: false,
             folded: pattern.to_lowercase(),
         }
+    }
+
+    /// Require each hit to stand as its own word. Off by default, which is
+    /// the plain substring comparison `match` has always made (#129).
+    pub fn whole_word(mut self, word: bool) -> Self {
+        self.word = word;
+        self
     }
 
     /// Whether the haystack holds the pattern, as it is written or as it is
@@ -49,7 +58,9 @@ impl Query {
     /// line `the [[style-guide|Style Guide]] review group` holds "Style Guide
     /// review group" for every reader and for no substring search. Both readings are compared,
     /// so neither the phrase nor the markup itself can be missed, and
-    /// `notes: 0` says the pattern is absent from both (#118).
+    /// `notes: 0` says the pattern is absent from both (#118). `word` is
+    /// asked of each reading in turn, so a phrase that stands alone in
+    /// either one answers.
     fn matches(&self, haystack: &str) -> bool {
         if self.holds(haystack) {
             return true;
@@ -63,13 +74,75 @@ impl Query {
     }
 
     /// One comparison, against one reading of the line.
+    ///
+    /// The insensitive path folds the line and compares the folded pattern,
+    /// so every offset below is into the folded string. `to_lowercase` does
+    /// not preserve length — `\u{130}` folds to two characters — so a folded
+    /// offset is not a raw one and the two are never mixed.
     fn holds(&self, haystack: &str) -> bool {
         if self.case_sensitive {
-            haystack.contains(&self.pattern)
+            self.occurs(haystack, &self.pattern)
         } else {
-            haystack.to_lowercase().contains(&self.folded)
+            self.occurs(&haystack.to_lowercase(), &self.folded)
         }
     }
+
+    /// Whether `needle` occurs in `haystack`, the two in one case already.
+    ///
+    /// Without `word` this is `contains`. With it the occurrences are walked,
+    /// because a boundary test needs the position and the first occurrence is
+    /// not the only chance: `The quarters hold the art.` carries the pattern
+    /// inside a longer word before it says the word itself.
+    fn occurs(&self, haystack: &str, needle: &str) -> bool {
+        if !self.word {
+            return haystack.contains(needle);
+        }
+        haystack
+            .match_indices(needle)
+            .any(|(at, hit)| self.stands_alone(haystack, at, hit.len()))
+    }
+
+    /// Whether the occurrence at byte offset `at` stands as its own word.
+    ///
+    /// A hit counts when the character before it and the character after it
+    /// are not word characters. An edge is tested only where the pattern's
+    /// own character there is a word character, so `--word "(DNA)"` stays
+    /// matchable: the pattern opens on punctuation, and there is nothing to
+    /// ask of what sits beside punctuation. A pattern of several words is
+    /// two edges like any other, so only its outer two are tested.
+    ///
+    /// Those two edge classes are read from the pattern **as the caller
+    /// wrote it**, never from the folded copy. `\u{130}` is a letter and folds
+    /// to `i` plus a combining dot, and a combining mark is not a word
+    /// character, so the folded copy would drop the right-hand test and let
+    /// `\u{130}x` answer as the word.
+    ///
+    /// Two limits are worth stating. A script that does not space its words —
+    /// Han, Kana — makes every neighbouring character alphanumeric, so the
+    /// rule rejects nearly every hit there; the flag is opt-in, so this is a
+    /// declared limit rather than a defect. And only wikilinks are rendered
+    /// (#118), so markup inside a word — `**art**ist` — puts a non-word
+    /// character beside the pattern in both readings and reads as a word
+    /// where a reader sees one word. That costs a reported line and never an
+    /// absence.
+    fn stands_alone(&self, haystack: &str, at: usize, len: usize) -> bool {
+        let open_left = !self.pattern.chars().next().is_some_and(is_word_char)
+            || !haystack[..at].chars().next_back().is_some_and(is_word_char);
+        let open_right = !self.pattern.chars().next_back().is_some_and(is_word_char)
+            || !haystack[at + len..]
+                .chars()
+                .next()
+                .is_some_and(is_word_char);
+        open_left && open_right
+    }
+}
+
+/// What a word is made of, for the boundary test: a letter, a digit or an
+/// underscore. The rule the `\b` of every regex dialect uses, spelled out
+/// because `match` compares a literal and has no regex engine to borrow it
+/// from.
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
 }
 
 /// One matched line.
@@ -173,7 +246,7 @@ pub fn run(
     }
     let scope = params.scope()?;
     let mut scanner = Scanner::new(
-        Query::new(&params.pattern, params.case_sensitive),
+        Query::new(&params.pattern, params.case_sensitive).whole_word(params.word),
         params.limit,
     );
     store.for_each_chunk_in_scope(&scope, |row| scanner.push(row))?;
@@ -281,6 +354,7 @@ mod tests {
         crate::params::Match {
             pattern: pattern.to_string(),
             case_sensitive: false,
+            word: false,
             scope: Vec::new(),
             all: Vec::new(),
             any: Vec::new(),
@@ -631,5 +705,181 @@ mod tests {
         assert_eq!(report.notes, 1);
         assert_eq!(report.lines, 1);
         assert_eq!(report.hits.len(), 1);
+    }
+
+    fn scan_word(rows: Vec<ChunkRow>, pattern: &str, case_sensitive: bool) -> MatchReport {
+        let mut scanner = Scanner::new(Query::new(pattern, case_sensitive).whole_word(true), None);
+        for r in rows {
+            scanner.push(r);
+        }
+        scanner.finish()
+    }
+
+    #[test]
+    fn a_word_match_refuses_a_longer_word_that_carries_the_pattern() {
+        let rows = || {
+            vec![row(
+                "Lore/Geography.md",
+                None,
+                "The earth is divided into quarters.",
+            )]
+        };
+
+        assert_eq!(
+            scan(rows(), "art", false).notes,
+            1,
+            "fixture check: the substring is there twice"
+        );
+        assert_eq!(scan_word(rows(), "art", false).notes, 0);
+    }
+
+    #[test]
+    fn a_word_match_finds_the_pattern_standing_as_its_own_word() {
+        let report = scan_word(
+            vec![row("Lore/Guild.md", None, "The art of the guild.")],
+            "art",
+            false,
+        );
+
+        assert_eq!(report.notes, 1);
+    }
+
+    #[test]
+    fn a_neighbour_that_is_not_a_word_character_admits_the_hit() {
+        // `DNA-based` and `DNA's` are the word with punctuation beside it.
+        for line in ["A DNA-based assay.", "The DNA's helix."] {
+            let report = scan_word(vec![row("Lab/notes.md", None, line)], "DNA", true);
+            assert_eq!(report.notes, 1, "{line}");
+        }
+    }
+
+    #[test]
+    fn a_neighbour_that_is_a_word_character_refuses_the_hit() {
+        for line in ["The DNA2 strand.", "The DNA_2 strand.", "The xDNA strand."] {
+            let report = scan_word(vec![row("Lab/notes.md", None, line)], "DNA", true);
+            assert_eq!(report.notes, 0, "{line}");
+        }
+    }
+
+    #[test]
+    fn an_edge_the_pattern_does_not_spell_with_a_word_character_is_not_tested() {
+        // `--word "(DNA)"` has to stay matchable: the pattern's own outer
+        // characters are punctuation, so there is nothing to ask of the
+        // characters beside them.
+        let report = scan_word(
+            vec![row("Lab/notes.md", None, "the sample(DNA)reference")],
+            "(DNA)",
+            true,
+        );
+
+        assert_eq!(report.notes, 1);
+    }
+
+    #[test]
+    fn a_phrase_pattern_tests_its_two_outer_edges_only() {
+        let rows = |line: &str| vec![row("Lore/War.md", None, line)];
+
+        assert_eq!(
+            scan_word(rows("The art of war ended."), "art of war", false).notes,
+            1
+        );
+        assert_eq!(
+            scan_word(rows("The art of warfare ended."), "art of war", false).notes,
+            0
+        );
+    }
+
+    #[test]
+    fn a_word_match_folds_case_like_any_other_comparison() {
+        let rows = |line: &str| vec![row("Lore/Guild.md", None, line)];
+
+        assert_eq!(
+            scan_word(rows("The ART of the guild."), "art", false).notes,
+            1
+        );
+        assert_eq!(scan_word(rows("The EARTH below."), "art", false).notes, 0);
+    }
+
+    #[test]
+    fn a_line_whose_first_occurrence_is_not_a_word_matches_on_a_later_one() {
+        // The comparison cannot stop at the first occurrence: `quarters`
+        // carries the pattern, and the word itself follows it on the line.
+        let report = scan_word(
+            vec![row("Lore/Guild.md", None, "The quarters hold the art.")],
+            "art",
+            false,
+        );
+
+        assert_eq!(report.notes, 1);
+        assert_eq!(report.lines, 1);
+    }
+
+    #[test]
+    fn a_word_match_reads_the_phrase_a_link_renders() {
+        // The phrase spans the markup, so it stands as a word in the
+        // rendered reading and is absent from the raw one (#118).
+        let report = scan_word(
+            vec![row("notes/team.md", None, ALIASED)],
+            "Style Guide review group",
+            false,
+        );
+
+        assert_eq!(report.notes, 1);
+    }
+
+    #[test]
+    fn a_folded_pattern_that_grows_a_mark_still_tests_its_written_edge() {
+        // `İ` lowercases to `i` plus a combining dot, and a combining mark is
+        // not a word character. The edge class is read from the pattern as it
+        // was written, so the right-hand edge is still tested and `İx` is not
+        // the word.
+        assert_eq!(
+            scan_word(vec![row("a.md", None, "İx")], "İ", false).notes,
+            0
+        );
+        assert_eq!(
+            scan_word(vec![row("a.md", None, "İ alone")], "İ", false).notes,
+            1
+        );
+    }
+
+    #[test]
+    fn a_script_that_does_not_space_its_words_refuses_nearly_every_hit() {
+        // A stated limit rather than a defect. Every neighbouring character
+        // in Han or Kana is alphanumeric, so the rule rejects a hit that a
+        // reader would call a word. The flag is opt-in and the default
+        // comparison still answers.
+        let rows = || vec![row("Places/tokyo.md", None, "東京都の地図")];
+
+        assert_eq!(scan(rows(), "京都", false).notes, 1, "fixture check");
+        assert_eq!(scan_word(rows(), "京都", false).notes, 0);
+    }
+
+    #[test]
+    fn markup_inside_a_word_reads_as_a_boundary() {
+        // A stated limit. Only wikilinks are rendered (#118), so `**art**ist`
+        // has `*` beside the pattern in both readings and counts as a word
+        // where a reader sees `artist`. It costs a reported line and never an
+        // absence.
+        let report = scan_word(
+            vec![row("Lore/Guild.md", None, "The **art**ist painted.")],
+            "art",
+            false,
+        );
+
+        assert_eq!(report.notes, 1);
+    }
+
+    #[test]
+    fn a_run_carries_the_word_flag_into_the_comparison() {
+        let mut p = params("tor");
+        assert_eq!(
+            run(&seeded_store(), &p).unwrap().notes,
+            1,
+            "fixture check: `story` carries the substring"
+        );
+
+        p.word = true;
+        assert_eq!(run(&seeded_store(), &p).unwrap().notes, 0);
     }
 }
