@@ -327,7 +327,7 @@ async fn main() -> Result<()> {
                 &params,
                 &args.file,
                 args.section.as_deref(),
-                args.metadata,
+                args.include,
             )?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&result)?);
@@ -345,6 +345,18 @@ async fn main() -> Result<()> {
                         String::new()
                     } else {
                         format!(" via {}", names.join(", "))
+                    }
+                };
+                // The YAML as a note writes it. `split_frontmatter` hands
+                // back the block without its fences, so they are put back
+                // here: they mark where the frontmatter ends, and a caller
+                // copying the output back into a note needs them. A note
+                // with no frontmatter prints none, rather than empty fences.
+                let yaml = |fm: &str| {
+                    if fm.trim().is_empty() {
+                        String::new()
+                    } else {
+                        format!("---\n{}\n---\n", fm.trim_end())
                     }
                 };
                 match result {
@@ -365,7 +377,16 @@ async fn main() -> Result<()> {
                             }
                             None => println!("{}", ident(&note.path, &note.docid)),
                         }
+                        // `--include all` prints the frontmatter above the
+                        // prose, which is the order a note writes them in.
+                        if let Some(fm) = note.frontmatter.as_deref() {
+                            print!("{}", yaml(fm));
+                        }
                         println!("{}", note.content);
+                    }
+                    ReadResult::Frontmatter(note) => {
+                        println!("{}", ident(&note.path, &note.docid));
+                        print!("{}", yaml(&note.frontmatter));
                     }
                     ReadResult::Metadata(meta) => {
                         println!("{}", ident(&meta.path, &meta.docid));

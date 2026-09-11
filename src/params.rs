@@ -130,14 +130,44 @@ pub struct Read {
     /// own level, so a `##` carries the `###` sections below it. Read one
     /// before a `replace` of it, because the replace writes over all of that
     /// (#116).
+    ///
+    /// It combines with `--include content` and `--include all`. The other
+    /// two modes answer the whole note and refuse it (#130).
     #[arg(long)]
     pub section: Option<String>,
-    /// Return the note's metadata — its frontmatter, its inbound and outbound
-    /// links, and its size — instead of its content. It describes the whole
-    /// note, so it cannot be combined with `--section` (#80).
-    #[arg(long, conflicts_with = "section")]
+    /// What the read answers (#130). `content`, the default, is the note's
+    /// prose alone — the whole body with the frontmatter stripped, or one
+    /// section's. `frontmatter` is the note's YAML alone, with no link graph,
+    /// which is the cheap per-note property check. `all` is the prose and the
+    /// frontmatter together, for a note whose YAML carries canon the prose
+    /// does not repeat. `metadata` is everything that is not prose: the
+    /// frontmatter, the inbound and outbound links, the properties and the
+    /// size. `frontmatter` and `metadata` answer the whole note, so neither
+    /// combines with `--section`; `all` does.
+    #[arg(long, value_enum, default_value_t = Include::Content)]
     #[serde(default)]
-    pub metadata: bool,
+    pub include: Include,
+}
+
+/// What a `read` answers (#130). An enum and not a set of booleans, so a
+/// wrong spelling is refused at the boundary, the legal values reach an MCP
+/// client and the OpenAPI spec (#62), and no caller can ask for two modes at
+/// once and leave the server to invent a meaning.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, JsonSchema, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum Include {
+    /// The note's prose alone: the whole body with the frontmatter stripped,
+    /// or one section's body. The default, and what a read has always been.
+    #[default]
+    Content,
+    /// The note's frontmatter alone, with no link graph. The cheap per-note
+    /// property check `metadata` is too heavy for.
+    Frontmatter,
+    /// The prose and the frontmatter together, in one call.
+    All,
+    /// Everything about the note that is not its prose: its frontmatter, its
+    /// inbound and outbound links, its properties and its size (#80).
+    Metadata,
 }
 
 #[derive(Debug, Args, Deserialize, JsonSchema)]

@@ -133,7 +133,7 @@ fn build_read() -> serde_json::Value {
     serde_json::json!({
         "get": {
             "operationId": "readNote",
-            "summary": "Read a note's content, or its metadata with metadata=true.",
+            "summary": "Read a note's content, its frontmatter, both, or its metadata, chosen with include.",
             "parameters": [
                 {
                     "name": "file", "in": "query", "required": true,
@@ -142,16 +142,16 @@ fn build_read() -> serde_json::Value {
                 },
                 {
                     "name": "section", "in": "query", "required": false,
-                    "description": "Read one section by its heading. The content is the section's body; its heading and level come back beside it, so this output can be written straight back through update. Omit for the whole note. The heading is one heading's own text, or its full path from the top heading down joined with ' > ', and the match folds case, so 'spells' finds '## Spells'. Cannot be combined with metadata.",
+                    "description": "Read one section by its heading. The content is the section's body; its heading and level come back beside it, so this output can be written straight back through update. Omit for the whole note. The heading is one heading's own text, or its full path from the top heading down joined with ' > ', and the match folds case, so 'spells' finds '## Spells'. Combines with include=content and include=all; the other two modes answer the whole note and refuse it.",
                     "schema": { "type": "string" }
                 },
                 {
-                    "name": "metadata", "in": "query", "required": false,
-                    "description": "Return the note's metadata — its frontmatter, its inbound and outbound links, and its size — instead of its content. Describes the whole note, so it cannot be combined with section.",
-                    "schema": { "type": "boolean" }
+                    "name": "include", "in": "query", "required": false,
+                    "description": "What the read answers. content (the default) is the note's prose alone. frontmatter is the note's YAML alone, with no link graph — the cheap per-note property check. all is the prose and the frontmatter in one call. metadata is everything that is not prose: the frontmatter, the inbound and outbound links, the properties and the size. frontmatter and metadata describe the whole note and cannot be combined with section.",
+                    "schema": { "type": "string", "enum": ["content", "frontmatter", "all", "metadata"], "default": "content" }
                 }
             ],
-            "responses": { "200": { "description": "Content mode returns {path, docid, content, and section when a section was read, which is {heading, level, line_start, line_end} — level absent for a promoted bold line}. Metadata mode returns {path, docid, frontmatter, byte_count, properties (every property row the note holds), and outgoing_links/incoming_links as arrays of {path, docid, properties} — properties names the custom properties that link is filed under, empty for a plain wikilink}." } }
+            "responses": { "200": { "description": "content returns {path, docid, content, and section when a section was read, which is {heading, level, line_start, line_end} — level absent for a promoted bold line}. all returns that plus frontmatter, the note's YAML without its --- fences and present even when the note has none, in which case it is an empty string. frontmatter returns {path, docid, frontmatter} and nothing else. metadata returns {path, docid, frontmatter, byte_count, properties (every property row the note holds), and outgoing_links/incoming_links as arrays of {path, docid, properties} — properties names the custom properties that link is filed under, empty for a plain wikilink}." } }
         }
     })
 }

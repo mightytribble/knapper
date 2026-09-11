@@ -223,7 +223,7 @@ impl KnapperServer {
 
     #[tool(
         name = "read",
-        description = "Read a note's content: the whole note's body, or one section's body with `section`, which carries the section's `heading` and `level` beside the content rather than in it. A section is its subtree — it runs to the next heading at or above its own level — so a `##` comes back with the `###` sections below it. What this returns is what `update` takes back: a body edit or a section `replace` handed this content writes the file it came from. With `metadata: true` it returns the note's frontmatter, inbound and outbound links, and size instead — which cannot be combined with `section`. Accepts file path, basename, or #docid."
+        description = "Read a note's content: the whole note's body, or one section's body with `section`, which carries the section's `heading` and `level` beside the content rather than in it. A section is its subtree — it runs to the next heading at or above its own level — so a `##` comes back with the `###` sections below it. What this returns is what `update` takes back: a body edit or a section `replace` handed this content writes the file it came from. `include` chooses what comes back: `content` (the default, above), `frontmatter` for the note's YAML alone with no link graph, `all` for the prose and the frontmatter in one call, and `metadata` for the frontmatter plus inbound and outbound links, properties and size. Reach for `all` when the frontmatter carries facts the prose does not repeat — an alias, a parent, an affiliation — and for `frontmatter` when only those are wanted; both skip the link graph, which is the bulk of a `metadata` reply. `frontmatter` and `metadata` describe the whole note and cannot be combined with `section`; `content` and `all` can. Accepts file path, basename, or #docid."
     )]
     async fn read(
         &self,
@@ -239,7 +239,7 @@ impl KnapperServer {
             &ctx,
             &params.0.file,
             params.0.section.as_deref(),
-            params.0.metadata,
+            params.0.include,
         )
         .map_err(|e| mcp_err(&e))?;
         to_json_result(&result)
@@ -903,7 +903,7 @@ pub const ORIENTATION: &[Orientation] = &[
     Orientation {
         capability: "read",
         group: "Read",
-        clause: "for content, where a `section` parameter narrows it to one heading and returns that section's body with the heading named beside it, and `metadata` returns the note's frontmatter, links and size instead",
+        clause: "for content, where a `section` parameter narrows it to one heading and returns that section's body with the heading named beside it, and an `include` of `frontmatter`, `all` or `metadata` returns the note's YAML alone, the prose and the YAML together, or the frontmatter with links and size",
     },
     Orientation {
         capability: "list",

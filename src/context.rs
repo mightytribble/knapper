@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use crate::params::Include;
 use anyhow::Result;
 use serde::Serialize;
 
@@ -28,6 +29,20 @@ pub struct NoteContent {
     /// The section's span, only when a section was asked for (#80).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub section: Option<SectionSpan>,
+    /// The note's frontmatter, only under `include = all` (#130). Absent
+    /// under `content`, so that mode's JSON is what it always was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frontmatter: Option<String>,
+}
+
+/// A note's frontmatter alone: the `include = frontmatter` read (#130). It
+/// is the note's own YAML, so it takes no section, and it carries no link
+/// graph — that is what separates it from a metadata read.
+#[derive(Debug, Serialize)]
+pub struct NoteFrontmatter {
+    pub path: String,
+    pub docid: Option<String>,
+    pub frontmatter: String,
 }
 
 /// A note's metadata: everything about the note that is not its prose — its
@@ -46,13 +61,16 @@ pub struct NoteMetadata {
     pub byte_count: usize,
 }
 
-/// What a read returns: a note's content, or its metadata. The two are
-/// separate reads, so a caller receives exactly one (#80). Serialized
+/// What a read returns: a note's content, its frontmatter, or its metadata.
+/// A caller receives exactly one, chosen by `include` (#80, #130) — `all` is
+/// `Content` with its `frontmatter` filled, not a variant of its own, so the
+/// default mode's JSON is unchanged by the mode existing. Serialized
 /// untagged, so the JSON is the inner object with no wrapper.
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
 pub enum ReadResult {
     Content(NoteContent),
+    Frontmatter(NoteFrontmatter),
     Metadata(NoteMetadata),
 }
 
@@ -223,21 +241,44 @@ fn link_refs<T>(
         .collect()
 }
 
-/// Read a note. Two modes (#80): the default returns the note's content —
-/// the whole note's body, frontmatter stripped, or one section's markdown —
-/// and `metadata` returns the note's frontmatter, links, and size instead.
-/// The two modes are exclusive, and `metadata` describes the whole note, so
-/// it cannot be combined with a section.
+/// Read a note, in one of four modes (#80, #130).
+///
+/// `content` is the default and the cheapest: the whole note's body with the
+/// frontmatter stripped, or one section's markdown. `frontmatter` is the
+/// note's YAML alone. `all` is both, which is the call a caller makes to
+/// narrate from a note whose frontmatter carries canon the prose does not
+/// repeat. `metadata` is everything that is not prose — the frontmatter, the
+/// link graph, the properties and the size.
+///
+/// Two of the four refuse a section, and for the same reason each: the answer
+/// they give is the whole note's and could not narrow to one heading.
+/// `metadata`'s link graph is note-level, and `frontmatter` carries no body at
+/// all. `all` takes a section happily — frontmatter is note-level and a
+/// section body is section-level, so returning both is no contradiction — and
+/// that is the read the section case wanted, since a section's body otherwise
+/// arrives with nothing but the path to say whose it is.
 pub fn context_read(
     params: &ContextParams,
     file_or_docid: &str,
     section: Option<&str>,
-    metadata: bool,
+    include: Include,
 ) -> Result<ReadResult> {
-    if metadata && section.is_some() {
-        anyhow::bail!(
-            "--section and --metadata cannot be combined: metadata describes the whole note"
-        );
+    if section.is_some() {
+        match include {
+            Include::Metadata => anyhow::bail!(
+                "--section cannot be combined with --include metadata: \
+                 metadata describes the whole note"
+            ),
+            // Refused rather than ignored: a caller who meant `all` would
+            // otherwise be handed a plausible answer with the section they
+            // named silently dropped.
+            Include::Frontmatter => anyhow::bail!(
+                "--section cannot be combined with --include frontmatter: \
+                 frontmatter is the note's own and not a section's — \
+                 use --include all for both"
+            ),
+            Include::Content | Include::All => {}
+        }
     }
 
     let record = resolve_file(params, file_or_docid)?
@@ -246,7 +287,7 @@ pub fn context_read(
     let full_path = params.vault_path.join(&record.path);
     let disk = std::fs::read_to_string(&full_path).ok();
 
-    if metadata {
+    if include == Include::Metadata {
         let (frontmatter, byte_count) = match &disk {
             Some(c) => (split_frontmatter(c).0, c.len()),
             // A row whose file is gone on disk still has its links and its
@@ -274,6 +315,30 @@ pub fn context_read(
         }));
     }
 
+    // The note's YAML alone, with none of the link work above: the two
+    // lookups and the property read are what makes a metadata read expensive,
+    // and this mode exists because a caller wanting four lines of frontmatter
+    // should not pay for the link graph to get them (#130).
+    if include == Include::Frontmatter {
+        return Ok(ReadResult::Frontmatter(NoteFrontmatter {
+            path: record.path,
+            docid: record.docid,
+            // A row whose file is gone on disk has no frontmatter to report.
+            // Empty rather than invented, the rule the metadata read follows.
+            frontmatter: disk.map(|c| split_frontmatter(&c).0).unwrap_or_default(),
+        }));
+    }
+
+    // `all` carries the frontmatter beside the content, and carries the key
+    // even where the note has none: the caller asked for it, an empty string
+    // is the honest answer, and an absent key would be indistinguishable from
+    // a `content` reply.
+    let frontmatter = (include == Include::All).then(|| {
+        disk.as_deref()
+            .map(|c| split_frontmatter(c).0)
+            .unwrap_or_default()
+    });
+
     // Content mode. A file the store holds and the disk does not answers the
     // re-index note in place of content, the way it always has (#62).
     let Some(content_str) = disk else {
@@ -282,6 +347,7 @@ pub fn context_read(
             docid: record.docid,
             content: "[File not found on disk. Re-run 'knapper index' to update.]".to_string(),
             section: None,
+            frontmatter,
         }));
     };
 
@@ -309,6 +375,7 @@ pub fn context_read(
         docid: record.docid,
         content,
         section: span,
+        frontmatter,
     }))
 }
 
@@ -573,11 +640,12 @@ mod tests {
         (tmp, store, root)
     }
 
-    /// The one content-mode read in these tests, unwrapped.
+    /// A content read in these tests, unwrapped. `content` and `all` both
+    /// answer this variant; `all` fills its `frontmatter`.
     fn content_of(res: ReadResult) -> NoteContent {
         match res {
             ReadResult::Content(note) => note,
-            ReadResult::Metadata(_) => panic!("expected content mode"),
+            other => panic!("expected content mode, got {other:?}"),
         }
     }
 
@@ -585,7 +653,15 @@ mod tests {
     fn metadata_of(res: ReadResult) -> NoteMetadata {
         match res {
             ReadResult::Metadata(meta) => meta,
-            ReadResult::Content(_) => panic!("expected metadata mode"),
+            other => panic!("expected metadata mode, got {other:?}"),
+        }
+    }
+
+    /// A frontmatter-mode read, unwrapped.
+    fn frontmatter_of(res: ReadResult) -> NoteFrontmatter {
+        match res {
+            ReadResult::Frontmatter(fm) => fm,
+            other => panic!("expected frontmatter mode, got {other:?}"),
         }
     }
 
@@ -597,7 +673,7 @@ mod tests {
             vault_path: &root,
             profile: None,
         };
-        let note = content_of(context_read(&params, "note.md", None, false).unwrap());
+        let note = content_of(context_read(&params, "note.md", None, Include::Content).unwrap());
         assert_eq!(note.path, "note.md");
         assert!(note.content.contains("Content here."));
         assert!(note.section.is_none());
@@ -612,7 +688,9 @@ mod tests {
             profile: None,
         };
         let docid = generate_docid("note.md");
-        let note = content_of(context_read(&params, &format!("#{}", docid), None, false).unwrap());
+        let note = content_of(
+            context_read(&params, &format!("#{}", docid), None, Include::Content).unwrap(),
+        );
         assert_eq!(note.path, "note.md");
     }
 
@@ -627,7 +705,7 @@ mod tests {
             vault_path: &root,
             profile: None,
         };
-        let note = content_of(context_read(&params, "ghost.md", None, false).unwrap());
+        let note = content_of(context_read(&params, "ghost.md", None, Include::Content).unwrap());
         assert!(note.content.contains("File not found on disk"));
     }
 
@@ -639,7 +717,7 @@ mod tests {
             vault_path: &root,
             profile: None,
         };
-        let note = content_of(context_read(&params, "note", None, false).unwrap());
+        let note = content_of(context_read(&params, "note", None, Include::Content).unwrap());
         assert_eq!(note.path, "note.md");
     }
 
@@ -653,7 +731,7 @@ mod tests {
             vault_path: &root,
             profile: None,
         };
-        let note = content_of(context_read(&params, "note.md", None, false).unwrap());
+        let note = content_of(context_read(&params, "note.md", None, Include::Content).unwrap());
         assert!(
             !note.content.contains("tags:"),
             "frontmatter leaked into content: {}",
@@ -673,7 +751,7 @@ mod tests {
             vault_path: &root,
             profile: None,
         };
-        let res = context_read(&params, "note.md", None, false).unwrap();
+        let res = context_read(&params, "note.md", None, Include::Content).unwrap();
         let json = serde_json::to_string(&res).unwrap();
         for absent in [
             "outgoing_links",
@@ -700,7 +778,7 @@ mod tests {
             vault_path: &root,
             profile: None,
         };
-        let meta = metadata_of(context_read(&params, "note.md", None, true).unwrap());
+        let meta = metadata_of(context_read(&params, "note.md", None, Include::Metadata).unwrap());
         assert_eq!(meta.path, "note.md");
         assert!(meta.frontmatter.contains("tags:"));
         assert_eq!(meta.outgoing_links.len(), 1);
@@ -720,7 +798,165 @@ mod tests {
             vault_path: &root,
             profile: None,
         };
-        assert!(context_read(&params, "note.md", Some("Note"), true).is_err());
+        assert!(context_read(&params, "note.md", Some("Note"), Include::Metadata).is_err());
+    }
+
+    /// `frontmatter` answers the YAML alone. It is the cheap per-note
+    /// property check `metadata` is too heavy for, so the link graph — the
+    /// bulk of a metadata read — must not be in it (#130).
+    #[test]
+    fn frontmatter_mode_answers_the_yaml_with_no_link_graph() {
+        let (_tmp, store, root) = setup_vault();
+        let params = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+        let res = context_read(&params, "note.md", None, Include::Frontmatter).unwrap();
+        let fm = frontmatter_of(res);
+        assert_eq!(fm.path, "note.md");
+        assert!(fm.frontmatter.contains("tags:"));
+
+        let json = serde_json::to_string(
+            &context_read(&params, "note.md", None, Include::Frontmatter).unwrap(),
+        )
+        .unwrap();
+        for absent in [
+            "outgoing_links",
+            "incoming_links",
+            "byte_count",
+            "properties",
+            "content",
+        ] {
+            assert!(
+                !json.contains(absent),
+                "frontmatter mode leaked {absent}: {json}"
+            );
+        }
+    }
+
+    /// `all` is the `cat` case: the prose and the frontmatter that qualifies
+    /// it, in one call and with no link graph (#130).
+    #[test]
+    fn all_mode_answers_content_and_frontmatter_together() {
+        let (_tmp, store, root) = setup_vault();
+        let params = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+        let note = content_of(context_read(&params, "note.md", None, Include::All).unwrap());
+        assert!(note.content.contains("Content here."));
+        assert_eq!(
+            note.frontmatter.as_deref().map(str::trim),
+            Some("tags:\n  - rust".trim())
+        );
+
+        let json =
+            serde_json::to_string(&context_read(&params, "note.md", None, Include::All).unwrap())
+                .unwrap();
+        for absent in ["outgoing_links", "incoming_links", "byte_count"] {
+            assert!(!json.contains(absent), "all mode leaked {absent}: {json}");
+        }
+    }
+
+    /// `all` returns the two halves apart. The content is the body it always
+    /// was, so what `update` takes back is unchanged by asking for the YAML
+    /// beside it (#96, #130).
+    #[test]
+    fn all_mode_keeps_the_content_frontmatter_stripped() {
+        let (_tmp, store, root) = setup_vault();
+        let params = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+        let all = content_of(context_read(&params, "note.md", None, Include::All).unwrap());
+        let plain = content_of(context_read(&params, "note.md", None, Include::Content).unwrap());
+        assert!(
+            !all.content.contains("tags:"),
+            "frontmatter leaked into content"
+        );
+        assert_eq!(all.content, plain.content);
+    }
+
+    /// A note with no YAML still carries the key in `all`, empty. The caller
+    /// asked for the frontmatter, and "this note has none" is the answer;
+    /// omitting the key would make `all` indistinguishable from `content`.
+    #[test]
+    fn all_mode_answers_an_empty_frontmatter_where_a_note_has_none() {
+        let (_tmp, store, root) = setup_vault();
+        let params = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+        let note = content_of(context_read(&params, "other.md", None, Include::All).unwrap());
+        assert_eq!(note.frontmatter.as_deref(), Some(""));
+    }
+
+    /// The union is most useful on a section read, where the path is
+    /// otherwise the only thing saying whose section it is. Frontmatter is
+    /// note-level and a section body is section-level, so there is nothing to
+    /// refuse (#130).
+    #[test]
+    fn a_section_read_carries_the_note_frontmatter_under_all() {
+        let (_tmp, store, root) = setup_vault();
+        let params = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+        let note =
+            content_of(context_read(&params, "note.md", Some("Note"), Include::All).unwrap());
+        assert!(note.content.contains("Content here."));
+        assert!(
+            note.frontmatter
+                .as_deref()
+                .is_some_and(|f| f.contains("tags:"))
+        );
+        assert_eq!(
+            note.section.as_ref().map(|s| s.heading.as_str()),
+            Some("Note")
+        );
+    }
+
+    /// `frontmatter` answers the note's own YAML and no body, so a section
+    /// beside it names something the answer cannot carry. Refused rather than
+    /// ignored: a caller who meant `all` would otherwise get a plausible
+    /// answer with the section silently dropped (#130).
+    #[test]
+    fn section_and_frontmatter_cannot_be_combined() {
+        let (_tmp, store, root) = setup_vault();
+        let params = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+        let err = context_read(&params, "note.md", Some("Note"), Include::Frontmatter).unwrap_err();
+        assert!(
+            err.to_string().contains("all"),
+            "the refusal should name the mode that answers both: {err}"
+        );
+    }
+
+    /// A row whose file is gone on disk has no frontmatter to report, which
+    /// is the rule the metadata read already follows: empty rather than
+    /// invented.
+    #[test]
+    fn frontmatter_mode_answers_empty_for_a_file_gone_from_disk() {
+        let (_tmp, store, root) = setup_vault();
+        store
+            .insert_file("ghost.md", "h3", 100, "ggg333", None, None)
+            .unwrap();
+        let params = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+        let fm =
+            frontmatter_of(context_read(&params, "ghost.md", None, Include::Frontmatter).unwrap());
+        assert_eq!(fm.frontmatter, "");
     }
 
     #[test]
@@ -1067,9 +1303,10 @@ mod tests {
             profile: None,
         };
 
-        let whole = content_of(context_read(&params, "person.md", None, false).unwrap());
-        let part =
-            content_of(context_read(&params, "person.md", Some("Interactions"), false).unwrap());
+        let whole = content_of(context_read(&params, "person.md", None, Include::Content).unwrap());
+        let part = content_of(
+            context_read(&params, "person.md", Some("Interactions"), Include::Content).unwrap(),
+        );
 
         // The content is the section's body, and a part of the whole note's.
         assert_eq!(part.content, "Met on 2026-03-26. See [[colleague]].");
@@ -1087,7 +1324,7 @@ mod tests {
         assert!(whole.section.is_none());
 
         // A heading the note does not have is an error, not an empty section.
-        assert!(context_read(&params, "person.md", Some("Nope"), false).is_err());
+        assert!(context_read(&params, "person.md", Some("Nope"), Include::Content).is_err());
     }
 
     /// A promoted bold line is a section a caller can read, and it has no
@@ -1110,7 +1347,9 @@ mod tests {
             profile: None,
         };
 
-        let part = content_of(context_read(&params, "creature.md", Some("Spells"), false).unwrap());
+        let part = content_of(
+            context_read(&params, "creature.md", Some("Spells"), Include::Content).unwrap(),
+        );
         let span = part.section.expect("a section read reports its span");
         assert_eq!(part.content, "Fireball");
         assert_eq!(span.heading, "Spells");
@@ -1132,7 +1371,8 @@ mod tests {
         };
 
         let body =
-            content_of(context_read(&params, "repro.md", Some("Alpha"), false).unwrap()).content;
+            content_of(context_read(&params, "repro.md", Some("Alpha"), Include::Content).unwrap())
+                .content;
         let written = crate::writer::apply_note_edits(
             &original,
             &[crate::writer::NoteEdit {
@@ -1156,7 +1396,8 @@ mod tests {
             vault_path: &root,
             profile: None,
         };
-        let meta = metadata_of(context_read(&params, "person.md", None, true).unwrap());
+        let meta =
+            metadata_of(context_read(&params, "person.md", None, Include::Metadata).unwrap());
         let first = meta.outgoing_links.first().expect("a link");
         assert!(!first.path.is_empty());
         assert!(first.docid.is_some(), "a link names the file's docid");
@@ -1189,7 +1430,8 @@ mod tests {
             profile: None,
         };
 
-        let body = content_of(context_read(&params, "repro.md", None, false).unwrap()).content;
+        let body =
+            content_of(context_read(&params, "repro.md", None, Include::Content).unwrap()).content;
         let written = crate::writer::apply_note_edits(
             &original,
             &[crate::writer::NoteEdit {
@@ -1245,7 +1487,7 @@ mod tests {
             vault_path: &root,
             profile: None,
         };
-        let meta = metadata_of(context_read(&params, "note.md", None, true).unwrap());
+        let meta = metadata_of(context_read(&params, "note.md", None, Include::Metadata).unwrap());
         let names: Vec<&str> = meta.properties.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, vec!["related", "status"]);
         assert_eq!(meta.outgoing_links[0].path, "other.md");
@@ -1255,7 +1497,8 @@ mod tests {
         );
         assert!(meta.incoming_links[0].properties.is_empty());
 
-        let other = metadata_of(context_read(&params, "other.md", None, true).unwrap());
+        let other =
+            metadata_of(context_read(&params, "other.md", None, Include::Metadata).unwrap());
         assert!(other.properties.is_empty());
         assert_eq!(
             other.incoming_links[0].properties,
