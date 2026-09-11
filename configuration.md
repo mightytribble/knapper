@@ -163,6 +163,21 @@ enabled = false
 #                              # content blocks and not `structuredContent`
 #                              # needs it true: with it false, that client is
 #                              # shown nothing.
+# show_less_relevant = true    # whether a reply names the candidates the
+#                              # answer floor rejected, in `less_relevant`,
+#                              # beside `answer_floor` — the floor they
+#                              # missed, on the same 0-100 scale the scores
+#                              # use. They take only the slots `top_n` had
+#                              # left after the answers, so a search that
+#                              # answered in full names none and reads
+#                              # nothing extra; a search that answered
+#                              # nothing names up to `top_n`. The rows carry
+#                              # no text and the status does not move: a
+#                              # `no_results` reply that names them is still
+#                              # `no_results`. They tell "the vault holds
+#                              # nothing like this" apart from "the floor
+#                              # took what nearly answered", which call for
+#                              # opposite next moves.
 
 # The file watcher behind `knapper serve`.
 # [watcher]

@@ -11,6 +11,7 @@ Links resolve against https://github.com/mightytribble/knapper.
 
 ### Added
 
+- A search that answers nothing now names what the answer floor rejected (#133). `less_relevant` lists them with their scores and `answer_floor`, the floor they missed, so "the vault holds nothing like this" reads differently from "the floor took what nearly answered". The rows carry no text and take only the slots `top_n` had left after the answers, so a search that answered in full is unchanged. `status` is still `no_results`. `[output] show_less_relevant = false` turns it off. ([`40cd2a8`](https://github.com/mightytribble/knapper/commit/40cd2a8))
 - `read --include` chooses what a read answers: `content` (the default, unchanged), `frontmatter` for the note's YAML alone, `all` for the prose and the YAML in one call, and `metadata` for what `--metadata` used to return (#130). `frontmatter` and `all` carry no link graph, so a note's properties no longer cost a whole metadata read; `all` combines with `--section`. ([`827c8a0`](https://github.com/mightytribble/knapper/commit/827c8a0))
 - `match --word` counts a hit only where the pattern stands as its own word (#129). `art` no longer answers on `earth`, `quarters` or `apartment`; `DNA --word` still finds `DNA-based` and `DNA's`. Off by default, and `word` on MCP and HTTP. ([`6b7e715`](https://github.com/mightytribble/knapper/commit/6b7e715))
 

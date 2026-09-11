@@ -116,6 +116,15 @@ pub struct OutputConfig {
     /// Whether the MCP result includes the text rendering beside the structured
     /// content. The CLI renders text unconditionally; HTTP returns JSON alone.
     pub emit_text_rendering: bool,
+    /// Whether a reply reports the candidates the answer floor rejected
+    /// (#133).
+    ///
+    /// It sits in `[output]` because it decides what the reply carries,
+    /// which is what `budget_tokens` and `emit_text_rendering` already
+    /// decide. The rows take only the slots `top_n` left after the answers,
+    /// so a search that answered in full reports none and costs nothing;
+    /// `false` turns the field off outright.
+    pub show_less_relevant: bool,
 }
 
 impl Default for OutputConfig {
@@ -123,6 +132,7 @@ impl Default for OutputConfig {
         OutputConfig {
             budget_tokens: 8192,
             emit_text_rendering: true,
+            show_less_relevant: true,
         }
     }
 }
@@ -1820,6 +1830,15 @@ batch_size = 128
         let c: Config = toml::from_str("[output]\nbudget_tokens = 4096\n").unwrap();
         assert_eq!(c.output.budget_tokens, 4096);
         assert!(c.output.emit_text_rendering); // serde(default) fills the rest
+    }
+
+    /// #133 ships on, so a caller who sets nothing gets the rejected
+    /// candidates in whatever slots the answers left.
+    #[test]
+    fn show_less_relevant_is_on_by_default_and_can_be_turned_off() {
+        assert!(OutputConfig::default().show_less_relevant);
+        let off: Config = toml::from_str("[output]\nshow_less_relevant = false\n").unwrap();
+        assert!(!off.output.show_less_relevant);
     }
 
     #[test]

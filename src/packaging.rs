@@ -60,6 +60,26 @@ pub struct SearchEnvelope {
     pub notes: std::collections::BTreeMap<String, NoteProperties>,
     pub blocks: Vec<Block>,
     pub overflow: Vec<Summary>,
+    /// The candidates the answer floor rejected, ranked, filling the slots
+    /// the answers did not use (#133).
+    ///
+    /// `no_results` alone cannot tell "the vault holds nothing like this"
+    /// from "several notes nearly answered and the floor took them", and the
+    /// two call for opposite next moves. These rows are the evidence behind
+    /// the status and not a softening of it: `status` does not move, and a
+    /// row carries no text, so acting on one is a deliberate `read`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub less_relevant: Vec<Summary>,
+    /// The floor those candidates failed to clear, on the envelope's own
+    /// 0-100 scale (#133).
+    ///
+    /// Which scorer ran decides the number — `[ranking] answer_floor` for
+    /// the cross-encoder, `[calibrated] floor` for the logistic — and the
+    /// one reported is the one that applied. A score shown against the other
+    /// floor would be worse than showing nothing. Absent when no row is
+    /// reported, so a floor never travels without the rows it explains.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub answer_floor: Option<f64>,
     /// The per-lane score breakdown, when the caller asked for it (#126).
     ///
     /// A client that reads `structuredContent` discards the text content
@@ -124,12 +144,30 @@ impl PropertyValue {
 
 /// The knobs `assemble` reads; everything else about a search stays in
 /// `InternalSearchResult` (#35).
-pub struct AssembleParams {
+pub struct AssembleParams<'a> {
     pub budget_tokens: u32,
     pub full: bool,
     pub summaries: bool,
     pub degraded: bool,
     pub per_note_cap: usize,
+    /// How many rows the reply carries, of any tier (#133).
+    ///
+    /// It counted the answers before `less_relevant` existed, and the answers
+    /// still take their slots first — what they leave is what the rejected
+    /// candidates may fill. That is the whole budget for the new field: a
+    /// search that answered in full reports none, which is what keeps the
+    /// common query exactly as it was.
+    pub top_n: usize,
+    /// The candidates the answer floor rejected, ranked (#133).
+    ///
+    /// Empty on a degraded search, which ran no scorer and so has no
+    /// probability and no floor, and empty when `[output]
+    /// show_less_relevant` is off. The pipeline bounds the hydration; this
+    /// function bounds what is reported.
+    pub less_relevant: &'a [InternalSearchResult],
+    /// The floor those candidates failed to clear, on the **scorer's** own
+    /// 0-1 scale; `assemble` puts it on the envelope's 0-100 scale (#133).
+    pub answer_floor: Option<f64>,
 }
 
 /// Which lanes account for a result, the machine channels' answer in place of
@@ -218,6 +256,19 @@ fn result_id(r: &InternalSearchResult) -> String {
     format!("{docid}#{}", r.chunk_seq)
 }
 
+/// A rejected candidate's row: a summary that always carries its score (#133).
+///
+/// `overflow` reports a score only when the caller asked for one, because
+/// there the row is an answer and the rank is the claim. Here the score
+/// against the floor *is* the claim, and without it "less relevant" is an
+/// assertion the caller cannot weigh.
+fn rejected_of(r: &InternalSearchResult) -> Summary {
+    Summary {
+        score: Some(r.confidence),
+        ..summary_of(r)
+    }
+}
+
 fn summary_of(r: &InternalSearchResult) -> Summary {
     Summary {
         id: result_id(r),
@@ -249,6 +300,9 @@ fn block_of(r: &InternalSearchResult) -> Block {
 /// emits every rank as a text-less row. `per_note_cap` is inert at 0.
 pub fn assemble(results: &[InternalSearchResult], p: AssembleParams) -> SearchEnvelope {
     if results.is_empty() {
+        // The case #133 was raised for: nothing cleared the floor, and the
+        // whole reply is what the floor rejected. Every slot is free.
+        let less_relevant = rejected_rows(&p, 0);
         return SearchEnvelope {
             status: SearchStatus::NoResults,
             degraded: p.degraded,
@@ -256,6 +310,8 @@ pub fn assemble(results: &[InternalSearchResult], p: AssembleParams) -> SearchEn
             notes: Default::default(),
             blocks: Vec::new(),
             overflow: Vec::new(),
+            answer_floor: floor_of(&p, &less_relevant),
+            less_relevant,
             explain: None,
         };
     }
@@ -285,6 +341,7 @@ pub fn assemble(results: &[InternalSearchResult], p: AssembleParams) -> SearchEn
 
     if p.summaries {
         overflow = capped.iter().map(|r| summary_of(r)).collect();
+        let less_relevant = rejected_rows(&p, overflow.len());
         return SearchEnvelope {
             status: SearchStatus::Ok,
             degraded: p.degraded,
@@ -292,6 +349,8 @@ pub fn assemble(results: &[InternalSearchResult], p: AssembleParams) -> SearchEn
             notes: Default::default(),
             blocks,
             overflow,
+            answer_floor: floor_of(&p, &less_relevant),
+            less_relevant,
             explain: None,
         };
     }
@@ -338,6 +397,10 @@ pub fn assemble(results: &[InternalSearchResult], p: AssembleParams) -> SearchEn
         notes.insert(r.file_path.clone(), note_properties(&r.properties));
     }
 
+    // An `overflow` row cleared the floor and the budget held it back, so it
+    // is an answer and keeps its slot. Counting blocks alone would serve
+    // rejected candidates to a search that found plenty (#133).
+    let less_relevant = rejected_rows(&p, blocks.len() + overflow.len());
     SearchEnvelope {
         status: SearchStatus::Ok,
         degraded: p.degraded,
@@ -345,8 +408,37 @@ pub fn assemble(results: &[InternalSearchResult], p: AssembleParams) -> SearchEn
         notes,
         blocks,
         overflow,
+        answer_floor: floor_of(&p, &less_relevant),
+        less_relevant,
         explain: None,
     }
+}
+
+/// The rejected candidates that fit the slots the answers did not use (#133).
+///
+/// `top_n` is the reply's whole row budget and the answers are served first,
+/// so this needs no cap of its own and no tuned lower bound: a search that
+/// answered in full reports nothing here, and one that answered nothing
+/// reports up to `top_n`.
+fn rejected_rows(p: &AssembleParams, answers: usize) -> Vec<Summary> {
+    p.less_relevant
+        .iter()
+        .take(p.top_n.saturating_sub(answers))
+        .map(rejected_of)
+        .collect()
+}
+
+/// The floor on the envelope's 0-100 scale, and only beside the rows it
+/// explains (#133).
+///
+/// `Summary::score` is the confidence — `rerank_score * 100` — so a floor
+/// reported on the scorer's own 0-1 scale would sit in the same reply as the
+/// scores it is meant to be read against and be a hundredfold out.
+fn floor_of(p: &AssembleParams, rows: &[Summary]) -> Option<f64> {
+    if rows.is_empty() {
+        return None;
+    }
+    p.answer_floor.map(|f| f * 100.0)
 }
 
 /// One note's property rows as a map from name to value (#119).
@@ -409,7 +501,13 @@ pub fn apply_scores(env: &mut SearchEnvelope, results: &[InternalSearchResult]) 
 /// The convenience text rendering of the envelope (design §9.3).
 pub fn render_text(env: &SearchEnvelope, scores: bool) -> String {
     if matches!(env.status, SearchStatus::NoResults) {
-        return format!("{}\n", crate::ranking::NO_RELEVANT_CONTENT);
+        // The message #34 always gave, and then the evidence behind it. The
+        // status has not moved: these are what the floor rejected, and
+        // saying so is what lets a caller tell a vault that covers nothing
+        // from a query that missed (#133).
+        let mut out = format!("{}\n", crate::ranking::NO_RELEVANT_CONTENT);
+        out.push_str(&render_less_relevant(env));
+        return out;
     }
     let mut out = String::new();
     if env.degraded {
@@ -450,6 +548,42 @@ pub fn render_text(env: &SearchEnvelope, scores: bool) -> String {
             provenance_label(&s.lanes)
         ));
     }
+    out.push_str(&render_less_relevant(env));
+    out
+}
+
+/// The rejected candidates, under a line that says what the claim is (#133).
+///
+/// The label carries the numbers rather than only the words: "less relevant"
+/// alone reads as a weaker ranking of relevant things, which invites a caller
+/// to treat the rows as answers. The score beside the floor it missed says
+/// what the claim actually is, and the scorer is known to be wrong in a
+/// measured way on short notes — so the rows are worth handing over, and
+/// worth labelling honestly.
+fn render_less_relevant(env: &SearchEnvelope) -> String {
+    if env.less_relevant.is_empty() {
+        return String::new();
+    }
+    let n = env.less_relevant.len();
+    let mut out = match env.answer_floor {
+        Some(floor) => format!(
+            "\n({n} scored below the answer floor of {floor:.0}%, so {} not answers)\n",
+            if n == 1 { "it is" } else { "they are" }
+        ),
+        None => format!("\n({n} scored below the answer floor)\n"),
+    };
+    for s in &env.less_relevant {
+        let pct = match s.score {
+            Some(v) => format!(" [{v:.0}%]"),
+            None => String::new(),
+        };
+        out.push_str(&format!(
+            "Below the floor: [{}]{pct} {} (matched: {})\n",
+            s.id,
+            s.heading_path,
+            provenance_label(&s.lanes)
+        ));
+    }
     out
 }
 
@@ -481,14 +615,155 @@ mod assemble_tests {
             properties: Vec::new(),
         }
     }
-    fn params(budget: u32) -> AssembleParams {
+    fn params(budget: u32) -> AssembleParams<'static> {
         AssembleParams {
             budget_tokens: budget,
             full: false,
             summaries: false,
             degraded: false,
             per_note_cap: 0,
+            top_n: 5,
+            less_relevant: &[],
+            answer_floor: None,
         }
+    }
+
+    /// #133: a search that cleared nothing still knows what it rejected, and
+    /// the rows fill the slots the answers did not use.
+    #[test]
+    fn a_search_that_answered_nothing_reports_what_the_floor_rejected() {
+        let rejected = vec![result(7, 10), result(8, 10)];
+        let mut p = params(100_000);
+        p.less_relevant = &rejected;
+        p.answer_floor = Some(0.75);
+        let env = assemble(&[], p);
+
+        assert_eq!(env.less_relevant.len(), 2);
+        assert_eq!(env.less_relevant[0].id, "000007#7");
+    }
+
+    /// The status is the server's claim and the field is the evidence behind
+    /// it. Handing back the rejects does not make them answers (#133).
+    #[test]
+    fn rejected_candidates_do_not_move_the_status() {
+        let rejected = vec![result(7, 10)];
+        let mut p = params(100_000);
+        p.less_relevant = &rejected;
+        p.answer_floor = Some(0.75);
+        let env = assemble(&[], p);
+
+        assert_eq!(env.status, SearchStatus::NoResults);
+    }
+
+    /// The answers get the slots first. A search that filled `top_n` reports
+    /// no rejects at all, which is what keeps the common query unchanged.
+    #[test]
+    fn a_full_answer_leaves_no_room_for_the_rejected() {
+        let rs = vec![result(1, 10), result(2, 10), result(3, 10)];
+        let rejected = vec![result(7, 10), result(8, 10)];
+        let mut p = params(100_000);
+        p.top_n = 3;
+        p.less_relevant = &rejected;
+        p.answer_floor = Some(0.75);
+        let env = assemble(&rs, p);
+
+        assert_eq!(env.blocks.len(), 3);
+        assert!(env.less_relevant.is_empty());
+    }
+
+    /// Two answers out of three slots leaves one, and one reject fills it.
+    #[test]
+    fn a_half_answer_fills_only_the_slots_it_did_not_use() {
+        let rs = vec![result(1, 10), result(2, 10)];
+        let rejected = vec![result(7, 10), result(8, 10)];
+        let mut p = params(100_000);
+        p.top_n = 3;
+        p.less_relevant = &rejected;
+        p.answer_floor = Some(0.75);
+        let env = assemble(&rs, p);
+
+        assert_eq!(env.less_relevant.len(), 1);
+        assert_eq!(env.less_relevant[0].id, "000007#7");
+    }
+
+    /// An overflow row cleared the floor — the budget held it back. It is an
+    /// answer, so it keeps a slot the rejects cannot have.
+    #[test]
+    fn an_overflow_row_is_an_answer_and_keeps_its_slot() {
+        // Budget 130 admits one 80-token block; the second overflows.
+        let rs = vec![result(1, 80), result(2, 80)];
+        let rejected = vec![result(7, 10), result(8, 10)];
+        let mut p = params(130);
+        p.top_n = 2;
+        p.less_relevant = &rejected;
+        p.answer_floor = Some(0.75);
+        let env = assemble(&rs, p);
+
+        assert_eq!(env.blocks.len(), 1);
+        assert_eq!(env.overflow.len(), 1);
+        assert!(env.less_relevant.is_empty());
+    }
+
+    /// The score is the whole signal, so it is present whether or not the
+    /// caller asked for scores, and the floor it missed rides beside it.
+    #[test]
+    fn a_rejected_row_carries_its_score_and_the_floor_it_missed() {
+        let rejected = vec![result(7, 10)];
+        let mut p = params(100_000);
+        p.less_relevant = &rejected;
+        p.answer_floor = Some(0.75);
+        let env = assemble(&[], p);
+
+        // `result` scores 90.0 on the envelope's 0-100 scale; the floor is
+        // reported on that same scale rather than the scorer's own 0-1.
+        assert_eq!(env.less_relevant[0].score, Some(90.0));
+        assert_eq!(env.answer_floor, Some(75.0));
+    }
+
+    /// The empty search says what it rejected, under the message it always
+    /// gave. The numbers carry the claim: "less relevant" alone reads as a
+    /// weaker ranking of relevant things (#133).
+    #[test]
+    fn the_text_rendering_names_the_floor_on_an_empty_search() {
+        let rejected = vec![result(7, 10)];
+        let mut p = params(100_000);
+        p.less_relevant = &rejected;
+        p.answer_floor = Some(0.75);
+        let env = assemble(&[], p);
+        let text = render_text(&env, false);
+
+        assert!(
+            text.starts_with(crate::ranking::NO_RELEVANT_CONTENT),
+            "the floor's own message went missing: {text}"
+        );
+        assert!(text.contains("75%"), "{text}");
+        assert!(text.contains("[90%]"), "{text}");
+        assert!(text.contains("000007#7"), "{text}");
+    }
+
+    /// The score rides on a rejected row whether or not `--scores` was asked
+    /// for, because there the score against the floor is the whole claim.
+    #[test]
+    fn a_rejected_row_shows_its_score_without_being_asked() {
+        let rejected = vec![result(7, 10)];
+        let mut p = params(100_000);
+        p.less_relevant = &rejected;
+        p.answer_floor = Some(0.75);
+        let env = assemble(&[], p);
+
+        assert!(render_text(&env, false).contains("[90%]"));
+    }
+
+    /// A vault and query that reject nothing render exactly as they did
+    /// before the field existed.
+    #[test]
+    fn rejecting_nothing_adds_no_json() {
+        let rs = vec![result(1, 10)];
+        let env = assemble(&rs, params(100_000));
+        let json = serde_json::to_value(&env).unwrap();
+
+        assert!(json.get("less_relevant").is_none(), "{json}");
+        assert!(json.get("answer_floor").is_none(), "{json}");
     }
 
     #[test]
@@ -691,6 +966,9 @@ mod assemble_tests {
                 summaries: true,
                 degraded: false,
                 per_note_cap: 0,
+                top_n: 5,
+                less_relevant: &[],
+                answer_floor: None,
             },
         );
         let json = serde_json::to_value(&env).unwrap();
@@ -897,6 +1175,8 @@ mod render_tests {
                 score: None,
             }],
             overflow: vec![],
+            less_relevant: vec![],
+            answer_floor: None,
             explain: None,
         };
         let out = render_text(&env, false);
@@ -926,6 +1206,8 @@ mod render_tests {
                 .lanes(),
                 score: None,
             }],
+            less_relevant: vec![],
+            answer_floor: None,
             explain: None,
         };
         let text = render_text(&env, false);
@@ -947,6 +1229,8 @@ mod render_tests {
             notes: Default::default(),
             blocks: vec![],
             overflow: vec![],
+            less_relevant: vec![],
+            answer_floor: None,
             explain: None,
         };
         assert_eq!(
@@ -979,6 +1263,8 @@ mod render_tests {
                 score: Some(83.0),
             }],
             overflow: vec![],
+            less_relevant: vec![],
+            answer_floor: None,
             explain: None,
         };
         assert!(render_text(&env, true).contains("[83%]"));
@@ -994,6 +1280,8 @@ mod render_tests {
             notes: Default::default(),
             blocks: vec![],
             overflow: vec![],
+            less_relevant: vec![],
+            answer_floor: None,
             explain: None,
         };
         assert!(
