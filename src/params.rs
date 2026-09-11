@@ -100,6 +100,8 @@ pub struct Search {
     #[serde(default)]
     pub full: bool,
     /// Return breadcrumb and provenance only, no text, for every result (#35).
+    /// The rows are answers, so they come back as blocks with no `text` and
+    /// `overflow` stays empty: nothing was held back (#134).
     #[arg(long)]
     #[serde(default)]
     pub summaries: bool,
