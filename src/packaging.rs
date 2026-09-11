@@ -24,7 +24,12 @@ pub struct Block {
     pub heading_path: String,
     /// Which lanes account for this result (#119).
     pub lanes: Vec<Lane>,
-    pub text: String,
+    /// The result's text, and absent rather than empty when the caller asked
+    /// for none: `summaries` answers with the ranking and no bodies, and an
+    /// empty string there would have to be told from a section of no words
+    /// (#134).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
     pub untrusted_content: bool,
     pub truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -279,13 +284,31 @@ fn summary_of(r: &InternalSearchResult) -> Summary {
     }
 }
 
+/// A block that answers with its breadcrumb and provenance and no text, which
+/// is what `summaries` asks for (#134).
+///
+/// It is a `Block` and not a `Summary` because it is an answer: `overflow` is
+/// what the budget cut and `less_relevant` is what the floor rejected, and a
+/// row in either is a thing the caller did not get. Sharing the shape means
+/// `blocks` is the answer under every flag combination, and `text` is absent
+/// rather than empty so a caller need not tell "no text was asked for" from a
+/// section of no words.
+fn summary_block_of(r: &InternalSearchResult) -> Block {
+    Block {
+        text: None,
+        // Nothing was cut to fit, because nothing was carried.
+        truncated: false,
+        ..block_of(r)
+    }
+}
+
 fn block_of(r: &InternalSearchResult) -> Block {
     Block {
         id: result_id(r),
         path: r.file_path.clone(),
         heading_path: r.heading_path.clone(),
         lanes: r.provenance.lanes(),
-        text: r.text.clone(),
+        text: Some(r.text.clone()),
         untrusted_content: true,
         truncated: r.truncated,
         score: None,
@@ -339,25 +362,20 @@ pub fn assemble(results: &[InternalSearchResult], p: AssembleParams) -> SearchEn
     let mut blocks = Vec::new();
     let mut overflow = Vec::new();
 
-    if p.summaries {
-        overflow = capped.iter().map(|r| summary_of(r)).collect();
-        let less_relevant = rejected_rows(&p, overflow.len());
-        return SearchEnvelope {
-            status: SearchStatus::Ok,
-            degraded: p.degraded,
-            warnings: Vec::new(),
-            notes: Default::default(),
-            blocks,
-            overflow,
-            answer_floor: floor_of(&p, &less_relevant),
-            less_relevant,
-            explain: None,
-        };
-    }
-
     let mut used = 0usize;
     let mut stopped = false;
     for r in &capped {
+        // `summaries` answers with every rank and holds nothing back, so each
+        // one is a block with no text. It used to be routed to `overflow`
+        // instead, which made `blocks: []` mean three things — the budget took
+        // everything, the caller asked for no text, or nothing matched — and
+        // left the rendering calling the whole answer "Not included (lower
+        // relevance)" (#134). The budget is not consulted: there is no text to
+        // spend it on.
+        if p.summaries {
+            blocks.push(summary_block_of(r));
+            continue;
+        }
         let cost = r.token_count + PER_BLOCK_OVERHEAD;
         if !p.full && !blocks.is_empty() && used + cost > p.budget_tokens as usize {
             stopped = true;
@@ -374,9 +392,9 @@ pub fn assemble(results: &[InternalSearchResult], p: AssembleParams) -> SearchEn
     // names each held-back result, but a caller reading `blocks` alone sees a
     // short list and no reason for it — and the reason is a number they can
     // raise. It names no flag, because the CLI spells the budget `--tokens`
-    // and MCP and HTTP spell it `budget_tokens`. The `summaries` return above
-    // carries no warning, because there the empty `blocks` is what was asked
-    // for.
+    // and MCP and HTTP spell it `budget_tokens`. A `summaries` call needs no
+    // suppression rule here: it holds nothing back, so `overflow` is empty
+    // and the warning does not arise.
     let mut warnings = Vec::new();
     if !overflow.is_empty() {
         let n = overflow.len();
@@ -527,8 +545,13 @@ pub fn render_text(env: &SearchEnvelope, scores: bool) -> String {
         if b.truncated {
             out.push_str("(truncated)\n");
         }
-        out.push_str(&b.text);
-        out.push_str("\n\n");
+        // The blank line separates a block from the body above it. A row
+        // with no body needs none, so a `summaries` listing renders one row
+        // per line (#134).
+        if let Some(text) = &b.text {
+            out.push_str(text);
+            out.push_str("\n\n");
+        }
     }
     // The reason, above the list it explains: "lower relevance" is the rank
     // order and not why these were cut, and the budget is a number the caller
@@ -795,9 +818,11 @@ mod assemble_tests {
     }
 
     #[test]
-    fn summaries_overflow_is_not_a_budget_warning() {
-        // `summaries` puts every rank in overflow by request, not because the
-        // budget stopped anything.
+    fn a_summaries_call_warns_about_no_budget() {
+        // The budget warning names what was held back, and `summaries` holds
+        // nothing back: it answers every rank, with no text to spend a budget
+        // on. The suppression this once needed is gone with the routing —
+        // `overflow` is empty, so the warning does not arise (#134).
         let rs = vec![result(1, 80), result(2, 80)];
         let mut p = params(100_000);
         p.summaries = true;
@@ -843,8 +868,105 @@ mod assemble_tests {
         let mut p = params(10_000);
         p.summaries = true;
         let env = assemble(&rs, p);
-        assert!(env.blocks.is_empty());
-        assert_eq!(env.overflow.len(), 2);
+        assert_eq!(env.blocks.len(), 2);
+        assert!(
+            env.blocks.iter().all(|b| b.text.is_none()),
+            "every row, not only the first"
+        );
+    }
+
+    /// The invariant the envelope is supposed to hold under every flag:
+    /// `blocks` is what answered, `overflow` is what the budget cut, and both
+    /// empty is a miss. `summaries` broke it by routing every answer to
+    /// `overflow`, so `blocks: []` meant either "the budget took everything"
+    /// or "you asked for no text" or "nothing matched", and only a second
+    /// field separated them (#134).
+    #[test]
+    fn summaries_answers_in_blocks_and_holds_nothing_back() {
+        let rs = vec![result(1, 10), result(2, 10)];
+        let mut p = params(10_000);
+        p.summaries = true;
+        let env = assemble(&rs, p);
+        assert_eq!(env.blocks.len(), 2, "every rank answered");
+        assert!(
+            env.overflow.is_empty(),
+            "nothing was held back, so nothing is overflow"
+        );
+        assert_eq!(env.status, SearchStatus::Ok);
+    }
+
+    /// The rows carry no text and say so by omission rather than by an empty
+    /// string, which a caller would have to tell from a note of no words
+    /// (#134).
+    #[test]
+    fn a_summaries_block_omits_its_text_field() {
+        let rs = vec![result(1, 10)];
+        let mut p = params(10_000);
+        p.summaries = true;
+        let env = assemble(&rs, p);
+        assert!(env.blocks[0].text.is_none());
+        let json = serde_json::to_value(&env).unwrap();
+        assert!(
+            json["blocks"][0].get("text").is_none(),
+            "an absent text is absent from the JSON, not null: {}",
+            json["blocks"][0]
+        );
+        assert_eq!(json["blocks"][0]["path"], "n1.md");
+    }
+
+    /// `summaries` is the reconnaissance call and frontmatter is the cheapest
+    /// signal in it — already per-note, and often enough to decide what to
+    /// `read` next without a second round trip. The early return skipped the
+    /// loop that builds it (#134).
+    #[test]
+    fn summaries_carries_the_per_note_properties() {
+        use crate::properties::Kind;
+        let mut r = result(1, 10);
+        r.properties = vec![prop("species", "nekojin", Kind::Text)];
+        let mut p = params(10_000);
+        p.summaries = true;
+        let env = assemble(&[r], p);
+        let json = serde_json::to_value(&env).unwrap();
+        assert_eq!(json["notes"]["n1.md"]["species"], "nekojin");
+    }
+
+    /// A row with no text needs no blank line after it: the paragraph break
+    /// separates a block from the body above it, and under `summaries` there
+    /// is no body. One row per line is what a reconnaissance listing is for
+    /// (#134).
+    #[test]
+    fn the_summaries_rendering_puts_one_row_on_one_line() {
+        let rs = vec![result(1, 10), result(2, 10)];
+        let mut p = params(10_000);
+        p.summaries = true;
+        let out = render_text(&assemble(&rs, p), false);
+        assert_eq!(
+            out.lines().filter(|l| l.is_empty()).count(),
+            0,
+            "no blank lines between text-less rows: {out:?}"
+        );
+        assert_eq!(out.lines().count(), 2);
+    }
+
+    /// A text-less answer is not a held-back one, so the rendering must not
+    /// label it with the budget's words. `--summaries` printed every answer
+    /// as "Not included (lower relevance)", which was false twice over: the
+    /// rows are the whole answer, and they are the top of the ranking (#134).
+    #[test]
+    fn the_summaries_rendering_does_not_call_its_answers_excluded() {
+        let rs = vec![result(1, 10), result(2, 10)];
+        let mut p = params(10_000);
+        p.summaries = true;
+        let out = render_text(&assemble(&rs, p), false);
+        assert!(
+            !out.contains("Not included"),
+            "a summaries answer is not an exclusion: {out}"
+        );
+        assert!(out.contains("n1.md"), "the rows still render: {out}");
+        assert!(
+            !out.contains(&"x".repeat(30)),
+            "and they still carry no text: {out}"
+        );
     }
 
     #[test]
@@ -951,26 +1073,18 @@ mod assemble_tests {
 
     #[test]
     fn an_overflow_row_names_its_lanes_the_same_way() {
-        let mut r = result(1, 10);
-        r.provenance = Provenance {
+        // A real overflow row, which is one the budget held back: the first
+        // result is always included, so a budget of 1 overflows the second.
+        let first = result(1, 10);
+        let mut held_back = result(2, 10);
+        held_back.provenance = Provenance {
             keyword: false,
             semantic: false,
             graph: true,
             linked_from: vec![],
         };
-        let env = assemble(
-            &[r],
-            AssembleParams {
-                budget_tokens: 10_000,
-                full: false,
-                summaries: true,
-                degraded: false,
-                per_note_cap: 0,
-                top_n: 5,
-                less_relevant: &[],
-                answer_floor: None,
-            },
-        );
+        let env = assemble(&[first, held_back], params(1));
+        assert_eq!(env.overflow.len(), 1);
         let json = serde_json::to_value(&env).unwrap();
         assert_eq!(json["overflow"][0]["lanes"], serde_json::json!(["linked"]));
     }
@@ -1169,7 +1283,7 @@ mod render_tests {
                     linked_from: vec![],
                 }
                 .lanes(),
-                text: "body".into(),
+                text: Some("body".into()),
                 untrusted_content: true,
                 truncated: false,
                 score: None,
@@ -1257,7 +1371,7 @@ mod render_tests {
                     linked_from: vec![],
                 }
                 .lanes(),
-                text: "body".into(),
+                text: Some("body".into()),
                 untrusted_content: true,
                 truncated: false,
                 score: Some(83.0),
