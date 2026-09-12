@@ -5,19 +5,17 @@ Links resolve against https://github.com/mightytribble/knapper.
 
 ## Unreleased
 
-**This build re-indexes an existing store.** A split section's chunk text
-changes (#139), so the first `knapper index` after the upgrade reads the vault,
-re-chunks every note and re-embeds it — as long as the vault's first index
-took. Run it before anything else: `knapper serve` refuses to start against an
-index an earlier build wrote, rather than answer from it.
+**This build re-indexes an existing store.** Chunk text changes (#139), so the
+first `knapper index` after the upgrade re-chunks and re-embeds the vault. Run
+it before `serve`, which refuses a stale index.
 
 ### Fixed
 
-- A split section's later chunks no longer carry a `## Heading (cont.)` line that is not in the note (#139). The marker made a search result open on a heading the file does not hold — one `read --section` could not address, and one an `update --section` round trip wrote into the note for real, which the next index then split again into `(cont.) (cont.)`. Every piece now carries the section's own heading. `read --section` and `update --section` still accept a `(cont.)` name, so a caller holding one from an older index is not broken before the vault re-indexes, and a heading a note genuinely wrote that way is still addressed as itself. ([`3e73079`](https://github.com/mightytribble/knapper/commit/3e73079))
+- A split section's later chunks no longer carry a `## Heading (cont.)` line the note does not hold (#139). A `(cont.)` name still resolves, so a caller holding one from an older index keeps working. ([`3e73079`](https://github.com/mightytribble/knapper/commit/3e73079))
 
 ### Changed
 
-- `vault_map`'s `recent_files` now sorts on each note's own modification time (#138). It sorted on when the row was indexed, which `knapper index --rebuild` rewrites in walk order, so after a rebuild the field presented the walk as recent activity. ([`af931b0`](https://github.com/mightytribble/knapper/commit/af931b0))
+- `vault_map`'s `recent_files` now sorts on each note's modification time, not on when it was indexed (#138). ([`af931b0`](https://github.com/mightytribble/knapper/commit/af931b0))
 - `match` now reads a note's frontmatter as well as its prose, so an alias or a property key is no longer missing from the count (#137). `scan` narrows the reading to `body` or `frontmatter`, each hit names the half it came from, and the first `knapper index` after the upgrade re-derives the vault graph — a vault read, no re-embed. ([`a3add40`](https://github.com/mightytribble/knapper/commit/a3add40))
 - `summaries` now answers in `blocks` rather than `overflow` (#134). Its rows are answers, so they sit where an answer sits, with the `text` key absent and `overflow` empty; `blocks` is what answered under every flag, `overflow` is what the budget cut, and both empty is a miss. `notes` carries each answering note's frontmatter under `summaries` too, which is the cheapest signal for deciding what to `read` next. The CLI no longer labels a `summaries` answer "Not included (lower relevance)" and prints one row per line. ([`ab9dabd`](https://github.com/mightytribble/knapper/commit/ab9dabd))
 - The MCP orientation now says that `search` takes the graph filters, and that the filter runs before the ranking (#136). It assigned filtering to `list` alone, so link-shaped questions went to the tool that cannot rank; pairing a query with `links_to` is what answers a question about two notes at once, because a neighbourhood on its own is usually a roster. The `search` tool description carries a worked two-field example. ([`3476635`](https://github.com/mightytribble/knapper/commit/3476635))
@@ -25,7 +23,7 @@ index an earlier build wrote, rather than answer from it.
 
 ### Added
 
-- `vault_map` now names the notes the vault points at most (#138). `top_notes` is the ten with the most links in, `path` and `links_in` each — enough to read what a vault is about before opening a note, which took a second `list` call before. `tagged_notes` gives the tag counts the denominator they lacked, so a head count no longer reads against the whole vault, and `tag_axes` says how many facets the vocabulary spans. ([`af931b0`](https://github.com/mightytribble/knapper/commit/af931b0))
+- `vault_map` now answers `top_notes`, the ten most-linked notes, plus `tagged_notes` and `tag_axes` — the share of the vault the tag vocabulary covers, and how many facets it spans (#138). ([`af931b0`](https://github.com/mightytribble/knapper/commit/af931b0))
 - `list` now answers each note's `chunk_count` and `token_count` beside `links_in` (#131). Read against each other they find the load-bearing but underwritten note — many others point at it and it holds almost nothing — which took a full enumeration and a client-side join before. Both numbers come from the index, so an undetailed listing still opens no file. ([`9e03336`](https://github.com/mightytribble/knapper/commit/9e03336))
 - A search that answers nothing now names what the answer floor rejected (#133). `less_relevant` lists them with their scores and `answer_floor`, the floor they missed, so "the vault holds nothing like this" reads differently from "the floor took what nearly answered". The rows carry no text and take only the slots `top_n` had left after the answers, so a search that answered in full is unchanged. `status` is still `no_results`. `[output] show_less_relevant = false` turns it off. ([`40cd2a8`](https://github.com/mightytribble/knapper/commit/40cd2a8))
 - `read --include` chooses what a read answers: `content` (the default, unchanged), `frontmatter` for the note's YAML alone, `all` for the prose and the YAML in one call, and `metadata` for what `--metadata` used to return (#130). `frontmatter` and `all` carry no link graph, so a note's properties no longer cost a whole metadata read; `all` combines with `--section`. ([`827c8a0`](https://github.com/mightytribble/knapper/commit/827c8a0))
