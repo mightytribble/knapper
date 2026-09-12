@@ -104,7 +104,15 @@ pub const CHUNK_RECORD_VERSION: u32 = 2;
 /// the rebuild this bump declares is what fills the table on a store an
 /// earlier binary built. A change to the property grammar or the shape rule
 /// is a bump here too, because that pass is what re-derives the rows.
-pub const LINK_RESOLVER_VERSION: u32 = 3;
+///
+/// Version 4 is issue #137: the pass also stores the raw YAML block in
+/// `files.frontmatter`, which `match` scans beside the prose. The column is
+/// NULL on a store an earlier binary built, and nothing the store already
+/// holds can fill it — the chunker strips the block. The rebuild this bump
+/// declares is a vault read with no model, which is what makes the upgrade
+/// cheap; `knapper index` runs it whether or not any file changed, so a
+/// vault nothing has edited still adopts the column.
+pub const LINK_RESOLVER_VERSION: u32 = 4;
 
 /// Bump when the *text* of a [`crate::llm::PromptFormat`] template changes
 /// while the template keeps its name.

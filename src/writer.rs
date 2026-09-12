@@ -563,7 +563,12 @@ pub fn create_note(
             store.insert_vec(vid, &c.vector)?;
         }
 
-        build_edges_for_file(store, file_id, &full_content)?;
+        build_edges_for_file(
+            store,
+            file_id,
+            &full_content,
+            crate::indexer::ContentSource::File,
+        )?;
         // Other notes may have named this one before it existed. Their own
         // content did not change, so nothing else ever revisits the links they
         // wrote (#108).
@@ -1648,7 +1653,12 @@ pub fn unarchive_note(
             store.insert_vec(vid, &c.vector)?;
         }
 
-        build_edges_for_file(store, file_id, &restored_content)?;
+        build_edges_for_file(
+            store,
+            file_id,
+            &restored_content,
+            crate::indexer::ContentSource::File,
+        )?;
         // The note is back in the index, so the links other notes wrote to it
         // resolve again (#108).
         crate::indexer::reconcile_links(store, vault_path, &[])?;

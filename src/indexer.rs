@@ -208,10 +208,25 @@ fn rebuild_all_edges(store: &Store, vault_path: &Path, files: &[PathBuf]) -> Res
         let Ok(content) = std::fs::read_to_string(path) else {
             continue;
         };
-        build_edges_for_file(store, file_record.id, &content)?;
+        build_edges_for_file(store, file_record.id, &content, ContentSource::File)?;
         rebuilt += 1;
     }
     Ok(rebuilt)
+}
+
+/// What the `content` handed to [`build_edges_for_file`] actually is.
+///
+/// Almost every caller reads the file. One does not: `backfill_edges_from_chunks`
+/// re-derives a pre-#28 store's edges from `chunks.text` with no vault read,
+/// and chunk text is the note with its YAML block already stripped. The two
+/// cannot be told apart by looking, and what the pass derives *beside* the
+/// edges depends on the difference, so the caller declares it (#137).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentSource {
+    /// The file's own bytes, frontmatter included.
+    File,
+    /// The file's chunk text joined back together, frontmatter absent.
+    Chunks,
 }
 
 /// Build wikilink edges for a single file, at chunk granularity on both ends.
@@ -243,7 +258,12 @@ fn rebuild_all_edges(store: &Store, vault_path: &Path, files: &[PathBuf]) -> Res
 /// Clears pre-existing `unresolved_links` entries for the source file
 /// before re-recording, so this is safe to call repeatedly during
 /// incremental indexing.
-pub fn build_edges_for_file(store: &Store, file_id: i64, content: &str) -> Result<()> {
+pub fn build_edges_for_file(
+    store: &Store,
+    file_id: i64,
+    content: &str,
+    source: ContentSource,
+) -> Result<()> {
     if store.get_file_by_id(file_id)?.is_none() {
         return Ok(()); // file vanished mid-index; no-op
     }
@@ -295,13 +315,24 @@ pub fn build_edges_for_file(store: &Store, file_id: i64, content: &str) -> Resul
     // reads the raw content and the chunk rows, and resolves every target,
     // and it is what every caller runs to keep a note's links right. A
     // property link is a link with a name, so it keeps right the same way.
-    derive_properties(store, file_id, content, &chunks)
+    //
+    // It stores the raw YAML block beside them (#137) — but only where
+    // `content` is the file's own bytes. The chunker strips the block, so
+    // chunk text carries none of it and `split_frontmatter` would answer
+    // `None` for a note that has one; writing that would record "this note
+    // has no frontmatter", which is the silent wrong answer the column exists
+    // to prevent. A reconstruction leaves the column as it found it.
+    let (frontmatter, _body) = crate::markdown::split_frontmatter(content);
+    if source == ContentSource::File {
+        store.set_file_frontmatter(file_id, frontmatter.as_deref().unwrap_or(""))?;
+    }
+    derive_properties(store, file_id, frontmatter.as_deref(), &chunks)
 }
 
 /// Replace one file's property rows from its frontmatter and its chunks (#66).
 ///
-/// Frontmatter comes from `content`, because the chunker strips it; the
-/// rows sit at [`DOC_LEVEL`]. Body rows come from `chunks`, the file's
+/// The frontmatter is the caller's, split from the file's content because the
+/// chunker strips it; the rows sit at [`DOC_LEVEL`]. Body rows come from `chunks`, the file's
 /// chunk rows, which the caller has already read. A link's target resolves
 /// through [`resolve_link_target`], the function every edge resolves
 /// through, so a property row and its edge name one note by construction.
@@ -310,12 +341,10 @@ pub fn build_edges_for_file(store: &Store, file_id: i64, content: &str) -> Resul
 fn derive_properties(
     store: &Store,
     file_id: i64,
-    content: &str,
+    frontmatter: Option<&str>,
     chunks: &[crate::store::ChunkRecord],
 ) -> Result<()> {
-    let (frontmatter, _body) = crate::markdown::split_frontmatter(content);
     let mut extracted: Vec<crate::properties::Extracted> = frontmatter
-        .as_deref()
         .map(crate::properties::from_frontmatter)
         .unwrap_or_default();
     // Body rows sit at the chunk that holds the line, so the file's chunks
@@ -424,7 +453,7 @@ fn rebuild_links_for(store: &Store, vault_path: &Path, sources: &BTreeSet<i64>) 
             continue; // not on disk; the next index removes its row and its links
         };
         store.delete_outgoing_edges_for_file(file_id)?;
-        build_edges_for_file(store, file_id, &content)?;
+        build_edges_for_file(store, file_id, &content, ContentSource::File)?;
         reconciled += 1;
     }
     Ok(reconciled)
@@ -459,7 +488,7 @@ pub fn backfill_edges_from_chunks(store: &Store) -> Result<usize> {
             .map(|c| c.text.as_str())
             .collect::<Vec<_>>()
             .join("\n");
-        build_edges_for_file(store, file.id, &content)?;
+        build_edges_for_file(store, file.id, &content, ContentSource::Chunks)?;
     }
 
     let after: HashSet<(i64, i64)> = store.wikilink_pairs()?.into_iter().collect();
@@ -523,7 +552,7 @@ pub fn reindex_written_file(
 
     // Outgoing only — see issue #27.
     store.delete_outgoing_edges_for_file(result.file_id)?;
-    build_edges_for_file(store, result.file_id, &content)?;
+    build_edges_for_file(store, result.file_id, &content, ContentSource::File)?;
     // The file may be one other notes already name. Their own content did not
     // change, so nothing else revisits the links they wrote (#108).
     reconcile_links(store, vault_path, &[])?;
@@ -1034,7 +1063,7 @@ fn run_index_inner(
             // deleted from a file would stay in the graph forever (issue #27).
             // Incoming edges are left alone: they belong to other files.
             store.delete_outgoing_edges_for_file(file_record.id)?;
-            build_edges_for_file(store, file_record.id, content)?;
+            build_edges_for_file(store, file_record.id, content, ContentSource::File)?;
         }
     }
 
@@ -2218,8 +2247,8 @@ mod tests {
         let content_a = std::fs::read_to_string(root.join("a.md")).unwrap();
         let content_b = std::fs::read_to_string(root.join("b.md")).unwrap();
 
-        build_edges_for_file(&store, f_a, &content_a).unwrap();
-        build_edges_for_file(&store, f_b, &content_b).unwrap();
+        build_edges_for_file(&store, f_a, &content_a, ContentSource::File).unwrap();
+        build_edges_for_file(&store, f_b, &content_b, ContentSource::File).unwrap();
 
         let a_out = store.get_outgoing(f_a, Some("wikilink")).unwrap();
         assert_eq!(a_out.len(), 1);
@@ -2252,8 +2281,8 @@ mod tests {
         let content_a = std::fs::read_to_string(root.join("a.md")).unwrap();
         let content_b = std::fs::read_to_string(root.join("b.md")).unwrap();
 
-        build_edges_for_file(&store, f_a, &content_a).unwrap();
-        build_edges_for_file(&store, f_b, &content_b).unwrap();
+        build_edges_for_file(&store, f_a, &content_a, ContentSource::File).unwrap();
+        build_edges_for_file(&store, f_b, &content_b, ContentSource::File).unwrap();
 
         // A → B exists (A's content has [[b]])
         let a_out = store.get_outgoing(f_a, Some("wikilink")).unwrap();
@@ -2297,7 +2326,7 @@ mod tests {
             .unwrap();
 
         let content_a = std::fs::read_to_string(root.join("a.md")).unwrap();
-        build_edges_for_file(&store, f_a, &content_a).unwrap();
+        build_edges_for_file(&store, f_a, &content_a, ContentSource::File).unwrap();
 
         // Unresolved target should be recorded
         let unresolved = store.get_unresolved_links().unwrap();
@@ -2326,12 +2355,12 @@ mod tests {
             .unwrap();
 
         let content_a_v1 = std::fs::read_to_string(root.join("a.md")).unwrap();
-        build_edges_for_file(&store, f_a, &content_a_v1).unwrap();
+        build_edges_for_file(&store, f_a, &content_a_v1, ContentSource::File).unwrap();
         assert_eq!(store.get_unresolved_links().unwrap().len(), 1);
 
         // Now A is edited to remove the broken wikilink entirely.
         let content_a_v2 = "# A\nNo wikilinks here now.";
-        build_edges_for_file(&store, f_a, content_a_v2).unwrap();
+        build_edges_for_file(&store, f_a, content_a_v2, ContentSource::File).unwrap();
         let unresolved = store.get_unresolved_links().unwrap();
         assert_eq!(
             unresolved.len(),
@@ -2358,7 +2387,7 @@ mod tests {
             .insert_file("a.md", "h1", 100, "aaa111", None, None)
             .unwrap();
         let content_a = std::fs::read_to_string(root.join("a.md")).unwrap();
-        build_edges_for_file(&store, f_a, &content_a).unwrap();
+        build_edges_for_file(&store, f_a, &content_a, ContentSource::File).unwrap();
         assert_eq!(store.get_unresolved_links().unwrap().len(), 1);
 
         write_file(root, "b.md", "# B");
@@ -2399,7 +2428,7 @@ mod tests {
             .insert_file("b.md", "h2", 100, "bbb222", None, None)
             .unwrap();
         let content_a = std::fs::read_to_string(root.join("a.md")).unwrap();
-        build_edges_for_file(&store, f_a, &content_a).unwrap();
+        build_edges_for_file(&store, f_a, &content_a, ContentSource::File).unwrap();
         assert_eq!(store.get_outgoing(f_a, Some("wikilink")).unwrap().len(), 1);
         assert!(store.get_unresolved_links().unwrap().is_empty());
 
@@ -2435,7 +2464,7 @@ mod tests {
             .insert_file("b.md", "h2", 100, "bbb222", None, None)
             .unwrap();
         let content_a = std::fs::read_to_string(root.join("a.md")).unwrap();
-        build_edges_for_file(&store, f_a, &content_a).unwrap();
+        build_edges_for_file(&store, f_a, &content_a, ContentSource::File).unwrap();
 
         reconcile_links(&store, root, &[]).unwrap();
 
@@ -3915,7 +3944,7 @@ mod tests {
             .insert_file("b.md", "h2", 100, "bbb222", None, None)
             .unwrap();
         let content_a = "---\ntags: [x]\nstatus: draft\nrating: 5\ndone: true\nemployer: \"[[b]]\"\nmanager: [[b]]\nghost: \"[[nobody]]\"\n---\n# A\n";
-        build_edges_for_file(&store, a, content_a).unwrap();
+        build_edges_for_file(&store, a, content_a, ContentSource::File).unwrap();
 
         let rows = store.file_properties(a).unwrap();
         let got: Vec<(&str, &str, Kind, Option<&str>)> = rows
@@ -3950,11 +3979,152 @@ mod tests {
         let a = store
             .insert_file("a.md", "h1", 100, "aaa111", None, None)
             .unwrap();
-        build_edges_for_file(&store, a, "---\nstatus: draft\n---\n# A\n").unwrap();
-        build_edges_for_file(&store, a, "---\nstatus: final\n---\n# A\n").unwrap();
+        build_edges_for_file(
+            &store,
+            a,
+            "---\nstatus: draft\n---\n# A\n",
+            ContentSource::File,
+        )
+        .unwrap();
+        build_edges_for_file(
+            &store,
+            a,
+            "---\nstatus: final\n---\n# A\n",
+            ContentSource::File,
+        )
+        .unwrap();
         let rows = store.file_properties(a).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].value, "final");
+    }
+
+    #[test]
+    fn the_edge_pass_records_the_notes_yaml_block() {
+        // `match` scans the block beside the prose (#137), and the chunker
+        // strips it, so this pass is the one that can store it.
+        let store = Store::open_memory().unwrap();
+        let a = store
+            .insert_file("a.md", "h1", 100, "aaa111", None, None)
+            .unwrap();
+        build_edges_for_file(
+            &store,
+            a,
+            "---\nstatus: draft\n---\n# A\nSome prose.\n",
+            ContentSource::File,
+        )
+        .unwrap();
+
+        assert_eq!(
+            store.get_file("a.md").unwrap().unwrap().id,
+            a,
+            "fixture check"
+        );
+        let mut rows = Vec::new();
+        store
+            .for_each_scan_row_in_scope(
+                &crate::tags::Scope::default(),
+                crate::params::Scan::Frontmatter,
+                |row| rows.push(row),
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].text, "status: draft");
+    }
+
+    #[test]
+    fn a_note_with_no_yaml_block_records_an_empty_one_and_not_an_unknown_one() {
+        // `''` is a note that carries no frontmatter and NULL is a row this
+        // binary never wrote. A scan refuses over the second and answers over
+        // the first, so a note with no block must not be left looking stale.
+        let store = Store::open_memory().unwrap();
+        let a = store
+            .insert_file("a.md", "h1", 100, "aaa111", None, None)
+            .unwrap();
+        build_edges_for_file(&store, a, "# A\nNo block here.\n", ContentSource::File).unwrap();
+
+        assert!(
+            !store
+                .frontmatter_unindexed(&crate::tags::Scope::default())
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn a_chunks_only_rebuild_leaves_the_recorded_yaml_alone() {
+        // `backfill_edges_from_chunks` re-derives a pre-#28 store's edges
+        // from `chunks.text`, which is the note with its block already
+        // stripped. Taking that as the file's own bytes would record "this
+        // note has no frontmatter" over a note that has one (#137).
+        let store = Store::open_memory().unwrap();
+        let a = store
+            .insert_file("a.md", "h1", 100, "aaa111", None, None)
+            .unwrap();
+        build_edges_for_file(
+            &store,
+            a,
+            "---\nstatus: draft\n---\n# A\nSome prose.\n",
+            ContentSource::File,
+        )
+        .unwrap();
+
+        build_edges_for_file(&store, a, "# A\nSome prose.\n", ContentSource::Chunks).unwrap();
+
+        let mut rows = Vec::new();
+        store
+            .for_each_scan_row_in_scope(
+                &crate::tags::Scope::default(),
+                crate::params::Scan::Frontmatter,
+                |row| rows.push(row),
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1, "the block should have survived");
+        assert_eq!(rows[0].text, "status: draft");
+    }
+
+    #[test]
+    fn a_full_index_leaves_match_able_to_read_an_alias() {
+        // The end to end of #137: an alias is in the note, in no chunk, and
+        // in no index table of its own — `properties::BUILT_IN` keeps
+        // `aliases` out of the property rows — so the vault walk is what has
+        // to make it reachable.
+        use crate::llm::MockLlm;
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write_file(
+            root,
+            "a.md",
+            "---\naliases:\n  - The Cartographer\n---\n# A\nSome prose.\n",
+        );
+        let store = Store::open_memory().unwrap();
+        let mut embedder = MockLlm::new(256);
+        let config = Config::default();
+        run_index_shared(
+            root,
+            &config,
+            IndexSettings::from_config(&config),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let params = crate::params::Match {
+            pattern: "The Cartographer".to_string(),
+            case_sensitive: false,
+            word: false,
+            scope: Vec::new(),
+            all: Vec::new(),
+            any: Vec::new(),
+            none: Vec::new(),
+            scan: crate::params::Scan::All,
+            limit: None,
+        };
+        let report = crate::matching::run(&store, &params).unwrap();
+
+        assert_eq!(report.notes, 1);
+        assert_eq!(report.hits[0].part, crate::matching::Part::Frontmatter);
+        assert_eq!(report.hits[0].line, "  - The Cartographer");
     }
 
     #[test]
@@ -4077,7 +4247,7 @@ mod tests {
                 .unwrap();
         }
         let content = "# A\nNothing here.\n## Work\nEmployer:: [[b]]\nRating:: 5\n";
-        build_edges_for_file(&store, a, content).unwrap();
+        build_edges_for_file(&store, a, content, ContentSource::File).unwrap();
         let rows = store.file_properties(a).unwrap();
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert_eq!(rows[0].chunk_seq, 1);

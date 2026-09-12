@@ -6,18 +6,44 @@
 //! ranking, and a count that comes back whole even when the reported lines are
 //! capped. It is for verification and maintenance — "prove nothing still says
 //! X" — and not for discovery, which is what `search` is for.
+//!
+//! The scan reads **both halves of a note**, its prose and its YAML block, and
+//! says on each hit which one answered (#137). Reading the body alone made
+//! `notes` a count of the wrong population with nothing to signal it: in a
+//! vault with structured frontmatter a rename lands in the YAML at least as
+//! often as in the prose — a retargeted `parent:`, a dropped alias, a renamed
+//! property key — and none of those could be verified. `scan` narrows the
+//! reading to one half where a caller wants that; an alias exists to keep an
+//! old name, so "prove no *prose* still calls it X" is a real question.
 
 use std::borrow::Cow;
 use std::collections::HashSet;
 
-/// One chunk's text, with what addresses it.
+/// Which half of a note a row came from (#137).
 ///
-/// The scan reads `chunks.text`, so it sees a note's body and not its
-/// frontmatter: the chunker strips the YAML block before it cuts a file into
-/// sections. That is the declared limit of the capability.
+/// A frontmatter hit has no heading, and a body chunk under no heading takes
+/// the note's own name as its whole breadcrumb (#46), so a null
+/// `heading_path` does not separate the two. This does, and it has to: the
+/// round-trip contract (#96) is that a hit is actionable as it stands, and
+/// the two kinds take different `update` edits — a section `replace` for
+/// prose, a property edit for YAML.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Part {
+    Body,
+    Frontmatter,
+}
+
+/// One row of a note's text, with what addresses it.
+///
+/// Two kinds arrive: a chunk of the body, and the note's YAML block, which
+/// the chunker strips before it cuts a file into sections and which is
+/// therefore in no chunk row at all. `store::for_each_scan_row_in_scope`
+/// streams a note's frontmatter before its chunks.
 #[derive(Debug, Clone)]
-pub struct ChunkRow {
+pub struct ScanRow {
     pub file: String,
+    pub part: Part,
     pub heading_path: Option<String>,
     pub text: String,
 }
@@ -154,6 +180,11 @@ fn is_word_char(c: char) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Hit {
     pub file: String,
+    /// Which half of the note holds the line (#137). Always present: an
+    /// absent key would be indistinguishable from a body hit, which is the
+    /// rule `read`'s own `frontmatter` key follows.
+    #[serde(rename = "in")]
+    pub part: Part,
     pub heading_path: Option<String>,
     pub line: String,
 }
@@ -182,12 +213,14 @@ pub struct Scanner {
     query: Query,
     limit: Option<usize>,
     notes: HashSet<String>,
-    /// Distinct `(file, heading path, line)` triples seen. The dedup is what
-    /// keeps an oversized-chunk split from reporting one line twice:
+    /// Distinct `(file, part, heading path, line)` quadruples seen. The dedup
+    /// is what keeps an oversized-chunk split from reporting one line twice:
     /// `split_oversized_chunks` repeats `OVERLAP_TOKENS` of the previous piece
     /// at the head of the next and gives both the same `heading_path`, so the
-    /// repeated lines arrive as two rows of one section.
-    seen: HashSet<(String, Option<String>, String)>,
+    /// repeated lines arrive as two rows of one section. `part` is in the key
+    /// because a note's YAML and a body chunk under no heading share the rest
+    /// of it, and a line written in both halves is two lines of the note.
+    seen: HashSet<(String, Part, Option<String>, String)>,
     hits: Vec<Hit>,
 }
 
@@ -202,13 +235,18 @@ impl Scanner {
         }
     }
 
-    /// Read one chunk row, recording every line of it that holds the pattern.
-    pub fn push(&mut self, row: ChunkRow) {
+    /// Read one row, recording every line of it that holds the pattern.
+    pub fn push(&mut self, row: ScanRow) {
         for line in row.text.lines() {
             if !self.query.matches(line) {
                 continue;
             }
-            let key = (row.file.clone(), row.heading_path.clone(), line.to_string());
+            let key = (
+                row.file.clone(),
+                row.part,
+                row.heading_path.clone(),
+                line.to_string(),
+            );
             if !self.seen.insert(key) {
                 continue;
             }
@@ -216,6 +254,7 @@ impl Scanner {
             if self.limit.is_none_or(|n| self.hits.len() < n) {
                 self.hits.push(Hit {
                     file: row.file.clone(),
+                    part: row.part,
                     heading_path: row.heading_path.clone(),
                     line: line.to_string(),
                 });
@@ -245,11 +284,25 @@ pub fn run(
         anyhow::bail!("pattern is empty: every line holds the empty string");
     }
     let scope = params.scope()?;
+    let scan = params.scan;
+    // A store written before `files.frontmatter` existed holds NULL there,
+    // which is not "this note has no YAML" — it is "this index cannot say".
+    // Answering a count over it would be the failure this capability exists
+    // to prevent, so the scan refuses (#137). The CLI loads no embedder and
+    // so never reaches `fingerprint::verify`, which is why the guard is here
+    // rather than on one surface.
+    if scan != crate::params::Scan::Body && store.frontmatter_unindexed(&scope)? {
+        anyhow::bail!(
+            "this index was built before `match` read frontmatter, so it cannot \
+             say what a note's YAML holds. Run 'knapper index' to bring it up \
+             to date, or pass scan=body to count the prose alone."
+        );
+    }
     let mut scanner = Scanner::new(
         Query::new(&params.pattern, params.case_sensitive).whole_word(params.word),
         params.limit,
     );
-    store.for_each_chunk_in_scope(&scope, |row| scanner.push(row))?;
+    store.for_each_scan_row_in_scope(&scope, scan, |row| scanner.push(row))?;
     Ok(scanner.finish())
 }
 
@@ -277,12 +330,17 @@ pub fn render_text(report: &MatchReport) -> String {
     for hit in &report.hits {
         // A chunk under no heading takes the note's own name as its whole
         // breadcrumb — `[breadcrumb_root] = path` (#46) — so printing both
-        // would say the same thing twice.
-        match &hit.heading_path {
-            Some(path) if path != &hit.file => {
+        // would say the same thing twice. The bracket slot says where in the
+        // note the line is, so a frontmatter hit takes it: that half has no
+        // breadcrumb of its own, and a bare path would read as prose (#137).
+        match (hit.part, &hit.heading_path) {
+            (Part::Frontmatter, _) => {
+                let _ = writeln!(out, "  {} [frontmatter]", hit.file);
+            }
+            (Part::Body, Some(path)) if path != &hit.file => {
                 let _ = writeln!(out, "  {} [{path}]", hit.file);
             }
-            _ => {
+            (Part::Body, _) => {
                 let _ = writeln!(out, "  {}", hit.file);
             }
         }
@@ -302,15 +360,26 @@ pub fn render_text(report: &MatchReport) -> String {
 mod tests {
     use super::*;
 
-    fn row(file: &str, heading: Option<&str>, text: &str) -> ChunkRow {
-        ChunkRow {
+    fn row(file: &str, heading: Option<&str>, text: &str) -> ScanRow {
+        ScanRow {
             file: file.to_string(),
+            part: Part::Body,
             heading_path: heading.map(str::to_string),
             text: text.to_string(),
         }
     }
 
-    fn scan(rows: Vec<ChunkRow>, pattern: &str, case_sensitive: bool) -> MatchReport {
+    /// One note's YAML block, the row the frontmatter arm streams.
+    fn yaml(file: &str, text: &str) -> ScanRow {
+        ScanRow {
+            file: file.to_string(),
+            part: Part::Frontmatter,
+            heading_path: None,
+            text: text.to_string(),
+        }
+    }
+
+    fn scan(rows: Vec<ScanRow>, pattern: &str, case_sensitive: bool) -> MatchReport {
         let mut scanner = Scanner::new(Query::new(pattern, case_sensitive), None);
         for r in rows {
             scanner.push(r);
@@ -318,15 +387,19 @@ mod tests {
         scanner.finish()
     }
 
-    /// A store holding two notes, one chunk each.
+    /// A store holding two notes, one chunk each, one of them with a YAML
+    /// block. Every row's `frontmatter` is set, which is what a note the
+    /// current binary indexed looks like: NULL is the pre-column state and
+    /// `run` refuses a frontmatter scan over it.
     fn seeded_store() -> crate::store::Store {
         let store = crate::store::Store::open_memory().unwrap();
-        for (i, (path, text)) in [
+        for (i, (path, yaml, text)) in [
             (
                 "People/ilse.md",
+                "aliases:\n  - The Cartographer\nstatus: draft",
                 "She is sixteen years old at the start of the story.",
             ),
-            ("Places/academy.md", "The Academy is in Kessel."),
+            ("Places/academy.md", "", "The Academy is in Kessel."),
         ]
         .iter()
         .enumerate()
@@ -334,6 +407,7 @@ mod tests {
             let file_id = store
                 .insert_file(path, "h", i as i64, &format!("d00000{i}"), None, None)
                 .unwrap();
+            store.set_file_frontmatter(file_id, yaml).unwrap();
             store
                 .insert_chunk(&crate::store::NewChunk {
                     file_id,
@@ -359,6 +433,7 @@ mod tests {
             all: Vec::new(),
             any: Vec::new(),
             none: Vec::new(),
+            scan: crate::params::Scan::All,
             limit: None,
         }
     }
@@ -455,6 +530,160 @@ mod tests {
     }
 
     #[test]
+    fn a_run_counts_a_note_that_holds_the_pattern_in_its_frontmatter_alone() {
+        // The reported bug (#137): a name carried as an alias is in the note
+        // and in no chunk, so the body-only scan answered a count of the
+        // wrong population without saying so.
+        let report = run(&seeded_store(), &params("The Cartographer")).unwrap();
+
+        assert_eq!(report.notes, 1);
+        assert_eq!(report.hits[0].file, "People/ilse.md");
+        assert_eq!(report.hits[0].part, Part::Frontmatter);
+    }
+
+    #[test]
+    fn a_run_counts_a_property_name_no_body_line_carries() {
+        let report = run(&seeded_store(), &params("status")).unwrap();
+
+        assert_eq!(report.notes, 1);
+        assert_eq!(report.hits[0].line, "status: draft");
+    }
+
+    #[test]
+    fn a_body_scan_does_not_read_the_frontmatter() {
+        let mut p = params("The Cartographer");
+        p.scan = crate::params::Scan::Body;
+
+        assert_eq!(run(&seeded_store(), &p).unwrap().notes, 0);
+    }
+
+    #[test]
+    fn a_frontmatter_scan_does_not_read_the_body() {
+        let mut p = params("sixteen years old");
+        p.scan = crate::params::Scan::Frontmatter;
+        assert_eq!(run(&seeded_store(), &p).unwrap().notes, 0);
+
+        p.scan = crate::params::Scan::All;
+        assert_eq!(run(&seeded_store(), &p).unwrap().notes, 1, "fixture check");
+    }
+
+    #[test]
+    fn a_notes_yaml_is_scanned_before_its_own_chunks() {
+        // The limit cuts in vault order, so the two halves cannot arrive as
+        // two passes: a note's frontmatter leads the note's own prose.
+        let store = seeded_store();
+        let mut p = params("a");
+        p.limit = Some(1);
+        let report = run(&store, &p).unwrap();
+
+        assert_eq!(report.hits.len(), 1);
+        assert_eq!(report.hits[0].file, "People/ilse.md");
+        assert_eq!(report.hits[0].part, Part::Frontmatter);
+    }
+
+    #[test]
+    fn a_scan_over_a_store_written_before_the_column_is_refused() {
+        // NULL is "this index cannot say", not "this note has no YAML".
+        // Answering a count over it is the failure the capability exists to
+        // prevent, so it refuses instead (#137).
+        let store = crate::store::Store::open_memory().unwrap();
+        store
+            .insert_file("People/ilse.md", "h", 1, "d000001", None, None)
+            .unwrap();
+
+        let err = run(&store, &params("anything")).unwrap_err();
+        assert!(
+            err.to_string().contains("knapper index"),
+            "the error should say what fixes it: {err}"
+        );
+    }
+
+    #[test]
+    fn a_body_scan_answers_over_a_store_written_before_the_column() {
+        // The prose is indexed and the count over it is whole, so the scan
+        // the stale column cannot affect is not refused with it.
+        let store = crate::store::Store::open_memory().unwrap();
+        let file_id = store
+            .insert_file("People/ilse.md", "h", 1, "d000001", None, None)
+            .unwrap();
+        store
+            .insert_chunk(&crate::store::NewChunk {
+                file_id,
+                seq: 0,
+                heading: "Biography",
+                heading_path: "Biography",
+                tags_text: "",
+                text: "The Academy is in Kessel.",
+                vector_id: 1,
+                token_count: 10,
+            })
+            .unwrap();
+
+        let mut p = params("Kessel");
+        p.scan = crate::params::Scan::Body;
+        assert_eq!(run(&store, &p).unwrap().notes, 1);
+    }
+
+    #[test]
+    fn a_word_boundary_applies_to_a_yaml_line_as_to_any_other() {
+        // A frontmatter line is text, and the boundary rule is about
+        // characters rather than about markdown (#137).
+        let rows = vec![yaml("People/ilse.md", "status: draft")];
+        assert_eq!(scan_word(rows.clone(), "draft", false).notes, 1);
+        assert_eq!(
+            scan_word(rows, "raft", false).notes,
+            0,
+            "the pattern sits inside a longer word"
+        );
+    }
+
+    #[test]
+    fn a_wikilink_in_a_property_value_is_compared_as_a_reader_reads_it() {
+        // #118's rule, applied unchanged: a property link is a link, so both
+        // the markup and the rendered value answer.
+        let rows = vec![yaml("People/ilse.md", "affiliation: \"[[the-academy]]\"")];
+        assert_eq!(
+            scan(rows.clone(), "affiliation: \"the-academy", false).notes,
+            1
+        );
+        assert_eq!(scan(rows, "[[the-academy]]", false).notes, 1);
+    }
+
+    #[test]
+    fn a_frontmatter_hit_names_the_half_it_came_from() {
+        // A body chunk under no heading prints as a bare path (#46), so the
+        // bracket slot is what separates the two.
+        let report = scan(
+            vec![yaml("People/ilse.md", "status: draft")],
+            "draft",
+            false,
+        );
+
+        assert!(
+            render_text(&report).contains("  People/ilse.md [frontmatter]"),
+            "{}",
+            render_text(&report)
+        );
+    }
+
+    #[test]
+    fn one_line_written_in_both_halves_of_a_note_counts_twice() {
+        // The dedup key carries the part, because a note that says the same
+        // thing in its YAML and in its prose says it on two lines.
+        let report = scan(
+            vec![
+                yaml("People/ilse.md", "status: draft"),
+                row("People/ilse.md", None, "status: draft"),
+            ],
+            "status: draft",
+            false,
+        );
+
+        assert_eq!(report.notes, 1);
+        assert_eq!(report.lines, 2);
+    }
+
+    #[test]
     fn an_empty_pattern_is_refused() {
         // Every line holds the empty string, so an empty pattern answers the
         // whole vault and says nothing. It is the caller's own mistake.
@@ -483,6 +712,7 @@ mod tests {
             report.hits,
             vec![Hit {
                 file: "People/Ilse.md".to_string(),
+                part: Part::Body,
                 heading_path: Some("Ilse > Biography".to_string()),
                 line: "She is sixteen years old at the start of the story.".to_string(),
             }]
@@ -707,7 +937,7 @@ mod tests {
         assert_eq!(report.hits.len(), 1);
     }
 
-    fn scan_word(rows: Vec<ChunkRow>, pattern: &str, case_sensitive: bool) -> MatchReport {
+    fn scan_word(rows: Vec<ScanRow>, pattern: &str, case_sensitive: bool) -> MatchReport {
         let mut scanner = Scanner::new(Query::new(pattern, case_sensitive).whole_word(true), None);
         for r in rows {
             scanner.push(r);
