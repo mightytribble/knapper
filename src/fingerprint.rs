@@ -74,7 +74,16 @@ pub const PARSER_VERSION: u32 = 2;
 /// existed. Gated by `carry_orphan_headings`, which the chunker digest also
 /// hashes, so the off arm reproduces version 4 exactly and the version bump is
 /// what re-indexes it once regardless.
-pub const CHUNKER_VERSION: u32 = 5;
+///
+/// Version 6 is issue #139: every piece of a split section carries the heading
+/// line the file holds, instead of the second and later pieces being labelled
+/// `## X (cont.)`. That label was prepended to the piece's text, so a chunk's
+/// body opened on a heading no note held — unaddressable by `read --section`,
+/// and written into the file for real by an `update --section` round trip.
+/// Boundaries move only where `split_oversized_chunks` cut a chunk sitting
+/// within a few tokens of the model's input wall, since the marker was part of
+/// the text it measured; the text a row holds changes wherever a section split.
+pub const CHUNKER_VERSION: u32 = 6;
 
 /// Bump when what a chunk **row** holds changes, even though the chunk
 /// boundaries do not.

@@ -22,21 +22,14 @@ impl Chunk {
     /// Build a chunk from a heading line and a body, deriving `text` and `snippet`.
     ///
     /// The heading line is prepended to the body so every chunk *begins* with the
-    /// heading it is labelled with. `continuation` appends ` (cont.)` to the label
-    /// for the second and later pieces of a split section.
-    fn from_section(
-        heading_line: Option<&str>,
-        heading_path: &[String],
-        body: &str,
-        continuation: bool,
-    ) -> Chunk {
-        let heading = heading_line.map(|h| {
-            if continuation {
-                format!("{h} (cont.)")
-            } else {
-                h.to_string()
-            }
-        });
+    /// heading it is labelled with. Every piece of a split section carries the
+    /// same line — the one the file holds — because `text` is shown to a reader
+    /// and `heading` names a section a caller may address: a label the file does
+    /// not hold is a section `read --section` cannot find and `update --section`
+    /// would create for real on the way back (#139). Which piece this is belongs
+    /// to the index, and `seq` already records it.
+    fn from_section(heading_line: Option<&str>, heading_path: &[String], body: &str) -> Chunk {
+        let heading = heading_line.map(str::to_string);
         let text = match &heading {
             Some(h) => format!("{h}\n{}", body.trim()),
             None => body.trim().to_string(),
@@ -619,7 +612,7 @@ pub fn structure_chunk(content: &str, target_tokens: usize, opts: ChunkOptions) 
             .collect::<Vec<_>>()
             .join("\n");
         if !text.trim().is_empty() {
-            chunks.push(Chunk::from_section(None, &[], &text, false));
+            chunks.push(Chunk::from_section(None, &[], &text));
         }
     }
 
@@ -729,7 +722,7 @@ fn emit_section(
     let budget = target_tokens.saturating_sub(heading_tokens).max(1);
 
     if approx_tokens(body) <= budget {
-        let mut chunk = Chunk::from_section(heading_line, heading_path, body, false);
+        let mut chunk = Chunk::from_section(heading_line, heading_path, body);
         chunk.prepend_carried(carried);
         out.push(chunk);
         return;
@@ -791,7 +784,7 @@ fn emit_section(
     }
 
     for (i, piece) in pieces.into_iter().enumerate() {
-        let mut chunk = Chunk::from_section(heading_line, heading_path, &piece, i > 0);
+        let mut chunk = Chunk::from_section(heading_line, heading_path, &piece);
         if i == 0 {
             chunk.prepend_carried(carried);
         }
@@ -850,7 +843,9 @@ pub fn chunk_markdown(content: &str, opts: ChunkOptions) -> ParsedMarkdown {
 /// - Over-sized chunks are split on sentence boundaries (`. ` or `\n`).
 /// - Each sub-chunk after the first includes `overlap_tokens` worth of trailing
 ///   text from the previous sub-chunk.
-/// - Subsequent sub-chunks get ` (cont.)` appended to the parent heading.
+/// - Every sub-chunk carries the parent's own heading, the one the file holds
+///   (#139). This pass runs over what `structure_chunk` already emitted, so a
+///   marker added here would compound on a piece the packing budget had cut.
 pub fn split_oversized_chunks(
     chunks: Vec<Chunk>,
     token_count: &dyn Fn(&str) -> usize,
@@ -889,12 +884,8 @@ pub fn split_oversized_chunks(
         }
 
         // Convert sub-chunks into Chunk structs
-        for (i, sub_text) in sub_chunks.into_iter().enumerate() {
-            let heading = if i == 0 {
-                chunk.heading.clone()
-            } else {
-                chunk.heading.as_ref().map(|h| format!("{h} (cont.)"))
-            };
+        for sub_text in sub_chunks {
+            let heading = chunk.heading.clone();
             let sub_text = sub_text.trim();
             let full_text = match &heading {
                 // Structure-first chunks already lead with their heading; only
@@ -1358,17 +1349,42 @@ mod tests {
             let heading = chunk.heading.as_deref().expect("every chunk is labelled");
             // The label is the chunk's first line, never a heading discovered
             // partway through the text.
-            let base = heading.trim_end_matches(" (cont.)");
             assert!(
-                chunk.text.starts_with(base),
+                chunk.text.starts_with(heading),
                 "chunk labelled {heading:?} does not begin with it:\n{}",
                 chunk.text
             );
         }
-        // Continuations are marked, and the section that fits is not.
+        // Every piece of the split section carries the heading the file holds,
+        // so the label is addressable and the text opens on a real line (#139).
         assert_eq!(chunks[0].heading.as_deref(), Some("## First"));
-        assert_eq!(chunks[1].heading.as_deref(), Some("## First (cont.)"));
+        assert_eq!(chunks[1].heading.as_deref(), Some("## First"));
         assert_eq!(chunks.last().unwrap().heading.as_deref(), Some("## Second"));
+    }
+
+    #[test]
+    fn no_chunk_carries_a_heading_line_the_file_does_not_hold() {
+        // The `(cont.)` marker put a fictional heading in the corpus: a
+        // coalesced block showed two heading lines, one of which `read
+        // --section` could not address and `update --section` would have
+        // written into the file for real (#139).
+        let filler = "Sentence of prose padding this section out. ".repeat(60);
+        let md = format!("## First\n{filler}\n\n{filler}\n\n## Second\nShort.\n");
+        let chunks = structure_chunk(&md, 128, opts(0));
+
+        assert!(chunks.len() > 2, "expected the first section to split");
+        for chunk in &chunks {
+            assert!(
+                !chunk.text.contains("(cont.)"),
+                "fictional heading in chunk text:\n{}",
+                chunk.text
+            );
+            assert!(
+                !chunk.heading.as_deref().unwrap_or("").contains("(cont.)"),
+                "fictional heading label: {:?}",
+                chunk.heading
+            );
+        }
     }
 
     #[test]
@@ -2191,12 +2207,12 @@ mod tests {
             "Expected at least 2 sub-chunks, got {}",
             result.len()
         );
-        // First chunk keeps original heading
+        // Every piece carries the section's real heading (#139).
         assert_eq!(result[0].heading.as_deref(), Some("## Long Section"));
-        // Subsequent chunks get (cont.)
-        assert_eq!(
-            result[1].heading.as_deref(),
-            Some("## Long Section (cont.)")
+        assert_eq!(result[1].heading.as_deref(), Some("## Long Section"));
+        assert!(
+            result.iter().all(|c| !c.text.contains("(cont.)")),
+            "fictional heading survived the token-aware split"
         );
         // All sub-chunks should be within token limit
         for c in &result {
@@ -2206,6 +2222,34 @@ mod tests {
         // Snippets should be regenerated
         for c in &result {
             assert!(!c.snippet.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_piece_split_twice_is_still_labelled_with_the_real_heading() {
+        // `split_oversized_chunks` runs over what `structure_chunk` emitted
+        // (`indexer::index_file`), so a piece the packing budget already cut
+        // could be cut again — which used to compound the marker into
+        // `## X (cont.) (cont.)`, a name no resolver folded (#139).
+        let filler = "Sentence of prose padding this section out. ".repeat(60);
+        let md = format!("## Long\n{filler}\n\n{filler}\n");
+        let chunks = structure_chunk(&md, 128, opts(0));
+        assert!(chunks.len() >= 2, "expected the packing budget to split it");
+
+        let token_fn = |s: &str| s.split_whitespace().count();
+        let result = split_oversized_chunks(chunks, &token_fn, 40, 5);
+
+        assert!(
+            result.len() > 2,
+            "expected the token wall to split it again"
+        );
+        for c in &result {
+            assert_eq!(c.heading.as_deref(), Some("## Long"));
+            assert!(
+                !c.text.contains("(cont.)"),
+                "compounded marker:\n{}",
+                c.text
+            );
         }
     }
 

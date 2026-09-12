@@ -140,6 +140,11 @@ pub struct Section {
 /// heading or none, so a wrong guess is an error rather than an edit to the
 /// wrong section.
 pub fn find_section(content: &str, heading_text: &str) -> Option<Section> {
+    locate(content, heading_text).or_else(|| locate(content, &strip_continuation(heading_text)?))
+}
+
+/// The lookup itself, over the name exactly as the caller wrote it.
+fn locate(content: &str, heading_text: &str) -> Option<Section> {
     // ATX first, then the same two lookups over the merged set, so an ATX
     // `### History` keeps precedence over a `**History**` under the same
     // parent: the second pass runs only when the first answered nothing
@@ -151,6 +156,37 @@ pub fn find_section(content: &str, heading_text: &str) -> Option<Section> {
                 by_text(&headings, heading_text).or_else(|| by_path(&headings, heading_text))?;
             Some(section_at(content, &headings, idx))
         })
+}
+
+/// The marker the chunker used to append to a split section's later pieces.
+const CONTINUATION_MARKER: &str = "(cont.)";
+
+/// `name` with every trailing [`CONTINUATION_MARKER`] removed, or `None` when
+/// it carries none or is nothing else (issue #139).
+///
+/// An index written before the marker was dropped labelled a split section's
+/// later pieces `## X (cont.)`, and a twice-split piece `## X (cont.) (cont.)`,
+/// so a caller reading such a store can still be holding a name no heading in
+/// the file matches. [`find_section`] retries with this only after the literal
+/// lookup has failed over both heading passes, which is what keeps a heading a
+/// note genuinely wrote — a transcript's `## Notes (cont.)` — addressable as
+/// itself: it is found first, and this is never reached. Stripping inside
+/// [`normalise`] instead would fold the file's headings as well as the query
+/// and make two real sections one, resolving a read, and an `update --section`
+/// write, to the wrong one.
+fn strip_continuation(name: &str) -> Option<String> {
+    let mut rest = name.trim_end();
+    let mut stripped = false;
+    while let Some(shorter) = rest.strip_suffix(CONTINUATION_MARKER) {
+        rest = shorter.trim_end();
+        stripped = true;
+    }
+    // A name that is only markers would otherwise answer the first heading in
+    // the file.
+    if !stripped || rest.trim().is_empty() {
+        return None;
+    }
+    Some(rest.to_string())
 }
 
 /// The first heading whose own text is `query`.
@@ -313,6 +349,57 @@ pub(crate) fn with_newline(text: &str, newline: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_continuation_name_resolves_to_the_section_it_names() {
+        // An index written before #139 labelled a split section's later pieces
+        // `## X (cont.)`, and a caller that pasted that name back got nothing.
+        // The file holds no such heading, so the lookup falls back to the name
+        // with the marker off.
+        let md = "## Drift\nFirst half.\n\n## Other\nElsewhere.\n";
+        let found = super::find_section(md, "Drift (cont.)").expect("resolves");
+        assert_eq!(found.heading.text, "Drift");
+        assert_eq!(found.body, "First half.");
+    }
+
+    #[test]
+    fn a_real_continuation_heading_wins_over_the_fallback() {
+        // A note may write `(cont.)` in a heading itself — a transcript, a long
+        // log. The literal lookup runs first over both passes, so the fallback
+        // can never shadow a heading the file actually holds.
+        let md = "## Notes\nFirst.\n\n## Notes (cont.)\nSecond.\n";
+        let found = super::find_section(md, "Notes (cont.)").expect("resolves");
+        assert_eq!(found.heading.text, "Notes (cont.)");
+        assert_eq!(found.body, "Second.");
+        // And the unmarked name still answers the unmarked heading.
+        let plain = super::find_section(md, "Notes").expect("resolves");
+        assert_eq!(plain.body, "First.");
+    }
+
+    #[test]
+    fn a_compounded_continuation_name_resolves() {
+        // A piece the packing budget split and the token wall split again was
+        // labelled `## X (cont.) (cont.)` before #139.
+        let md = "## Long\nBody.\n";
+        let found = super::find_section(md, "Long (cont.) (cont.)").expect("resolves");
+        assert_eq!(found.heading.text, "Long");
+    }
+
+    #[test]
+    fn a_name_that_is_nothing_but_the_marker_resolves_nothing() {
+        // Stripping it leaves an empty name, which would otherwise answer the
+        // first heading in the file.
+        let md = "## Drift\nBody.\n";
+        assert!(super::find_section(md, "(cont.)").is_none());
+        assert!(super::find_section(md, " (cont.) ").is_none());
+    }
+
+    #[test]
+    fn a_continuation_name_resolves_inside_a_path() {
+        let md = "# Top\n\n## Drift\nBody.\n";
+        let found = super::find_section(md, "Top > Drift (cont.)").expect("resolves");
+        assert_eq!(found.heading.text, "Drift");
+    }
+
     use super::*;
 
     #[test]

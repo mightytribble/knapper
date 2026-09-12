@@ -210,15 +210,20 @@ CREATE INDEX IF NOT EXISTS idx_properties_target ON properties(target_file);";
 /// Reduce a heading to the form two spellings of the same section share.
 ///
 /// Strips the leading `#`s a stored heading carries and a link's does not,
-/// case-folds, and drops the `(cont.)` suffix the chunker appends when it splits
-/// an oversized section — a `[[Note#Events]]` means `## Events (cont.)` too.
+/// case-folds, and drops every trailing `(cont.)` — a `[[Note#Events]]` means
+/// `## Events (cont.)` too, whether the suffix is on the row because an index
+/// written before #139 labelled a split piece that way, or because the note
+/// wrote the heading itself.
+///
+/// The loop is what folds a compounded `## Events (cont.) (cont.)`: after one
+/// suffix comes off, the remainder ends in a space, and a single
+/// `trim_end_matches` stops there.
 pub(crate) fn normalise_heading(heading: &str) -> String {
-    heading
-        .trim_start_matches('#')
-        .trim()
-        .trim_end_matches("(cont.)")
-        .trim()
-        .to_lowercase()
+    let mut base = heading.trim_start_matches('#').trim();
+    while let Some(shorter) = base.strip_suffix("(cont.)") {
+        base = shorter.trim_end();
+    }
+    base.to_lowercase()
 }
 
 /// Build a [`ChunkRecord`] from a row selecting [`CHUNK_COLUMNS`].
@@ -1195,8 +1200,10 @@ impl Store {
     /// The seqs of a file's chunks sitting under `heading`.
     ///
     /// A deep link's target end (issue #28). Plural because `(file, heading)` is
-    /// not unique: the chunker splits an oversized section into `## Events` and
-    /// `## Events (cont.)`, and a link to `#Events` means both.
+    /// not unique: an oversized section is split across several chunks, each
+    /// labelled with the section's own heading, and a link to `#Events` means
+    /// every one of them (#139). A store written before that carries the later
+    /// pieces as `## Events (cont.)`, which [`normalise_heading`] folds.
     ///
     /// Empty when nothing matches — a renamed heading. The caller degrades that
     /// to [`DOC_LEVEL`] rather than dropping the link, because a deep link is
@@ -6504,9 +6511,39 @@ mod tests {
     }
 
     #[test]
-    fn chunk_seqs_with_heading_finds_a_split_section() {
-        // `(file, heading)` is not unique: an oversized section becomes
-        // `## Events` and `## Events (cont.)`, and a link to `#Events` means both.
+    fn chunk_seqs_with_heading_finds_every_piece_of_a_split_section() {
+        // What the chunker writes since #139: each piece of a split section
+        // carries the section's own heading, so `(file, heading)` is not
+        // unique and a link to `#Events` means every piece.
+        let store = Store::open_memory().unwrap();
+        let f = file(&store, "session.md");
+        for (seq, heading) in [(0, "## Summary"), (1, "## Events"), (2, "## Events")] {
+            store
+                .insert_chunk_with_vector(
+                    &NewChunk {
+                        file_id: f,
+                        seq,
+                        heading,
+                        text: "text",
+                        vector_id: seq as u64,
+                        token_count: 1,
+                        ..Default::default()
+                    },
+                    &[0.0],
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            store.chunk_seqs_with_heading(f, "Events").unwrap(),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn chunk_seqs_with_heading_finds_a_split_section_in_a_store_written_before_139() {
+        // A store an earlier binary built labelled the later pieces
+        // `## Events (cont.)`. `normalise_heading` folds the suffix, so a deep
+        // link still resolves to both without a re-index.
         let store = Store::open_memory().unwrap();
         let f = file(&store, "session.md");
         for (seq, heading) in [
@@ -7545,6 +7582,18 @@ mod tests {
         let store = operator_fixture();
         let filter = crate::tags::Scope::default();
         assert_eq!(listed_paths(&store, &filter).len(), 3);
+    }
+
+    #[test]
+    fn normalise_heading_folds_a_compounded_continuation() {
+        // `split_oversized_chunks` runs over what the packing budget already
+        // cut, so a twice-split section was labelled `## X (cont.) (cont.)`.
+        // `trim_end_matches` stopped after one suffix — the remainder ends in
+        // `"(cont.) "`, and the space defeats the match — so `[[Note#X]]` did
+        // not resolve to that piece (#139).
+        assert_eq!(normalise_heading("## Events (cont.) (cont.)"), "events");
+        assert_eq!(normalise_heading("## Events (cont.)"), "events");
+        assert_eq!(normalise_heading("## Events"), "events");
     }
 
     #[test]
