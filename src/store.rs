@@ -490,7 +490,17 @@ CREATE TABLE IF NOT EXISTS files (
     content_hash TEXT NOT NULL,
     mtime        INTEGER NOT NULL,
     indexed_at   TEXT NOT NULL,
-    docid        TEXT
+    docid        TEXT,
+    -- The note's YAML block, as the note wrote it and with no `---` fences.
+    -- The chunker strips it before it cuts a file into sections, so no chunk
+    -- row holds it and `match` had no way to read it (#137).
+    --
+    -- Nullable, and with no default, because the two empty cases are not the
+    -- same fact: `''` is a note that carries no frontmatter, NULL is a row
+    -- written before this column existed. Reading them alike would answer a
+    -- confident count over a half-read vault, which is the failure the
+    -- capability exists to prevent.
+    frontmatter  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS chunks (
@@ -740,6 +750,16 @@ impl Store {
         let _ = self
             .conn
             .execute_batch("ALTER TABLE files ADD COLUMN note_date INTEGER;");
+
+        // Add files.frontmatter (#137). It stays NULL here on purpose: the
+        // YAML block is in the vault and in no column this table holds, so
+        // nothing can derive it without a file read. `LINK_RESOLVER_VERSION`
+        // declares the `RebuildEdges` that fills it — a vault read and no
+        // model — and `matching::run` refuses a frontmatter scan until it has.
+        if !self.column_exists("files", "frontmatter")? {
+            self.conn
+                .execute_batch("ALTER TABLE files ADD COLUMN frontmatter TEXT;")?;
+        }
 
         // Add chunks.seq, and backfill it for databases indexed before chunk
         // identity existed. Chunks were always inserted in document order, so the
@@ -2143,11 +2163,84 @@ impl Store {
     ///
     /// `none` is not checked, for the reason `list_files` does not check it:
     /// excluding a tag no note carries is a no-op.
-    pub fn for_each_chunk_in_scope(
+    pub fn for_each_scan_row_in_scope(
         &self,
         scope: &crate::tags::Scope,
-        mut visit: impl FnMut(crate::matching::ChunkRow),
+        scan: crate::params::Scan,
+        mut visit: impl FnMut(crate::matching::ScanRow),
     ) -> Result<()> {
+        use crate::params::Scan;
+
+        let checked: Vec<&crate::tags::ScopeTerm> =
+            scope.all.iter().chain(scope.any.iter()).collect();
+        crate::tags::check_terms(&self.conn, &checked)?;
+        let links = self.resolve_scope_links(scope)?;
+
+        // One statement over both halves, not two passes, so a note's YAML
+        // and its prose arrive together and `limit` still cuts in vault order
+        // (#137). The frontmatter arm sits at `DOC_LEVEL`, the sentinel
+        // `properties` already gives a frontmatter row, and -1 sorts before
+        // chunk 0, so a note's YAML leads its own chunks. A note whose block
+        // is empty contributes no row: there is nothing in it to match.
+        //
+        // The scope clauses are built twice because each arm binds its own
+        // copy of the arguments; `scope_clauses` is the one builder, so the
+        // two arms cannot select different notes.
+        let (scope_sql, mut args) = scope_clauses(scope, &links);
+        let frontmatter_arm = format!(
+            "SELECT f.path AS path, {DOC_LEVEL} AS seq, '' AS heading_path, f.frontmatter AS text
+               FROM files f
+              WHERE f.frontmatter IS NOT NULL AND f.frontmatter <> ''{scope_sql}"
+        );
+        let body_arm = format!(
+            "SELECT f.path AS path, c.seq AS seq, c.heading_path AS heading_path, c.text AS text
+               FROM chunks c JOIN files f ON f.id = c.file_id
+              WHERE 1=1{scope_sql}"
+        );
+        let (sql, bound) = match scan {
+            Scan::All => {
+                // Each arm binds its own copy: a bound value is a boxed
+                // `dyn ToSql` and cannot be cloned, so the builder runs again.
+                let (_, second) = scope_clauses(scope, &links);
+                args.extend(second);
+                (
+                    format!("{frontmatter_arm} UNION ALL {body_arm} ORDER BY path, seq"),
+                    args,
+                )
+            }
+            Scan::Frontmatter => (format!("{frontmatter_arm} ORDER BY path, seq"), args),
+            Scan::Body => (format!("{body_arm} ORDER BY path, seq"), args),
+        };
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(bound.iter()))?;
+        while let Some(row) = rows.next()? {
+            let seq: i64 = row.get(1)?;
+            let heading_path: String = row.get(2)?;
+            visit(crate::matching::ScanRow {
+                file: row.get(0)?,
+                part: if seq == DOC_LEVEL {
+                    crate::matching::Part::Frontmatter
+                } else {
+                    crate::matching::Part::Body
+                },
+                // NOT NULL with an empty default: no breadcrumb, rather than a
+                // breadcrumb of no characters. A frontmatter row never has one.
+                heading_path: (!heading_path.is_empty()).then_some(heading_path),
+                text: row.get(3)?,
+            });
+        }
+        Ok(())
+    }
+
+    /// Whether any note the scope admits predates `files.frontmatter` (#137).
+    ///
+    /// NULL is the pre-column state, and it is not `''`: a scan over it would
+    /// answer a count of the wrong population without saying so, which is the
+    /// one thing `match` must not do. Per-scope rather than per-store, so a
+    /// scope of freshly indexed notes answers while the rest of the vault
+    /// waits for its re-index.
+    pub fn frontmatter_unindexed(&self, scope: &crate::tags::Scope) -> Result<bool> {
         let checked: Vec<&crate::tags::ScopeTerm> =
             scope.all.iter().chain(scope.any.iter()).collect();
         crate::tags::check_terms(&self.conn, &checked)?;
@@ -2155,22 +2248,23 @@ impl Store {
 
         let (scope_sql, args) = scope_clauses(scope, &links);
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT f.path, c.heading_path, c.text
-               FROM chunks c JOIN files f ON f.id = c.file_id
-              WHERE 1=1{scope_sql}
-              ORDER BY f.path, c.seq"
+            "SELECT EXISTS(SELECT 1 FROM files f WHERE f.frontmatter IS NULL{scope_sql})"
         ))?;
-        let mut rows = stmt.query(rusqlite::params_from_iter(args.iter()))?;
-        while let Some(row) = rows.next()? {
-            let heading_path: String = row.get(1)?;
-            visit(crate::matching::ChunkRow {
-                file: row.get(0)?,
-                // NOT NULL with an empty default: no breadcrumb, rather than a
-                // breadcrumb of no characters.
-                heading_path: (!heading_path.is_empty()).then_some(heading_path),
-                text: row.get(2)?,
-            });
-        }
+        let pending: bool =
+            stmt.query_row(rusqlite::params_from_iter(args.iter()), |row| row.get(0))?;
+        Ok(pending)
+    }
+
+    /// Record a note's YAML block, the text `match` scans beside its prose.
+    ///
+    /// Written by the pass that derives the rows read *out* of the block, so
+    /// the raw text and the parsed properties are filled by one vault read
+    /// and cannot disagree about which revision of the note they describe.
+    pub fn set_file_frontmatter(&self, file_id: i64, frontmatter: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE files SET frontmatter = ?2 WHERE id = ?1",
+            params![file_id, frontmatter],
+        )?;
         Ok(())
     }
 
@@ -6622,6 +6716,9 @@ mod tests {
             let file_id = store
                 .insert_file(path, "h", i as i64, &format!("d00000{i}"), None, None)
                 .unwrap();
+            store
+                .set_file_frontmatter(file_id, &format!("{path} yaml"))
+                .unwrap();
             for seq in 0..2 {
                 store
                     .insert_chunk(&NewChunk {
@@ -6640,17 +6737,30 @@ mod tests {
         store
     }
 
-    fn scanned(store: &Store, scope: &crate::tags::Scope) -> Vec<crate::matching::ChunkRow> {
+    fn scanned(store: &Store, scope: &crate::tags::Scope) -> Vec<crate::matching::ScanRow> {
+        scanned_with(store, scope, crate::params::Scan::All)
+    }
+
+    /// The body arm alone, which is what the chunk-order tests below assert.
+    fn scanned_body(store: &Store, scope: &crate::tags::Scope) -> Vec<crate::matching::ScanRow> {
+        scanned_with(store, scope, crate::params::Scan::Body)
+    }
+
+    fn scanned_with(
+        store: &Store,
+        scope: &crate::tags::Scope,
+        scan: crate::params::Scan,
+    ) -> Vec<crate::matching::ScanRow> {
         let mut rows = Vec::new();
         store
-            .for_each_chunk_in_scope(scope, |row| rows.push(row))
+            .for_each_scan_row_in_scope(scope, scan, |row| rows.push(row))
             .unwrap();
         rows
     }
 
     #[test]
     fn a_chunk_scan_answers_every_chunk_in_path_then_chunk_order() {
-        let rows = scanned(&chunk_fixture(), &crate::tags::Scope::default());
+        let rows = scanned_body(&chunk_fixture(), &crate::tags::Scope::default());
         assert_eq!(
             rows.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(),
             vec![
@@ -6664,8 +6774,114 @@ mod tests {
     }
 
     #[test]
-    fn a_chunk_scan_answers_only_what_the_scope_admits() {
+    fn a_scan_puts_a_notes_yaml_before_its_own_chunks() {
+        // The frontmatter arm sits at `DOC_LEVEL`, and -1 sorts before chunk
+        // 0, so the two halves interleave per note rather than arriving as
+        // two passes — which is what keeps `limit` cutting in vault order.
+        let rows = scanned(&chunk_fixture(), &crate::tags::Scope::default());
+        assert_eq!(
+            rows.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(),
+            vec![
+                "People/marcus.md yaml",
+                "People/marcus.md chunk 0",
+                "People/marcus.md chunk 1",
+                "Places/varenholt.md yaml",
+                "Places/varenholt.md chunk 0",
+                "Places/varenholt.md chunk 1",
+            ]
+        );
+        assert_eq!(rows[0].part, crate::matching::Part::Frontmatter);
+        assert_eq!(rows[1].part, crate::matching::Part::Body);
+    }
+
+    #[test]
+    fn a_scan_narrowed_to_one_half_reads_only_that_half() {
+        let store = chunk_fixture();
+        let read = |scan| {
+            let mut rows = Vec::new();
+            store
+                .for_each_scan_row_in_scope(&crate::tags::Scope::default(), scan, |row| {
+                    rows.push(row)
+                })
+                .unwrap();
+            rows
+        };
+
+        let yaml = read(crate::params::Scan::Frontmatter);
+        assert_eq!(yaml.len(), 2);
+        assert!(
+            yaml.iter()
+                .all(|r| r.part == crate::matching::Part::Frontmatter)
+        );
+
+        let body = read(crate::params::Scan::Body);
+        assert_eq!(body.len(), 4);
+        assert!(body.iter().all(|r| r.part == crate::matching::Part::Body));
+    }
+
+    #[test]
+    fn a_scans_two_halves_answer_one_scope() {
+        // The arms are built from one `scope_clauses`, so a filter cannot
+        // admit a note's prose and drop its frontmatter.
         let rows = scanned(&chunk_fixture(), &folder_scope(&["/Places/"], &[], &[]));
+        assert_eq!(
+            rows.iter().map(|r| r.file.as_str()).collect::<Vec<_>>(),
+            vec![
+                "Places/varenholt.md",
+                "Places/varenholt.md",
+                "Places/varenholt.md"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_note_with_an_empty_yaml_block_contributes_no_frontmatter_row() {
+        // `''` is a note that carries no block. There is nothing in it to
+        // match, so it is not a row — and it is still not the NULL that means
+        // the index cannot say.
+        let store = Store::open_memory().unwrap();
+        let file_id = store
+            .insert_file("People/marcus.md", "h", 1, "d000001", None, None)
+            .unwrap();
+        store.set_file_frontmatter(file_id, "").unwrap();
+
+        assert!(scanned(&store, &crate::tags::Scope::default()).is_empty());
+        assert!(
+            !store
+                .frontmatter_unindexed(&crate::tags::Scope::default())
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn a_row_written_before_the_column_reads_as_unindexed_only_in_its_own_scope() {
+        // Per-scope rather than per-store, so a scope of freshly indexed
+        // notes answers while the rest of the vault waits for its re-index.
+        let store = chunk_fixture();
+        let marcus = store.get_file("People/marcus.md").unwrap().unwrap().id;
+        store
+            .conn
+            .execute(
+                "UPDATE files SET frontmatter = NULL WHERE id = ?1",
+                [marcus],
+            )
+            .unwrap();
+
+        assert!(
+            store
+                .frontmatter_unindexed(&crate::tags::Scope::default())
+                .unwrap()
+        );
+        assert!(
+            !store
+                .frontmatter_unindexed(&folder_scope(&["/Places/"], &[], &[]))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn a_chunk_scan_answers_only_what_the_scope_admits() {
+        let rows = scanned_body(&chunk_fixture(), &folder_scope(&["/Places/"], &[], &[]));
         assert_eq!(
             rows.iter().map(|r| r.file.as_str()).collect::<Vec<_>>(),
             vec!["Places/varenholt.md", "Places/varenholt.md"]
@@ -6677,7 +6893,7 @@ mod tests {
         // `chunks.heading_path` is NOT NULL and defaults to the empty string,
         // which is the absence of a breadcrumb rather than a breadcrumb of no
         // characters.
-        let rows = scanned(&chunk_fixture(), &crate::tags::Scope::default());
+        let rows = scanned_body(&chunk_fixture(), &crate::tags::Scope::default());
         assert_eq!(rows[0].heading_path, None);
         assert_eq!(rows[1].heading_path.as_deref(), Some("Marcus > Biography"));
     }

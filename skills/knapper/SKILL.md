@@ -33,9 +33,10 @@ reach for, what to check first, and where an edit can lose data.
 something. It cannot tell you a string is absent. `match` is the other
 contract: one literal pattern, exhaustive over every note in scope, unranked,
 so `No note holds "…"` is a reliable answer. Reach for `match` to confirm an
-edit took, or to find what still carries an old form. It reads indexed note
-bodies, so it does not see frontmatter, and it will not tell you what a note
-is about. A wikilink is compared as its display text as well as its markup,
+edit took, or to find what still carries an old form. It reads a note's prose
+and its frontmatter both, and each hit says which one holds it in `in`, so you
+know whether it takes a section edit or a property edit; `scan` narrows the
+reading to `body` or `frontmatter`. It will not tell you what a note is about. A wikilink is compared as its display text as well as its markup,
 so `Style Guide review` finds `[[style-guide|Style Guide]] review` and
 `[[style-guide|` finds the link itself.
 

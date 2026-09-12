@@ -317,6 +317,14 @@ pub struct Match {
     #[arg(long, value_delimiter = ',')]
     #[serde(default, deserialize_with = "deserialize_tag_list")]
     pub none: Vec<String>,
+    /// Which half of a note to read (#137). `all`, the default, reads the
+    /// prose and the frontmatter, so a pattern living in either is counted.
+    /// `body` is the prose alone, which is the check a rename wants where
+    /// the YAML deliberately keeps an old name — an alias exists to do
+    /// exactly that. `frontmatter` is the YAML alone.
+    #[arg(long, value_enum, default_value_t = Scan::All)]
+    #[serde(default)]
+    pub scan: Scan,
     /// Maximum matched lines to report. Absent, every one comes back — a
     /// caller that wants less names a scope or a limit, which is `list`'s
     /// rule for the same field (#68). `0` reports none. The note and line
@@ -325,6 +333,24 @@ pub struct Match {
     #[arg(long)]
     #[serde(default)]
     pub limit: Option<usize>,
+}
+
+/// Which half of a note `match` reads (#137). An enum and not a pair of
+/// booleans, for the reason [`Include`] gives itself: two exclusive booleans
+/// let a caller pass both and leave the server to invent a meaning.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, JsonSchema, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum Scan {
+    /// The prose and the frontmatter both. The default: a count that omits
+    /// half the file is a wrong answer to the one question `match` exists to
+    /// answer.
+    #[default]
+    All,
+    /// The note's prose alone: what the chunker cut the file into, which is
+    /// what `match` read before frontmatter was stored.
+    Body,
+    /// The note's YAML block alone.
+    Frontmatter,
 }
 
 impl Match {

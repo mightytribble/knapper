@@ -173,8 +173,10 @@ No note holds "years old at the start of the story".
 ```
 
 The counts come back whole even when `--limit` shortens the listed lines. It
-reads the indexed note bodies, so it does not see frontmatter, and it will
-not tell you what a note is *about* — that is what `search` is for.
+reads a note's prose and its frontmatter both, and marks a YAML hit
+`[frontmatter]` so you know which kind of edit it takes; `--scan body` or
+`--scan frontmatter` narrows it to one half. It will not tell you what a note
+is *about* — that is what `search` is for.
 
 A wikilink is compared as its display text as well as its markup, so
 `Style Guide review` finds the line written `the [[style-guide|Style

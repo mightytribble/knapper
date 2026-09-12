@@ -120,11 +120,12 @@ fn build_match() -> serde_json::Value {
                         "all": { "type": "array", "items": { "type": "string" }, "description": "Tag terms a note carries every one of, or directory terms (starting with /, case-sensitive, a trailing / its subtree) it lies under" },
                         "any": { "type": "array", "items": { "type": "string" }, "description": "Tag terms a note carries at least one of, or directory terms (starting with /, case-sensitive, a trailing / its subtree) it lies under" },
                         "none": { "type": "array", "items": { "type": "string" }, "description": "Tag terms a note carries none of, or directory terms (starting with /, case-sensitive, a trailing / its subtree) it does not lie under" },
+                        "scan": { "type": "string", "enum": ["all", "body", "frontmatter"], "description": "Which half of a note to read. all, the default, reads the prose and the frontmatter both. body is the prose alone, which is the check a rename wants where the YAML deliberately keeps an old name. frontmatter is the YAML alone" },
                         "limit": { "type": "integer", "description": "Maximum matched lines to report. Absent, every one comes back; 0 reports none. The notes and lines counts are whole whatever this says" }
                     }
                 }}}
             },
-            "responses": { "200": { "description": "{pattern, notes (how many notes hold it — 0 means nothing in scope says it), lines (distinct matched lines across every note), hits (the matched lines, capped by limit, each {file, heading_path, line})}. The scan is exhaustive and unranked over the indexed note bodies, so it does not read frontmatter. A wikilink is compared as its display text as well as its markup, so a phrase spanning one is found; the reported line is the note as written." } }
+            "responses": { "200": { "description": "{pattern, notes (how many notes hold it — 0 means nothing in scope says it), lines (distinct matched lines across every note), hits (the matched lines, capped by limit, each {file, in, heading_path, line})}. The scan is exhaustive and unranked over a note's prose and its frontmatter both; `in` names which half a hit came from, and `scan` narrows the reading to one of them. A wikilink is compared as its display text as well as its markup, so a phrase spanning one is found; the reported line is the note as written." } }
         }
     })
 }
