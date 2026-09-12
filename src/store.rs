@@ -1466,10 +1466,20 @@ impl Store {
 
     // ── Stats ───────────────────────────────────────────────────
 
-    pub fn stats(&self) -> Result<StoreStats> {
-        let file_count: i64 = self
+    /// How many files the index holds.
+    ///
+    /// Disk truth, and the one question a `meta` key cannot answer for a store
+    /// old enough to predate the key: an index built before a fingerprint
+    /// existed still has its file rows (issue #141).
+    pub fn file_count(&self) -> Result<usize> {
+        let count: i64 = self
             .conn
             .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))?;
+        Ok(count as usize)
+    }
+
+    pub fn stats(&self) -> Result<StoreStats> {
+        let file_count = self.file_count()?;
         let chunk_count: i64 = self
             .conn
             .query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))?;
@@ -1477,7 +1487,7 @@ impl Store {
         let last_indexed_at = self.get_meta("last_indexed_at")?;
         let vault_path = self.get_meta("vault_path")?;
         Ok(StoreStats {
-            file_count: file_count as usize,
+            file_count,
             chunk_count: chunk_count as usize,
             tombstone_count,
             last_indexed_at,
