@@ -510,15 +510,28 @@ async fn main() -> Result<()> {
                     "Files: {}, Chunks: {}, Edges: {}\n",
                     map.total_files, map.total_chunks, map.total_edges
                 );
+                if !map.top_notes.is_empty() {
+                    println!("Most linked notes:");
+                    for note in &map.top_notes {
+                        println!("  {}: {} links in", note.path, note.links_in);
+                    }
+                    println!();
+                }
                 println!("Folders:");
                 for f in &map.folders {
                     println!("  {}: {} notes", f.path, f.note_count);
                 }
-                println!("\nTop tags:");
+                println!(
+                    "\nTop tags ({} of {} notes tagged, {} {}):",
+                    map.tagged_notes,
+                    map.total_files,
+                    map.tag_axes,
+                    if map.tag_axes == 1 { "axis" } else { "axes" }
+                );
                 for (tag, count) in &map.top_tags {
                     println!("  {}: {}", tag, count);
                 }
-                println!("\nRecent files:");
+                println!("\nRecently changed:");
                 for path in &map.recent_files {
                     println!("  {}", path);
                 }

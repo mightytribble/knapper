@@ -25,7 +25,7 @@ what the parameters mean.
 | GET | `/api/list` | read | List notes by tag or directory terms — a leading `/` reads a term as a directory path (`scope`/`all`, `any`, `none`), creator, limit, and `detailed=true` for each note's heading outline, and `property`, `links_to`, `linked_from` (one value each) |
 | GET | `/api/tags` | read | The tag vocabulary, whole or under one term (`under`) |
 | GET | `/api/properties` | read | The custom-property registry, or one property's values (`name`) |
-| GET | `/api/vault-map` | read | Vault structure overview (folders, tags, recent files) |
+| GET | `/api/vault-map` | read | Vault structure overview (folders, counts, the tag vocabulary and its reach, the most-linked notes, recently changed files) |
 | GET | `/api/status` | read | Index status and statistics |
 | GET | `/api/health` | read | Vault health diagnostics |
 | POST | `/api/validate` | read | Check vault markdown for structural and indexing problems — one note (`path`), a scope, or the whole vault; reads the files, not the index |

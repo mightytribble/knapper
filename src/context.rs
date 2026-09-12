@@ -174,7 +174,16 @@ pub struct VaultMap {
     pub total_edges: usize,
     pub folders: Vec<FolderInfo>,
     pub top_tags: Vec<(String, usize)>,
+    pub tagged_notes: usize,
+    pub tag_axes: usize,
+    pub top_notes: Vec<TopNote>,
     pub recent_files: Vec<String>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct TopNote {
+    pub path: String,
+    pub links_in: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -547,7 +556,12 @@ pub fn context_list(
     Ok(items)
 }
 
-/// High-level vault overview: folders, tags, recent files, counts.
+/// How many hubs the map names. Ten is enough to read a vault's subject off
+/// and short enough that the map stays a map (#138).
+const TOP_NOTES: usize = 10;
+
+/// High-level vault overview: folders, the tag vocabulary and its reach, the
+/// most-linked notes, recently changed files, counts.
 pub fn vault_map(params: &ContextParams) -> Result<VaultMap> {
     let stats = params.store.stats()?;
     let edge_stats = params.store.get_edge_stats().ok();
@@ -570,6 +584,21 @@ pub fn vault_map(params: &ContextParams) -> Result<VaultMap> {
         .collect();
 
     let top_tags = params.store.top_tags(20)?;
+    let tagged_notes = params.store.tagged_file_count()?;
+    // How many facets the vocabulary spans, from the store's own axis rollup
+    // (#60): one axis says the vault tags a single facet, which is what turns
+    // a tag head count into something a caller can read a structure off.
+    let tag_axes = params.store.tag_axes()?.len();
+
+    // The ten notes the vault points at most. `chunk_count` and `token_count`
+    // are deliberately not carried beside them: a map is a fixed shape, and a
+    // caller who wants sizes has `list` (#131, #138).
+    let top_notes: Vec<TopNote> = params
+        .store
+        .top_linked_files(TOP_NOTES)?
+        .into_iter()
+        .map(|(path, links_in)| TopNote { path, links_in })
+        .collect();
 
     let recent = params.store.recent_files(10)?;
     let recent_files: Vec<String> = recent.into_iter().map(|f| f.path).collect();
@@ -583,6 +612,9 @@ pub fn vault_map(params: &ContextParams) -> Result<VaultMap> {
         total_edges: edge_stats.map(|e| e.total_edges).unwrap_or(0),
         folders,
         top_tags,
+        tagged_notes,
+        tag_axes,
+        top_notes,
         recent_files,
     })
 }
@@ -1296,6 +1328,73 @@ mod tests {
         assert_eq!(map.total_files, 2);
         assert!(!map.folders.is_empty());
         assert!(map.top_tags.iter().any(|(t, _)| t == "rust"));
+    }
+
+    #[test]
+    fn vault_map_names_the_notes_the_vault_points_at() {
+        // Folder counts answer where notes are filed. `top_notes` answers
+        // which ones matter, which is the question an orienting caller has
+        // and the one that used to take a second `list` call (#138).
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let store = Store::open_memory().unwrap();
+        let mut ids = Vec::new();
+        for name in ["hub.md", "mid.md", "leaf.md", "lonely.md"] {
+            let id = store
+                .insert_file(name, "h", 100, &generate_docid(name), None, None)
+                .unwrap();
+            ids.push(id);
+        }
+        let (hub, mid, leaf) = (ids[0], ids[1], ids[2]);
+        store
+            .insert_edge(leaf, DOC_LEVEL, hub, DOC_LEVEL, "wikilink")
+            .unwrap();
+        store
+            .insert_edge(mid, DOC_LEVEL, hub, DOC_LEVEL, "wikilink")
+            .unwrap();
+        store
+            .insert_edge(leaf, DOC_LEVEL, mid, DOC_LEVEL, "wikilink")
+            .unwrap();
+
+        let params = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+        let map = vault_map(&params).unwrap();
+
+        assert_eq!(
+            map.top_notes,
+            vec![
+                TopNote {
+                    path: "hub.md".into(),
+                    links_in: 2
+                },
+                TopNote {
+                    path: "mid.md".into(),
+                    links_in: 1
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn vault_map_gives_the_tag_counts_a_denominator() {
+        // `top_tags` alone reads against `total_files` and overstates the
+        // vocabulary's reach; `tag_axes` says whether the vocabulary is a
+        // structure or one facet (#138).
+        let (_tmp, store, root) = setup_vault();
+        let params = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+        let map = vault_map(&params).unwrap();
+
+        // One of the two notes carries a tag, on the single axis `rust`.
+        assert_eq!(map.total_files, 2);
+        assert_eq!(map.tagged_notes, 1);
+        assert_eq!(map.tag_axes, 1);
     }
 
     #[test]
