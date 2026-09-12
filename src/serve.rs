@@ -328,7 +328,7 @@ impl KnapperServer {
 
     #[tool(
         name = "vault_map",
-        description = "Vault structure overview: folders, tags, file counts, recent files. Use to orient before deeper queries."
+        description = "Vault structure overview: folders, file counts, the tag vocabulary with the share of notes it covers, the most-linked notes, and recently changed files. The first call on a vault you do not know: top_notes names what the vault points at most, which is where to start reading."
     )]
     async fn vault_map(&self) -> Result<CallToolResult, McpError> {
         let store = self.store.lock().await;
@@ -898,7 +898,7 @@ pub const ORIENTATION: &[Orientation] = &[
     Orientation {
         capability: "vault-map",
         group: "Read",
-        clause: "to orient",
+        clause: "to orient on a vault you do not know — `top_notes` names the notes the vault points at most, which is what it is about and where to start reading, and the tag counts come with the share of notes they cover",
     },
     Orientation {
         capability: "tags",

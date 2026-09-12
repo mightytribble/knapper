@@ -2354,6 +2354,55 @@ impl Store {
         Ok(results)
     }
 
+    /// The notes the vault points at most, each with how many distinct notes
+    /// link to it (#138).
+    ///
+    /// One grouped pass over `idx_edges_to`, not `list_files_with_links_in`'s
+    /// per-file subquery: that call ranks on a computed column, so its `LIMIT`
+    /// stops no work — every row in `files` is counted before ten survive, and
+    /// `chunk_count` and `token_count` are counted beside it. `vault_map` asks
+    /// this of the whole vault on every call, so it takes the plan that reads
+    /// the edge index once.
+    ///
+    /// It counts what `list --sort links_in` counts, distinct linking notes,
+    /// so a note that links to another four times is one link in and the two
+    /// surfaces cannot disagree about the same vault.
+    ///
+    /// A note nothing links to is absent rather than zero: `edges` holds no
+    /// row for it, and it is not an answer to which notes the vault points at.
+    pub fn top_linked_files(&self, limit: usize) -> Result<Vec<(String, usize)>> {
+        // `f.path` is the tie-break, so two equally linked notes come back in
+        // the same order every call.
+        let mut stmt = self.conn.prepare(
+            "SELECT f.path, COUNT(DISTINCT e.from_file) AS links_in
+               FROM edges e JOIN files f ON f.id = e.to_file
+              GROUP BY e.to_file ORDER BY links_in DESC, f.path LIMIT ?",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
+    /// How many notes carry any tag at all — the denominator `top_tags` counts
+    /// against (#138).
+    ///
+    /// Without it a head count reads against `total_files` and overstates the
+    /// vocabulary's reach, which is the difference between a tag filter being
+    /// worth reaching for and not.
+    pub fn tagged_file_count(&self) -> Result<usize> {
+        let count: i64 =
+            self.conn
+                .query_row("SELECT COUNT(DISTINCT file_id) FROM file_tags", [], |row| {
+                    row.get(0)
+                })?;
+        Ok(count as usize)
+    }
+
     /// The vault's vocabulary, whole or under one term (#60).
     ///
     /// A prefix names a subtree whether or not it carries the `/` marker,
@@ -2395,8 +2444,15 @@ impl Store {
 
     /// Most recently indexed files.
     pub fn recent_files(&self, limit: usize) -> Result<Vec<FileRecord>> {
+        // `mtime` and not `indexed_at` (#138): `indexed_at` is stamped when a
+        // row is inserted, so `index --rebuild` reinserts every file in walk
+        // order and the column collapses into that order. Presenting it as
+        // recency answers the walk. `mtime` is the note's own, so it answers
+        // what changed — as of the last index, which is all any column here
+        // can answer. `f.path` is the tie-break, since a bulk-written vault
+        // gives whole folders one mtime.
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT {FILE_COLUMNS} FROM files f ORDER BY f.indexed_at DESC LIMIT ?"
+            "SELECT {FILE_COLUMNS} FROM files f ORDER BY f.mtime DESC, f.path LIMIT ?"
         ))?;
         let rows = stmt.query_map(params![limit as i64], file_from_row)?;
         let mut results = Vec::new();
@@ -4858,16 +4914,222 @@ mod tests {
     }
 
     #[test]
-    fn test_recent_files() {
+    fn recent_files_ranks_on_the_note_s_own_mtime() {
+        // Insert order is walk order, which is what `index --rebuild` writes
+        // into `indexed_at`. The edited note is the one inserted first, so a
+        // sort on `indexed_at` puts it last and a sort on `mtime` puts it
+        // first (#138).
         let store = Store::open_memory().unwrap();
         store
-            .insert_file("old.md", "h1", 100, "a1", None, None)
+            .insert_file("edited.md", "h1", 900, "a1", None, None)
             .unwrap();
         store
-            .insert_file("new.md", "h2", 200, "b2", None, None)
+            .insert_file("untouched.md", "h2", 100, "b2", None, None)
             .unwrap();
-        let recent = store.recent_files(1).unwrap();
-        assert_eq!(recent.len(), 1);
+        // `insert_file` stamps `indexed_at` from the clock, and a rebuild
+        // walks both files inside one second, so the two rows tie there and
+        // the tie hides which column the sort reads. Oppose them outright.
+        store
+            .conn
+            .execute(
+                "UPDATE files SET indexed_at = '100' WHERE path = 'edited.md'",
+                [],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE files SET indexed_at = '900' WHERE path = 'untouched.md'",
+                [],
+            )
+            .unwrap();
+
+        let recent = store.recent_files(2).unwrap();
+        assert_eq!(
+            recent.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
+            vec!["edited.md", "untouched.md"]
+        );
+    }
+
+    #[test]
+    fn top_linked_files_ranks_the_notes_the_vault_points_at() {
+        let store = Store::open_memory().unwrap();
+        let hub = store
+            .insert_file("hub.md", "h", 1, "d000001", None, None)
+            .unwrap();
+        let mid = store
+            .insert_file("mid.md", "h", 1, "d000002", None, None)
+            .unwrap();
+        let leaf = store
+            .insert_file("leaf.md", "h", 1, "d000003", None, None)
+            .unwrap();
+        store.insert_edge(leaf, 0, hub, -1, "wikilink").unwrap();
+        store.insert_edge(mid, 0, hub, -1, "wikilink").unwrap();
+        store.insert_edge(leaf, 0, mid, -1, "wikilink").unwrap();
+
+        let top = store.top_linked_files(10).unwrap();
+        assert_eq!(
+            top,
+            vec![("hub.md".to_string(), 2), ("mid.md".to_string(), 1)]
+        );
+    }
+
+    #[test]
+    fn a_note_nothing_links_to_is_not_a_hub() {
+        // The ranking answers which notes the vault points at. A note with no
+        // inbound edge is not an answer to that, however short the list runs.
+        let store = Store::open_memory().unwrap();
+        let hub = store
+            .insert_file("hub.md", "h", 1, "d000001", None, None)
+            .unwrap();
+        let leaf = store
+            .insert_file("leaf.md", "h", 1, "d000002", None, None)
+            .unwrap();
+        store.insert_edge(leaf, 0, hub, -1, "wikilink").unwrap();
+
+        let top = store.top_linked_files(10).unwrap();
+        assert_eq!(top, vec![("hub.md".to_string(), 1)]);
+    }
+
+    #[test]
+    fn one_note_linking_twice_is_one_link_in() {
+        // `list --sort links_in` counts distinct linking notes, and the map's
+        // ranking has to agree with it or the two disagree on the same vault.
+        let store = Store::open_memory().unwrap();
+        let hub = store
+            .insert_file("hub.md", "h", 1, "d000001", None, None)
+            .unwrap();
+        let leaf = store
+            .insert_file("leaf.md", "h", 1, "d000002", None, None)
+            .unwrap();
+        store.insert_edge(leaf, 0, hub, -1, "wikilink").unwrap();
+        store.insert_edge(leaf, 1, hub, -1, "wikilink").unwrap();
+
+        assert_eq!(
+            store.top_linked_files(10).unwrap(),
+            vec![("hub.md".to_string(), 1)]
+        );
+    }
+
+    #[test]
+    fn tied_hubs_come_back_in_path_order() {
+        let store = Store::open_memory().unwrap();
+        let b = store
+            .insert_file("b.md", "h", 1, "d000001", None, None)
+            .unwrap();
+        let a = store
+            .insert_file("a.md", "h", 1, "d000002", None, None)
+            .unwrap();
+        let leaf = store
+            .insert_file("leaf.md", "h", 1, "d000003", None, None)
+            .unwrap();
+        store.insert_edge(leaf, 0, b, -1, "wikilink").unwrap();
+        store.insert_edge(leaf, 0, a, -1, "wikilink").unwrap();
+
+        let top = store.top_linked_files(10).unwrap();
+        assert_eq!(
+            top.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>(),
+            vec!["a.md", "b.md"]
+        );
+    }
+
+    #[test]
+    fn top_linked_files_honours_its_limit() {
+        let store = Store::open_memory().unwrap();
+        let a = store
+            .insert_file("a.md", "h", 1, "d000001", None, None)
+            .unwrap();
+        let b = store
+            .insert_file("b.md", "h", 1, "d000002", None, None)
+            .unwrap();
+        let leaf = store
+            .insert_file("leaf.md", "h", 1, "d000003", None, None)
+            .unwrap();
+        store.insert_edge(leaf, 0, a, -1, "wikilink").unwrap();
+        store.insert_edge(leaf, 0, b, -1, "wikilink").unwrap();
+
+        assert_eq!(store.top_linked_files(1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn tagged_file_count_counts_a_note_once_however_many_tags_it_carries() {
+        let store = Store::open_memory().unwrap();
+        let a = store
+            .insert_file("a.md", "h", 1, "d000001", None, None)
+            .unwrap();
+        let b = store
+            .insert_file("b.md", "h", 1, "d000002", None, None)
+            .unwrap();
+        store
+            .insert_file("untagged.md", "h", 1, "d000003", None, None)
+            .unwrap();
+        let tag = |p: &str| crate::tags::Tag {
+            path: p.into(),
+            display: p.into(),
+        };
+        store
+            .reconcile_file_tags(a, &[tag("dimension/sol-prime"), tag("status/active")])
+            .unwrap();
+        store
+            .reconcile_file_tags(b, &[tag("status/active")])
+            .unwrap();
+
+        assert_eq!(store.tagged_file_count().unwrap(), 2);
+    }
+
+    #[test]
+    fn a_tag_carrying_no_slash_is_an_axis_of_its_own() {
+        // The axis is the path's first segment (`tags::Tag`), and a tag with
+        // no separator is entirely its own first segment. `vault_map` counts
+        // these rows, so a flat vocabulary has to count as many axes as it has
+        // tags rather than collapse to one (#138).
+        let store = Store::open_memory().unwrap();
+        let a = store
+            .insert_file("a.md", "h", 1, "d000001", None, None)
+            .unwrap();
+        let tag = |p: &str| crate::tags::Tag {
+            path: p.into(),
+            display: p.into(),
+        };
+        store
+            .reconcile_file_tags(
+                a,
+                &[
+                    tag("dimension/sol-prime"),
+                    tag("dimension/earth"),
+                    tag("status/active"),
+                    tag("draft"),
+                ],
+            )
+            .unwrap();
+
+        let rows = store.tag_axes().unwrap();
+        let axes: Vec<&str> = rows.iter().map(|(a, _)| a.as_str()).collect();
+        assert_eq!(axes, vec!["dimension", "draft", "status"]);
+    }
+
+    #[test]
+    fn a_tag_no_note_carries_is_not_an_axis() {
+        let store = Store::open_memory().unwrap();
+        let a = store
+            .insert_file("a.md", "h", 1, "d000001", None, None)
+            .unwrap();
+        let tag = |p: &str| crate::tags::Tag {
+            path: p.into(),
+            display: p.into(),
+        };
+        store
+            .reconcile_file_tags(a, &[tag("dimension/sol-prime"), tag("status/active")])
+            .unwrap();
+        // The note releases one axis outright.
+        store
+            .reconcile_file_tags(a, &[tag("dimension/sol-prime")])
+            .unwrap();
+
+        assert_eq!(
+            store.tag_axes().unwrap(),
+            vec![("dimension".to_string(), 1)]
+        );
     }
 
     #[test]

@@ -210,7 +210,7 @@ fn build_vault_map() -> serde_json::Value {
     serde_json::json!({
         "get": {
             "operationId": "getVaultMap",
-            "summary": "Get vault structure overview with folder tree, tag cloud, and statistics.",
+            "summary": "Get vault structure overview: folders, counts, the tag vocabulary and the share of notes it covers, the most-linked notes, and recently changed files.",
             "responses": { "200": { "description": "Vault structure map" } }
         }
     })
