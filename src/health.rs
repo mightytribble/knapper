@@ -254,9 +254,11 @@ mod tests {
         assert!(find_stale_headings(&store).unwrap().is_empty());
     }
 
-    /// An oversized section becomes `## Events` and `## Events (cont.)`, and a
-    /// link to `#Events` means both. `normalise_heading` is what says so, and
-    /// this check reads headings through it (#99).
+    /// A store written before #139 labelled a split section's later pieces
+    /// `## Events (cont.)`, and a link to `#Events` means those too.
+    /// `normalise_heading` is what says so, and this check reads headings
+    /// through it (#99), so a deep link into such a store is not reported stale
+    /// before anything re-indexes.
     #[test]
     fn a_heading_split_across_two_passages_still_resolves() {
         let store = Store::open_memory().unwrap();
