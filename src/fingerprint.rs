@@ -336,7 +336,8 @@ fn document_title_identity(config: &Config) -> String {
 pub struct Mismatch {
     pub key: &'static str,
     pub action: Action,
-    pub stored: String,
+    /// What the store held, or `None` where it never held the key at all.
+    pub stored: Option<String>,
     pub computed: String,
 }
 
@@ -344,13 +345,14 @@ pub struct Mismatch {
 #[derive(Debug, Clone, Default)]
 pub struct Comparison {
     pub mismatches: Vec<Mismatch>,
-    /// Keys the store has never held.
+    /// Keys the store has never held, and can adopt without a rebuild.
     ///
-    /// Adopted without a rebuild. There is no evidence the index disagrees, and
-    /// forcing every pre-#31 store through a full reindex to find out is the
-    /// same uselessness as rebuilding on every startup — just once. Fingerprints
-    /// protect against changes made *after* they are first recorded, and the
-    /// warning says so.
+    /// An empty store qualifies on every key: nothing is indexed, so nothing
+    /// can disagree, and rebuilding it on suspicion is the same uselessness as
+    /// rebuilding on every startup. A store that holds rows qualifies only on a
+    /// key whose action is [`Action::InvalidateThresholds`], because there the
+    /// index really is untouched — every other action reports the absence as a
+    /// mismatch instead (issue #141).
     pub unrecorded: Vec<&'static str>,
 }
 
@@ -373,7 +375,10 @@ impl Comparison {
     fn summary(&self) -> String {
         self.mismatches
             .iter()
-            .map(|m| format!("{} ({})", m.key, m.action.describe()))
+            .map(|m| match m.stored {
+                Some(_) => format!("{} ({})", m.key, m.action.describe()),
+                None => format!("{} (never recorded; {})", m.key, m.action.describe()),
+            })
             .collect::<Vec<_>>()
             .join(", ")
     }
@@ -382,15 +387,31 @@ impl Comparison {
 /// Check the store's recorded fingerprints against `computed`.
 pub fn compare(store: &Store, computed: &Fingerprints) -> Result<Comparison> {
     let mut comparison = Comparison::default();
+    // A store with no rows holds nothing that could be stale, so every key is
+    // adopted there. A store that holds rows is the case #141 is about.
+    let holds_rows = store.file_count()? > 0;
     for (key, value) in computed.entries() {
         match store.get_meta(key.name)? {
             Some(stored) if stored != value => comparison.mismatches.push(Mismatch {
                 key: key.name,
                 action: key.action,
-                stored,
+                stored: Some(stored),
                 computed: value.to_string(),
             }),
             Some(_) => {}
+            // Absent and different have the same consequence for what an
+            // indexed store holds (issue #141). A key that declares real work
+            // is therefore a mismatch, not an adoption: stamping
+            // `chunker_fingerprint` on a store built before it existed claims
+            // the stored chunks match rules that never produced them.
+            None if holds_rows && key.action.blocks_reads() => {
+                comparison.mismatches.push(Mismatch {
+                    key: key.name,
+                    action: key.action,
+                    stored: None,
+                    computed: value.to_string(),
+                })
+            }
             None => comparison.unrecorded.push(key.name),
         }
     }
@@ -437,9 +458,11 @@ pub fn verify(store: &Store, computed: &Fingerprints) -> Result<()> {
     Ok(())
 }
 
-/// Stamp keys the store has never held, leaving every key it has alone.
+/// Stamp the keys [`Comparison::unrecorded`] holds, leaving every other alone.
 ///
-/// This is the only path that ever writes `reranker_fingerprint`. The index
+/// On an indexed store that is `reranker_fingerprint` and nothing else, since
+/// every other key reports its absence as a mismatch (issue #141). This is the
+/// only path that ever writes `reranker_fingerprint`. The index
 /// loads no cross-encoder, so it cannot honestly claim one is current; a search
 /// that loads one can, and does, the first time it runs. Without this the
 /// reranker key would never exist and a model swap would never be noticed.
@@ -896,6 +919,69 @@ mod tests {
             "the recorded value must survive a read that disagrees with it"
         );
         assert_eq!(compare(&store, &swapped).unwrap().mismatches.len(), 1);
+    }
+
+    /// A store that holds rows, with every fingerprint recorded but `skip`.
+    ///
+    /// The shape issue #141 is about: an index built before a key existed, not
+    /// a fresh store with nothing in it.
+    fn indexed_store_missing(skip: &str) -> Store {
+        let store = Store::open_memory().unwrap();
+        store
+            .insert_file("note.md", "hash", 0, "docid", None, None)
+            .unwrap();
+        for (key, value) in fps().entries() {
+            if key.name != skip {
+                store.set_meta(key.name, value).unwrap();
+            }
+        }
+        store
+    }
+
+    #[test]
+    fn an_indexed_store_missing_the_chunker_key_demands_the_reindex() {
+        // #141: absent and different have the same consequence for what the
+        // store holds. Stamping the key claims the stored chunks match rules
+        // that never produced them, which is the silent wrong answer the
+        // fingerprints exist to prevent.
+        let store = indexed_store_missing(CHUNKER.name);
+        let computed = fps();
+
+        let comparison = compare(&store, &computed).unwrap();
+        assert_eq!(comparison.mismatches.len(), 1, "{comparison:?}");
+        assert_eq!(comparison.mismatches[0].key, CHUNKER.name);
+        assert_eq!(comparison.mismatches[0].action, Action::Reindex);
+        assert!(
+            comparison.mismatches[0].stored.is_none(),
+            "a key the store never held has no stored value to report"
+        );
+        assert!(comparison.blocks_reads());
+
+        assert!(verify(&store, &computed).is_err());
+        assert_eq!(
+            store.get_meta(CHUNKER.name).unwrap(),
+            None,
+            "a refused read must not stamp the key it refused over"
+        );
+    }
+
+    #[test]
+    fn an_indexed_store_missing_the_reranker_key_still_adopts_it() {
+        // The other half of #141, and the case `adopt_unrecorded` was written
+        // for: the index loads no cross-encoder, so it cannot claim one is
+        // current, and the first read that loads one can.
+        let store = indexed_store_missing(RERANKER.name);
+        let computed = fps();
+
+        let comparison = compare(&store, &computed).unwrap();
+        assert!(comparison.is_clean(), "{:?}", comparison.mismatches);
+        assert_eq!(comparison.unrecorded, vec![RERANKER.name]);
+
+        verify(&store, &computed).unwrap();
+        assert_eq!(
+            store.get_meta(RERANKER.name).unwrap().as_deref(),
+            computed.reranker.as_deref()
+        );
     }
 
     #[test]

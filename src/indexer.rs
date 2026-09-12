@@ -880,11 +880,20 @@ fn run_index_inner(
     crate::fingerprint::warn_unrecorded(&staleness);
     let actions = staleness.actions();
     for mismatch in &staleness.mismatches {
-        eprintln!(
-            "{} changed since the index was built. Will {}.",
-            mismatch.key,
-            mismatch.action.describe()
-        );
+        match mismatch.stored {
+            Some(_) => eprintln!(
+                "{} changed since the index was built. Will {}.",
+                mismatch.key,
+                mismatch.action.describe()
+            ),
+            // An index built before the key existed (#141). The store cannot
+            // show what rules cut its rows, so the work is owed either way.
+            None => eprintln!(
+                "{} was not recorded when the index was built. Will {}.",
+                mismatch.key,
+                mismatch.action.describe()
+            ),
+        }
         // The vectors below are rebuilt; the numbers that read them are not
         // (#103). `[calibrated]` is EmbeddingGemma's fit, so a re-index onto
         // another embedder puts a different cosine scale under a floor read
@@ -1980,12 +1989,12 @@ mod tests {
     }
 
     #[test]
-    fn a_pre_fingerprint_store_is_adopted_rather_than_rebuilt() {
-        // Every store written before #31 has no fingerprints. Forcing them all
-        // through a full reindex to find out whether they were stale is the same
-        // uselessness as rebuilding on every startup, just once — and there is
-        // no evidence to act on. Fingerprints protect what happens after they
-        // are first recorded.
+    fn a_pre_fingerprint_store_is_reindexed_rather_than_adopted() {
+        // #141 reverses the reading #31 shipped with. A store written before
+        // the fingerprints existed cannot show which rules cut its chunks, and
+        // absent has the same consequence for those rows as different, so the
+        // work is owed either way. Every released binary records these five
+        // keys, so the one-time cost falls on stores no release built.
         let (tmp, store, mut embedder, config) = fingerprint_fixture();
         for key in [
             crate::fingerprint::PARSER,
@@ -2011,9 +2020,11 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(result.new_files, 0);
-        assert_eq!(result.updated_files, 0);
-        assert!(embedder.seen.is_empty(), "{:?}", embedder.seen);
+        assert_eq!(result.new_files, 3, "a rebuild treats every file as new");
+        assert!(
+            !embedder.seen.is_empty(),
+            "the chunks are cut again by the rules that are running now"
+        );
         assert!(
             store
                 .get_meta(crate::fingerprint::CHUNKER.name)
@@ -2021,6 +2032,38 @@ mod tests {
                 .is_some(),
             "and they are recorded on the way out, so the next change is caught"
         );
+    }
+
+    #[test]
+    fn a_store_with_no_rows_records_rather_than_rebuilds() {
+        // The half of #141 that must not overreach: a store nothing has indexed
+        // holds nothing that could be stale, so the first run adopts the keys
+        // silently instead of announcing a re-index of an empty index.
+        let tmp = TempDir::new().unwrap();
+        write_file(tmp.path(), "a.md", "# A\nSome prose.");
+        let store = Store::open_memory().unwrap();
+        let mut embedder = RecordingEmbed::new(256);
+        let config = Config::default();
+
+        let fingerprints = crate::fingerprint::Fingerprints::compute(
+            &config,
+            &crate::llm::EmbedModel::fingerprint(&embedder),
+            None,
+        );
+        let comparison = crate::fingerprint::compare(&store, &fingerprints).unwrap();
+        assert!(comparison.is_clean(), "{:?}", comparison.mismatches);
+
+        let result = run_index_shared(
+            tmp.path(),
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(result.new_files, 1);
     }
 
     #[test]
