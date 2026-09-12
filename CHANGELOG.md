@@ -5,9 +5,15 @@ Links resolve against https://github.com/mightytribble/knapper.
 
 ## Unreleased
 
+**This build re-indexes an existing store.** A split section's chunk text
+changes (#139), so the first `knapper index` after the upgrade reads the vault,
+re-chunks every note and re-embeds it — as long as the vault's first index
+took. Run it before anything else: `knapper serve` refuses to start against an
+index an earlier build wrote, rather than answer from it.
+
 ### Fixed
 
-- A split section's later chunks no longer carry a `## Heading (cont.)` line that is not in the note (#139). The marker made a search result open on a heading the file does not hold — one `read --section` could not address, and one an `update --section` round trip wrote into the note for real, which the next index then split again into `(cont.) (cont.)`. Every piece now carries the section's own heading. `read --section` and `update --section` still accept a `(cont.)` name, so a caller holding one from an older index is not broken before the vault re-indexes, and a heading a note genuinely wrote that way is still addressed as itself. **The first `knapper index` after the upgrade re-indexes the vault** — chunk text changes, so the embeddings do too. ([`3e73079`](https://github.com/mightytribble/knapper/commit/3e73079))
+- A split section's later chunks no longer carry a `## Heading (cont.)` line that is not in the note (#139). The marker made a search result open on a heading the file does not hold — one `read --section` could not address, and one an `update --section` round trip wrote into the note for real, which the next index then split again into `(cont.) (cont.)`. Every piece now carries the section's own heading. `read --section` and `update --section` still accept a `(cont.)` name, so a caller holding one from an older index is not broken before the vault re-indexes, and a heading a note genuinely wrote that way is still addressed as itself. ([`3e73079`](https://github.com/mightytribble/knapper/commit/3e73079))
 
 ### Changed
 
