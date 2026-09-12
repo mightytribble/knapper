@@ -11,6 +11,7 @@ it before `serve`, which refuses a stale index.
 
 ### Fixed
 
+- A store too old to hold a fingerprint key is now re-indexed rather than stamped as current (#141), so the oldest stores stop skipping the guard that refuses a stale index. ([`16d83b7`](https://github.com/mightytribble/knapper/commit/16d83b7))
 - A split section's later chunks no longer carry a `## Heading (cont.)` line the note does not hold (#139). A `(cont.)` name still resolves, so a caller holding one from an older index keeps working. ([`3e73079`](https://github.com/mightytribble/knapper/commit/3e73079))
 
 ### Changed
