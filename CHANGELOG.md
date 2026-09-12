@@ -3,11 +3,17 @@
 Every entry below the upstream-lineage line names the commit it describes.
 Links resolve against https://github.com/mightytribble/knapper.
 
-## Unreleased
+## 0.9.11 (2026-09-11)
 
-**This build re-indexes an existing store.** Chunk text changes (#139), so the
-first `knapper index` after the upgrade re-chunks and re-embeds the vault. Run
-it before `serve`, which refuses a stale index.
+A section's chunks carry the heading the note holds, not an invented `(cont.)`
+line. `vault_map` names the notes the vault points at, `match` reads
+frontmatter beside prose, and a search that answers nothing says what the
+answer floor rejected.
+
+**This release re-indexes an existing store.** Chunk text changes (#139), so
+the first `knapper index` after the upgrade re-chunks and re-embeds the vault.
+Run it before `serve`, which refuses a stale index. A store too old to hold a
+fingerprint key is no longer exempt from that refusal (#141).
 
 ### Fixed
 
