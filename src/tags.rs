@@ -578,7 +578,8 @@ pub struct PropertyTerm {
 }
 
 /// A note a link filter names, as the caller wrote it (#66). It resolves
-/// the way a wikilink target does, in `Store::resolve_scope_links`.
+/// the way a wikilink target does, and then by alias (#142), in
+/// `Store::resolve_scope_links`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkTerm {
     pub written: String,

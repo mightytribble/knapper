@@ -366,11 +366,14 @@ async fn handle_plugin_manifest(State(state): State<ApiState>) -> impl IntoRespo
 /// request rather than a server fault. `check_terms` gives the caller the
 /// nearest tag or folder in the message, and `resolve_scope_links` the
 /// nearest note for a `links_to` or `linked_from` name — the cheapest honest
-/// signal this far from where the error is built (#60, #65, #66).
+/// signal this far from where the error is built (#60, #65, #66). A name that
+/// is an alias more than one note carries is the caller's to repair as well,
+/// and the message names the candidates (#142).
 fn is_scope_typo(message: &str) -> bool {
     message.starts_with("no such tag")
         || message.starts_with("no such folder")
         || message.starts_with("no such note")
+        || message.starts_with("ambiguous alias")
 }
 
 async fn handle_match(
@@ -504,7 +507,8 @@ async fn handle_read(
     };
     let result =
         context::context_read(&ctx, &p.file, p.section.as_deref(), p.include).map_err(|e| {
-            // A file or a section the vault does not hold, or a `section`
+            // A file or a section the vault does not hold, an alias more than
+            // one note carries (#142), or a `section`
             // beside an `include` mode that answers the whole note, is the
             // caller's own input naming nothing or asking two things at once,
             // not a server fault — the rule `handle_search` and
@@ -514,6 +518,7 @@ async fn handle_read(
             let message = e.to_string();
             if message.starts_with("Section not found")
                 || message.starts_with("File not found")
+                || message.starts_with("ambiguous alias")
                 || message.starts_with("--section cannot be combined")
             {
                 ApiError::bad_request(&format!("{e:#}"))
@@ -2423,6 +2428,28 @@ mod tests {
             json_body(get(state.clone(), "/api/list?property=employer&links_to=acme").await).await;
         assert_eq!(paths(&rows), vec!["ada.md"]);
         let response = get(state, "/api/list?links_to=nobody").await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn an_alias_two_notes_carry_is_a_400_on_read_and_on_list() {
+        // The caller's own name matched more than one note, which is the
+        // caller's input to repair and not a server fault (#142).
+        let state = test_api_state();
+        {
+            let store = state.store.lock().await;
+            for (path, docid) in [("a.md", "aaa111"), ("b.md", "bbb222")] {
+                let id = store
+                    .insert_file(path, "h", 100, docid, None, None)
+                    .unwrap();
+                store
+                    .replace_file_aliases(id, &["Twin".to_string()])
+                    .unwrap();
+            }
+        }
+        let response = get(state.clone(), "/api/read?file=Twin").await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let response = get(state, "/api/list?links_to=Twin").await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }

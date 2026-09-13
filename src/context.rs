@@ -133,6 +133,10 @@ pub struct NoteListItem {
     pub path: String,
     pub docid: Option<String>,
     pub tags: Vec<String>,
+    /// The other names the note's frontmatter records for it, as written
+    /// (#142). `read` and the link filters take any of them in place of the
+    /// path, so a listing is also a registry of the names a caller can use.
+    pub aliases: Vec<String>,
     /// When this note was last indexed, as `YYYY-MM-DDTHH:MM:SSZ` (#121).
     pub indexed_at: String,
     /// How many distinct notes link to this note (#121). A note named from
@@ -207,7 +211,12 @@ fn resolve_file(
     }
 
     // Basename fallback via SQL
-    params.store.find_file_by_basename(file_or_docid)
+    if let Some(f) = params.store.find_file_by_basename(file_or_docid)? {
+        return Ok(Some(f));
+    }
+
+    // Alias last (#142), so a note's filename beats another note's alias.
+    params.store.find_file_by_alias(file_or_docid)
 }
 
 /// Split content into (frontmatter YAML, body) parts.
@@ -534,6 +543,7 @@ pub fn context_list(
         .list_files_with_links_in(tags, created_by, limit, order)?;
     let file_ids: Vec<i64> = files.iter().map(|r| r.file.id).collect();
     let mut matched = matched_properties(params, tags, &file_ids)?;
+    let mut aliases = params.store.aliases_for_files(&file_ids)?;
     let mut items = Vec::new();
     for row in files {
         let f = row.file;
@@ -545,6 +555,7 @@ pub fn context_list(
             path: f.path,
             docid: f.docid,
             tags: f.tags,
+            aliases: aliases.remove(&f.id).unwrap_or_default(),
             indexed_at: indexed_at_iso(&f.indexed_at),
             links_in: row.links_in,
             chunk_count: row.chunk_count,
@@ -763,6 +774,157 @@ mod tests {
         };
         let note = content_of(context_read(&params, "note", None, Include::Content).unwrap());
         assert_eq!(note.path, "note.md");
+    }
+
+    // ── A caller names a note by its alias (#142) ───────────────
+
+    /// Give a note of `setup_vault` its aliases, the rows the edge pass writes.
+    fn give_aliases(store: &Store, path: &str, aliases: &[&str]) {
+        let id = store.get_file(path).unwrap().unwrap().id;
+        let aliases: Vec<String> = aliases.iter().map(|a| a.to_string()).collect();
+        store.replace_file_aliases(id, &aliases).unwrap();
+    }
+
+    fn list_under(params: &ContextParams, scope: &crate::tags::Scope) -> Result<Vec<String>> {
+        Ok(context_list(
+            params,
+            scope,
+            None,
+            None,
+            crate::store::ListOrder::Path,
+            false,
+        )?
+        .into_iter()
+        .map(|item| item.path)
+        .collect())
+    }
+
+    #[test]
+    fn a_note_is_read_by_an_alias_it_carries() {
+        let (_tmp, store, root) = setup_vault();
+        give_aliases(&store, "other.md", &["The Other One"]);
+        let params = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+        let note =
+            content_of(context_read(&params, "the other one", None, Include::Content).unwrap());
+        assert_eq!(
+            note.path, "other.md",
+            "the reply names the note that answered"
+        );
+    }
+
+    #[test]
+    fn a_basename_beats_another_notes_alias_on_read() {
+        let (_tmp, store, root) = setup_vault();
+        give_aliases(&store, "other.md", &["note"]);
+        let params = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+        let note = content_of(context_read(&params, "note", None, Include::Content).unwrap());
+        assert_eq!(note.path, "note.md");
+    }
+
+    #[test]
+    fn a_read_by_an_alias_two_notes_carry_is_refused_and_names_both() {
+        let (_tmp, store, root) = setup_vault();
+        give_aliases(&store, "note.md", &["Twin"]);
+        give_aliases(&store, "other.md", &["twin"]);
+        let params = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+        let err = context_read(&params, "Twin", None, Include::Content)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("note.md") && err.contains("other.md"), "{err}");
+    }
+
+    #[test]
+    fn a_link_filter_takes_an_alias() {
+        // `setup_vault` links note.md and other.md both ways.
+        let (_tmp, store, root) = setup_vault();
+        give_aliases(&store, "other.md", &["Otto"]);
+        give_aliases(&store, "note.md", &["Nora"]);
+        let params = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+        let to_otto = crate::tags::Scope::default()
+            .with_filters(None, Some("otto"), None)
+            .unwrap();
+        assert_eq!(list_under(&params, &to_otto).unwrap(), ["note.md"]);
+        let from_nora = crate::tags::Scope::default()
+            .with_filters(None, None, Some("Nora"))
+            .unwrap();
+        assert_eq!(list_under(&params, &from_nora).unwrap(), ["other.md"]);
+    }
+
+    #[test]
+    fn a_link_filter_naming_an_alias_two_notes_carry_is_refused_and_names_both() {
+        let (_tmp, store, root) = setup_vault();
+        give_aliases(&store, "note.md", &["Twin"]);
+        give_aliases(&store, "other.md", &["Twin"]);
+        let params = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+        let scope = crate::tags::Scope::default()
+            .with_filters(None, Some("Twin"), None)
+            .unwrap();
+        let err = list_under(&params, &scope).unwrap_err().to_string();
+        assert!(err.contains("note.md") && err.contains("other.md"), "{err}");
+    }
+
+    #[test]
+    fn a_basename_beats_another_notes_alias_in_a_link_filter() {
+        let (_tmp, store, root) = setup_vault();
+        give_aliases(&store, "note.md", &["other"]);
+        let params = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+        let scope = crate::tags::Scope::default()
+            .with_filters(None, Some("other"), None)
+            .unwrap();
+        // Notes linking to other.md, which is note.md — not notes linking
+        // to note.md, which would be other.md.
+        assert_eq!(list_under(&params, &scope).unwrap(), ["note.md"]);
+    }
+
+    #[test]
+    fn a_listing_carries_each_notes_aliases() {
+        let (_tmp, store, root) = setup_vault();
+        give_aliases(&store, "other.md", &["Otto", "The Other One"]);
+        let params = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+        let items = context_list(
+            &params,
+            &crate::tags::Scope::default(),
+            None,
+            None,
+            crate::store::ListOrder::Path,
+            false,
+        )
+        .unwrap();
+        let other = items.iter().find(|i| i.path == "other.md").unwrap();
+        assert_eq!(other.aliases, ["Otto", "The Other One"]);
+        let note = items.iter().find(|i| i.path == "note.md").unwrap();
+        assert!(note.aliases.is_empty());
+        // The field is there when it is empty, as `tags` is.
+        let json = serde_json::to_value(note).unwrap();
+        assert_eq!(json["aliases"], serde_json::json!([]));
     }
 
     /// The whole-note read strips the frontmatter, so a caller reads the prose

@@ -3,6 +3,12 @@
 Every entry below the upstream-lineage line names the commit it describes.
 Links resolve against https://github.com/mightytribble/knapper.
 
+## Unreleased
+
+### Added
+
+- `read`, `links_to` and `linked_from` now accept a note's alias, and `list` rows carry `aliases` (#142); run `knapper index` before `serve` to record an existing store's aliases, with no re-embed. ([`23672cd`](https://github.com/mightytribble/knapper/commit/23672cd))
+
 ## 0.9.11 (2026-09-11)
 
 A section's chunks carry the heading the note holds, not an invented `(cont.)`

@@ -1,3 +1,4 @@
+pub mod aliases;
 pub mod calibrate;
 pub mod chunker;
 pub mod cli;

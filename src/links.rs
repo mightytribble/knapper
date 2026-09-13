@@ -1,48 +1,7 @@
 use anyhow::Result;
-use std::path::Path;
 
 use crate::store::Store;
 use strsim::normalized_levenshtein;
-
-/// Extract aliases from YAML frontmatter.
-fn extract_aliases_from_frontmatter(content: &str) -> Option<Vec<String>> {
-    let trimmed = content.trim_start();
-    if !trimmed.starts_with("---") {
-        return None;
-    }
-    let after = trimmed[3..].trim_start_matches('-').strip_prefix('\n')?;
-    let end = after.find("\n---")?;
-    let yaml = &after[..end];
-
-    let lines: Vec<&str> = yaml.lines().collect();
-    for (i, line) in lines.iter().enumerate() {
-        let t = line.trim();
-        if t.starts_with("aliases:") {
-            let after_colon = t.strip_prefix("aliases:")?.trim();
-            let mut aliases = Vec::new();
-            if after_colon.starts_with('[') {
-                let inner = after_colon.trim_start_matches('[').trim_end_matches(']');
-                for a in inner.split(',') {
-                    let a = a.trim().trim_matches('"').trim_matches('\'').to_string();
-                    if !a.is_empty() {
-                        aliases.push(a);
-                    }
-                }
-            } else if after_colon.is_empty() {
-                for sub in &lines[i + 1..] {
-                    let st = sub.trim();
-                    if st.starts_with("- ") {
-                        aliases.push(st.strip_prefix("- ").unwrap().trim().to_string());
-                    } else if !st.is_empty() {
-                        break;
-                    }
-                }
-            }
-            return Some(aliases);
-        }
-    }
-    None
-}
 
 /// A potential wikilink discovered in note content.
 #[derive(Debug, Clone, PartialEq)]
@@ -90,10 +49,14 @@ pub(crate) struct NameEntry {
 /// Build a lookup table of (name, path, match_type) from all indexed files.
 ///
 /// For each file: extract basename (without .md) as ExactName (if len >= 3),
-/// then read the file from disk to extract aliases (each len >= 2) as Alias entries.
+/// then each alias the store records for it (each len >= 2) as an Alias entry.
+/// The aliases are the rows the edge pass wrote (#142), so a suggestion and
+/// `read` agree on what a note's aliases are.
 /// Results are sorted by name length descending so longer names match first.
-pub(crate) fn build_name_index(store: &Store, vault_path: &Path) -> Result<Vec<NameEntry>> {
+pub(crate) fn build_name_index(store: &Store) -> Result<Vec<NameEntry>> {
     let all_files = store.get_all_files()?;
+    let file_ids: Vec<i64> = all_files.iter().map(|f| f.id).collect();
+    let mut aliases = store.aliases_for_files(&file_ids)?;
     let mut entries = Vec::new();
 
     for file in &all_files {
@@ -114,21 +77,15 @@ pub(crate) fn build_name_index(store: &Store, vault_path: &Path) -> Result<Vec<N
             });
         }
 
-        // Read file from disk to extract aliases
-        let full_path = vault_path.join(&file.path);
-        if let Ok(content) = std::fs::read_to_string(&full_path)
-            && let Some(aliases) = extract_aliases_from_frontmatter(&content)
-        {
-            for alias in aliases {
-                if alias.len() >= 2 {
-                    let alias_lower = alias.to_lowercase();
-                    entries.push(NameEntry {
-                        name: alias,
-                        name_lower: alias_lower,
-                        path: file.path.clone(),
-                        match_type: LinkMatchType::Alias,
-                    });
-                }
+        for alias in aliases.remove(&file.id).unwrap_or_default() {
+            if alias.len() >= 2 {
+                let alias_lower = alias.to_lowercase();
+                entries.push(NameEntry {
+                    name: alias,
+                    name_lower: alias_lower,
+                    path: file.path.clone(),
+                    match_type: LinkMatchType::Alias,
+                });
             }
         }
     }
@@ -520,10 +477,9 @@ pub(crate) fn find_first_name_matches(
 pub fn discover_links(
     store: &Store,
     content: &str,
-    vault_path: &Path,
     people_folder: Option<&str>,
 ) -> Result<Vec<DiscoveredLink>> {
-    let name_index = build_name_index(store, vault_path)?;
+    let name_index = build_name_index(store)?;
     let wikilink_regions = find_wikilink_regions(content);
     let protected_regions = find_protected_regions(content);
     let content_lower = content.to_lowercase();
@@ -753,29 +709,9 @@ pub fn apply_links(content: &str, links: &[DiscoveredLink]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_extract_aliases_from_frontmatter() {
-        let content = "---\ntags:\n  - person\naliases:\n  - Johnny\n  - JN\n---\n# John Nelson";
-        let aliases = extract_aliases_from_frontmatter(content).unwrap();
-        assert_eq!(aliases, vec!["Johnny", "JN"]);
-    }
-
-    #[test]
-    fn test_extract_aliases_inline() {
-        let content = "---\naliases: [Max, MD]\n---\n# Max Darski";
-        let aliases = extract_aliases_from_frontmatter(content).unwrap();
-        assert_eq!(aliases, vec!["Max", "MD"]);
-    }
-
-    #[test]
-    fn test_extract_aliases_no_frontmatter() {
-        assert!(extract_aliases_from_frontmatter("# Just a heading").is_none());
-    }
     use crate::store::Store;
 
-    fn setup_store_and_vault() -> (Store, tempfile::TempDir) {
-        let vault_dir = tempfile::TempDir::new().unwrap();
+    fn setup_store() -> Store {
         let store = Store::open_memory().unwrap();
 
         // Insert files into store
@@ -789,7 +725,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        store
+        let rrf = store
             .insert_file(
                 "03-Resources/Code-Snippets/Reciprocal Rank Fusion.md",
                 "h2",
@@ -799,28 +735,20 @@ mod tests {
                 None,
             )
             .unwrap();
+        // The aliases come from the store, where the edge pass records them
+        // (#142).
+        store
+            .replace_file_aliases(rrf, &["RRF".to_string()])
+            .unwrap();
 
-        // Create files on disk for alias reading
-        let people = vault_dir.path().join("03-Resources/People");
-        std::fs::create_dir_all(&people).unwrap();
-        std::fs::write(people.join("Steve Barbera.md"), "# Steve Barbera\n").unwrap();
-
-        let snippets = vault_dir.path().join("03-Resources/Code-Snippets");
-        std::fs::create_dir_all(&snippets).unwrap();
-        std::fs::write(
-            snippets.join("Reciprocal Rank Fusion.md"),
-            "---\naliases: [RRF]\n---\n# Reciprocal Rank Fusion\n",
-        )
-        .unwrap();
-
-        (store, vault_dir)
+        store
     }
 
     #[test]
     fn test_exact_name_match() {
-        let (store, vault_dir) = setup_store_and_vault();
+        let store = setup_store();
         let content = "Talked to Steve Barbera";
-        let links = discover_links(&store, content, vault_dir.path(), None).unwrap();
+        let links = discover_links(&store, content, None).unwrap();
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].matched_text, "Steve Barbera");
         assert_eq!(links[0].match_type, LinkMatchType::ExactName);
@@ -828,17 +756,17 @@ mod tests {
 
     #[test]
     fn test_skip_existing_wikilinks() {
-        let (store, vault_dir) = setup_store_and_vault();
+        let store = setup_store();
         let content = "Talked to [[Steve Barbera]]";
-        let links = discover_links(&store, content, vault_dir.path(), None).unwrap();
+        let links = discover_links(&store, content, None).unwrap();
         assert_eq!(links.len(), 0);
     }
 
     #[test]
     fn test_multiple_matches() {
-        let (store, vault_dir) = setup_store_and_vault();
+        let store = setup_store();
         let content = "Steve Barbera explained Reciprocal Rank Fusion";
-        let links = discover_links(&store, content, vault_dir.path(), None).unwrap();
+        let links = discover_links(&store, content, None).unwrap();
         assert_eq!(links.len(), 2);
 
         let names: Vec<&str> = links.iter().map(|l| l.matched_text.as_str()).collect();
@@ -848,9 +776,9 @@ mod tests {
 
     #[test]
     fn test_alias_match() {
-        let (store, vault_dir) = setup_store_and_vault();
+        let store = setup_store();
         let content = "We use RRF for search";
-        let links = discover_links(&store, content, vault_dir.path(), None).unwrap();
+        let links = discover_links(&store, content, None).unwrap();
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].match_type, LinkMatchType::Alias);
         assert_eq!(
@@ -862,9 +790,9 @@ mod tests {
 
     #[test]
     fn test_apply_links() {
-        let (store, vault_dir) = setup_store_and_vault();
+        let store = setup_store();
         let content = "Steve Barbera explained RRF to me";
-        let links = discover_links(&store, content, vault_dir.path(), None).unwrap();
+        let links = discover_links(&store, content, None).unwrap();
         let result = apply_links(content, &links);
 
         assert!(result.contains("[[Steve Barbera]]"));
@@ -882,19 +810,19 @@ mod tests {
 
     #[test]
     fn test_case_insensitive_match() {
-        let (store, vault_dir) = setup_store_and_vault();
+        let store = setup_store();
         let content = "talked to steve barbera today";
-        let links = discover_links(&store, content, vault_dir.path(), None).unwrap();
+        let links = discover_links(&store, content, None).unwrap();
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].matched_text, "steve barbera");
     }
 
     #[test]
     fn test_word_boundary_check() {
-        let (store, vault_dir) = setup_store_and_vault();
+        let store = setup_store();
         // "RRF" embedded inside a word should not match
         let content = "The xRRFy algorithm";
-        let links = discover_links(&store, content, vault_dir.path(), None).unwrap();
+        let links = discover_links(&store, content, None).unwrap();
         assert_eq!(links.len(), 0);
     }
 
@@ -1093,17 +1021,14 @@ mod tests {
 
     #[test]
     fn test_skip_fenced_code_block_in_discover() {
-        let (store, vault_dir) = setup_store_and_vault();
+        let store = setup_store();
         // Add a note named "Drift" so it can be matched
         store
             .insert_file("01-Projects/Drift.md", "h", 0, "ccc333", None, None)
             .unwrap();
-        let projects = vault_dir.path().join("01-Projects");
-        std::fs::create_dir_all(&projects).unwrap();
-        std::fs::write(projects.join("Drift.md"), "# Drift\n").unwrap();
 
         let content = "Some text\n```\nDrift config here\n```\nMore text about Drift";
-        let links = discover_links(&store, content, vault_dir.path(), None).unwrap();
+        let links = discover_links(&store, content, None).unwrap();
         // Should only match the "Drift" outside the code block
         assert_eq!(links.len(), 1);
         // The matched position should be in the "More text about Drift" part
@@ -1112,16 +1037,13 @@ mod tests {
 
     #[test]
     fn test_skip_inline_code_in_discover() {
-        let (store, vault_dir) = setup_store_and_vault();
+        let store = setup_store();
         store
             .insert_file("01-Projects/Drift.md", "h", 0, "ccc333", None, None)
             .unwrap();
-        let projects = vault_dir.path().join("01-Projects");
-        std::fs::create_dir_all(&projects).unwrap();
-        std::fs::write(projects.join("Drift.md"), "# Drift\n").unwrap();
 
         let content = "Use `Drift` in code but Drift in text";
-        let links = discover_links(&store, content, vault_dir.path(), None).unwrap();
+        let links = discover_links(&store, content, None).unwrap();
         // Should only match the Drift outside backticks
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].matched_text, "Drift");
@@ -1129,16 +1051,13 @@ mod tests {
 
     #[test]
     fn test_skip_frontmatter_in_discover() {
-        let (store, vault_dir) = setup_store_and_vault();
+        let store = setup_store();
         store
             .insert_file("01-Projects/Drift.md", "h", 0, "ccc333", None, None)
             .unwrap();
-        let projects = vault_dir.path().join("01-Projects");
-        std::fs::create_dir_all(&projects).unwrap();
-        std::fs::write(projects.join("Drift.md"), "# Drift\n").unwrap();
 
         let content = "---\ntags: [drift]\ndate: 2026-03-27\n---\nTalked about Drift today";
-        let links = discover_links(&store, content, vault_dir.path(), None).unwrap();
+        let links = discover_links(&store, content, None).unwrap();
         // Should only match "Drift" in the body, not "drift" in frontmatter tags
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].matched_text, "Drift");
@@ -1146,17 +1065,14 @@ mod tests {
 
     #[test]
     fn test_skip_file_extension_in_discover() {
-        let (store, vault_dir) = setup_store_and_vault();
+        let store = setup_store();
         // Add a note called "image-url" that could match
         store
             .insert_file("03-Resources/image-url.md", "h", 0, "ddd444", None, None)
             .unwrap();
-        let resources = vault_dir.path().join("03-Resources");
-        std::fs::create_dir_all(&resources).unwrap();
-        std::fs::write(resources.join("image-url.md"), "# image-url\n").unwrap();
 
         let content = "Edit image-url.ts for the fix, then check image-url docs";
-        let links = discover_links(&store, content, vault_dir.path(), None).unwrap();
+        let links = discover_links(&store, content, None).unwrap();
         // "image-url.ts" should NOT match (file extension), but "image-url" at end should
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].matched_text, "image-url");
@@ -1164,17 +1080,14 @@ mod tests {
 
     #[test]
     fn test_apply_links_skips_protected_regions() {
-        let (store, vault_dir) = setup_store_and_vault();
+        let store = setup_store();
         store
             .insert_file("01-Projects/Drift.md", "h", 0, "ccc333", None, None)
             .unwrap();
-        let projects = vault_dir.path().join("01-Projects");
-        std::fs::create_dir_all(&projects).unwrap();
-        std::fs::write(projects.join("Drift.md"), "# Drift\n").unwrap();
 
         let content =
             "---\ntags: [drift]\n---\n`Drift` config\n```\nDrift code\n```\nReal Drift ref";
-        let links = discover_links(&store, content, vault_dir.path(), None).unwrap();
+        let links = discover_links(&store, content, None).unwrap();
         let result = apply_links(content, &links);
 
         // Frontmatter, inline code, and fenced code block should be untouched
@@ -1187,9 +1100,9 @@ mod tests {
 
     #[test]
     fn test_normal_text_still_linked() {
-        let (store, vault_dir) = setup_store_and_vault();
+        let store = setup_store();
         let content = "Steve Barbera and Reciprocal Rank Fusion are great";
-        let links = discover_links(&store, content, vault_dir.path(), None).unwrap();
+        let links = discover_links(&store, content, None).unwrap();
         let result = apply_links(content, &links);
         assert!(result.contains("[[Steve Barbera]]"));
         assert!(result.contains("[[Reciprocal Rank Fusion]]"));

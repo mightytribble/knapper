@@ -80,14 +80,16 @@ pub struct Search {
     #[serde(default)]
     pub property: Option<String>,
     /// Filter to notes that link to this note, named the way a wikilink
-    /// names it. With `property`, only links filed under that property
-    /// count. An unknown note is an error naming the nearest one (#66).
+    /// names it, or by one of its aliases (#142). With `property`, only
+    /// links filed under that property count. An unknown note is an error
+    /// naming the nearest one (#66).
     #[arg(long)]
     #[serde(default)]
     pub links_to: Option<String>,
     /// Filter to the notes this note links to, named the way a wikilink
-    /// names it. With `property`, only links filed under that property
-    /// count. An unknown note is an error naming the nearest one (#66).
+    /// names it, or by one of its aliases (#142). With `property`, only
+    /// links filed under that property count. An unknown note is an error
+    /// naming the nearest one (#66).
     #[arg(long)]
     #[serde(default)]
     pub linked_from: Option<String>,
@@ -113,7 +115,10 @@ pub struct Search {
 
 #[derive(Debug, Args, Deserialize, JsonSchema)]
 pub struct Read {
-    /// File path, basename, or #docid.
+    /// File path, basename, alias, or #docid. An alias is one of the names
+    /// the note's `aliases` frontmatter lists, and it is tried last, so a
+    /// filename wins over another note's alias. An alias that more than one
+    /// note lists is refused (#142).
     pub file: String,
     /// Read one section by its heading. Omit for the whole note.
     ///
@@ -212,14 +217,16 @@ pub struct List {
     #[serde(default)]
     pub property: Option<String>,
     /// Filter to notes that link to this note, named the way a wikilink
-    /// names it. With `property`, only links filed under that property
-    /// count. An unknown note is an error naming the nearest one (#66).
+    /// names it, or by one of its aliases (#142). With `property`, only
+    /// links filed under that property count. An unknown note is an error
+    /// naming the nearest one (#66).
     #[arg(long)]
     #[serde(default)]
     pub links_to: Option<String>,
     /// Filter to the notes this note links to, named the way a wikilink
-    /// names it. With `property`, only links filed under that property
-    /// count. An unknown note is an error naming the nearest one (#66).
+    /// names it, or by one of its aliases (#142). With `property`, only
+    /// links filed under that property count. An unknown note is an error
+    /// naming the nearest one (#66).
     #[arg(long)]
     #[serde(default)]
     pub linked_from: Option<String>,

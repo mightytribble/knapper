@@ -207,6 +207,23 @@ CREATE INDEX IF NOT EXISTS idx_properties_file   ON properties(file_id);
 CREATE INDEX IF NOT EXISTS idx_properties_name   ON properties(name, value);
 CREATE INDEX IF NOT EXISTS idx_properties_target ON properties(target_file);";
 
+/// A note's aliases (#142): one row per alias, as `aliases::extract` reads
+/// them from the note's frontmatter.
+///
+/// One table and not a vocabulary table beside a junction, as `tags` has. A
+/// tag is a value many notes share. An alias names one note, and an alias two
+/// notes carry is the case a lookup refuses. `folded` is the identity and
+/// `display` is what the note wrote. `id` keeps the note's own order, because
+/// the edge pass inserts a note's rows in the order the note lists them.
+const ALIASES_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS aliases (
+    id      INTEGER PRIMARY KEY,
+    file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    folded  TEXT NOT NULL,
+    display TEXT NOT NULL,
+    UNIQUE(file_id, folded)
+);
+CREATE INDEX IF NOT EXISTS idx_aliases_folded ON aliases(folded);";
+
 /// Reduce a heading to the form two spellings of the same section share.
 ///
 /// Strips the leading `#`s a stored heading carries and a link's does not,
@@ -926,6 +943,11 @@ impl Store {
         // the `LINK_RESOLVER_VERSION` bump that shipped with it declares the
         // rebuild that fills a store an earlier binary built.
         self.conn.execute_batch(PROPERTIES_SCHEMA)?;
+
+        // Aliases (#142). Created empty; the edge pass fills it, and the
+        // `LINK_RESOLVER_VERSION` bump that shipped with it declares the
+        // rebuild that fills a store an earlier binary built.
+        self.conn.execute_batch(ALIASES_SCHEMA)?;
 
         // Migration log table — records PARA migration batch operations.
         self.conn.execute_batch(
@@ -2311,13 +2333,20 @@ impl Store {
     }
 
     /// Resolve a scope's link terms to note ids (#66), the way a wikilink
-    /// target resolves. An unresolvable name errors, naming the nearest note
-    /// the fuzzy file resolver finds.
+    /// target resolves, and then by alias (#142). An alias more than one note
+    /// carries errors, naming the candidates. An unresolvable name errors,
+    /// naming the nearest note the fuzzy file resolver finds.
     pub fn resolve_scope_links(&self, scope: &crate::tags::Scope) -> Result<LinkIds> {
         let resolve = |field: &str, term: &Option<crate::tags::LinkTerm>| -> Result<Option<i64>> {
             let Some(term) = term else { return Ok(None) };
             if let Some(id) = crate::graph::resolve_link_target(self, &term.written)? {
                 return Ok(Some(id));
+            }
+            // A name the caller passed in also resolves by alias (#142). Not
+            // inside `resolve_link_target`, which every edge resolves through:
+            // Obsidian leaves `[[Sam]]` unresolved when only an alias matches.
+            if let Some(f) = self.find_file_by_alias(&term.written)? {
+                return Ok(Some(f.id));
             }
             match self.resolve_file(&term.written).ok().flatten() {
                 Some(near) => anyhow::bail!(
@@ -3129,6 +3158,74 @@ impl Store {
         }
     }
 
+    /// Make `aliases` the aliases of this file (#142).
+    ///
+    /// Owns the file's rows the way `replace_file_properties` owns its
+    /// property rows: delete, then insert. The edge pass calls it once per
+    /// file. Rows go in the order given, which is the order `aliases_for_files`
+    /// answers. A second spelling of an alias the list already holds is
+    /// dropped, the rule `aliases::extract` follows.
+    pub fn replace_file_aliases(&self, file_id: i64, aliases: &[String]) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM aliases WHERE file_id = ?1", params![file_id])?;
+        let mut stmt = self.conn.prepare(
+            "INSERT OR IGNORE INTO aliases (file_id, folded, display) VALUES (?1, ?2, ?3)",
+        )?;
+        for alias in aliases {
+            stmt.execute(params![file_id, crate::aliases::fold(alias), alias])?;
+        }
+        Ok(())
+    }
+
+    /// The note that carries `alias` (#142), compared case-folded on the
+    /// whole alias.
+    ///
+    /// An alias that more than one note carries is an error naming every
+    /// candidate, the rule `find_file_by_fuzzy` follows for equidistant
+    /// basenames: picking one would answer with a note the caller may not
+    /// have meant, and nothing in the reply would say so.
+    pub fn find_file_by_alias(&self, alias: &str) -> Result<Option<FileRecord>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {FILE_COLUMNS}
+               FROM files f JOIN aliases a ON a.file_id = f.id
+              WHERE a.folded = ?1
+              ORDER BY f.path"
+        ))?;
+        let mut found = stmt
+            .query_map(params![crate::aliases::fold(alias)], file_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        match found.len() {
+            0 | 1 => Ok(found.pop()),
+            _ => Err(anyhow::anyhow!(
+                "ambiguous alias '{}': carried by [{}]",
+                alias,
+                found
+                    .iter()
+                    .map(|f| f.path.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        }
+    }
+
+    /// The aliases of each listed note, as the note wrote them and in its
+    /// order, keyed by file id (#142).
+    ///
+    /// One query for a whole listing. A note with no alias has no entry.
+    pub fn aliases_for_files(
+        &self,
+        file_ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, Vec<String>>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT file_id, display FROM aliases
+              WHERE file_id IN rarray(?1)
+              ORDER BY file_id, id",
+        )?;
+        group_by_file(stmt.query_map(params![id_array(file_ids)], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?)
+    }
+
     pub fn resolve_tag(&self, proposed: &str) -> Result<crate::tags::TagResolution> {
         crate::tags::resolve_tag(&self.conn, proposed)
     }
@@ -3281,15 +3378,14 @@ fn keyed_property_row_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, Pr
     Ok((row.get(0)?, property_row_at(row, 1)?))
 }
 
-/// The map both batched readers answer, grouped in the query's own order.
-fn group_by_file(
-    rows: impl Iterator<Item = rusqlite::Result<(i64, PropertyRow)>>,
-) -> Result<std::collections::HashMap<i64, Vec<PropertyRow>>> {
-    let mut out: std::collections::HashMap<i64, Vec<PropertyRow>> =
-        std::collections::HashMap::new();
+/// The map the batched readers answer, grouped in the query's own order.
+fn group_by_file<T>(
+    rows: impl Iterator<Item = rusqlite::Result<(i64, T)>>,
+) -> Result<std::collections::HashMap<i64, Vec<T>>> {
+    let mut out: std::collections::HashMap<i64, Vec<T>> = std::collections::HashMap::new();
     for row in rows {
-        let (file_id, prop) = row?;
-        out.entry(file_id).or_default().push(prop);
+        let (file_id, item) = row?;
+        out.entry(file_id).or_default().push(item);
     }
     Ok(out)
 }
@@ -6087,6 +6183,133 @@ mod tests {
             .unwrap();
         let result = store.resolve_file("#abc123").unwrap();
         assert!(result.is_some());
+    }
+
+    // ── Alias tests (#142) ──────────────────────────────────────
+
+    fn aliases(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    #[test]
+    fn an_alias_finds_its_note_whatever_the_case() {
+        let store = Store::open_memory().unwrap();
+        let id = store
+            .insert_file("npcs/samantha-hoyle.md", "h", 0, "aaa111", None, None)
+            .unwrap();
+        store
+            .replace_file_aliases(id, &aliases(&["Sam", "Élodie"]))
+            .unwrap();
+
+        let found = store.find_file_by_alias("SAM").unwrap().unwrap();
+        assert_eq!(found.path, "npcs/samantha-hoyle.md");
+        let found = store.find_file_by_alias("éLODIE").unwrap().unwrap();
+        assert_eq!(found.path, "npcs/samantha-hoyle.md");
+    }
+
+    #[test]
+    fn an_alias_matches_on_the_whole_alias_only() {
+        let store = Store::open_memory().unwrap();
+        let id = store
+            .insert_file("npcs/samantha-hoyle.md", "h", 0, "aaa111", None, None)
+            .unwrap();
+        store
+            .replace_file_aliases(id, &aliases(&["Drone 7-422"]))
+            .unwrap();
+
+        assert!(store.find_file_by_alias("7-422").unwrap().is_none());
+        assert!(store.find_file_by_alias("Drone").unwrap().is_none());
+        assert!(store.find_file_by_alias("").unwrap().is_none());
+    }
+
+    #[test]
+    fn an_alias_two_notes_carry_is_refused_and_names_both() {
+        let store = Store::open_memory().unwrap();
+        let a = store
+            .insert_file("npcs/samantha-hoyle.md", "h1", 0, "aaa111", None, None)
+            .unwrap();
+        let b = store
+            .insert_file("npcs/sam-okafor.md", "h2", 0, "bbb222", None, None)
+            .unwrap();
+        store.replace_file_aliases(a, &aliases(&["Sam"])).unwrap();
+        store.replace_file_aliases(b, &aliases(&["sam"])).unwrap();
+
+        let err = store.find_file_by_alias("Sam").unwrap_err().to_string();
+        assert!(err.contains("npcs/samantha-hoyle.md"), "{err}");
+        assert!(err.contains("npcs/sam-okafor.md"), "{err}");
+    }
+
+    #[test]
+    fn replacing_a_note_s_aliases_releases_the_old_ones() {
+        let store = Store::open_memory().unwrap();
+        let id = store
+            .insert_file("npcs/samantha-hoyle.md", "h", 0, "aaa111", None, None)
+            .unwrap();
+        store.replace_file_aliases(id, &aliases(&["Sam"])).unwrap();
+        store
+            .replace_file_aliases(id, &aliases(&["Dragon"]))
+            .unwrap();
+
+        assert!(store.find_file_by_alias("Sam").unwrap().is_none());
+        assert!(store.find_file_by_alias("Dragon").unwrap().is_some());
+    }
+
+    #[test]
+    fn a_file_removal_cascades_its_alias_rows() {
+        let store = Store::open_memory().unwrap();
+        let id = store
+            .insert_file("npcs/samantha-hoyle.md", "h", 0, "aaa111", None, None)
+            .unwrap();
+        store.replace_file_aliases(id, &aliases(&["Sam"])).unwrap();
+        store.delete_file(id).unwrap();
+
+        let rows: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM aliases", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    #[test]
+    fn the_write_resolver_does_not_read_aliases() {
+        // `update`, `move`, `archive` and `delete` resolve through
+        // `resolve_file`. A destructive call reached through a name the caller
+        // did not know was an alias fails worse than `File not found`, so the
+        // alias lookup belongs to the read side alone (#142).
+        let store = Store::open_memory().unwrap();
+        let id = store
+            .insert_file("npcs/samantha-hoyle.md", "h", 0, "aaa111", None, None)
+            .unwrap();
+        store
+            .replace_file_aliases(id, &aliases(&["Empress"]))
+            .unwrap();
+
+        assert!(store.resolve_file("Empress").unwrap().is_none());
+    }
+
+    #[test]
+    fn aliases_for_files_answers_each_note_s_aliases_as_written_and_in_order() {
+        let store = Store::open_memory().unwrap();
+        let a = store
+            .insert_file("npcs/samantha-hoyle.md", "h1", 0, "aaa111", None, None)
+            .unwrap();
+        let b = store
+            .insert_file("npcs/jeanine-wang.md", "h2", 0, "bbb222", None, None)
+            .unwrap();
+        let c = store
+            .insert_file("npcs/no-aliases.md", "h3", 0, "ccc333", None, None)
+            .unwrap();
+        store
+            .replace_file_aliases(a, &aliases(&["Sam", "Dragon"]))
+            .unwrap();
+        store
+            .replace_file_aliases(b, &aliases(&["El Ja'nadine", "Empress"]))
+            .unwrap();
+
+        let by_file = store.aliases_for_files(&[a, b, c]).unwrap();
+        assert_eq!(by_file[&a], aliases(&["Sam", "Dragon"]));
+        assert_eq!(by_file[&b], aliases(&["El Ja'nadine", "Empress"]));
+        assert!(!by_file.contains_key(&c));
     }
 
     // ── CLI events tests ────────────────────────────────────────

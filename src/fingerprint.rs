@@ -121,7 +121,13 @@ pub const CHUNK_RECORD_VERSION: u32 = 2;
 /// declares is a vault read with no model, which is what makes the upgrade
 /// cheap; `knapper index` runs it whether or not any file changed, so a
 /// vault nothing has edited still adopts the column.
-pub const LINK_RESOLVER_VERSION: u32 = 4;
+///
+/// Version 5 is issue #142: the pass also records each note's aliases in the
+/// `aliases` table, which `read` and the link filters resolve a name through.
+/// The table is empty on a store an earlier binary built, and the rebuild this
+/// bump declares is what fills it. A change to the alias grammar in
+/// `aliases::extract` is a bump here too.
+pub const LINK_RESOLVER_VERSION: u32 = 5;
 
 /// Bump when the *text* of a [`crate::llm::PromptFormat`] template changes
 /// while the template keeps its name.
