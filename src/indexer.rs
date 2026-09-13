@@ -254,6 +254,9 @@ pub enum ContentSource {
 ///
 /// The pass also derives the file's custom properties into the `properties`
 /// table (#66), so a caller that keeps edges right keeps properties right.
+/// It records the note's aliases into the `aliases` table the same way (#142).
+/// An alias resolves a name a caller passes in and never a link the vault
+/// wrote, so no edge this pass writes reads that table.
 ///
 /// Clears pre-existing `unresolved_links` entries for the source file
 /// before re-recording, so this is safe to call repeatedly during
@@ -322,9 +325,15 @@ pub fn build_edges_for_file(
     // `None` for a note that has one; writing that would record "this note
     // has no frontmatter", which is the silent wrong answer the column exists
     // to prevent. A reconstruction leaves the column as it found it.
+    //
+    // The note's aliases are read out of the same block (#142), so they take
+    // the same rule: a reconstruction holds no block to read them from, and
+    // leaves the rows as it found them.
     let (frontmatter, _body) = crate::markdown::split_frontmatter(content);
     if source == ContentSource::File {
-        store.set_file_frontmatter(file_id, frontmatter.as_deref().unwrap_or(""))?;
+        let block = frontmatter.as_deref().unwrap_or("");
+        store.set_file_frontmatter(file_id, block)?;
+        store.replace_file_aliases(file_id, &crate::aliases::extract(block))?;
     }
     derive_properties(store, file_id, frontmatter.as_deref(), &chunks)
 }
@@ -4124,6 +4133,89 @@ mod tests {
         assert_eq!(rows[0].text, "status: draft");
     }
 
+    // ── Aliases ride the edge pass (#142) ─────────────────────────
+
+    #[test]
+    fn the_edge_pass_records_the_notes_aliases_and_a_second_pass_replaces_them() {
+        let store = Store::open_memory().unwrap();
+        let a = store
+            .insert_file("npcs/samantha-hoyle.md", "h1", 100, "aaa111", None, None)
+            .unwrap();
+        build_edges_for_file(
+            &store,
+            a,
+            "---\naliases:\n  - Sam\n  - Dragon\n---\n# Samantha\n",
+            ContentSource::File,
+        )
+        .unwrap();
+        assert_eq!(
+            store.aliases_for_files(&[a]).unwrap()[&a],
+            vec!["Sam", "Dragon"]
+        );
+
+        build_edges_for_file(
+            &store,
+            a,
+            "---\naliases: [Sam]\n---\n# Samantha\n",
+            ContentSource::File,
+        )
+        .unwrap();
+        assert_eq!(store.aliases_for_files(&[a]).unwrap()[&a], vec!["Sam"]);
+
+        build_edges_for_file(&store, a, "# Samantha\n", ContentSource::File).unwrap();
+        assert!(store.aliases_for_files(&[a]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_chunks_only_rebuild_leaves_the_recorded_aliases_alone() {
+        // Chunk text is the note with its block stripped, so it holds no
+        // aliases to read — the reason #137 leaves `files.frontmatter` alone
+        // on the same path.
+        let store = Store::open_memory().unwrap();
+        let a = store
+            .insert_file("a.md", "h1", 100, "aaa111", None, None)
+            .unwrap();
+        build_edges_for_file(
+            &store,
+            a,
+            "---\naliases: [Sam]\n---\n# A\nSome prose.\n",
+            ContentSource::File,
+        )
+        .unwrap();
+
+        build_edges_for_file(&store, a, "# A\nSome prose.\n", ContentSource::Chunks).unwrap();
+
+        assert_eq!(store.aliases_for_files(&[a]).unwrap()[&a], vec!["Sam"]);
+    }
+
+    #[test]
+    fn a_wikilink_that_names_only_an_alias_stays_unresolved() {
+        // Obsidian resolves `[[Sam]]` by filename and shows it as broken when
+        // only an alias matches. The edge rule keeps that, or `health` stops
+        // reporting a link Obsidian reports (#142).
+        let store = Store::open_memory().unwrap();
+        let sam = store
+            .insert_file("npcs/samantha-hoyle.md", "h1", 100, "aaa111", None, None)
+            .unwrap();
+        let a = store
+            .insert_file("a.md", "h2", 100, "bbb222", None, None)
+            .unwrap();
+        build_edges_for_file(
+            &store,
+            sam,
+            "---\naliases: [Sam]\n---\n# Samantha\n",
+            ContentSource::File,
+        )
+        .unwrap();
+        build_edges_for_file(&store, a, "# A\nMet [[Sam]].\n", ContentSource::File).unwrap();
+
+        assert!(store.get_outgoing(a, Some("wikilink")).unwrap().is_empty());
+        assert_eq!(
+            store.get_unresolved_links().unwrap(),
+            vec![("a.md".to_string(), "Sam".to_string())]
+        );
+    }
+
     #[test]
     fn a_full_index_leaves_match_able_to_read_an_alias() {
         // The end to end of #137: an alias is in the note, in no chunk, and
@@ -4168,6 +4260,40 @@ mod tests {
         assert_eq!(report.notes, 1);
         assert_eq!(report.hits[0].part, crate::matching::Part::Frontmatter);
         assert_eq!(report.hits[0].line, "  - The Cartographer");
+    }
+
+    #[test]
+    fn rebuild_all_edges_fills_aliases_from_empty() {
+        // The upgrade path of #142: a store an earlier binary built holds an
+        // empty `aliases` table, and the rebuild `LINK_RESOLVER_VERSION`
+        // declares is what fills it.
+        use crate::llm::MockLlm;
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write_file(root, "a.md", "---\naliases: [Sam]\n---\n# A\nSome prose.\n");
+        let store = Store::open_memory().unwrap();
+        let mut embedder = MockLlm::new(256);
+        let config = Config::default();
+        run_index_shared(
+            root,
+            &config,
+            IndexSettings::from_config(&config),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(store.find_file_by_alias("Sam").unwrap().is_some());
+
+        store.conn().execute("DELETE FROM aliases", []).unwrap();
+        let files = walk_vault(root, &[], true).unwrap();
+        rebuild_all_edges(&store, root, &files).unwrap();
+
+        assert_eq!(
+            store.find_file_by_alias("Sam").unwrap().unwrap().path,
+            "a.md"
+        );
     }
 
     #[test]

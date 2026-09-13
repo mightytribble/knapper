@@ -455,7 +455,7 @@ pub fn create_note(
 
     // Step 3: Discover links and apply them (unless auto_link is explicitly false)
     let people_folder = profile.and_then(|p| p.structure.folders.people.as_deref());
-    let discovered = links::discover_links(store, &input.content, vault_path, people_folder)?;
+    let discovered = links::discover_links(store, &input.content, people_folder)?;
 
     // Split discovered links into auto-apply and suggestion-only
     let (auto_apply, suggestions): (Vec<_>, Vec<_>) = if input.auto_link.unwrap_or(true) {
