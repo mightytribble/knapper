@@ -251,7 +251,7 @@ impl KnapperServer {
 
     #[tool(
         name = "list",
-        description = "List notes, filtered by scope operators (all/any/none) or with no filter at all to enumerate the whole vault. A term is a tag path, or a directory path when it starts with `/`; a trailing `/` matches the tag's descendants or the directory's subtree. Returns every note the scope admits, with paths, docids, tags, `aliases` (the names a note's frontmatter lists, which `read`, `links_to` and `linked_from` accept in place of its path), `links_in` — how many distinct notes link to it, counted over the whole vault — and two sizes from the index: `chunk_count`, how many units `search` can return the note as, and `token_count`, its indexed size in tokens. With `detailed`, each note's heading outline. Read the sizes against `links_in`: a note many others point at that holds little is underwritten and worth expanding, and a long note of few chunks answers the same way however a query is phrased and wants its sections split finer. Path order by default; `sort: \"links_in\"` ranks the notes the vault points at most, which is where to start reading a vault you do not know."
+        description = "List notes, filtered by scope operators (all/any/none) or with no filter at all to enumerate the whole vault. A term is a tag path, or a directory path when it starts with `/`; a trailing `/` matches the tag's descendants or the directory's subtree. Returns every note the scope admits, with paths, docids, tags, `aliases` (the names a note's frontmatter lists, which `read`, `links_to` and `linked_from` accept in place of its path), `links_in` — how many distinct notes link to it, counted over the whole vault — and two sizes from the index: `chunk_count`, how many units `search` can return the note as, and `token_count`, its indexed size in tokens. With `detailed`, each note's heading outline. Read the sizes against `links_in`: a note many others point at that holds little is underwritten and worth expanding, and a long note of few chunks answers the same way however a query is phrased and wants its sections split finer. Path order by default; `sort: \"links_in\"` ranks the notes the vault points at most, which is where to start reading a vault you do not know. A listing too large for one response, most often a `detailed` one, reads in pages: pass `limit`, then `after` set to the last `path` received; a page shorter than `limit` is the last."
     )]
     async fn list(
         &self,
@@ -278,6 +278,7 @@ impl KnapperServer {
             &tags,
             params.0.created_by.as_deref(),
             params.0.limit,
+            params.0.after.as_deref(),
             params.0.sort.into(),
             params.0.detailed,
         )

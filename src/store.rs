@@ -2114,7 +2114,7 @@ impl Store {
         limit: Option<usize>,
     ) -> Result<Vec<FileRecord>> {
         Ok(self
-            .list_files_with_links_in(tags, created_by, limit, ListOrder::Path)?
+            .list_files_with_links_in(tags, created_by, limit, None, ListOrder::Path)?
             .into_iter()
             .map(|row| row.file)
             .collect())
@@ -2135,11 +2135,25 @@ impl Store {
     ///
     /// The ordering runs in SQL, before the limit: a limit applied first
     /// would rank the first N notes by path rather than the vault.
+    ///
+    /// `after` is the path of the last row a caller received, and the listing
+    /// starts at the row after it, so `limit` and `after` read a listing in
+    /// pages (#143). The page is found by the row's sort key and not by a
+    /// count of rows from the start: a note created or deleted before the
+    /// boundary between two pages repeats or skips no other note. In path
+    /// order the key is the path alone, so `after` need not name a note the
+    /// vault still holds. Under a ranking the key is the note's `links_in`
+    /// and its path, the count is read from the note as it is now, and a
+    /// path no note holds is refused, because a guessed count would move the
+    /// boundary with no sign of it. A link edit between two pages changes
+    /// the count the ranking sorts on, so it can still move a note across
+    /// the boundary.
     pub fn list_files_with_links_in(
         &self,
         tags: &crate::tags::Scope,
         created_by: Option<&str>,
         limit: Option<usize>,
+        after: Option<&str>,
         order: ListOrder,
     ) -> Result<Vec<ListRow>> {
         // `none` is not checked: excluding a tag no note carries is a no-op.
@@ -2148,10 +2162,33 @@ impl Store {
         crate::tags::check_terms(&self.conn, &checked)?;
         let links = self.resolve_scope_links(tags)?;
 
+        const LINKS_IN: &str =
+            "(SELECT COUNT(DISTINCT e.from_file) FROM edges e WHERE e.to_file = f.id)";
+        let ranked_after = match (after, order) {
+            (Some(path), ListOrder::LinksInDesc | ListOrder::LinksInAsc) => {
+                let count: i64 = self
+                    .conn
+                    .query_row(
+                        &format!("SELECT {LINKS_IN} FROM files f WHERE f.path = ?1"),
+                        [path],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "no such note '{path}' for 'after'; a links_in ranking \
+                             starts a page from that note's count, so start the \
+                             listing again or list in path order"
+                        )
+                    })?;
+                Some((path, count))
+            }
+            _ => None,
+        };
+
         let mut sql = format!(
             "SELECT {FILE_COLUMNS}, \
-             (SELECT COUNT(DISTINCT e.from_file) FROM edges e WHERE e.to_file = f.id) \
-               AS links_in, \
+             {LINKS_IN} AS links_in, \
              (SELECT COUNT(*) FROM chunks c WHERE c.file_id = f.id) \
                AS chunk_count, \
              (SELECT COALESCE(SUM(c.token_count), 0) FROM chunks c WHERE c.file_id = f.id) \
@@ -2166,12 +2203,38 @@ impl Store {
             sql.push_str(" AND f.created_by = ?");
             param_values.push(Box::new(cb.to_string()));
         }
-        // `f.path` is the tie-break under either ranking, so two notes with
-        // the same number of links in come back in the same order every call.
-        sql.push_str(match order {
-            ListOrder::Path => " ORDER BY f.path",
-            ListOrder::LinksInDesc => " ORDER BY links_in DESC, f.path",
-            ListOrder::LinksInAsc => " ORDER BY links_in ASC, f.path",
+        if let (Some(path), ListOrder::Path) = (after, order) {
+            // The UNIQUE index on `files.path` serves this range as well as
+            // the ordering.
+            sql.push_str(" AND f.path > ?");
+            param_values.push(Box::new(path.to_string()));
+        }
+        if let Some((path, count)) = ranked_after {
+            // `links_in` is a column of the result and not of `files`, so the
+            // keyset condition reads it from a subselect.
+            let past = if order == ListOrder::LinksInDesc {
+                "<"
+            } else {
+                ">"
+            };
+            sql = format!(
+                "SELECT * FROM ({sql}) \
+                 WHERE links_in {past} ? OR (links_in = ? AND path > ?)"
+            );
+            param_values.push(Box::new(count));
+            param_values.push(Box::new(count));
+            param_values.push(Box::new(path.to_string()));
+        }
+        // The path is the tie-break under either ranking, so two notes with
+        // the same number of links in come back in the same order every call,
+        // and a page boundary inside a tie means one thing.
+        let wrapped = ranked_after.is_some();
+        sql.push_str(match (order, wrapped) {
+            (ListOrder::Path, _) => " ORDER BY f.path",
+            (ListOrder::LinksInDesc, false) => " ORDER BY links_in DESC, f.path",
+            (ListOrder::LinksInAsc, false) => " ORDER BY links_in ASC, f.path",
+            (ListOrder::LinksInDesc, true) => " ORDER BY links_in DESC, path",
+            (ListOrder::LinksInAsc, true) => " ORDER BY links_in ASC, path",
         });
         if let Some(limit) = limit {
             sql.push_str(" LIMIT ?");
@@ -5293,6 +5356,7 @@ mod tests {
                 &crate::tags::Scope::default(),
                 None,
                 None,
+                None,
                 ListOrder::LinksInDesc,
             )
             .unwrap();
@@ -5320,6 +5384,7 @@ mod tests {
                 &crate::tags::Scope::default(),
                 None,
                 Some(1),
+                None,
                 ListOrder::LinksInDesc,
             )
             .unwrap();
@@ -5344,6 +5409,7 @@ mod tests {
         let rows = store
             .list_files_with_links_in(
                 &crate::tags::Scope::parse(&["/lore/".to_string()], &[], &[]).unwrap(),
+                None,
                 None,
                 None,
                 ListOrder::LinksInDesc,
@@ -5380,6 +5446,7 @@ mod tests {
                 &crate::tags::Scope::default(),
                 None,
                 None,
+                None,
                 ListOrder::LinksInDesc,
             )
             .unwrap();
@@ -5403,6 +5470,7 @@ mod tests {
         let rows = store
             .list_files_with_links_in(
                 &crate::tags::Scope::default(),
+                None,
                 None,
                 None,
                 ListOrder::LinksInAsc,
@@ -5447,7 +5515,13 @@ mod tests {
             .unwrap();
 
         let rows = store
-            .list_files_with_links_in(&crate::tags::Scope::default(), None, None, ListOrder::Path)
+            .list_files_with_links_in(
+                &crate::tags::Scope::default(),
+                None,
+                None,
+                None,
+                ListOrder::Path,
+            )
             .unwrap();
         let long_row = rows.iter().find(|r| r.file.path == "long.md").unwrap();
         assert_eq!(long_row.chunk_count, 3);
@@ -5472,10 +5546,181 @@ mod tests {
             .unwrap();
 
         let rows = store
-            .list_files_with_links_in(&crate::tags::Scope::default(), None, None, ListOrder::Path)
+            .list_files_with_links_in(
+                &crate::tags::Scope::default(),
+                None,
+                None,
+                None,
+                ListOrder::Path,
+            )
             .unwrap();
         assert_eq!(rows[0].chunk_count, 0);
         assert_eq!(rows[0].token_count, 0);
+    }
+
+    /// Six notes in two folders. The `links_in` counts are a 2, b 1, c 2,
+    /// d 0, e 1, f 2, so a tie falls across a page boundary at most page
+    /// sizes, in both rankings and under a `/lore/` scope (#143).
+    fn paging_fixture() -> Store {
+        let store = Store::open_memory().unwrap();
+        let mut id = std::collections::HashMap::new();
+        for name in ["a", "b", "c", "d", "e", "f"] {
+            let folder = if name < "d" { "lore" } else { "npcs" };
+            let path = format!("{folder}/{name}.md");
+            id.insert(
+                name,
+                store
+                    .insert_file(&path, "h", 100, &format!("{name}1"), None, None)
+                    .unwrap(),
+            );
+        }
+        for (from, to) in [
+            ("d", "a"),
+            ("e", "a"),
+            ("d", "b"),
+            ("e", "c"),
+            ("f", "c"),
+            ("a", "e"),
+            ("a", "f"),
+            ("b", "f"),
+        ] {
+            store
+                .insert_edge(id[from], 0, id[to], DOC_LEVEL, "wikilink")
+                .unwrap();
+        }
+        store
+    }
+
+    /// Read a listing page by page, each page starting after the last path
+    /// the one before it answered, and stop at the first short page.
+    fn page_through(
+        store: &Store,
+        scope: &crate::tags::Scope,
+        order: ListOrder,
+        size: usize,
+    ) -> Vec<String> {
+        let mut paths: Vec<String> = Vec::new();
+        // A page that ignores `after` repeats itself for ever; the bound
+        // turns that into a failure rather than a hang.
+        for _ in 0..16 {
+            let page = store
+                .list_files_with_links_in(
+                    scope,
+                    None,
+                    Some(size),
+                    paths.last().map(String::as_str),
+                    order,
+                )
+                .unwrap();
+            let full = page.len() == size;
+            paths.extend(page.into_iter().map(|r| r.file.path));
+            if !full {
+                return paths;
+            }
+        }
+        panic!("no short page after 16 pages: {paths:?}");
+    }
+
+    #[test]
+    fn pages_read_after_the_last_path_join_into_the_whole_listing_in_every_order() {
+        let store = paging_fixture();
+        let lore = crate::tags::Scope::parse(&["/lore/".to_string()], &[], &[]).unwrap();
+        for scope in [crate::tags::Scope::default(), lore] {
+            for order in [
+                ListOrder::Path,
+                ListOrder::LinksInDesc,
+                ListOrder::LinksInAsc,
+            ] {
+                let whole: Vec<String> = store
+                    .list_files_with_links_in(&scope, None, None, None, order)
+                    .unwrap()
+                    .into_iter()
+                    .map(|r| r.file.path)
+                    .collect();
+                for size in 1..=whole.len() + 1 {
+                    assert_eq!(
+                        page_through(&store, &scope, order, size),
+                        whole,
+                        "{order:?}, pages of {size}, scope {scope:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The case `after` exists for: a caller that writes notes while it
+    /// reads a listing. A position counted from the start would shift by one
+    /// for the new note and answer the boundary row a second time (#143).
+    #[test]
+    fn a_note_created_before_the_boundary_repeats_no_row_on_the_next_page() {
+        let store = Store::open_memory().unwrap();
+        for name in ["b.md", "d.md", "f.md", "h.md"] {
+            store.insert_file(name, "h", 100, name, None, None).unwrap();
+        }
+        let scope = crate::tags::Scope::default();
+        let first = store
+            .list_files_with_links_in(&scope, None, Some(2), None, ListOrder::Path)
+            .unwrap();
+        assert_eq!(first.last().unwrap().file.path, "d.md");
+
+        store
+            .insert_file("a.md", "h", 100, "a.md", None, None)
+            .unwrap();
+
+        let second: Vec<String> = store
+            .list_files_with_links_in(&scope, None, Some(2), Some("d.md"), ListOrder::Path)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.file.path)
+            .collect();
+        assert_eq!(second, vec!["f.md", "h.md"]);
+    }
+
+    /// In path order the boundary is a comparison of text, so the note that
+    /// ended the last page may have gone since.
+    #[test]
+    fn a_path_listing_starts_after_a_path_no_note_holds() {
+        let store = Store::open_memory().unwrap();
+        for name in ["b.md", "d.md", "f.md"] {
+            store.insert_file(name, "h", 100, name, None, None).unwrap();
+        }
+        let rows: Vec<String> = store
+            .list_files_with_links_in(
+                &crate::tags::Scope::default(),
+                None,
+                None,
+                Some("c.md"),
+                ListOrder::Path,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|r| r.file.path)
+            .collect();
+        assert_eq!(rows, vec!["d.md", "f.md"]);
+    }
+
+    /// A ranking places the next page by the boundary note's count, and a
+    /// note that has gone has none. Guessing one would skip or repeat rows
+    /// with no sign of it, so the call is refused (#143).
+    #[test]
+    fn a_links_in_ranking_refuses_to_start_after_a_note_the_vault_does_not_hold() {
+        let store = paging_fixture();
+        for order in [ListOrder::LinksInDesc, ListOrder::LinksInAsc] {
+            let err = store
+                .list_files_with_links_in(
+                    &crate::tags::Scope::default(),
+                    None,
+                    Some(2),
+                    Some("lore/gone.md"),
+                    order,
+                )
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.starts_with("no such note 'lore/gone.md' for 'after'"),
+                "{order:?}: {err}"
+            );
+        }
     }
 
     #[test]

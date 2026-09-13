@@ -44,7 +44,8 @@ command it answers, with `-` written as `_`.
 - `search` — hybrid search across the vault
 - `read` — read a full note with metadata, or one section of it (`section`)
 - `list` — every note the scope admits, in path order (tag terms, directory
-  terms, creator); `detailed` adds each note's heading outline
+  terms, creator); `detailed` adds each note's heading outline, and `limit`
+  with `after` reads a large listing in pages
 - `tags` — the vault's tag vocabulary, whole or under one term
 - `vault_map` — vault structure overview
 
