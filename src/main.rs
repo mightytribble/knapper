@@ -436,6 +436,7 @@ async fn main() -> Result<()> {
                 &filter,
                 args.created_by.as_deref(),
                 args.limit,
+                args.after.as_deref(),
                 args.sort.into(),
                 args.detailed,
             )?;

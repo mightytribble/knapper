@@ -421,6 +421,21 @@ mod tests {
         }
     }
 
+    /// A listing is read in pages from the command line as it is over MCP and
+    /// HTTP: `--limit`, then `--after` the last path printed (#143).
+    #[test]
+    fn list_takes_the_path_a_page_starts_after() {
+        let cli = Cli::try_parse_from(["knapper", "list", "--limit", "50", "--after", "lore/a.md"])
+            .expect("list parses with --after");
+        match cli.command {
+            Command::List(args) => {
+                assert_eq!(args.limit, Some(50));
+                assert_eq!(args.after.as_deref(), Some("lore/a.md"));
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
     /// The flags are the one-edit form of the edit list, and `--edits` is the
     /// whole grammar. The two cannot be given together (#62).
     #[test]

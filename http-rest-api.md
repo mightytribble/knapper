@@ -22,7 +22,7 @@ what the parameters mean.
 | POST | `/api/search` | read | Hybrid search (semantic + FTS5 + graph + reranker + temporal), scoped by tag or directory terms — a leading `/` reads a term as a directory path (`scope`/`all`, `any`, `none`), and `property`, `links_to`, `linked_from` (one value each) |
 | POST | `/api/match` | read | Find every note whose text holds a literal string, and count them — scoped the same way. For verification, not discovery: `notes: 0` means nothing in scope says it |
 | GET | `/api/read` | read | Read a note (`file`), or one of its sections (`section`) |
-| GET | `/api/list` | read | List notes by tag or directory terms — a leading `/` reads a term as a directory path (`scope`/`all`, `any`, `none`), creator, limit, and `detailed=true` for each note's heading outline, and `property`, `links_to`, `linked_from` (one value each) |
+| GET | `/api/list` | read | List notes by tag or directory terms — a leading `/` reads a term as a directory path (`scope`/`all`, `any`, `none`), creator, limit, `after` (the last path a page answered, which starts the next page), and `detailed=true` for each note's heading outline, and `property`, `links_to`, `linked_from` (one value each) |
 | GET | `/api/tags` | read | The tag vocabulary, whole or under one term (`under`) |
 | GET | `/api/properties` | read | The custom-property registry, or one property's values (`name`) |
 | GET | `/api/vault-map` | read | Vault structure overview (folders, counts, the tag vocabulary and its reach, the most-linked notes, recently changed files) |

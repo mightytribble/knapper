@@ -172,6 +172,7 @@ fn build_list() -> serde_json::Value {
                 { "name": "linked_from", "in": "query", "required": false, "description": "The notes this note links to, named the way a wikilink names it, or by one of its aliases. With property, only links filed under that property count. An unknown note is a 400 naming the nearest one", "schema": { "type": "string" } },
                 { "name": "created_by", "in": "query", "required": false, "description": "Agent filter", "schema": { "type": "string" } },
                 { "name": "limit", "in": "query", "required": false, "description": "Maximum notes to answer. Absent, every note the scope admits", "schema": { "type": "integer" } },
+                { "name": "after", "in": "query", "required": false, "description": "Start after the note at this path, the last path the previous page answered. With limit it reads the listing in pages; a page shorter than limit is the last. A note created or deleted between two pages repeats or skips no other note. In path order the path need not be a note the vault still holds; under a links_in sort it must be, or the answer is a 400, and a link edit between two pages can still move a note across the boundary", "schema": { "type": "string" } },
                 { "name": "sort", "in": "query", "required": false, "description": "Order of the answer: path (default) is the vault's own order, links_in ranks the notes the most other notes link to, links_in_asc the fewest. The ranking runs over the whole listing, so it composes with limit", "schema": { "type": "string", "enum": ["path", "links_in", "links_in_asc"] } },
                 { "name": "detailed", "in": "query", "required": false, "description": "detailed=true answers each note's heading outline beside its path. The value is required; a bare `detailed` does not parse", "schema": { "type": "boolean" } }
             ],
@@ -591,6 +592,19 @@ mod tests {
             .map(|p| p["name"].as_str().unwrap())
             .collect();
         assert!(named.contains(&"detailed"), "missing parameter: detailed");
+    }
+
+    /// Paging is a documented parameter of the HTTP surface (#143).
+    #[test]
+    fn test_list_documents_after() {
+        let spec = build_openapi_spec("http://localhost:3000");
+        let named: Vec<&str> = spec["paths"]["/api/list"]["get"]["parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["name"].as_str().unwrap())
+            .collect();
+        assert!(named.contains(&"after"), "missing parameter: after");
     }
 
     #[test]

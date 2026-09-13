@@ -527,12 +527,14 @@ fn indexed_at_iso(stored: &str) -> String {
 /// and not a `LIKE`.
 ///
 /// `detailed` costs one file read per listed note, and only then; an
-/// undetailed listing touches no file.
+/// undetailed listing touches no file. `limit` and `after` page the query
+/// itself, so a page reads the files of its own notes and no others (#143).
 pub fn context_list(
     params: &ContextParams,
     tags: &crate::tags::Scope,
     created_by: Option<&str>,
     limit: Option<usize>,
+    after: Option<&str>,
     order: crate::store::ListOrder,
     detailed: bool,
 ) -> Result<Vec<NoteListItem>> {
@@ -540,7 +542,7 @@ pub fn context_list(
     // the number a listing reports is the number it was ranked by (#121).
     let files = params
         .store
-        .list_files_with_links_in(tags, created_by, limit, order)?;
+        .list_files_with_links_in(tags, created_by, limit, after, order)?;
     let file_ids: Vec<i64> = files.iter().map(|r| r.file.id).collect();
     let mut matched = matched_properties(params, tags, &file_ids)?;
     let mut aliases = params.store.aliases_for_files(&file_ids)?;
@@ -791,6 +793,7 @@ mod tests {
             scope,
             None,
             None,
+            None,
             crate::store::ListOrder::Path,
             false,
         )?
@@ -912,6 +915,7 @@ mod tests {
         let items = context_list(
             &params,
             &crate::tags::Scope::default(),
+            None,
             None,
             None,
             crate::store::ListOrder::Path,
@@ -1194,6 +1198,7 @@ mod tests {
             &crate::tags::Scope::default(),
             None,
             None,
+            None,
             crate::store::ListOrder::Path,
             false,
         )
@@ -1220,6 +1225,7 @@ mod tests {
             &crate::tags::Scope::default(),
             None,
             Some(20),
+            None,
             crate::store::ListOrder::Path,
             false,
         )
@@ -1240,6 +1246,7 @@ mod tests {
             &crate::tags::Scope::parse(&["rust".into()], &[], &[]).unwrap(),
             None,
             Some(20),
+            None,
             crate::store::ListOrder::Path,
             false,
         )
@@ -1277,6 +1284,7 @@ mod tests {
             &crate::tags::Scope::parse(&["type/undead".into(), "/lore/".into()], &[], &[]).unwrap(),
             None,
             None,
+            None,
             crate::store::ListOrder::Path,
             false,
         )
@@ -1302,6 +1310,7 @@ mod tests {
         let items = context_list(
             &params,
             &crate::tags::Scope::default(),
+            None,
             None,
             None,
             crate::store::ListOrder::Path,
@@ -1440,6 +1449,7 @@ mod tests {
             &crate::tags::Scope::default(),
             None,
             None,
+            None,
             crate::store::ListOrder::Path,
             true,
         )
@@ -1468,6 +1478,7 @@ mod tests {
         let items = context_list(
             &params,
             &crate::tags::Scope::default(),
+            None,
             None,
             None,
             crate::store::ListOrder::Path,
@@ -1894,6 +1905,7 @@ mod tests {
             &scope,
             None,
             None,
+            None,
             crate::store::ListOrder::Path,
             false,
         )
@@ -1924,6 +1936,7 @@ mod tests {
             &scope,
             None,
             None,
+            None,
             crate::store::ListOrder::Path,
             false,
         )
@@ -1952,6 +1965,7 @@ mod tests {
             &crate::tags::Scope::default(),
             None,
             None,
+            None,
             crate::store::ListOrder::Path,
             false,
         )
@@ -1966,6 +1980,7 @@ mod tests {
         let items = context_list(
             &params,
             &scope,
+            None,
             None,
             None,
             crate::store::ListOrder::Path,

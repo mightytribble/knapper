@@ -556,6 +556,7 @@ async fn handle_list(
         &filter,
         params.created_by.as_deref(),
         params.limit,
+        params.after.as_deref(),
         params.sort.into(),
         params.detailed,
     )
@@ -1642,6 +1643,25 @@ mod tests {
         let mut listed = paths(&json_body(response).await);
         listed.sort();
         assert_eq!(listed, vec!["wight.md", "wolf.md"]);
+    }
+
+    #[tokio::test]
+    async fn test_list_starts_a_page_after_the_path_it_names() {
+        let state = test_api_state();
+        seed_tags(&state).await;
+        let response = get(state, "/api/list?limit=1&after=draft.md").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(paths(&json_body(response).await), vec!["wight.md"]);
+    }
+
+    /// A ranked page after a note the vault does not hold is the caller's
+    /// cursor naming nothing, not a server fault (#143).
+    #[tokio::test]
+    async fn test_list_ranked_after_a_note_the_vault_does_not_hold_is_a_400() {
+        let state = test_api_state();
+        seed_tags(&state).await;
+        let response = get(state, "/api/list?sort=links_in&after=gone.md").await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

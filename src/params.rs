@@ -240,6 +240,17 @@ pub struct List {
     #[arg(long)]
     #[serde(default)]
     pub limit: Option<usize>,
+    /// Start after the note at this path, which is the last `path` the
+    /// previous page answered. With `limit` it reads a listing in pages, and
+    /// a page shorter than `limit` is the last one. A note created or deleted
+    /// between two pages repeats or skips no other note. In path order the
+    /// path need not be a note the vault still holds; under a `links_in`
+    /// sort it must be, because the next page starts from that note's count,
+    /// and a link edit between two pages can still move a note across the
+    /// boundary (#143).
+    #[arg(long)]
+    #[serde(default)]
+    pub after: Option<String>,
     /// The order notes come back in. `path` is the vault's own order.
     /// `links_in` ranks the notes the vault points at most, which is the
     /// question a caller with no note name has; `links_in_asc` ranks the
