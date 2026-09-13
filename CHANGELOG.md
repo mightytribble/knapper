@@ -7,6 +7,7 @@ Links resolve against https://github.com/mightytribble/knapper.
 
 ### Added
 
+- `list` now reads in pages — pass `limit`, then `after` set to the last path received — so a listing too large for one response no longer has to be split by scope (#143). ([`6e8d674`](https://github.com/mightytribble/knapper/commit/6e8d674))
 - `read`, `links_to` and `linked_from` now accept a note's alias, and `list` rows carry `aliases` (#142); run `knapper index` before `serve` to record an existing store's aliases, with no re-embed. ([`23672cd`](https://github.com/mightytribble/knapper/commit/23672cd))
 
 ## 0.9.11 (2026-09-11)
