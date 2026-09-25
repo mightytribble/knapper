@@ -9,6 +9,10 @@ no cloud.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
+https://github.com/user-attachments/assets/2932d1b7-03f2-42a6-a1b7-32c1be7eaba4
+
+*A 90-second paper film about what knapper does.*
+
 It works on any tree of markdown files but it is built for Obsidian: it reads
 and writes Obsidian's frontmatter, tag and wikilink conventions. Under active
 development — still experimental.
