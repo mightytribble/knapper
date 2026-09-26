@@ -7,6 +7,7 @@ Links resolve against https://github.com/mightytribble/knapper.
 
 ### Added
 
+- A scope term that is a note's path — `/Projects/big-note.md` — admits that one note, so `list --detailed --all /Projects/big-note.md` is one note's heading outline, the names `read --section` takes, and `search` and `match` can be confined to or exclude a single note (#144). ([`a609016`](https://github.com/mightytribble/knapper/commit/a609016))
 - `list` now reads in pages — pass `limit`, then `after` set to the last path received — so a listing too large for one response no longer has to be split by scope (#143). ([`6e8d674`](https://github.com/mightytribble/knapper/commit/6e8d674))
 - `read`, `links_to` and `linked_from` now accept a note's alias, and `list` rows carry `aliases` (#142); run `knapper index` before `serve` to record an existing store's aliases, with no re-embed. ([`23672cd`](https://github.com/mightytribble/knapper/commit/23672cd))
 
