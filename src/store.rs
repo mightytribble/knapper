@@ -2003,6 +2003,10 @@ fn scope_clauses(
                 }
                 format!("({pred})")
             }
+            ScopeTerm::File(path) => {
+                args.push(Box::new(path.clone()));
+                "(f.path = ?)".to_string()
+            }
         }
     }
 
@@ -7819,6 +7823,84 @@ mod tests {
             .files_in_scope(&folder_scope(&["/Nowhere/"], &[], &[]))
             .unwrap_err();
         assert_eq!(err.to_string(), "no such folder '/Nowhere/'");
+    }
+
+    #[test]
+    fn a_file_term_admits_that_note_alone() {
+        let store = folder_fixture();
+        assert_eq!(
+            scoped_paths(
+                &store,
+                &folder_scope(&["/Locations/aurelian-empire.md"], &[], &[])
+            ),
+            vec!["Locations/aurelian-empire.md"]
+        );
+        // `Locations.md` sits beside the `Locations/` folder, and a file term
+        // names it without taking the folder's notes along.
+        assert_eq!(
+            scoped_paths(&store, &folder_scope(&["/Locations.md"], &[], &[])),
+            vec!["Locations.md"]
+        );
+    }
+
+    #[test]
+    fn a_file_term_excludes_one_note_and_mixes_with_other_terms() {
+        let store = folder_fixture();
+        assert_eq!(
+            scoped_paths(
+                &store,
+                &folder_scope(&["/Locations/"], &[], &["/Locations/aurelian-empire.md"])
+            ),
+            vec!["Locations/cities/varenholt.md"]
+        );
+        assert_eq!(
+            scoped_paths(
+                &store,
+                &folder_scope(&[], &["/People/", "/Locations.md"], &[])
+            ),
+            vec!["Locations.md", "People/marcus.md"]
+        );
+    }
+
+    #[test]
+    fn a_file_term_differing_only_in_case_names_the_vaults_spelling() {
+        let store = folder_fixture();
+        let err = store
+            .files_in_scope(&folder_scope(&["/locations/Aurelian-Empire.md"], &[], &[]))
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "no such note '/locations/Aurelian-Empire.md'; nearest: '/Locations/aurelian-empire.md'"
+        );
+    }
+
+    #[test]
+    fn a_file_term_in_the_wrong_folder_names_the_note_of_that_name() {
+        let store = folder_fixture();
+        let err = store
+            .files_in_scope(&folder_scope(&["/People/varenholt.md"], &[], &[]))
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "no such note '/People/varenholt.md'; nearest: '/Locations/cities/varenholt.md'"
+        );
+    }
+
+    #[test]
+    fn an_unknown_file_term_falls_back_to_its_nearest_folder() {
+        let store = folder_fixture();
+        let err = store
+            .files_in_scope(&folder_scope(&["/Locations/cities/atlantis.md"], &[], &[]))
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "no such note '/Locations/cities/atlantis.md'; nearest: '/Locations/cities/'"
+        );
+
+        let err = store
+            .files_in_scope(&folder_scope(&["/Nowhere.md"], &[], &[]))
+            .unwrap_err();
+        assert_eq!(err.to_string(), "no such note '/Nowhere.md'");
     }
 
     #[test]

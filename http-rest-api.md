@@ -60,7 +60,8 @@ curl -X POST http://localhost:3000/api/search \
   -d '{"query": "authentication architecture", "top_n": 5}'
 
 # Search, scoped to a tag or directory filter (scope/all, any, none; a
-# leading / reads a term as a directory path from the vault root)
+# leading / reads a term as a directory path from the vault root, and a
+# path ending in .md as that one note)
 curl -X POST http://localhost:3000/api/search \
   -H "Authorization: Bearer kn_..." \
   -H "Content-Type: application/json" \

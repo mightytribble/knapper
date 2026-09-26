@@ -892,6 +892,7 @@ fn term_matches(
     match term {
         ScopeTerm::Folder(FolderTerm::Exact(d)) => parent_dir(rel) == d.as_str(),
         ScopeTerm::Folder(FolderTerm::Subtree(d)) => rel.starts_with(&format!("{d}/")),
+        ScopeTerm::File(p) => rel == p,
         ScopeTerm::Tag(TagTerm::Exact(t)) => {
             tags.is_some_and(|ts| ts.iter().any(|tag| &tag.path == t))
         }
@@ -1187,6 +1188,11 @@ mod tests {
                 .iter()
                 .all(|f| f.rule != Rule::UnresolvableWikilink)
         );
+
+        // a file scope checks that one note (#144)
+        let scope = Scope::parse(&["/home.md".to_string()], &[], &[]).unwrap();
+        let r = validate_target(root, &Target::Scope(scope), &limits, false).unwrap();
+        assert_eq!(r.files_checked, 1);
 
         // a note reference that resolves to nothing is a hard error
         assert!(validate_target(root, &Target::Note("nope".into()), &limits, false).is_err());

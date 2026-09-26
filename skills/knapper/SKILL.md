@@ -53,7 +53,9 @@ empty result.
   property's actual values, before filtering with `--property status=draft`.
 
 Scope terms are tags **or** directories: a leading `/` reads the term as a
-vault-root path, a trailing `/` as a subtree. `--all` requires every term,
+vault-root path, a trailing `/` as a subtree, and a path ending in `.md` as
+that one note — `list --detailed --all /Projects/big-note.md` is one note's
+heading outline, the names `read --section` takes. `--all` requires every term,
 `--any` at least one, `--none` excludes. `--scope` is an alias of `--all`.
 
 ## Editing without losing data

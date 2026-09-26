@@ -44,30 +44,32 @@ pub struct Search {
     pub group_by: Option<crate::config::GroupBy>,
     /// An alias of `all`. A term starting with `/` is a directory path from
     /// the vault root instead of a tag, case-sensitive; a trailing `/`
-    /// scopes to its subtree.
+    /// scopes to its subtree, and one ending in `.md` names that note alone.
     #[arg(long, value_delimiter = ',')]
     #[serde(default, deserialize_with = "deserialize_tag_list")]
     pub scope: Vec<String>,
     /// Filter to notes carrying every term. A term is a tag path; a trailing
     /// `/` or `/*` matches the tag and its descendants. A term starting with
     /// `/` is a directory path from the vault root instead, case-sensitive,
-    /// with a trailing `/` scoping to its subtree. An unknown term is an
-    /// error naming the nearest tag or folder the vault holds (#60).
+    /// with a trailing `/` scoping to its subtree, and one ending in `.md`
+    /// names that note alone (#144). An unknown term is an error naming the
+    /// nearest tag, folder or note the vault holds (#60).
     #[arg(long, value_delimiter = ',')]
     #[serde(default, deserialize_with = "deserialize_tag_list")]
     pub all: Vec<String>,
     /// Filter to notes carrying at least one of these terms. A term starting
     /// with `/` is a directory path from the vault root instead of a tag,
-    /// case-sensitive; a trailing `/` scopes to its subtree. An unknown
-    /// term is an error naming the nearest tag or folder the vault holds
-    /// (#60).
+    /// case-sensitive; a trailing `/` scopes to its subtree, and one ending
+    /// in `.md` names that note alone (#144). An unknown term is an error
+    /// naming the nearest tag, folder or note the vault holds (#60).
     #[arg(long, value_delimiter = ',')]
     #[serde(default, deserialize_with = "deserialize_tag_list")]
     pub any: Vec<String>,
     /// Filter out notes carrying any of these terms. A term starting with
     /// `/` is a directory path from the vault root instead of a tag,
-    /// case-sensitive; a trailing `/` scopes to its subtree. An unknown
-    /// term here is ignored (#60).
+    /// case-sensitive; a trailing `/` scopes to its subtree, and one ending
+    /// in `.md` names that note alone (#144). An unknown term here is
+    /// ignored (#60).
     #[arg(long, value_delimiter = ',')]
     #[serde(default, deserialize_with = "deserialize_tag_list")]
     pub none: Vec<String>,
@@ -182,29 +184,31 @@ pub struct List {
     /// Filter to notes carrying every term. A term is a tag path; a trailing
     /// `/` or `/*` matches the tag and its descendants. A term starting with
     /// `/` is a directory path from the vault root instead, case-sensitive,
-    /// with a trailing `/` scoping to its subtree. An unknown term is an
-    /// error naming the nearest tag or folder the vault holds (#60).
+    /// with a trailing `/` scoping to its subtree, and one ending in `.md`
+    /// names that note alone (#144). An unknown term is an error naming the
+    /// nearest tag, folder or note the vault holds (#60).
     #[arg(long, value_delimiter = ',')]
     #[serde(default, deserialize_with = "deserialize_tag_list")]
     pub all: Vec<String>,
     /// An alias of `all`. A term starting with `/` is a directory path from
     /// the vault root instead of a tag, case-sensitive; a trailing `/`
-    /// scopes to its subtree.
+    /// scopes to its subtree, and one ending in `.md` names that note alone.
     #[arg(long, value_delimiter = ',')]
     #[serde(default, deserialize_with = "deserialize_tag_list")]
     pub scope: Vec<String>,
     /// Filter to notes carrying at least one of these terms. A term starting
     /// with `/` is a directory path from the vault root instead of a tag,
-    /// case-sensitive; a trailing `/` scopes to its subtree. An unknown
-    /// term is an error naming the nearest tag or folder the vault holds
-    /// (#60).
+    /// case-sensitive; a trailing `/` scopes to its subtree, and one ending
+    /// in `.md` names that note alone (#144). An unknown term is an error
+    /// naming the nearest tag, folder or note the vault holds (#60).
     #[arg(long, value_delimiter = ',')]
     #[serde(default, deserialize_with = "deserialize_tag_list")]
     pub any: Vec<String>,
     /// Filter out notes carrying any of these terms. A term starting with
     /// `/` is a directory path from the vault root instead of a tag,
-    /// case-sensitive; a trailing `/` scopes to its subtree. An unknown
-    /// term here is ignored (#60).
+    /// case-sensitive; a trailing `/` scopes to its subtree, and one ending
+    /// in `.md` names that note alone (#144). An unknown term here is
+    /// ignored (#60).
     #[arg(long, value_delimiter = ',')]
     #[serde(default, deserialize_with = "deserialize_tag_list")]
     pub none: Vec<String>,
@@ -316,14 +320,15 @@ pub struct Match {
     pub word: bool,
     /// An alias of `all`. A term starting with `/` is a directory path from
     /// the vault root instead of a tag, case-sensitive; a trailing `/`
-    /// scopes to its subtree.
+    /// scopes to its subtree, and one ending in `.md` names that note alone.
     #[arg(long, value_delimiter = ',')]
     #[serde(default, deserialize_with = "deserialize_tag_list")]
     pub scope: Vec<String>,
     /// Look only in notes carrying every term. A term is a tag path; a
     /// trailing `/` or `/*` matches the tag and its descendants. A term
     /// starting with `/` is a directory path from the vault root instead,
-    /// case-sensitive, with a trailing `/` scoping to its subtree.
+    /// case-sensitive, with a trailing `/` scoping to its subtree, and one
+    /// ending in `.md` names that note alone (#144).
     #[arg(long, value_delimiter = ',')]
     #[serde(default, deserialize_with = "deserialize_tag_list")]
     pub all: Vec<String>,
@@ -937,12 +942,13 @@ pub struct Validate {
     pub path: Option<String>,
     /// An alias of `all`. A term starting with `/` is a directory path from
     /// the vault root instead of a tag, case-sensitive; a trailing `/` scopes
-    /// to its subtree.
+    /// to its subtree, and one ending in `.md` names that note alone.
     #[arg(long, value_delimiter = ',')]
     #[serde(default, deserialize_with = "deserialize_tag_list")]
     pub scope: Vec<String>,
     /// Check only notes carrying every term. A directory term (leading `/`,
-    /// case-sensitive, trailing `/` its subtree) scopes by folder instead.
+    /// case-sensitive, trailing `/` its subtree) scopes by folder instead,
+    /// and a path ending in `.md` to that one note.
     #[arg(long, value_delimiter = ',')]
     #[serde(default, deserialize_with = "deserialize_tag_list")]
     pub all: Vec<String>,
