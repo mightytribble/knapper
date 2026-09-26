@@ -188,7 +188,8 @@ the query link maintenance asks. The line the hit reports is the note as written
 An agent edits by naming a section, not by rewriting a file. `read` returns a
 section's body — the text **below** its heading — and `update` takes exactly
 that back, so a read, change and write round trip leaves the rest of the note
-byte for byte. `list --detailed` gives the agent each note's heading outline,
+byte for byte. `list --detailed` gives the agent each note's heading outline —
+one note's alone when the scope names its path, `--all /Folder/note.md` —
 which is how it finds the section to name before it touches anything.
 
 The write pipeline refuses the edits that would damage a note, rather than

@@ -340,12 +340,15 @@ impl std::fmt::Display for FolderTerm {
     }
 }
 
-/// One scope term: a tag or a directory. A term that opens with `/` is a
-/// directory path; every other term is a tag path, the grammar #61 settled.
+/// One scope term: a tag, a directory or a note. A term that opens with `/`
+/// is a path from the vault root — a note's when it ends in `.md`, a
+/// directory's otherwise; every other term is a tag path, the grammar #61
+/// settled. `File` holds the note's path as `files.path` keys it (#144).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScopeTerm {
     Tag(TagTerm),
     Folder(FolderTerm),
+    File(String),
 }
 
 impl std::fmt::Display for ScopeTerm {
@@ -353,6 +356,7 @@ impl std::fmt::Display for ScopeTerm {
         match self {
             ScopeTerm::Tag(t) => write!(f, "{t}"),
             ScopeTerm::Folder(fl) => write!(f, "{fl}"),
+            ScopeTerm::File(p) => write!(f, "/{p}"),
         }
     }
 }
@@ -391,9 +395,17 @@ pub fn parse_term(written: &str) -> Option<TagTerm> {
 /// subtree marker, the same rule tags use. A term with no leading slash is a
 /// tag, folded by `parse_term`. A term that empties after the markers are
 /// stripped returns `None`, so a bare `/` in a list is dropped, not an error.
+///
+/// A path ending in `.md` with no subtree marker names one note (#144). The
+/// kind is read from the spelling and never from the vault, so a term means
+/// the same thing whatever the vault holds: `/X` is still the folder, and
+/// `/X.md/` is the subtree of a folder called `X.md`.
 pub fn parse_scope_term(written: &str) -> Option<ScopeTerm> {
     let trimmed = written.trim();
     if let Some(rest) = trimmed.strip_prefix('/') {
+        if rest.to_ascii_lowercase().ends_with(".md") && rest.len() > ".md".len() {
+            return Some(ScopeTerm::File(rest.to_string()));
+        }
         let (head, subtree) = match rest.strip_suffix("/*") {
             Some(head) => (head, true),
             None => match rest.strip_suffix('/') {
@@ -494,6 +506,15 @@ pub fn check_terms(conn: &Connection, terms: &[&ScopeTerm]) -> Result<()> {
                     None => anyhow::bail!("no such folder '{folder}'"),
                 }
             }
+            ScopeTerm::File(path) => {
+                if file_exists(conn, path)? {
+                    continue;
+                }
+                match nearest_note(conn, path)? {
+                    Some(near) => anyhow::bail!("no such note '{term}'; nearest: '{near}'"),
+                    None => anyhow::bail!("no such note '{term}'"),
+                }
+            }
         }
     }
     Ok(())
@@ -567,6 +588,48 @@ fn longest_existing_folder_ancestor(conn: &Connection, path: &str) -> Result<Opt
         }
     }
     Ok(None)
+}
+
+/// Whether the vault holds a note at exactly `path`.
+fn file_exists(conn: &Connection, path: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM files WHERE path = ?1)",
+        params![path],
+        |row| row.get(0),
+    )?)
+}
+
+/// The note a file term that named nothing most likely meant, as its term
+/// spelling `/path` (#144). A wrong case is the likeliest slip, then the
+/// right name in the wrong folder, and failing both the term's nearest
+/// folder, which is what an unknown directory term answers (#65).
+fn nearest_note(conn: &Connection, path: &str) -> Result<Option<String>> {
+    use rusqlite::OptionalExtension;
+
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let found: Option<String> = conn
+        .query_row(
+            "SELECT path FROM files WHERE path = ?1 COLLATE NOCASE
+             UNION ALL
+             SELECT * FROM (SELECT path FROM files
+                            WHERE path = ?2 OR path LIKE ?3 ESCAPE '\\'
+                            ORDER BY path)
+             LIMIT 1",
+            params![path, name, format!("%/{}", escape_like(name))],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match found {
+        Some(p) => Ok(Some(ScopeTerm::File(p).to_string())),
+        None => longest_existing_folder_ancestor(conn, path),
+    }
+}
+
+/// `text` with `LIKE`'s wildcards and its escape character made literal.
+fn escape_like(text: &str) -> String {
+    text.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 /// A property filter (#66): a name, or a name and one value compared as
@@ -1123,6 +1186,45 @@ mod tests {
         assert_eq!(
             parse_scope_term("Type/Undead"),
             Some(ScopeTerm::Tag(TagTerm::Exact("type/undead".into())))
+        );
+    }
+
+    #[test]
+    fn a_path_ending_in_md_parses_a_file_and_keeps_its_case() {
+        assert_eq!(
+            parse_scope_term("/Locations/Aurelian-Empire.md"),
+            Some(ScopeTerm::File("Locations/Aurelian-Empire.md".into()))
+        );
+        assert_eq!(
+            parse_scope_term("/home.MD"),
+            Some(ScopeTerm::File("home.MD".into()))
+        );
+        assert_eq!(
+            ScopeTerm::File("Locations/home.md".into()).to_string(),
+            "/Locations/home.md"
+        );
+    }
+
+    #[test]
+    fn a_file_term_needs_the_extension_and_no_subtree_marker() {
+        // Without `.md` the term names a folder, as it did before #144.
+        assert_eq!(
+            parse_scope_term("/Locations/home"),
+            Some(ScopeTerm::Folder(FolderTerm::Exact(
+                "Locations/home".into()
+            )))
+        );
+        // A trailing `/` names the subtree of a folder called `home.md`.
+        assert_eq!(
+            parse_scope_term("/Locations/home.md/"),
+            Some(ScopeTerm::Folder(FolderTerm::Subtree(
+                "Locations/home.md".into()
+            )))
+        );
+        // A tag term is never a file, whatever it ends in.
+        assert_eq!(
+            parse_scope_term("notes.md"),
+            Some(ScopeTerm::Tag(TagTerm::Exact("notes.md".into())))
         );
     }
 
