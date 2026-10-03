@@ -1,6 +1,6 @@
 # ChatGPT Actions
 
-> **Untested in v0.9.** The API half of this path works, but the GPT import step is known to fail on the shipped OpenAPI spec (two endpoint descriptions exceed ChatGPT's 300-character cap), and the setup flow still references the retired plugin-manifest format. The fixes are tracked in [#87](https://github.com/mightytribble/knapper/issues/87) for v1. The HTTP API itself ([http-rest-api.md](http-rest-api.md)) is supported.
+> **Untested in v0.9.** The import step has not been run against the generated `/openapi.json`. The two things that made the earlier import fail are gone: every operation summary is held under ChatGPT's 300-character cap by a test, and the retired plugin manifest is no longer served. What remains is a real import, tracked in [#87](https://github.com/mightytribble/knapper/issues/87). The HTTP API itself ([http-rest-api.md](http-rest-api.md)) is supported.
 
 Connect your Obsidian vault to ChatGPT as a custom GPT Action. ChatGPT can search, read, create, and edit your notes through knapper's REST API.
 
@@ -12,7 +12,7 @@ Connect your Obsidian vault to ChatGPT as a custom GPT Action. ChatGPT can searc
 ## Step 1: Configure knapper
 
 ```bash
-# Interactive setup — enables HTTP, creates API key, sets CORS
+# Enables HTTP, creates a read key if there is none, allows the ChatGPT origins
 knapper configure --setup-chatgpt
 ```
 
@@ -25,16 +25,12 @@ port = 3000
 host = "127.0.0.1"
 rate_limit = 60
 cors_origins = ["https://chat.openai.com", "https://chatgpt.com"]
+public_url = "https://your-tunnel-url.trycloudflare.com"   # set after starting tunnel
 
 [[http.api_keys]]
 key = "kn_your_key_here"    # generate with: knapper configure --add-api-key --key-name chatgpt --key-permissions write
 name = "chatgpt"
 permissions = "write"        # "read" for search-only, "write" to also create/edit notes
-
-[http.plugin]
-name = "My Vault"
-description = "Search and manage my Obsidian vault"
-public_url = "https://your-tunnel-url.trycloudflare.com"   # set after starting tunnel
 ```
 
 ## Step 2: Start knapper + tunnel
@@ -61,7 +57,7 @@ ngrok http 3000
 Edit `~/.knapper/config.toml` and set `public_url` to your tunnel URL:
 
 ```toml
-[http.plugin]
+[http]
 public_url = "https://abc-xyz.trycloudflare.com"
 ```
 
@@ -70,9 +66,8 @@ Then restart knapper (`Ctrl+C` and re-run `knapper serve --http`). This ensures 
 ## Step 4: Verify endpoints
 
 ```bash
-# Both should return JSON (no auth required)
+# Returns the OpenAPI document (no auth required)
 curl https://your-tunnel-url/openapi.json
-curl https://your-tunnel-url/.well-known/ai-plugin.json
 
 # Search with auth
 curl -X POST -H "Authorization: Bearer kn_your_key" \
