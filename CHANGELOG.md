@@ -23,6 +23,7 @@ Links resolve against https://github.com/mightytribble/knapper.
 - The OpenAPI document carries the error body: `components.schemas.Error` is `{error, kind}`, and every capability operation lists 400, 401, 403, 404, 409, 429 and 500 with the kinds each carries. ([`215016f`](https://github.com/mightytribble/knapper/commit/215016f))
 - `[http.plugin] public_url` is `[http] public_url`. A config that still holds the old table loads, and its `public_url` has no effect until it is moved. ([`0917b5c`](https://github.com/mightytribble/knapper/commit/0917b5c))
 - `knapper configure --setup-chatgpt` no longer prompts for a public URL, and it allows `https://chatgpt.com` beside `https://chat.openai.com`. ([`0917b5c`](https://github.com/mightytribble/knapper/commit/0917b5c))
+- The index records its schema version (`PRAGMA user_version`), so an open no longer probes every column and table; the probes run once, on the first open after the upgrade. An index written by a newer knapper is refused on open with `stale_index`, where it was opened and read. ([`7ae1e50`](https://github.com/mightytribble/knapper/commit/7ae1e50))
 
 ### Removed
 
