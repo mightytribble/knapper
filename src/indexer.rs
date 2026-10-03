@@ -663,78 +663,74 @@ pub fn index_file(
 
     let docid = generate_docid(rel_path);
 
-    // 4. Begin transaction (skip if caller already opened one)
-    let owns_transaction = store.conn().is_autocommit();
-    if owns_transaction {
-        store.conn().execute_batch("BEGIN DEFERRED")?;
-    }
-
-    // 5. If file already exists, clean up old entries.
-    //
-    // Deliberately NOT `delete_file`: the row must survive so the file keeps its
-    // id, and the id is what every backlink into this file is keyed on. Dropping
-    // the row cascades those edges away and nothing puts them back, because the
-    // files that own them are not being re-indexed (issue #27). `insert_file`
-    // below upserts on `path` and returns the same id.
-    if let Some(record) = store.get_file(rel_path)? {
-        let vector_ids = store.get_vector_ids_for_file(record.id)?;
-        for &vid in &vector_ids {
-            store.delete_vec(vid)?;
+    // 4. Write the file's rows. Under `run_index` this nests inside the run's
+    //    transaction as a savepoint, so a failure here rolls back this file
+    //    alone and the files before it stay written (#84).
+    let (file_id, total_chunks) = store.transaction(|store| {
+        // 5. If file already exists, clean up old entries.
+        //
+        // Deliberately NOT `delete_file`: the row must survive so the file keeps its
+        // id, and the id is what every backlink into this file is keyed on. Dropping
+        // the row cascades those edges away and nothing puts them back, because the
+        // files that own them are not being re-indexed (issue #27). `insert_file`
+        // below upserts on `path` and returns the same id.
+        if let Some(record) = store.get_file(rel_path)? {
+            let vector_ids = store.get_vector_ids_for_file(record.id)?;
+            for &vid in &vector_ids {
+                store.delete_vec(vid)?;
+            }
+            // The keyword index goes with the chunks: `chunks_fts` is external
+            // content over `chunks`, and its delete trigger fires on every row this
+            // statement removes (issue #37).
+            store.delete_chunks_for_file(record.id)?;
         }
-        // The keyword index goes with the chunks: `chunks_fts` is external
-        // content over `chunks`, and its delete trigger fires on every row this
-        // statement removes (issue #37).
-        store.delete_chunks_for_file(record.id)?;
-    }
 
-    // 6. Insert new file and chunks
-    let file_id = store.insert_file(
-        rel_path,
-        content_hash,
-        mtime,
-        &docid,
-        created_by.as_deref(),
-        note_date,
-    )?;
-
-    let start_vector_id: u64 = store.next_vector_id()?;
-    let total_chunks = chunks.len();
-
-    for (chunk_seq, chunk) in chunks.iter().enumerate() {
-        let heading = chunk.heading.clone().unwrap_or_default();
-        let vector = &all_vectors[chunk_seq];
-        let vector_id = start_vector_id + chunk_seq as u64;
-
-        // The whole chunk goes to storage; the store derives the snippet from
-        // it (issue #14). The keyword index needs no write of its own — the
-        // insert trigger indexes this row from the columns below (issue #37).
-        store.insert_chunk_with_vector(
-            &crate::store::NewChunk {
-                file_id,
-                seq: chunk_seq as i64,
-                heading: &heading,
-                heading_path: &lexical[chunk_seq].heading_path,
-                tags_text: &lexical[chunk_seq].tags_text,
-                text: &chunk.text,
-                vector_id,
-                token_count: token_counts[chunk_seq] as i64,
-            },
-            vector,
+        // 6. Insert new file and chunks
+        let file_id = store.insert_file(
+            rel_path,
+            content_hash,
+            mtime,
+            &docid,
+            created_by.as_deref(),
+            note_date,
         )?;
-        store.insert_vec(vector_id, vector)?;
-    }
 
-    // 7. Reconcile the file's tags (#60)
-    //
-    // The extractor reads the property and the body, and the store owns this
-    // file's rows the way step 5 owns its chunks. The watcher calls this
-    // function, so the warm path needs no second implementation.
-    store.reconcile_file_tags(file_id, &crate::tags::extract(content))?;
+        let start_vector_id: u64 = store.next_vector_id()?;
+        let total_chunks = chunks.len();
 
-    // 8. Commit (only if we own the transaction)
-    if owns_transaction {
-        store.commit()?;
-    }
+        for (chunk_seq, chunk) in chunks.iter().enumerate() {
+            let heading = chunk.heading.clone().unwrap_or_default();
+            let vector = &all_vectors[chunk_seq];
+            let vector_id = start_vector_id + chunk_seq as u64;
+
+            // The whole chunk goes to storage; the store derives the snippet from
+            // it (issue #14). The keyword index needs no write of its own — the
+            // insert trigger indexes this row from the columns below (issue #37).
+            store.insert_chunk_with_vector(
+                &crate::store::NewChunk {
+                    file_id,
+                    seq: chunk_seq as i64,
+                    heading: &heading,
+                    heading_path: &lexical[chunk_seq].heading_path,
+                    tags_text: &lexical[chunk_seq].tags_text,
+                    text: &chunk.text,
+                    vector_id,
+                    token_count: token_counts[chunk_seq] as i64,
+                },
+                vector,
+            )?;
+            store.insert_vec(vector_id, vector)?;
+        }
+
+        // 7. Reconcile the file's tags (#60)
+        //
+        // The extractor reads the property and the body, and the store owns this
+        // file's rows the way step 5 owns its chunks. The watcher calls this
+        // function, so the warm path needs no second implementation.
+        store.reconcile_file_tags(file_id, &crate::tags::extract(content))?;
+
+        Ok((file_id, total_chunks))
+    })?;
 
     Ok(IndexFileResult {
         file_id,
@@ -756,37 +752,30 @@ pub fn remove_file(rel_path: &str, store: &Store, vault_path: &Path) -> Result<(
         .get_file(rel_path)?
         .ok_or_else(|| anyhow!("File not found: '{}'", rel_path))?;
 
-    let owns_transaction = store.conn().is_autocommit();
-    if owns_transaction {
-        store.conn().execute_batch("BEGIN DEFERRED")?;
-    }
+    store.transaction(|store| {
+        // The notes that link to this one, read before the cascade takes their
+        // edges away. Each of them writes a link that names a note the vault is
+        // about to lose, and only a re-derivation of those notes records that —
+        // their own content does not change, so no walk ever lists them (#108).
+        let linking = sources_linking_to(store, file.id)?;
 
-    // The notes that link to this one, read before the cascade takes their
-    // edges away. Each of them writes a link that names a note the vault is
-    // about to lose, and only a re-derivation of those notes records that —
-    // their own content does not change, so no walk ever lists them (#108).
-    let linking = sources_linking_to(store, file.id)?;
-
-    let vector_ids = store.get_vector_ids_for_file(file.id)?;
-    for &vid in &vector_ids {
-        store.delete_vec(vid)?;
-    }
-    // The ids this file is about to release. `file_tags` cascades off the
-    // `files` row below, so steps 1 and 2 of reconciliation need no code here;
-    // step 3 does, and it needs the ids read before the cascade (#60).
-    let released_tags = store.file_tag_ids(file.id)?;
-    // No FTS delete: `chunks` CASCADEs off the `files` row below, and the
-    // keyword index follows the chunks (issue #37). `unresolved_links` rides
-    // the same cascade since #98, so the file's broken links need no call of
-    // their own either.
-    store.delete_file(file.id)?;
-    store.prune_unused_tags(&released_tags)?;
-    rebuild_links_for(store, vault_path, &linking.into_iter().collect())?;
-
-    if owns_transaction {
-        store.commit()?;
-    }
-    Ok(())
+        let vector_ids = store.get_vector_ids_for_file(file.id)?;
+        for &vid in &vector_ids {
+            store.delete_vec(vid)?;
+        }
+        // The ids this file is about to release. `file_tags` cascades off the
+        // `files` row below, so steps 1 and 2 of reconciliation need no code here;
+        // step 3 does, and it needs the ids read before the cascade (#60).
+        let released_tags = store.file_tag_ids(file.id)?;
+        // No FTS delete: `chunks` CASCADEs off the `files` row below, and the
+        // keyword index follows the chunks (issue #37). `unresolved_links` rides
+        // the same cascade since #98, so the file's broken links need no call of
+        // their own either.
+        store.delete_file(file.id)?;
+        store.prune_unused_tags(&released_tags)?;
+        rebuild_links_for(store, vault_path, &linking.into_iter().collect())?;
+        Ok(())
+    })
 }
 
 /// Rename a file in the store, preserving its file_id and all edge integrity.
@@ -1046,41 +1035,33 @@ fn run_index_inner(
 
     // A failing file is skipped rather than propagated: an API embedder can die
     // mid-index, and one bad file must not cost the whole run. `index_file`
-    // embeds before it writes anything (see its step 2 vs. steps 4-8), so an
-    // embed failure leaves the store untouched for this file on its own — but
-    // a failure *after* the embed, inside one of `index_file`'s own store
-    // writes (insert_file / insert_chunk_with_vector / reconcile_file_tags),
-    // would otherwise leave that file's partial rows sitting in the ambient
-    // transaction below, to be persisted by the final `store.commit()` along
-    // with everything that actually succeeded. A per-file SAVEPOINT closes
-    // that gap: on `Err` it rolls back exactly this file's writes (a no-op
-    // for the embed-failure case, since nothing was written) so a skipped
-    // file is left exactly as it was either way. A new file then has no row,
-    // a changed file keeps its prior row, chunks and content hash, and
-    // `diff_vault` re-lists it next run and it is re-attempted (#84).
+    // embeds before it writes anything, so an embed failure leaves the store
+    // untouched for this file on its own. A failure after the embed, inside
+    // one of `index_file`'s own store writes, is rolled back by `index_file`'s
+    // transaction, which nests inside this one as a savepoint: the file's
+    // partial rows go, the files before it stay, and the final commit persists
+    // only what succeeded. A new file then has no row, a changed file keeps
+    // its prior row, chunks and content hash, and `diff_vault` re-lists it
+    // next run and it is re-attempted (#84).
     let mut skipped: Vec<String> = Vec::new();
-    store.conn().execute_batch("BEGIN DEFERRED")?;
-    for (rel_str, content, hash) in &file_contents {
-        pb.set_message(rel_str.clone());
-        store.conn().execute_batch("SAVEPOINT file_sp")?;
-        match index_file(rel_str, content, hash, store, embedder, vault_path, config) {
-            Ok(result) => {
-                store.conn().execute_batch("RELEASE file_sp")?;
-                total_chunks += result.total_chunks;
-                indexed_rel_paths.push(rel_str.clone());
+    store.transaction(|store| {
+        for (rel_str, content, hash) in &file_contents {
+            pb.set_message(rel_str.clone());
+            match index_file(rel_str, content, hash, store, embedder, vault_path, config) {
+                Ok(result) => {
+                    total_chunks += result.total_chunks;
+                    indexed_rel_paths.push(rel_str.clone());
+                }
+                Err(e) => {
+                    tracing::warn!(path = %rel_str, error = %e, "embedding failed, skipping file");
+                    skipped.push(rel_str.clone());
+                }
             }
-            Err(e) => {
-                store
-                    .conn()
-                    .execute_batch("ROLLBACK TO file_sp; RELEASE file_sp")?;
-                tracing::warn!(path = %rel_str, error = %e, "embedding failed, skipping file");
-                skipped.push(rel_str.clone());
-            }
+            pb.inc(1);
         }
-        pb.inc(1);
-    }
+        Ok(())
+    })?;
     pb.finish_with_message("done");
-    store.commit()?;
 
     // Step 9: Build vault graph edges.
     info!("building vault graph edges");

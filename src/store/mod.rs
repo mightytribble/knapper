@@ -180,22 +180,52 @@ impl Store {
         })
     }
 
-    pub fn begin_transaction(&self) -> Result<()> {
-        self.conn.execute_batch("BEGIN IMMEDIATE")?;
-        Ok(())
+    /// Run `f` and keep what it wrote, or roll it back if `f` fails.
+    ///
+    /// The outermost call begins an immediate transaction and commits it. A
+    /// call inside one opens a savepoint and releases it, so a failure inside
+    /// rolls back only what the inner closure wrote and the outer transaction
+    /// goes on. Every savepoint carries one name; SQLite resolves `RELEASE`
+    /// and `ROLLBACK TO` to the innermost savepoint of that name, so nesting
+    /// is a stack with no counter.
+    ///
+    /// The closure's error is the one returned. A rollback that itself fails
+    /// is logged and does not replace it.
+    pub fn transaction<T>(&self, f: impl FnOnce(&Store) -> Result<T>) -> Result<T> {
+        let nested = !self.conn.is_autocommit();
+        let (begin, commit, rollback) = if nested {
+            (
+                "SAVEPOINT knapper",
+                "RELEASE knapper",
+                "ROLLBACK TO knapper; RELEASE knapper",
+            )
+        } else {
+            ("BEGIN IMMEDIATE", "COMMIT", "ROLLBACK")
+        };
+        self.conn
+            .execute_batch(begin)
+            .context("beginning a transaction")?;
+        match f(self) {
+            Ok(value) => match self.conn.execute_batch(commit) {
+                Ok(()) => Ok(value),
+                Err(e) => {
+                    if let Err(r) = self.conn.execute_batch(rollback) {
+                        tracing::warn!(error = %r, "rolling back after a failed commit");
+                    }
+                    Err(e).context("committing a transaction")
+                }
+            },
+            Err(e) => {
+                if let Err(r) = self.conn.execute_batch(rollback) {
+                    tracing::warn!(error = %r, "rolling back a transaction");
+                }
+                Err(e)
+            }
+        }
     }
 
-    pub fn commit(&self) -> Result<()> {
-        self.conn.execute_batch("COMMIT")?;
-        Ok(())
-    }
-
-    pub fn rollback(&self) -> Result<()> {
-        self.conn.execute_batch("ROLLBACK")?;
-        Ok(())
-    }
-
-    /// Borrow the underlying connection (for modules that need direct access).
+    /// The connection, for a test that asserts on rows no method reads.
+    #[cfg(test)]
     pub fn conn(&self) -> &Connection {
         &self.conn
     }
@@ -266,14 +296,62 @@ mod tests {
     }
 
     #[test]
-    fn test_store_transaction() {
+    fn a_transaction_commits_what_its_closure_wrote() {
         let store = Store::open_memory().unwrap();
-        store.begin_transaction().unwrap();
-        store.set_meta("test_key", "test_value").unwrap();
-        store.commit().unwrap();
-        assert_eq!(
-            store.get_meta("test_key").unwrap(),
-            Some("test_value".into())
+        store.transaction(|s| s.set_meta("k", "v")).unwrap();
+        assert_eq!(store.get_meta("k").unwrap(), Some("v".into()));
+        assert!(store.conn.is_autocommit(), "nothing is left open");
+    }
+
+    #[test]
+    fn a_failing_closure_rolls_back_its_writes() {
+        let store = Store::open_memory().unwrap();
+        let err = store
+            .transaction(|s| -> Result<()> {
+                s.set_meta("k", "v")?;
+                anyhow::bail!("no")
+            })
+            .unwrap_err();
+        assert_eq!(err.to_string(), "no");
+        assert_eq!(store.get_meta("k").unwrap(), None);
+        assert!(store.conn.is_autocommit(), "nothing is left open");
+    }
+
+    #[test]
+    fn a_nested_failure_rolls_back_only_the_inner_writes() {
+        let store = Store::open_memory().unwrap();
+        store
+            .transaction(|s| {
+                s.set_meta("outer", "1")?;
+                let inner = s.transaction(|s| -> Result<()> {
+                    s.set_meta("inner", "1")?;
+                    anyhow::bail!("inner failed")
+                });
+                assert!(inner.is_err());
+                assert!(
+                    !s.conn.is_autocommit(),
+                    "the outer transaction is still open after the inner one failed"
+                );
+                s.set_meta("after", "1")
+            })
+            .unwrap();
+        assert_eq!(store.get_meta("outer").unwrap(), Some("1".into()));
+        assert_eq!(store.get_meta("inner").unwrap(), None);
+        assert_eq!(store.get_meta("after").unwrap(), Some("1".into()));
+    }
+
+    #[test]
+    fn the_closures_error_is_the_one_returned() {
+        use crate::fault::Fault;
+        let store = Store::open_memory().unwrap();
+        let err = store
+            .transaction(|_| -> Result<()> {
+                anyhow::bail!(Fault::Conflict("already there".into()))
+            })
+            .unwrap_err();
+        assert!(
+            matches!(Fault::of(&err), Some(Fault::Conflict(_))),
+            "the kind survives the rollback: {err:#}"
         );
     }
 
@@ -348,16 +426,17 @@ mod tests {
             .unwrap();
         assert_eq!(reader.file_count().unwrap(), 1);
 
-        writer.begin_transaction().unwrap();
         writer
-            .insert_file("b.md", "h", 1, "bbb222", None, None)
+            .transaction(|w| {
+                w.insert_file("b.md", "h", 1, "bbb222", None, None)?;
+                assert_eq!(
+                    reader.file_count().unwrap(),
+                    1,
+                    "an uncommitted row is not visible"
+                );
+                Ok(())
+            })
             .unwrap();
-        assert_eq!(
-            reader.file_count().unwrap(),
-            1,
-            "an uncommitted row is not visible"
-        );
-        writer.commit().unwrap();
         assert_eq!(reader.file_count().unwrap(), 2);
 
         assert!(
