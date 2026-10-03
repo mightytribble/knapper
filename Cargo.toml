@@ -21,6 +21,7 @@ toml = "0.8"
 toml_edit = "0.22"
 dirs = "5"
 anyhow = "1"
+thiserror = "2"
 rusqlite = { version = "0.32", features = ["bundled", "array"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
