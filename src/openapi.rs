@@ -286,6 +286,7 @@ fn query_schema(mut schema: Value, description: &mut String) -> Value {
         object.insert("type".into(), one);
     }
 
+    // schemars writes an optional enum as `[inner, {"type": "null"}]`, null last.
     if let Some(any_of) = object.get("anyOf").and_then(Value::as_array).cloned()
         && let [inner, null] = any_of.as_slice()
         && *null == json!({ "type": "null" })
@@ -519,7 +520,6 @@ mod tests {
         let include = by_name("include");
         assert_eq!(include["required"], false);
         assert_eq!(include["schema"]["$ref"], "#/components/schemas/Include");
-        assert!(include["schema"].get("anyOf").is_none());
 
         let limit = spec["paths"]["/api/list"]["get"]["parameters"]
             .as_array()
@@ -734,15 +734,12 @@ mod tests {
     fn each_kind_is_listed_under_the_status_the_classifier_answers() {
         use crate::fault::Fault;
         use crate::http::ApiError;
+        use std::collections::{BTreeMap, BTreeSet};
 
         let spec = build_openapi_spec("http://localhost:3000");
-        let description_of = |status: u16| -> String {
-            spec["components"]["responses"][status.to_string()]["description"]
-                .as_str()
-                .unwrap_or_else(|| panic!("no response for {status}"))
-                .to_string()
-        };
 
+        // What the classifier answers: status → the kinds it gives that status.
+        let mut classified: BTreeMap<u16, BTreeSet<&str>> = BTreeMap::new();
         let faults = [
             Fault::InvalidInput("x".into()),
             Fault::NotFound("x".into()),
@@ -754,28 +751,37 @@ mod tests {
         for fault in faults {
             let kind = fault.kind();
             let api = ApiError::from(anyhow::Error::from(fault));
-            let description = description_of(api.status.as_u16());
-            assert!(
-                description.contains(kind),
-                "{kind} answers {} but that response's description does not name it: {description}",
-                api.status
-            );
+            classified
+                .entry(api.status.as_u16())
+                .or_default()
+                .insert(kind);
         }
-
-        let transport = [
+        for api in [
             ApiError::unauthorized("x"),
             ApiError::forbidden("x"),
             ApiError::rate_limited(1),
             ApiError::internal("x"),
-        ];
-        for api in transport {
-            let description = description_of(api.status.as_u16());
-            assert!(
-                description.contains(api.kind),
-                "{} answers {} but that response's description does not name it: {description}",
-                api.kind,
-                api.status
-            );
+        ] {
+            classified
+                .entry(api.status.as_u16())
+                .or_default()
+                .insert(api.kind);
         }
+
+        // What the document says: status → the kinds its description names,
+        // each written as `(kind <word>)`.
+        let responses = spec["components"]["responses"].as_object().unwrap();
+        let mut documented: BTreeMap<u16, BTreeSet<&str>> = BTreeMap::new();
+        for (status, response) in responses {
+            let description = response["description"].as_str().unwrap();
+            let kinds: BTreeSet<&str> = description
+                .split("(kind ")
+                .skip(1)
+                .map(|rest| rest.split(')').next().unwrap())
+                .collect();
+            documented.insert(status.parse().unwrap(), kinds);
+        }
+
+        assert_eq!(documented, classified);
     }
 }

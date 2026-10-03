@@ -54,14 +54,15 @@ ngrok http 3000
 
 ## Step 3: Update config with tunnel URL
 
-Edit `~/.knapper/config.toml` and set `public_url` to your tunnel URL:
+Edit `~/.knapper/config.toml` and add `public_url` inside the `[http]` table that is already there, above any `[[http.api_keys]]` entry — a second `[http]` header makes the file unreadable, and a key placed below an `[[http.api_keys]]` entry lands in that key and is ignored:
 
 ```toml
 [http]
+# ...the keys already there...
 public_url = "https://abc-xyz.trycloudflare.com"
 ```
 
-Then restart knapper (`Ctrl+C` and re-run `knapper serve --http`). This ensures the OpenAPI spec points to the correct public URL.
+Then restart knapper (`Ctrl+C` and re-run `knapper serve --http`). The OpenAPI document names this URL as its server.
 
 ## Step 4: Verify endpoints
 

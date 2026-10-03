@@ -25,7 +25,7 @@ through a tunnel; the document names it as its server.
 
 | Method | Endpoint | Permission | Description |
 |--------|----------|------------|-------------|
-| GET | `/api/health-check` | read | Server health check |
+| GET | `/api/health-check` | none | Server health check |
 | POST | `/api/search` | read | Hybrid search (semantic + FTS5 + graph + reranker + temporal), scoped by tag or directory terms — a leading `/` reads a term as a directory path (`scope`/`all`, `any`, `none`), and `property`, `links_to`, `linked_from` (one value each) |
 | POST | `/api/match` | read | Find every note whose text holds a literal string, and count them — scoped the same way. For verification, not discovery: `notes: 0` means nothing in scope says it |
 | GET | `/api/read` | read | Read a note (`file`), or one of its sections (`section`) |

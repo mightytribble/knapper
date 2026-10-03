@@ -849,7 +849,7 @@ async fn main() -> Result<()> {
                     cfg.http.port
                 );
                 println!(
-                    "3. Set public_url = \"<your-tunnel-url>\" under [http] in config.toml and restart serve"
+                    "3. Add public_url = \"<your-tunnel-url>\" inside the existing [http] table of config.toml, above any [[http.api_keys]], and restart serve"
                 );
                 println!(
                     "4. ChatGPT \u{2192} Create GPT \u{2192} Add Action \u{2192} Import from: <your-tunnel-url>/openapi.json"

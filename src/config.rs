@@ -2097,8 +2097,8 @@ public_url = "https://vault.example.com"
         assert!(Config::default().http.public_url.is_none());
     }
 
-    /// The manifest's section is gone. A file that still carries it loads,
-    /// and the key that moved has no effect from its old place.
+    /// A file that carries an `[http.plugin]` table loads, and a `public_url`
+    /// under it has no effect: the key is read from `[http]` alone.
     #[test]
     fn an_old_plugin_table_is_ignored() {
         let toml = r#"

@@ -135,6 +135,19 @@ mod tests {
         for (i, fault) in variants.iter().enumerate() {
             assert_eq!(Fault::KINDS[i], fault.kind(), "{fault:?}");
         }
+
+        // A new variant must be added to `variants` above and to `KINDS`.
+        // This match has no wildcard, so adding one is a compile error here.
+        for fault in &variants {
+            match fault {
+                Fault::InvalidInput(_)
+                | Fault::NotFound(_)
+                | Fault::Ambiguous(_)
+                | Fault::Conflict(_)
+                | Fault::StaleIndex(_)
+                | Fault::ReadOnly => {}
+            }
+        }
     }
 
     #[test]
