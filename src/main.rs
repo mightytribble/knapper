@@ -832,22 +832,13 @@ async fn main() -> Result<()> {
                     println!("\u{2713} API key already configured");
                 }
 
-                let chatgpt_origin = "https://chat.openai.com".to_string();
-                if !cfg.http.cors_origins.contains(&chatgpt_origin) {
-                    cfg.http.cors_origins.push(chatgpt_origin);
-                    println!("\u{2713} CORS origin added: https://chat.openai.com");
-                } else {
-                    println!("\u{2713} CORS already configured for ChatGPT");
-                }
-
-                eprint!("\nPublic URL (leave empty to skip): ");
-                io::stderr().flush().ok();
-                let mut url = String::new();
-                io::stdin().lock().read_line(&mut url).ok();
-                let url = url.trim();
-                if !url.is_empty() {
-                    cfg.http.plugin.public_url = Some(url.to_string());
-                    println!("\u{2713} Public URL: {url}");
+                for origin in ["https://chat.openai.com", "https://chatgpt.com"] {
+                    if cfg.http.cors_origins.iter().any(|o| o == origin) {
+                        println!("\u{2713} CORS origin already configured: {origin}");
+                    } else {
+                        cfg.http.cors_origins.push(origin.to_string());
+                        println!("\u{2713} CORS origin added: {origin}");
+                    }
                 }
 
                 cfg.save()?;
@@ -857,16 +848,13 @@ async fn main() -> Result<()> {
                     "2. Expose via tunnel: cloudflared tunnel --url http://localhost:{}",
                     cfg.http.port
                 );
-                if !url.is_empty() {
-                    println!(
-                        "3. ChatGPT \u{2192} Create GPT \u{2192} Add Action \u{2192} Import from: {url}/openapi.json"
-                    );
-                } else {
-                    println!(
-                        "3. ChatGPT \u{2192} Create GPT \u{2192} Add Action \u{2192} Import from: <your-tunnel-url>/openapi.json"
-                    );
-                }
-                println!("4. Auth: API Key, Bearer, paste your key");
+                println!(
+                    "3. Set public_url = \"<your-tunnel-url>\" under [http] in config.toml and restart serve"
+                );
+                println!(
+                    "4. ChatGPT \u{2192} Create GPT \u{2192} Add Action \u{2192} Import from: <your-tunnel-url>/openapi.json"
+                );
+                println!("5. Auth: API Key, Bearer, paste your key");
             }
 
             cfg.save()?;

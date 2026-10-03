@@ -64,15 +64,6 @@ impl Default for EmbedApiConfig {
     }
 }
 
-/// ChatGPT Actions plugin metadata.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct PluginConfig {
-    pub name: Option<String>,
-    pub description: Option<String>,
-    pub contact_email: Option<String>,
-    pub public_url: Option<String>,
-}
-
 /// User identity for AI agent context.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -147,8 +138,9 @@ pub struct HttpConfig {
     pub rate_limit: u32, // requests per minute per key, 0 = unlimited
     pub cors_origins: Vec<String>,
     pub api_keys: Vec<ApiKeyConfig>,
-    #[serde(default)]
-    pub plugin: PluginConfig,
+    /// The address a caller reaches this server at, when it is not the
+    /// bound one: a tunnel's URL. `/openapi.json` names it as the server.
+    pub public_url: Option<String>,
 }
 
 impl Default for HttpConfig {
@@ -160,7 +152,7 @@ impl Default for HttpConfig {
             rate_limit: 60,
             cors_origins: vec![],
             api_keys: vec![],
-            plugin: PluginConfig::default(),
+            public_url: None,
         }
     }
 }
@@ -2092,14 +2084,49 @@ permissions = "read"
     }
 
     #[test]
-    fn test_config_with_plugin() {
+    fn public_url_is_read_from_the_http_table() {
+        let toml = r#"
+[http]
+public_url = "https://vault.example.com"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            config.http.public_url.as_deref(),
+            Some("https://vault.example.com")
+        );
+        assert!(Config::default().http.public_url.is_none());
+    }
+
+    /// The manifest's section is gone. A file that still carries it loads,
+    /// and the key that moved has no effect from its old place.
+    #[test]
+    fn an_old_plugin_table_is_ignored() {
         let toml = r#"
 [http.plugin]
 name = "my-vault"
 public_url = "https://vault.example.com"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
-        assert_eq!(config.http.plugin.name.as_deref(), Some("my-vault"));
+        assert!(config.http.public_url.is_none());
+    }
+
+    #[test]
+    fn public_url_survives_a_save_and_a_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = Config::default();
+        cfg.http.public_url = Some("https://abc.trycloudflare.com".into());
+        cfg.save_to(&path).unwrap();
+        let back = Config::load_from(&path).unwrap();
+        assert_eq!(
+            back.http.public_url.as_deref(),
+            Some("https://abc.trycloudflare.com")
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("public_url = \"https://abc.trycloudflare.com\""),
+            "{text}"
+        );
     }
 
     #[test]

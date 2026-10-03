@@ -483,10 +483,6 @@ pub const ORIENTATION_OMITTED: &[(&str, &str)] = &[];
 pub const HTTP_TRANSPORT_ROUTES: &[(&str, &str)] = &[
     ("/api/health-check", "a liveness probe for the transport"),
     ("/openapi.json", "the transport describing itself"),
-    (
-        "/.well-known/ai-plugin.json",
-        "the transport describing itself",
-    ),
 ];
 
 /// The set a surface should register: every capability the table puts on it,

@@ -13,7 +13,6 @@ use rmcp::schemars::JsonSchema;
 use rmcp::schemars::generate::{SchemaGenerator, SchemaSettings};
 use serde_json::{Value, json};
 
-use crate::config::HttpConfig;
 use crate::surface::{CAPABILITIES, Http, OPERATIONS};
 
 /// Build the OpenAPI 3.1 document for every route under `/api/`.
@@ -68,8 +67,7 @@ pub fn build_openapi_spec(server_url: &str) -> Value {
         paths.insert(capability.http_path(), Value::Object(item));
     }
 
-    let schemas = generator.take_definitions(true);
-    let mut schemas = schemas;
+    let mut schemas = generator.take_definitions(true);
     let (error, responses) = error_components();
     schemas.insert("Error".into(), error);
 
@@ -313,30 +311,6 @@ fn query_schema(mut schema: Value, description: &mut String) -> Value {
     }
 
     schema
-}
-
-/// Build the ChatGPT plugin manifest (ai-plugin.json).
-pub fn build_plugin_manifest(config: &HttpConfig, server_url: &str) -> Value {
-    json!({
-        "schema_version": "v1",
-        "name_for_human": config.plugin.name.as_deref().unwrap_or("knapper"),
-        "name_for_model": "knapper",
-        "description_for_human": config.plugin.description.as_deref()
-            .unwrap_or("Search and manage your Obsidian vault with AI-powered hybrid search."),
-        "description_for_model": "Access an Obsidian knowledge vault. Use search to find notes by content or time, match to find a literal string or learn that no note holds one, read for a note's content or one of its sections, and list to filter notes by tag or folder. Write tools create, update, and organize notes.",
-        "auth": {
-            "type": "service_http",
-            "authorization_type": "bearer",
-            "verification_tokens": {}
-        },
-        "api": {
-            "type": "openapi",
-            "url": format!("{}/openapi.json", server_url)
-        },
-        "logo_url": "",
-        "contact_email": config.plugin.contact_email.as_deref().unwrap_or(""),
-        "legal_info_url": ""
-    })
 }
 
 #[cfg(test)]
@@ -803,29 +777,5 @@ mod tests {
                 api.status
             );
         }
-    }
-
-    #[test]
-    fn test_plugin_manifest() {
-        let config = crate::config::HttpConfig::default();
-        let manifest = build_plugin_manifest(&config, "https://vault.example.com");
-        assert_eq!(manifest["schema_version"], "v1");
-        assert_eq!(manifest["name_for_model"], "knapper");
-        assert!(
-            manifest["api"]["url"]
-                .as_str()
-                .unwrap()
-                .contains("openapi.json")
-        );
-    }
-
-    #[test]
-    fn test_plugin_manifest_custom_config() {
-        let mut config = crate::config::HttpConfig::default();
-        config.plugin.name = Some("my-vault".into());
-        config.plugin.contact_email = Some("test@example.com".into());
-        let manifest = build_plugin_manifest(&config, "https://example.com");
-        assert_eq!(manifest["name_for_human"], "my-vault");
-        assert_eq!(manifest["contact_email"], "test@example.com");
     }
 }

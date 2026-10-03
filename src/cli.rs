@@ -236,7 +236,8 @@ pub enum Command {
         #[arg(long)]
         revoke_api_key: Option<String>,
 
-        /// Interactive setup for ChatGPT Actions integration.
+        /// Set up the HTTP server for a ChatGPT Action: enable it, mint a
+        /// read key if there is none, and allow the ChatGPT origins.
         #[arg(long)]
         setup_chatgpt: bool,
     },
