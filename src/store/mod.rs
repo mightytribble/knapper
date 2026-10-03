@@ -2,8 +2,10 @@
 //!
 //! Each file under this module is one table family: the types that describe
 //! its rows and the `impl Store` block that reads and writes them. `schema.rs`
-//! holds every `CREATE TABLE` and the version ladder; a domain file holds no
-//! DDL. Everything a caller names is re-exported here, so `crate::store::X`
+//! holds the versioned schema and the ladder that brings a store up to it.
+//! Two declarations live outside it: `fts.rs` builds the keyword index from
+//! `[fts]` and `vectors.rs` sizes the vector table to the model, and both are
+//! reconciled on every open rather than by a step. Everything a caller names is re-exported here, so `crate::store::X`
 //! is the path to every public item whichever file holds it.
 
 mod aliases;
@@ -190,7 +192,13 @@ impl Store {
     /// is a stack with no counter.
     ///
     /// The closure's error is the one returned. A rollback that itself fails
-    /// is logged and does not replace it.
+    /// is logged and does not replace it. A panic inside the closure rolls
+    /// back on the way out, so the connection is never left inside a
+    /// transaction nothing will commit.
+    ///
+    /// A caller that changes the disk after the call returns must not itself
+    /// be inside a transaction: an inner release is final only when the
+    /// outermost commit is, and no rollback can undo a rename.
     pub fn transaction<T>(&self, f: impl FnOnce(&Store) -> Result<T>) -> Result<T> {
         let nested = !self.conn.is_autocommit();
         let (begin, commit, rollback) = if nested {
@@ -202,23 +210,25 @@ impl Store {
         } else {
             ("BEGIN IMMEDIATE", "COMMIT", "ROLLBACK")
         };
-        self.conn
-            .execute_batch(begin)
-            .context("beginning a transaction")?;
+        self.conn.execute_batch(begin)?;
+        let mut open = OpenTransaction {
+            conn: &self.conn,
+            rollback,
+            done: false,
+        };
         match f(self) {
             Ok(value) => match self.conn.execute_batch(commit) {
-                Ok(()) => Ok(value),
+                Ok(()) => {
+                    open.done = true;
+                    Ok(value)
+                }
                 Err(e) => {
-                    if let Err(r) = self.conn.execute_batch(rollback) {
-                        tracing::warn!(error = %r, "rolling back after a failed commit");
-                    }
-                    Err(e).context("committing a transaction")
+                    open.finish();
+                    Err(e.into())
                 }
             },
             Err(e) => {
-                if let Err(r) = self.conn.execute_batch(rollback) {
-                    tracing::warn!(error = %r, "rolling back a transaction");
-                }
+                open.finish();
                 Err(e)
             }
         }
@@ -267,6 +277,35 @@ fn chrono_now() -> String {
     format!("{}", duration.as_secs())
 }
 
+/// A transaction or savepoint `Store::transaction` has begun and not yet
+/// ended. Dropped before `done` is set, it rolls back: that is the path a
+/// panic inside the closure takes.
+struct OpenTransaction<'a> {
+    conn: &'a Connection,
+    rollback: &'static str,
+    done: bool,
+}
+
+impl OpenTransaction<'_> {
+    /// Roll back, unless SQLite already ended the transaction on its own.
+    fn finish(&mut self) {
+        if !self.conn.is_autocommit()
+            && let Err(e) = self.conn.execute_batch(self.rollback)
+        {
+            tracing::warn!(error = %e, "rolling back a transaction");
+        }
+        self.done = true;
+    }
+}
+
+impl Drop for OpenTransaction<'_> {
+    fn drop(&mut self) {
+        if !self.done {
+            self.finish();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,6 +332,23 @@ mod tests {
         // Verify stats reflects it.
         let st = store.stats().unwrap();
         assert_eq!(st.vault_path.unwrap(), "/other/vault");
+    }
+
+    #[test]
+    fn a_panic_inside_the_closure_leaves_no_transaction_open() {
+        let store = Store::open_memory().unwrap();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            store.transaction(|s| -> Result<()> {
+                s.set_meta("k", "v")?;
+                panic!("the closure panicked")
+            })
+        }));
+        assert!(outcome.is_err());
+        assert!(
+            store.conn.is_autocommit(),
+            "the guard rolled back on the way out"
+        );
+        assert_eq!(store.get_meta("k").unwrap(), None);
     }
 
     #[test]

@@ -11,6 +11,7 @@ use anyhow::{Context, Result, bail};
 /// (source passage, target passage, kind). A document's link set is exactly the
 /// union of its chunks', so only the fine grain is stored and the coarse view is
 /// derived — a stored copy of a derivable fact is a copy that can drift.
+/// Frozen with `migrate_to_1`: a change to this table is a later step.
 const EDGES_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS edges (
     id             INTEGER PRIMARY KEY,
     from_file      INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
@@ -30,6 +31,7 @@ CREATE INDEX IF NOT EXISTS idx_edges_type ON edges(edge_type);";
 /// No `parent_id` and no `depth`: the path text holds the ancestors, a leaf row
 /// has no parent to orphan, and a materialised ancestor would need a recursive
 /// delete that leaves rows behind when it stops early.
+/// Frozen with `migrate_to_1`: a change to this table is a later step.
 const TAGS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS tags (
     id      INTEGER PRIMARY KEY,
     path    TEXT NOT NULL UNIQUE,
@@ -50,6 +52,7 @@ CREATE INDEX IF NOT EXISTS file_tags_tag ON file_tags(tag_id);";
 /// owing a manual cleanup — one of six paid it, so a deleted note went on
 /// reporting broken links from a file that was no longer there, and nothing
 /// short of deleting the store could clear the row.
+/// Frozen with `migrate_to_1`: a change to this table is a later step.
 const UNRESOLVED_LINKS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS unresolved_links (
     id         INTEGER PRIMARY KEY,
     file_id    INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
@@ -67,6 +70,7 @@ CREATE INDEX IF NOT EXISTS idx_unresolved_file ON unresolved_links(file_id);";
 /// outlives the note it named. The source's own rows cascade off `files(id)`
 /// the way `chunks`, `edges` and `file_tags` do, so no removal path owes
 /// this table a cleanup.
+/// Frozen with `migrate_to_1`: a change to this table is a later step.
 const PROPERTIES_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS properties (
     id          INTEGER PRIMARY KEY,
     file_id     INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
@@ -88,6 +92,7 @@ CREATE INDEX IF NOT EXISTS idx_properties_target ON properties(target_file);";
 /// notes carry is the case a lookup refuses. `folded` is the identity and
 /// `display` is what the note wrote. `id` keeps the note's own order, because
 /// the edge pass inserts a note's rows in the order the note lists them.
+/// Frozen with `migrate_to_1`: a change to this table is a later step.
 const ALIASES_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS aliases (
     id      INTEGER PRIMARY KEY,
     file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
@@ -167,7 +172,7 @@ const STEPS: [fn(&Store) -> Result<()>; SCHEMA_VERSION as usize] = [Store::migra
 impl Store {
     /// The schema version the store records. 0 for a store that records none,
     /// which is every store written before versions and every fresh file.
-    pub(super) fn user_version(&self) -> Result<i64> {
+    fn user_version(&self) -> Result<i64> {
         Ok(self
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))?)
@@ -184,11 +189,18 @@ impl Store {
     /// Each step runs in its own transaction and stamps the version inside
     /// it. SQLite rolls `user_version` back with the transaction, so a step
     /// that fails leaves the store at the version before it, and the next
-    /// open runs it again.
-    pub(super) fn upgrade(&self, from: i64, steps: &[fn(&Store) -> Result<()>]) -> Result<()> {
+    /// open runs it again. The version is read again inside each step's
+    /// transaction, so a second process opening the same store runs no step
+    /// the first already ran.
+    fn upgrade(&self, from: i64, steps: &[fn(&Store) -> Result<()>]) -> Result<()> {
         for (i, step) in steps.iter().enumerate().skip(from.max(0) as usize) {
             let to = i as i64 + 1;
             self.transaction(|store| {
+                // Another process may have run this step while this one
+                // waited for the write lock.
+                if store.user_version()? >= to {
+                    return Ok(());
+                }
                 step(store)
                     .with_context(|| format!("upgrading the index schema to version {to}"))?;
                 store.set_user_version(to)
@@ -857,6 +869,21 @@ mod tests {
             text.contains(&format!("version {}", SCHEMA_VERSION + 1)),
             "{text}"
         );
+    }
+
+    #[test]
+    fn a_step_another_writer_already_applied_is_not_run_again() {
+        fn must_not_run(store: &Store) -> Result<()> {
+            store.set_meta("ran", "1")?;
+            anyhow::bail!("the step ran")
+        }
+        // A fresh store is already at version 1, which is what a second
+        // process sees once the first has stamped it.
+        let store = Store::open_memory().unwrap();
+        let steps: [fn(&Store) -> Result<()>; 1] = [must_not_run];
+        store.upgrade(0, &steps).unwrap();
+        assert_eq!(store.get_meta("ran").unwrap(), None);
+        assert_eq!(store.user_version().unwrap(), SCHEMA_VERSION);
     }
 
     #[test]

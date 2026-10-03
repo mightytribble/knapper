@@ -2736,8 +2736,8 @@ mod tests {
         assert!(
             store.get_file("poison.md").unwrap().is_none(),
             "poison.md's files row must be rolled back with its failed chunk write, \
-             not committed as a partial (chunk-less) file — the exact leak the \
-             per-file SAVEPOINT closes"
+             not committed as a partial (chunk-less) file — the exact leak \
+             index_file's own transaction closes"
         );
         assert!(
             store.get_meta("embedding_fingerprint").unwrap().is_none(),
