@@ -1,5 +1,4 @@
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -7,14 +6,11 @@ use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo};
 use rmcp::{ErrorData as McpError, ServiceExt, tool, tool_handler, tool_router};
-use tokio::sync::Mutex;
 
-use crate::config::{Config, db_path};
+use crate::config::Config;
 use crate::context::{self, ContextParams};
-use crate::llm::{EmbedModel, RerankModel};
-use crate::profile::VaultProfile;
+use crate::core::Core;
 use crate::search;
-use crate::store::Store;
 
 // ---------------------------------------------------------------------------
 // Server
@@ -24,47 +20,19 @@ pub use crate::core::RecentWrites;
 
 #[derive(Clone)]
 pub struct KnapperServer {
-    store: Arc<Mutex<Store>>,
-    embedder: Arc<Mutex<Box<dyn EmbedModel + Send>>>,
-    vault_path: Arc<PathBuf>,
-    profile: Arc<Option<VaultProfile>>,
+    /// What this server shares with the HTTP server and the watcher.
+    pub(crate) core: Core,
     #[allow(dead_code)] // Required by rmcp #[tool_router] macro infrastructure
     tool_router: ToolRouter<Self>,
-    /// Result reranker (None when intelligence is disabled or failed to load).
-    reranker: Option<Arc<Mutex<Box<dyn RerankModel + Send>>>>,
-    /// Tracks files recently written by MCP tools so the watcher can skip re-indexing them.
-    recent_writes: RecentWrites,
-    /// When true, write/edit/delete MCP tools return an error instead of executing.
-    read_only: bool,
-    /// Retrieval granularity settings from `config.toml`, so MCP callers get the
-    /// same result shape the CLI does.
-    max_chunks_per_file: usize,
-    group_by: crate::config::GroupBy,
-    /// How many results a call that names no `top_n` gets. It comes from
-    /// `config.toml`, the way the CLI's does: a default that differs per
-    /// surface is the last place one query answers two ways (#62).
-    top_n: usize,
-    /// Rerank-lane settings from `config.toml`.
-    rerank: crate::config::RerankConfig,
-    /// Ranking-stage settings from `config.toml`.
-    ranking: crate::config::RankingConfig,
-    lane_weights: crate::config::LaneWeights,
-    /// Keyword-lane settings from `config.toml`. The BM25 weights are
-    /// positional over the columns the store's index is declared with, so this
-    /// has to be the config the store was built from (issue #37).
-    fts: crate::config::FtsConfig,
-    /// Calibrated score fusion for the model-free sorted stage, from
-    /// `config.toml` (docs/specs/2026-08-30-calibrated-fusion-design.md).
-    calibrated: crate::config::CalibratedConfig,
-    /// The index-time settings — how a note written by an MCP tool is chunked,
-    /// and the vector it is embedded as — captured once at startup so every
-    /// write tool and every full index this server runs shares one chunking and
-    /// one vector space with the indexed vault (issues #43, #44, #72).
-    index_settings: crate::indexer::IndexSettings,
-    /// Output-packaging settings from `config.toml` (#35): the default token
-    /// budget and whether the text rendering rides beside the structured
-    /// content.
-    output: crate::config::OutputConfig,
+}
+
+impl KnapperServer {
+    pub fn new(core: Core) -> Self {
+        Self {
+            core,
+            tool_router: Self::tool_router(),
+        }
+    }
 }
 
 fn read_only_err() -> McpError {
@@ -98,15 +66,6 @@ fn to_json_result<T: serde::Serialize>(value: &T) -> Result<CallToolResult, McpE
     Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
 }
 
-/// Record a recently-written file path + mtime so the watcher can skip re-indexing it.
-async fn record_write(recent_writes: &RecentWrites, path: &Path) {
-    if let Ok(meta) = std::fs::metadata(path)
-        && let Ok(mtime) = meta.modified()
-    {
-        recent_writes.lock().await.insert(path.to_path_buf(), mtime);
-    }
-}
-
 #[tool_router(vis = "pub(crate)")]
 impl KnapperServer {
     #[tool(
@@ -117,106 +76,33 @@ impl KnapperServer {
         &self,
         params: Parameters<crate::params::Search>,
     ) -> Result<CallToolResult, McpError> {
-        // `full` and `summaries` both name the whole result set and disagree on
-        // its shape, so asking for both is a usage error rather than one flag
-        // silently winning. Checked before the pipeline runs, so a caller's
-        // typo fails fast instead of paying for embed+retrieve+rerank first
-        // (#35).
-        if params.0.full && params.0.summaries {
+        let req = params.0;
+        // Checked before the pipeline runs, so a typo fails fast (#35).
+        if req.full && req.summaries {
             return Err(mcp_err(&anyhow::anyhow!(
                 "--full and --summaries are mutually exclusive"
             )));
         }
-
-        // Per call, with the configured default behind it (#62).
-        let top_n = params.0.top_n.unwrap_or(self.top_n);
-        let all_terms = crate::tags::merge_scope_alias(params.0.scope, params.0.all);
-        let scope = crate::tags::Scope::parse(&all_terms, &params.0.any, &params.0.none)
-            .and_then(|s| {
-                s.with_filters(
-                    params.0.property.as_deref(),
-                    params.0.links_to.as_deref(),
-                    params.0.linked_from.as_deref(),
-                )
+        let scope = search::parse_scope(&req).map_err(|e| mcp_err(&e))?;
+        let scores = req.scores;
+        let config = self.core.config.clone();
+        let env = self
+            .core
+            .with_core(move |g| {
+                search::run_query(req, scope, &config, g.store, g.embedder, g.reranker)
             })
+            .await
             .map_err(|e| mcp_err(&e))?;
-        let store = self.store.lock().await;
-        let mut embedder = self.embedder.lock().await;
-
-        // Lock the cross-encoder if it is available.
-        let mut rerank_guard = match &self.reranker {
-            Some(r) => Some(r.lock().await),
-            None => None,
-        };
-
-        let mut config = search::SearchConfig {
-            reranker: rerank_guard
-                .as_mut()
-                .map(|g| g.as_mut() as &mut dyn RerankModel),
-            store: &store,
-            rerank_candidates: 30,
-            rerank: self.rerank,
-            max_chunks_per_file: self.max_chunks_per_file,
-            // Per call, with the process setting as the default: one query
-            // answers the same way whoever asks it, and the granularity is
-            // part of the question rather than of how the server was started
-            // (#62).
-            group_by: params.0.group_by.unwrap_or(self.group_by),
-            ranking: self.ranking,
-            lane_weights: self.lane_weights,
-            fts: self.fts,
-            scope,
-            calibrated: self.calibrated.clone(),
-            show_less_relevant: self.output.show_less_relevant,
-        };
-
-        let output =
-            search::search_with_intelligence(&params.0.query, top_n, &mut *embedder, &mut config)
-                .map_err(|e| mcp_err(&e))?;
-
-        // `top_n` follows the same pattern: the call's value, or the
-        // configured default (#35, #62).
-        let budget = params.0.budget_tokens.unwrap_or(self.output.budget_tokens);
-        let mut env = crate::packaging::assemble(
-            &output.results,
-            crate::packaging::AssembleParams {
-                budget_tokens: budget,
-                full: params.0.full,
-                summaries: params.0.summaries,
-                degraded: output.degraded,
-                per_note_cap: self.ranking.per_note_cap,
-                top_n,
-                less_relevant: &output.less_relevant,
-                answer_floor: output.answer_floor,
-            },
-        );
-        // A number invites a caller to trust it as ground truth rather than as
-        // a reranker's opinion, so it ships only when asked (#35).
-        if params.0.scores {
-            crate::packaging::apply_scores(&mut env, &output.results);
-        }
-        // The per-lane detail rides in the envelope, the way the HTTP body
-        // carries it and the CLI prints it after the results. A client that
-        // reads `structuredContent` discards the text content blocks beside
-        // it, so a second block reaches nothing (#62, #126). It is absent
-        // unless the caller asked, because an agent that did not ask must not
-        // have to read past it.
-        if params.0.explain {
-            crate::packaging::apply_explain(&mut env, search::explain_report(&output, top_n));
-        }
         let value = serde_json::to_value(&env).map_err(|e| mcp_err(&anyhow::anyhow!(e)))?;
 
         // The text rendering is a convenience for a client that reads content
-        // blocks and not `structuredContent`; HTTP returns JSON alone, so this
-        // stays a server setting rather than a per-call flag (#35).
+        // blocks and not `structuredContent` (#35).
         let mut content = Vec::new();
-        if self.output.emit_text_rendering {
+        if self.core.config.output.emit_text_rendering {
             content.push(ContentBlock::text(crate::packaging::render_text(
-                &env,
-                params.0.scores,
+                &env, scores,
             )));
         }
-
         let mut result = CallToolResult::success(content);
         result.structured_content = Some(value);
         Ok(result)
@@ -230,19 +116,21 @@ impl KnapperServer {
         &self,
         params: Parameters<crate::params::Read>,
     ) -> Result<CallToolResult, McpError> {
-        let store = self.store.lock().await;
-        let ctx = ContextParams {
-            store: &store,
-            vault_path: &self.vault_path,
-            profile: self.profile.as_ref().as_ref(),
-        };
-        let result = context::context_read(
-            &ctx,
-            &params.0.file,
-            params.0.section.as_deref(),
-            params.0.include,
-        )
-        .map_err(|e| mcp_err(&e))?;
+        let p = params.0;
+        let vault = self.core.vault_path.clone();
+        let profile = self.core.profile.clone();
+        let result = self
+            .core
+            .with_reader(move |store| {
+                let ctx = ContextParams {
+                    store,
+                    vault_path: &vault,
+                    profile: profile.as_ref().as_ref(),
+                };
+                context::context_read(&ctx, &p.file, p.section.as_deref(), p.include)
+            })
+            .await
+            .map_err(|e| mcp_err(&e))?;
         to_json_result(&result)
     }
 
@@ -254,32 +142,39 @@ impl KnapperServer {
         &self,
         params: Parameters<crate::params::List>,
     ) -> Result<CallToolResult, McpError> {
-        let store = self.store.lock().await;
-        let ctx = ContextParams {
-            store: &store,
-            vault_path: &self.vault_path,
-            profile: self.profile.as_ref().as_ref(),
-        };
-        let all_terms = crate::tags::merge_scope_alias(params.0.scope, params.0.all);
-        let tags = crate::tags::Scope::parse(&all_terms, &params.0.any, &params.0.none)
+        let p = params.0;
+        let all_terms = crate::tags::merge_scope_alias(p.scope, p.all);
+        let tags = crate::tags::Scope::parse(&all_terms, &p.any, &p.none)
             .and_then(|s| {
                 s.with_filters(
-                    params.0.property.as_deref(),
-                    params.0.links_to.as_deref(),
-                    params.0.linked_from.as_deref(),
+                    p.property.as_deref(),
+                    p.links_to.as_deref(),
+                    p.linked_from.as_deref(),
                 )
             })
             .map_err(|e| mcp_err(&e))?;
-        let items = context::context_list(
-            &ctx,
-            &tags,
-            params.0.created_by.as_deref(),
-            params.0.limit,
-            params.0.after.as_deref(),
-            params.0.sort.into(),
-            params.0.detailed,
-        )
-        .map_err(|e| mcp_err(&e))?;
+        let vault = self.core.vault_path.clone();
+        let profile = self.core.profile.clone();
+        let items = self
+            .core
+            .with_reader(move |store| {
+                let ctx = ContextParams {
+                    store,
+                    vault_path: &vault,
+                    profile: profile.as_ref().as_ref(),
+                };
+                context::context_list(
+                    &ctx,
+                    &tags,
+                    p.created_by.as_deref(),
+                    p.limit,
+                    p.after.as_deref(),
+                    p.sort.into(),
+                    p.detailed,
+                )
+            })
+            .await
+            .map_err(|e| mcp_err(&e))?;
         to_json_result(&items)
     }
 
@@ -291,8 +186,12 @@ impl KnapperServer {
         &self,
         params: Parameters<crate::params::Match>,
     ) -> Result<CallToolResult, McpError> {
-        let store = self.store.lock().await;
-        let report = crate::matching::run(&store, &params.0).map_err(|e| mcp_err(&e))?;
+        let p = params.0;
+        let report = self
+            .core
+            .with_reader(move |store| crate::matching::run(store, &p))
+            .await
+            .map_err(|e| mcp_err(&e))?;
         to_json_result(&report)
     }
 
@@ -304,9 +203,12 @@ impl KnapperServer {
         &self,
         params: Parameters<crate::params::Tags>,
     ) -> Result<CallToolResult, McpError> {
-        let store = self.store.lock().await;
         let prefix = params.0.under.as_deref().and_then(crate::tags::parse_term);
-        let rows = store.tags_under(prefix.as_ref()).map_err(|e| mcp_err(&e))?;
+        let rows = self
+            .core
+            .with_reader(move |store| store.tags_under(prefix.as_ref()))
+            .await
+            .map_err(|e| mcp_err(&e))?;
         to_json_result(&rows)
     }
 
@@ -318,9 +220,13 @@ impl KnapperServer {
         &self,
         params: Parameters<crate::params::Properties>,
     ) -> Result<CallToolResult, McpError> {
-        let store = self.store.lock().await;
-        let report =
-            crate::properties::run(&store, &self.vault_path, &params.0).map_err(|e| mcp_err(&e))?;
+        let p = params.0;
+        let vault = self.core.vault_path.clone();
+        let report = self
+            .core
+            .with_reader(move |store| crate::properties::run(store, &vault, &p))
+            .await
+            .map_err(|e| mcp_err(&e))?;
         to_json_result(&report)
     }
 
@@ -329,13 +235,20 @@ impl KnapperServer {
         description = "Vault structure overview: folders, file counts, the tag vocabulary with the share of notes it covers, the most-linked notes, and recently changed files. The first call on a vault you do not know: top_notes names what the vault points at most, which is where to start reading."
     )]
     async fn vault_map(&self) -> Result<CallToolResult, McpError> {
-        let store = self.store.lock().await;
-        let ctx = ContextParams {
-            store: &store,
-            vault_path: &self.vault_path,
-            profile: self.profile.as_ref().as_ref(),
-        };
-        let map = context::vault_map(&ctx).map_err(|e| mcp_err(&e))?;
+        let vault = self.core.vault_path.clone();
+        let profile = self.core.profile.clone();
+        let map = self
+            .core
+            .with_reader(move |store| {
+                let ctx = ContextParams {
+                    store,
+                    vault_path: &vault,
+                    profile: profile.as_ref().as_ref(),
+                };
+                context::vault_map(&ctx)
+            })
+            .await
+            .map_err(|e| mcp_err(&e))?;
         to_json_result(&map)
     }
 
@@ -347,7 +260,7 @@ impl KnapperServer {
         &self,
         params: Parameters<crate::params::Create>,
     ) -> Result<CallToolResult, McpError> {
-        if self.read_only {
+        if self.core.read_only {
             return Err(read_only_err());
         }
         // No stdin exists on this surface, so an omitted content is an
@@ -359,8 +272,6 @@ impl KnapperServer {
                 None::<serde_json::Value>,
             )
         })?;
-        let store = self.store.lock().await;
-        let mut embedder = self.embedder.lock().await;
         let input = crate::writer::CreateNoteInput {
             content,
             filename: params.0.filename,
@@ -370,16 +281,24 @@ impl KnapperServer {
             created_by: "claude-code".into(),
             auto_link: params.0.auto_link,
         };
-        let result = crate::writer::create_note(
-            input,
-            &store,
-            &mut *embedder,
-            self.index_settings.embed,
-            self.index_settings.chunk,
-            &self.vault_path,
-            self.profile.as_ref().as_ref(),
-        )
-        .map_err(|e| mcp_err(&e))?;
+        let vault = self.core.vault_path.clone();
+        let profile = self.core.profile.clone();
+        let settings = self.core.index_settings;
+        let result = self
+            .core
+            .with_core(move |g| {
+                crate::writer::create_note(
+                    input,
+                    g.store,
+                    g.embedder,
+                    settings.embed,
+                    settings.chunk,
+                    &vault,
+                    profile.as_ref().as_ref(),
+                )
+            })
+            .await
+            .map_err(|e| mcp_err(&e))?;
         to_json_result(&result)
     }
 
@@ -402,12 +321,10 @@ impl KnapperServer {
         &self,
         params: Parameters<crate::params::Update>,
     ) -> Result<CallToolResult, McpError> {
-        if self.read_only {
+        if self.core.read_only {
             return Err(read_only_err());
         }
-        // The whole list is read before anything is written, so a request
-        // that names an impossible target is a parameter error and not a
-        // half-applied write (#62).
+        // The whole list is read before anything is written (#62).
         let edits = params.0.to_writer_edits().map_err(|e| {
             McpError::new(
                 rmcp::model::ErrorCode::INVALID_PARAMS,
@@ -415,41 +332,40 @@ impl KnapperServer {
                 None::<serde_json::Value>,
             )
         })?;
-        let store = self.store.lock().await;
         let input = crate::writer::UpdateInput {
             file: params.0.file,
             edits,
         };
-        let result = crate::writer::update_note(&store, &self.vault_path, &input)
-            .map_err(|e| mcp_err(&e))?;
+        let vault = self.core.vault_path.clone();
+        let settings = self.core.index_settings;
         // `update_note` stores the new content hash and writes no chunks, so
-        // nothing else will re-derive them: not `diff_vault`, which sees a
-        // hash that already matches disk, and not the watcher, which the
-        // `record_write` below tells to skip this file. Re-index here or the
-        // note stays searchable only as the text it held before the edit (#62).
-        let mut embedder = self.embedder.lock().await;
-        // A failure here happens after the write, so a bare INTERNAL_ERROR
-        // would read as "nothing happened" — say what did. Returning early
-        // also skips `record_write` below, so the watcher's event on this
-        // file is not suppressed and it re-indexes it on its own; that
-        // recovery is deliberate, not accidental.
-        crate::indexer::reindex_written_file(
-            &result.path,
-            &store,
-            &mut *embedder,
-            &self.vault_path,
-            self.index_settings,
-        )
-        .with_context(|| {
-            format!(
-                "the file was written; its index rows were not updated for {}",
-                result.path
-            )
-        })
-        .map_err(|e| mcp_err(&e))?;
-        // Record write so the watcher skips re-indexing
-        let full_path = self.vault_path.join(&result.path);
-        record_write(&self.recent_writes, &full_path).await;
+        // the re-index runs here, in the same core call (#62). A failure
+        // after the write says so, and `record_write` is skipped, so the
+        // watcher's own event on this file re-indexes it.
+        let result = self
+            .core
+            .with_core(move |g| {
+                let result = crate::writer::update_note(g.store, &vault, &input)?;
+                crate::indexer::reindex_written_file(
+                    &result.path,
+                    g.store,
+                    g.embedder,
+                    &vault,
+                    settings,
+                )
+                .with_context(|| {
+                    format!(
+                        "the file was written; its index rows were not updated for {}",
+                        result.path
+                    )
+                })?;
+                Ok(result)
+            })
+            .await
+            .map_err(|e| mcp_err(&e))?;
+        self.core
+            .record_write(&self.core.vault_path.join(&result.path))
+            .await;
         to_json_result(&result)
     }
 
@@ -463,17 +379,16 @@ impl KnapperServer {
         &self,
         params: Parameters<crate::params::Move>,
     ) -> Result<CallToolResult, McpError> {
-        if self.read_only {
+        if self.core.read_only {
             return Err(read_only_err());
         }
-        let store = self.store.lock().await;
-        let result = crate::writer::move_note(
-            &params.0.file,
-            &params.0.new_folder,
-            &store,
-            &self.vault_path,
-        )
-        .map_err(|e| mcp_err(&e))?;
+        let p = params.0;
+        let vault = self.core.vault_path.clone();
+        let result = self
+            .core
+            .with_core(move |g| crate::writer::move_note(&p.file, &p.new_folder, g.store, &vault))
+            .await
+            .map_err(|e| mcp_err(&e))?;
         to_json_result(&result)
     }
 
@@ -485,32 +400,32 @@ impl KnapperServer {
         &self,
         params: Parameters<crate::params::Archive>,
     ) -> Result<CallToolResult, McpError> {
-        if self.read_only {
+        if self.core.read_only {
             return Err(read_only_err());
         }
-        let store = self.store.lock().await;
-        // Archiving and restoring are one operation and its reverse, so they
-        // are one capability with a flag rather than two names (#62).
-        let result = if params.0.undo {
-            let mut embedder = self.embedder.lock().await;
-            crate::writer::unarchive_note(
-                &params.0.file,
-                &store,
-                &mut *embedder,
-                self.index_settings.embed,
-                self.index_settings.chunk,
-                &self.vault_path,
-            )
-            .map_err(|e| mcp_err(&e))?
-        } else {
-            crate::writer::archive_note(
-                &params.0.file,
-                &store,
-                &self.vault_path,
-                self.profile.as_ref().as_ref(),
-            )
-            .map_err(|e| mcp_err(&e))?
-        };
+        let p = params.0;
+        let vault = self.core.vault_path.clone();
+        let profile = self.core.profile.clone();
+        let settings = self.core.index_settings;
+        // Archiving and restoring are one operation and its reverse (#62).
+        let result = self
+            .core
+            .with_core(move |g| {
+                if p.undo {
+                    crate::writer::unarchive_note(
+                        &p.file,
+                        g.store,
+                        g.embedder,
+                        settings.embed,
+                        settings.chunk,
+                        &vault,
+                    )
+                } else {
+                    crate::writer::archive_note(&p.file, g.store, &vault, profile.as_ref().as_ref())
+                }
+            })
+            .await
+            .map_err(|e| mcp_err(&e))?;
         to_json_result(&result)
     }
 
@@ -522,14 +437,16 @@ impl KnapperServer {
         &self,
         _params: Parameters<crate::params::Health>,
     ) -> Result<CallToolResult, McpError> {
-        let store = self.store.lock().await;
-        let profile_ref = self.profile.as_ref().as_ref();
+        let profile_ref = self.core.profile.as_ref().as_ref();
         let config = crate::health::HealthConfig {
             daily_folder: profile_ref.and_then(|p| p.structure.folders.daily.clone()),
             inbox_folder: profile_ref.and_then(|p| p.structure.folders.inbox.clone()),
         };
-        let report =
-            crate::health::generate_health_report(&store, &config).map_err(|e| mcp_err(&e))?;
+        let report = self
+            .core
+            .with_reader(move |store| crate::health::generate_health_report(store, &config))
+            .await
+            .map_err(|e| mcp_err(&e))?;
         to_json_result(&report)
     }
 
@@ -542,16 +459,17 @@ impl KnapperServer {
         params: Parameters<crate::params::Validate>,
     ) -> Result<CallToolResult, McpError> {
         let target = params.0.target().map_err(|e| mcp_err(&e))?;
-        let min_chars = crate::config::Config::load()
-            .map(|c| c.chunk_min_chars)
-            .unwrap_or_else(|_| crate::config::default_chunk_min_chars());
         let limits = crate::validate::ChunkLimits {
-            min_chars,
+            min_chars: self.core.config.chunk_min_chars,
             target_tokens: crate::chunker::limits::TARGET_TOKENS,
         };
-        let report =
-            crate::validate::validate_target(&self.vault_path, &target, &limits, params.0.strict)
-                .map_err(|e| mcp_err(&e))?;
+        let report = crate::validate::validate_target(
+            &self.core.vault_path,
+            &target,
+            &limits,
+            params.0.strict,
+        )
+        .map_err(|e| mcp_err(&e))?;
         to_json_result(&report)
     }
 
@@ -563,26 +481,25 @@ impl KnapperServer {
         &self,
         params: Parameters<crate::params::Migrate>,
     ) -> Result<CallToolResult, McpError> {
-        // The CLI already took a mode. MCP and HTTP split it into three
-        // names, which is the same capability spelled three ways (#62).
+        let vault = self.core.vault_path.clone();
         match params.0.mode.as_str() {
             "preview" => {
-                let store = self.store.lock().await;
-                let profile_ref = self.profile.as_ref().as_ref();
-                let preview =
-                    crate::migrate::generate_preview(&store, &self.vault_path, profile_ref)
-                        .map_err(|e| mcp_err(&e))?;
+                let profile = self.core.profile.clone();
+                let preview = self
+                    .core
+                    .with_reader(move |store| {
+                        crate::migrate::generate_preview(store, &vault, profile.as_ref().as_ref())
+                    })
+                    .await
+                    .map_err(|e| mcp_err(&e))?;
                 to_json_result(&preview)
             }
             "apply" => {
-                if self.read_only {
+                if self.core.read_only {
                     return Err(read_only_err());
                 }
-                let store = self.store.lock().await;
-                // The preview is required here: this server's own `preview`
-                // mode returned the plan to the caller, so a caller holds it
-                // and sends it back. A dropped key must not silently apply an
-                // unrelated plan (#62).
+                // The preview is required here: a dropped key must not
+                // silently apply an unrelated plan (#62).
                 let preview = crate::migrate::resolve_preview(params.0.preview).map_err(|e| {
                     McpError::new(
                         rmcp::model::ErrorCode::INVALID_PARAMS,
@@ -590,21 +507,24 @@ impl KnapperServer {
                         None::<serde_json::Value>,
                     )
                 })?;
-                let result = crate::migrate::apply_preview(&preview, &store, &self.vault_path)
+                let result = self
+                    .core
+                    .with_core(move |g| crate::migrate::apply_preview(&preview, g.store, &vault))
+                    .await
                     .map_err(|e| mcp_err(&e))?;
                 to_json_result(&result)
             }
             "undo" => {
-                if self.read_only {
+                if self.core.read_only {
                     return Err(read_only_err());
                 }
-                let store = self.store.lock().await;
-                let result =
-                    crate::migrate::undo_last(&store, &self.vault_path).map_err(|e| mcp_err(&e))?;
+                let result = self
+                    .core
+                    .with_core(move |g| crate::migrate::undo_last(g.store, &vault))
+                    .await
+                    .map_err(|e| mcp_err(&e))?;
                 to_json_result(&result)
             }
-            // The mode is the caller's own text, so a word that names no
-            // operation is an invalid parameter and not an internal fault.
             other => Err(McpError::new(
                 rmcp::model::ErrorCode::INVALID_PARAMS,
                 format!("Unknown mode: {other}. Use 'preview', 'apply' or 'undo'."),
@@ -621,28 +541,30 @@ impl KnapperServer {
         &self,
         params: Parameters<crate::params::Delete>,
     ) -> Result<CallToolResult, McpError> {
-        if self.read_only {
+        if self.core.read_only {
             return Err(read_only_err());
         }
-        let store = self.store.lock().await;
-        let mode = crate::writer::DeleteMode::from(params.0.mode);
+        let p = params.0;
+        let mode = crate::writer::DeleteMode::from(p.mode);
         let archive_folder = self
+            .core
             .profile
             .as_ref()
             .as_ref()
-            .and_then(|p| p.structure.folders.archive.as_deref())
-            .unwrap_or("04-Archive");
-        crate::writer::delete_note(
-            &store,
-            &self.vault_path,
-            &params.0.file,
-            mode,
-            archive_folder,
-        )
-        .map_err(|e| mcp_err(&e))?;
+            .and_then(|pr| pr.structure.folders.archive.as_deref())
+            .unwrap_or("04-Archive")
+            .to_string();
+        let vault = self.core.vault_path.clone();
+        let file = p.file.clone();
+        self.core
+            .with_core(move |g| {
+                crate::writer::delete_note(g.store, &vault, &file, mode, &archive_folder)
+            })
+            .await
+            .map_err(|e| mcp_err(&e))?;
         let result = serde_json::json!({
-            "deleted": params.0.file,
-            "mode": params.0.mode,
+            "deleted": p.file,
+            "mode": p.mode,
         });
         to_json_result(&result)
     }
@@ -655,30 +577,26 @@ impl KnapperServer {
         &self,
         params: Parameters<crate::params::ReindexFile>,
     ) -> Result<CallToolResult, McpError> {
-        let store = self.store.lock().await;
-        let mut embedder = self.embedder.lock().await;
         let rel_path = params.0.file;
-
-        // One helper packages the six steps this used to spell out, so the
-        // three callers cannot drift apart (#62). A file the server cannot
-        // read is the caller's own text naming nothing, which is this
-        // surface's INVALID_PARAMS and the HTTP route's 400.
-        let result = crate::indexer::reindex_written_file(
-            &rel_path,
-            &store,
-            &mut *embedder,
-            &self.vault_path,
-            self.index_settings,
-        )
-        .map_err(|e| match e.downcast_ref::<std::io::Error>() {
-            Some(_) => McpError::new(
-                rmcp::model::ErrorCode::INVALID_PARAMS,
-                format!("Cannot read file {rel_path}: {e:#}"),
-                None::<serde_json::Value>,
-            ),
-            None => mcp_err(&e),
-        })?;
-
+        let vault = self.core.vault_path.clone();
+        let settings = self.core.index_settings;
+        let file = rel_path.clone();
+        // A file the server cannot read is the caller's own text naming
+        // nothing, which is this surface's INVALID_PARAMS (#62).
+        let result = self
+            .core
+            .with_core(move |g| {
+                crate::indexer::reindex_written_file(&file, g.store, g.embedder, &vault, settings)
+            })
+            .await
+            .map_err(|e| match e.downcast_ref::<std::io::Error>() {
+                Some(_) => McpError::new(
+                    rmcp::model::ErrorCode::INVALID_PARAMS,
+                    format!("Cannot read file {rel_path}: {e:#}"),
+                    None::<serde_json::Value>,
+                ),
+                None => mcp_err(&e),
+            })?;
         let output = serde_json::json!({
             "file": rel_path,
             "chunks": result.total_chunks,
@@ -690,43 +608,39 @@ impl KnapperServer {
     #[tool(
         name = "index",
         description = "Index the server's vault: walk it, diff it against the store, and re-embed what changed. `rebuild: true` discards the index and builds it again. Use after a batch of writes made outside knapper; a single file is cheaper through reindex_file. \
-             The call runs to completion once it starts. It holds the store and the embedder while it runs, so every other tool waits on it, and a graceful shutdown will not interrupt it. On a large vault a rebuild takes minutes."
+             The call runs to completion once it starts. It holds the store and the embedder while it runs, so search and every write wait on it while reads keep answering, and a graceful shutdown will not interrupt it. On a large vault a rebuild takes minutes."
     )]
     async fn index(
         &self,
         params: Parameters<crate::params::Index>,
     ) -> Result<CallToolResult, McpError> {
-        // An agent that writes a batch of notes needs a way to rebuild the whole
-        // index, and a multi-minute call is acceptable for that (#62).
-        //
-        // A read-only server refuses it like any other write: `rebuild: true`
-        // discards the index before it builds one again, so this destroys
-        // derived state and stalls every other tool while it runs.
-        if self.read_only {
+        if self.core.read_only {
             return Err(read_only_err());
         }
-        let store = self.store.lock().await;
-        let mut embedder = self.embedder.lock().await;
-        let mut config = crate::config::Config::load().unwrap_or_default();
+        // The startup config, with the call's one override (#55, #72).
+        let mut config = (*self.core.config).clone();
         if params.0.no_gitignore {
             config.respect_gitignore = false;
         }
-        // The index-time settings come from the session, not this load: the
-        // signature asks for them, so a fresh `Config::load` cannot be a second
-        // source of the store's chunking or vector space (#55, #72). This load
-        // supplies only the other index fields, such as `respect_gitignore`.
-        // A server is bound to the vault it was started on, so there is no
-        // path parameter here — that argument is the CLI's alone (#62).
-        let result = crate::indexer::run_index_shared(
-            &self.vault_path,
-            &config,
-            self.index_settings,
-            &store,
-            &mut *embedder,
-            params.0.rebuild,
-            self.profile.as_ref().as_ref(),
-        )
-        .map_err(|e| mcp_err(&e))?;
+        let rebuild = params.0.rebuild;
+        let vault = self.core.vault_path.clone();
+        let profile = self.core.profile.clone();
+        let settings = self.core.index_settings;
+        let result = self
+            .core
+            .with_core(move |g| {
+                crate::indexer::run_index_shared(
+                    &vault,
+                    &config,
+                    settings,
+                    g.store,
+                    g.embedder,
+                    rebuild,
+                    profile.as_ref().as_ref(),
+                )
+            })
+            .await
+            .map_err(|e| mcp_err(&e))?;
         to_json_result(&serde_json::json!({
             "new_files": result.new_files,
             "updated_files": result.updated_files,
@@ -738,25 +652,23 @@ impl KnapperServer {
 
     #[tool(
         name = "status",
-        description = "What the index holds: vault path, file and chunk counts, edge and connectivity counts, date coverage, index size, and whether intelligence is enabled."
+        description = "What the index holds: vault path, file and chunk counts, edge and connectivity counts, date coverage, index size, whether intelligence is enabled, and how many watcher events are not yet applied."
     )]
     async fn status(
         &self,
         _params: Parameters<crate::params::Status>,
     ) -> Result<CallToolResult, McpError> {
         let data_dir = crate::config::Config::data_dir().map_err(|e| mcp_err(&e))?;
-        // The same fields the CLI's `status --json` prints: one composer, so
-        // the three surfaces cannot report different ones (#62). The store is
-        // this server's own, so the reads see one snapshot and no second
-        // connection runs the schema batch against the writer.
-        let store = self.store.lock().await;
-        let report = search::status_json(
-            &store,
-            &data_dir,
-            &crate::config::Config::load().unwrap_or_default(),
-            0,
-        )
-        .map_err(|e| mcp_err(&e))?;
+        let config = self.core.config.clone();
+        let pending = self
+            .core
+            .pending_events
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let report = self
+            .core
+            .with_reader(move |store| search::status_json(store, &data_dir, &config, pending))
+            .await
+            .map_err(|e| mcp_err(&e))?;
         to_json_result(&report)
     }
 
@@ -768,26 +680,33 @@ impl KnapperServer {
         &self,
         params: Parameters<crate::params::Identity>,
     ) -> Result<CallToolResult, McpError> {
-        let store = self.store.lock().await;
-        // `refresh` is a parameter of the capability on every surface (#62).
-        // It clears the `identity_facts` rows and derives them again, which is
-        // a write of derived state, so a read-only server refuses it.
-        if params.0.refresh {
-            if self.read_only {
+        let config = self.core.config.clone();
+        let block = if params.0.refresh {
+            // A write of derived state, so a read-only server refuses it.
+            if self.core.read_only {
                 return Err(read_only_err());
             }
-            let profile = self.profile.as_ref().as_ref().ok_or_else(|| {
-                McpError::new(
+            if self.core.profile.is_none() {
+                return Err(McpError::new(
                     rmcp::model::ErrorCode::INVALID_REQUEST,
                     "No vault profile found. Run `knapper init` first.",
                     None::<serde_json::Value>,
-                )
-            })?;
-            crate::identity::extract_l1_facts(&store, profile).map_err(|e| mcp_err(&e))?;
+                ));
+            }
+            let profile = self.core.profile.clone();
+            self.core
+                .with_core(move |g| {
+                    let profile = profile.as_ref().as_ref().expect("checked above");
+                    crate::identity::extract_l1_facts(g.store, profile)?;
+                    crate::identity::format_identity_block(&config, g.store)
+                })
+                .await
+        } else {
+            self.core
+                .with_reader(move |store| crate::identity::format_identity_block(&config, store))
+                .await
         }
-        let config = crate::config::Config::load().unwrap_or_default();
-        let block =
-            crate::identity::format_identity_block(&config, &store).map_err(|e| mcp_err(&e))?;
+        .map_err(|e| mcp_err(&e))?;
         Ok(CallToolResult::success(vec![ContentBlock::text(block)]))
     }
 
@@ -801,27 +720,14 @@ impl KnapperServer {
     ) -> Result<CallToolResult, McpError> {
         match params.0.mode.as_deref() {
             Some("detect") => {
-                let result = crate::onboarding::run_detect_json(&self.vault_path)
+                let result = crate::onboarding::run_detect_json(&self.core.vault_path)
                     .map_err(|e| mcp_err(&e))?;
                 to_json_result(&result)
             }
             Some("apply") => {
-                // `apply` indexes the vault, which is the work `index` is
-                // guarded against on a read-only server. The mode is read
-                // first, so `detect` — which writes nothing — still runs
-                // (#62).
-                if self.read_only {
+                if self.core.read_only {
                     return Err(read_only_err());
                 }
-                let mut config = crate::config::Config::load().unwrap_or_default();
-                // `apply` indexes the whole vault. The index-time settings come
-                // from the session, not this load: `run_apply_json` asks for
-                // them, so a fresh load that fell back to the defaults, or
-                // drifted from disk, cannot build the index at a chunking or a
-                // vector space the rest of the session does not use — the
-                // divergence nothing downstream can tell apart (#55, #72). This
-                // load supplies only the identity and profile fields `apply`
-                // writes.
                 let data_dir = crate::config::Config::data_dir().map_err(|e| mcp_err(&e))?;
                 let flags = crate::onboarding::ApplyFlags {
                     name: params.0.name,
@@ -830,14 +736,30 @@ impl KnapperServer {
                     identity_only: false,
                     reindex_only: false,
                 };
-                let result = crate::onboarding::run_apply_json(
-                    &self.vault_path,
-                    &mut config,
-                    self.index_settings,
-                    &data_dir,
-                    flags,
-                )
-                .map_err(|e| mcp_err(&e))?;
+                let vault = self.core.vault_path.clone();
+                let settings = self.core.index_settings;
+                // `apply` writes `config.toml`, so it is the one handler that
+                // loads the file: it edits it. The running server keeps the
+                // config it started with, which the reply says.
+                let result = self
+                    .core
+                    .with_core(move |g| {
+                        let _ = g;
+                        let mut config = crate::config::Config::load().unwrap_or_default();
+                        let mut result = crate::onboarding::run_apply_json(
+                            &vault,
+                            &mut config,
+                            settings,
+                            &data_dir,
+                            flags,
+                        )?;
+                        if let Some(object) = result.as_object_mut() {
+                            object.insert("restart_required".into(), serde_json::json!(true));
+                        }
+                        Ok(result)
+                    })
+                    .await
+                    .map_err(|e| mcp_err(&e))?;
                 to_json_result(&result)
             }
             Some(other) => Err(McpError::new(
@@ -845,9 +767,6 @@ impl KnapperServer {
                 format!("Unknown mode: {other}. Use 'detect' or 'apply'."),
                 None::<serde_json::Value>,
             )),
-            // A server has no interactive flow, so `init` there needs a
-            // mode. The CLI's no-mode form is its own prompt sequence and
-            // reaches no surface but the CLI (#62).
             None => Err(McpError::new(
                 rmcp::model::ErrorCode::INVALID_PARAMS,
                 "init needs mode=detect or mode=apply",
@@ -1048,8 +967,13 @@ pub struct HttpServeOpts {
 // Entry point
 // ---------------------------------------------------------------------------
 
+/// Start the MCP server on stdio, the watcher, and the HTTP server when asked.
+///
+/// `config` is read once by the caller. Everything in this process reads the
+/// copy the core holds; a later edit to `config.toml` takes effect on restart.
 pub async fn run_serve(
     data_dir: &Path,
+    config: Config,
     http_opts: Option<HttpServeOpts>,
     read_only: bool,
 ) -> Result<()> {
@@ -1063,79 +987,11 @@ pub async fn run_serve(
         );
     }
 
-    let db_path = db_path(data_dir);
-    let models_dir = data_dir.join("models");
+    let core = Core::open(data_dir, config, read_only)?;
 
-    let store = Store::open(&db_path)?;
-    let config = Config::load()?;
-    let embedder = crate::llm::load_embedder(&models_dir, &config)?;
-    store.verify_embedding_dim(embedder.dim())?;
-
-    let vault_path_str = store.get_meta("vault_path")?.ok_or_else(|| {
-        anyhow::anyhow!("No vault path in index. Run 'knapper index <path>' first.")
-    })?;
-    let vault_path = PathBuf::from(&vault_path_str);
-
-    let cleaned = crate::writer::cleanup_temp_files(&vault_path)?;
-    if cleaned > 0 {
-        eprintln!(
-            "Cleaned up {} incomplete write(s) from previous run",
-            cleaned
-        );
-    }
-
-    let orphans = crate::writer::verify_index_integrity(&store, &vault_path)?;
-    if orphans > 0 {
-        eprintln!("Cleaned up {} orphan DB entries for missing files", orphans);
-    }
-
-    let profile = Config::load_vault_profile().ok().flatten();
-
-    // Load the cross-encoder if enabled
-    let reranker: Option<Arc<Mutex<Box<dyn RerankModel + Send>>>> = if config.intelligence_enabled()
-    {
-        match crate::llm::LlamaRerank::new(&models_dir, &config) {
-            Ok(rerank) => Some(Arc::new(Mutex::new(
-                Box::new(rerank) as Box<dyn RerankModel + Send>
-            ))),
-            Err(e) => {
-                tracing::warn!("failed to load reranker: {e}, reranking disabled");
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    // Refuse to serve an index this build did not produce (issue #31).
-    //
-    // The startup reconciliation below would fix a stale store, but it runs in a
-    // spawned task and only warns on failure — so the server would answer from
-    // the old index in the meantime, which is exactly the silent wrong answer
-    // fingerprints exist to prevent. Checked here, synchronously, beside the
-    // dimension guard that already refuses to start for the same reason.
-    {
-        let rerank_fp = match &reranker {
-            Some(model) => Some(model.lock().await.fingerprint()),
-            None => None,
-        };
-        let fingerprints = crate::fingerprint::Fingerprints::compute(
-            &config,
-            &EmbedModel::fingerprint(&embedder),
-            rerank_fp.as_deref(),
-        );
-        crate::fingerprint::verify(&store, &fingerprints)?;
-    }
-
-    let store_arc = Arc::new(Mutex::new(store));
-    let embedder_arc: Arc<Mutex<Box<dyn EmbedModel + Send>>> = Arc::new(Mutex::new(embedder));
-    let vault_path_arc = Arc::new(vault_path);
-    let profile_arc = Arc::new(profile);
-    let recent_writes: RecentWrites = Arc::new(Mutex::new(HashMap::new()));
-
-    // Start file watcher for real-time index updates
-    let mut exclude = config.exclude.clone();
-    if let Some(ref prof) = *profile_arc
+    // The watcher's exclude list: config excludes plus the archive folder.
+    let mut exclude = core.config.exclude.clone();
+    if let Some(ref prof) = *core.profile
         && let Some(ref archive) = prof.structure.folders.archive
     {
         let pattern = format!("{}/", archive);
@@ -1143,58 +999,13 @@ pub async fn run_serve(
             exclude.push(pattern);
         }
     }
-    // The retrieval settings the MCP server answers with, off the startup config.
-    let max_chunks_per_file = config.max_chunks_per_file;
-    let group_by = config.group_by;
-    let top_n = config.top_n;
-    let rerank = config.rerank;
-    let ranking = config.ranking;
-    let lane_weights = config.lane_weights;
-    let fts = config.fts;
-    let calibrated = config.calibrated.clone();
-    // The index-time settings read once, off this startup config, so the write
-    // tools, the full index and the watcher all share one chunking and one
-    // vector space with the vault (#72).
-    let index_settings = crate::indexer::IndexSettings::from_config(&config);
-    let output = config.output.clone();
-
-    let core = crate::core::Core::from_parts(
-        store_arc.clone(),
-        Store::open_reader(&db_path)?,
-        embedder_arc.clone(),
-        reranker.as_ref().map(Arc::clone),
-        config.clone(),
-        vault_path_arc.clone(),
-        profile_arc.clone(),
-        recent_writes.clone(),
-        read_only,
-    );
     let (watcher_handle, watcher_shutdown) = crate::watcher::start_watcher(core.clone(), exclude)?;
 
     if read_only {
         eprintln!("Read-only mode: write tools disabled");
     }
 
-    let server = KnapperServer {
-        store: store_arc,
-        embedder: embedder_arc,
-        vault_path: vault_path_arc,
-        profile: profile_arc,
-        tool_router: KnapperServer::tool_router(),
-        reranker,
-        recent_writes,
-        read_only,
-        max_chunks_per_file,
-        group_by,
-        top_n,
-        rerank,
-        ranking,
-        lane_weights,
-        fts,
-        calibrated,
-        index_settings,
-        output,
-    };
+    let server = KnapperServer::new(core.clone());
 
     // Cancellation token for coordinated shutdown of HTTP + MCP
     let cancel_token = tokio_util::sync::CancellationToken::new();
@@ -1202,10 +1013,10 @@ pub async fn run_serve(
     // Spawn HTTP server as a background task (before MCP blocks on stdio)
     if let Some(ref opts) = http_opts {
         let api_state = crate::http::ApiState {
-            core: core.clone(),
-            http_config: Arc::new(config.http.clone()),
+            http_config: Arc::new(core.config.http.clone()),
             no_auth: opts.no_auth,
-            rate_limiter: Arc::new(crate::http::RateLimiter::new(config.http.rate_limit)),
+            rate_limiter: Arc::new(crate::http::RateLimiter::new(core.config.http.rate_limit)),
+            core: core.clone(),
         };
         let router = crate::http::build_router(api_state);
         let addr = format!("{}:{}", opts.host, opts.port);
@@ -1297,20 +1108,10 @@ mod tests {
         );
     }
 
-    /// A server over a vault of two notes, indexed in memory. The mock's
-    /// vectors are hashes, so the keyword lane carries the meaning here —
-    /// which is all a granularity assertion needs.
-    fn indexed_server(
-        group_by: crate::config::GroupBy,
-    ) -> (tempfile::TempDir, super::KnapperServer) {
-        use std::sync::Arc;
-        use tokio::sync::Mutex;
-
-        let tmp = tempfile::TempDir::new().unwrap();
-        let root = tmp.path();
-        std::fs::create_dir_all(root.join("rules")).unwrap();
-        std::fs::write(
-            root.join("rules/abjuration-spells.md"),
+    /// The two abjuration-school notes the search tests index.
+    const ABJURATION_NOTES: &[(&str, &str)] = &[
+        (
+            "rules/abjuration-spells.md",
             "# Abjuration\n\n\
              ## Level 3 Counterspell\n\nA warding effect that stops a spell mid-cast. \
              It interrupts the casting itself and does nothing to a spell already in effect.\n\n\
@@ -1320,62 +1121,22 @@ mod tests {
              ## Level 9 Dimensional Anchor\n\nA warding effect that pins a creature. \
              It closes every route out of the space the creature \
              currently stands in, and it does not care how that route was opened.\n",
-        )
-        .unwrap();
-        std::fs::write(
-            root.join("rules/evocation-spells.md"),
+        ),
+        (
+            "rules/evocation-spells.md",
             "# Evocation\n\n## Level 1 Firebolt\n\nA bolt of flame.\n",
-        )
-        .unwrap();
+        ),
+    ];
 
-        let store = crate::store::Store::open_memory().unwrap();
-        let mut embedder = crate::llm::MockLlm::new(256);
-        crate::indexer::run_index_shared(
-            root,
-            &crate::config::Config::default(),
-            crate::indexer::IndexSettings::from_config(&crate::config::Config::default()),
-            &store,
-            &mut embedder,
-            false,
-            None,
-        )
-        .unwrap();
-
-        let server = super::KnapperServer {
-            store: Arc::new(Mutex::new(store)),
-            embedder: Arc::new(Mutex::new(
-                Box::new(embedder) as Box<dyn crate::llm::EmbedModel + Send>
-            )),
-            vault_path: Arc::new(root.to_path_buf()),
-            profile: Arc::new(None),
-            tool_router: super::KnapperServer::tool_router(),
-            reranker: None,
-            recent_writes: Arc::new(Mutex::new(std::collections::HashMap::new())),
-            read_only: false,
-            max_chunks_per_file: crate::config::default_max_chunks_per_file(),
-            group_by,
-            top_n: crate::config::Config::default().top_n,
-            rerank: crate::config::RerankConfig::default(),
-            ranking: crate::config::RankingConfig::default(),
-            lane_weights: crate::config::LaneWeights::default(),
-            fts: crate::config::FtsConfig::default(),
-            // These tests assert the pre-calibration paths; the calibrated
-            // sort has its own tests (Task 7).
-            calibrated: crate::config::CalibratedConfig {
-                enabled: false,
-                ..Default::default()
-            },
-            index_settings: crate::indexer::IndexSettings {
-                chunk: crate::chunker::ChunkOptions {
-                    min_chars: 0,
-                    promote_bold: false,
-                    carry_orphan_headings: false,
-                },
-                embed: crate::prefix::EmbedComposition::default(),
-            },
-            output: crate::config::OutputConfig::default(),
-        };
-        (tmp, server)
+    /// A server over a vault of two notes. The mock's vectors are hashes, so
+    /// the keyword lane carries the meaning here.
+    fn indexed_server(
+        group_by: crate::config::GroupBy,
+    ) -> (tempfile::TempDir, super::KnapperServer) {
+        let mut config = crate::core::testing::test_config();
+        config.group_by = group_by;
+        let (tmp, core) = crate::core::testing::indexed_core(ABJURATION_NOTES, config);
+        (tmp, super::KnapperServer::new(core))
     }
 
     /// A PARA profile over `root`, for the calls that need one.
@@ -1398,7 +1159,7 @@ mod tests {
     #[tokio::test]
     async fn the_undo_flag_chooses_the_operation_it_names() {
         let (_tmp, server) = indexed_server(crate::config::GroupBy::Chunk);
-        let vault = server.vault_path.as_ref().clone();
+        let vault = server.core.vault_path.as_ref().clone();
         let live = vault.join("rules/evocation-spells.md");
         let archived = vault.join("04-Archive/rules/evocation-spells.md");
         assert!(live.exists());
@@ -1431,11 +1192,12 @@ mod tests {
     #[tokio::test]
     async fn identity_refresh_re_extracts_the_l1_facts() {
         let (_tmp, mut server) = indexed_server(crate::config::GroupBy::Chunk);
-        let root = server.vault_path.as_ref().clone();
-        server.profile = std::sync::Arc::new(Some(test_profile(&root)));
+        let root = server.core.vault_path.as_ref().clone();
+        server.core.profile = std::sync::Arc::new(Some(test_profile(&root)));
 
         let stale = || {
-            let store = server.store.try_lock().expect("uncontended");
+            let writer = server.core.writer();
+            let store = writer.try_lock().expect("uncontended");
             store
                 .get_identity_facts(1)
                 .unwrap()
@@ -1443,7 +1205,8 @@ mod tests {
                 .any(|f| f.key == "stale")
         };
         {
-            let store = server.store.try_lock().expect("uncontended");
+            let writer = server.core.writer();
+            let store = writer.try_lock().expect("uncontended");
             store
                 .upsert_identity_fact(1, "stale", "from an older session", None)
                 .unwrap();
@@ -1472,9 +1235,9 @@ mod tests {
     #[tokio::test]
     async fn a_read_only_server_refuses_an_identity_refresh_and_answers_a_plain_one() {
         let (_tmp, mut server) = indexed_server(crate::config::GroupBy::Chunk);
-        let root = server.vault_path.as_ref().clone();
-        server.profile = std::sync::Arc::new(Some(test_profile(&root)));
-        server.read_only = true;
+        let root = server.core.vault_path.as_ref().clone();
+        server.core.profile = std::sync::Arc::new(Some(test_profile(&root)));
+        server.core.read_only = true;
 
         assert!(
             server
@@ -1497,7 +1260,7 @@ mod tests {
     #[tokio::test]
     async fn a_read_only_server_refuses_init_apply_and_runs_init_detect() {
         let (_tmp, mut server) = indexed_server(crate::config::GroupBy::Chunk);
-        server.read_only = true;
+        server.core.read_only = true;
 
         let init = |mode: &str| crate::params::Init {
             mode: Some(mode.to_string()),
@@ -1584,7 +1347,7 @@ mod tests {
         let (_tmp, mut server) = indexed_server(crate::config::GroupBy::File);
         // This test asserts per-section output. That output is below
         // coalescing. Coalescing has its own tests (#39).
-        server.ranking.coalesce_adjacent = false;
+        server.core.config_mut().ranking.coalesce_adjacent = false;
 
         let by_default = server
             .search(super::Parameters(search_params(None, false)))
@@ -1642,74 +1405,28 @@ mod tests {
     /// more to give (#62). Each body is well over `chunk_min_chars`, so each
     /// note is one chunk of its own.
     fn server_over_five_answering_notes(top_n: usize) -> (tempfile::TempDir, super::KnapperServer) {
-        use std::sync::Arc;
-        use tokio::sync::Mutex;
-
-        let tmp = tempfile::TempDir::new().unwrap();
-        let root = tmp.path();
-        for (i, subject) in ["counterspell", "dispel", "anchor", "ward", "seal"]
+        let notes: Vec<(String, String)> = ["counterspell", "dispel", "anchor", "ward", "seal"]
             .iter()
             .enumerate()
-        {
-            std::fs::write(
-                root.join(format!("{i}-{subject}.md")),
-                format!(
-                    "# The {subject} rule\n\nA warding effect. Every warding effect in this \
-                     ruleset states what it stops, when it may be cast, and what it leaves \
-                     alone, and the {subject} rule is one of them among several others.\n"
-                ),
-            )
-            .unwrap();
-        }
-
-        let store = crate::store::Store::open_memory().unwrap();
-        let mut embedder = crate::llm::MockLlm::new(256);
-        crate::indexer::run_index_shared(
-            root,
-            &crate::config::Config::default(),
-            crate::indexer::IndexSettings::from_config(&crate::config::Config::default()),
-            &store,
-            &mut embedder,
-            false,
-            None,
-        )
-        .unwrap();
-
-        let server = super::KnapperServer {
-            store: Arc::new(Mutex::new(store)),
-            embedder: Arc::new(Mutex::new(
-                Box::new(embedder) as Box<dyn crate::llm::EmbedModel + Send>
-            )),
-            vault_path: Arc::new(root.to_path_buf()),
-            profile: Arc::new(None),
-            tool_router: super::KnapperServer::tool_router(),
-            reranker: None,
-            recent_writes: Arc::new(Mutex::new(std::collections::HashMap::new())),
-            read_only: false,
-            max_chunks_per_file: crate::config::default_max_chunks_per_file(),
-            group_by: crate::config::GroupBy::Chunk,
-            top_n,
-            rerank: crate::config::RerankConfig::default(),
-            ranking: crate::config::RankingConfig::default(),
-            lane_weights: crate::config::LaneWeights::default(),
-            fts: crate::config::FtsConfig::default(),
-            // These tests assert the pre-calibration paths; the calibrated
-            // sort has its own tests (Task 7).
-            calibrated: crate::config::CalibratedConfig {
-                enabled: false,
-                ..Default::default()
-            },
-            index_settings: crate::indexer::IndexSettings {
-                chunk: crate::chunker::ChunkOptions {
-                    min_chars: 0,
-                    promote_bold: false,
-                    carry_orphan_headings: false,
-                },
-                embed: crate::prefix::EmbedComposition::default(),
-            },
-            output: crate::config::OutputConfig::default(),
-        };
-        (tmp, server)
+            .map(|(i, subject)| {
+                (
+                    format!("{i}-{subject}.md"),
+                    format!(
+                        "# The {subject} rule\n\nA warding effect. Every warding effect in this \
+                         ruleset states what it stops, when it may be cast, and what it leaves \
+                         alone, and the {subject} rule is one of them among several others.\n"
+                    ),
+                )
+            })
+            .collect();
+        let borrowed: Vec<(&str, &str)> = notes
+            .iter()
+            .map(|(p, b)| (p.as_str(), b.as_str()))
+            .collect();
+        let mut config = crate::core::testing::test_config();
+        config.top_n = top_n;
+        let (tmp, core) = crate::core::testing::indexed_core(&borrowed, config);
+        (tmp, super::KnapperServer::new(core))
     }
 
     /// R21 (#62): the number of results a call that names no `top_n` gets is
@@ -1798,8 +1515,11 @@ mod tests {
         // and `[calibrated] floor` is the floor that applies — which is the
         // one that must be reported. Above 1.0, so it rejects every candidate
         // whatever the mock's hash returns.
-        server.calibrated.enabled = true;
-        server.calibrated.floor = 1.01;
+        {
+            let c = server.core.config_mut();
+            c.calibrated.enabled = true;
+            c.calibrated.floor = 1.01;
+        }
 
         let result = server
             .search(super::Parameters(search_params(None, false)))
@@ -1865,5 +1585,87 @@ mod tests {
         params.summaries = true;
         let err = server.search(super::Parameters(params)).await.unwrap_err();
         assert!(err.message.contains("mutually exclusive"), "got {err:?}");
+    }
+
+    /// The design's promise on the MCP surface: a search parked on the
+    /// embedder does not stop `tags` from answering (serve-core spec).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_search_in_flight_does_not_block_a_read() {
+        use crate::core::testing::{GatedEmbed, indexed_vault, test_config};
+        use std::time::Duration;
+
+        let config = test_config();
+        let (_tmp, vault, db) = indexed_vault(ABJURATION_NOTES, &config);
+        let (embed, release, entered) = GatedEmbed::new(256);
+        let server = super::KnapperServer::new(crate::core::Core::for_test(
+            &db,
+            Box::new(embed),
+            config,
+            vault,
+        ));
+
+        let searching = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                server
+                    .search(super::Parameters(search_params(None, false)))
+                    .await
+            })
+        };
+        tokio::task::spawn_blocking(move || entered.recv_timeout(Duration::from_secs(5)))
+            .await
+            .unwrap()
+            .expect("search reached the embedder");
+
+        let tags = tokio::time::timeout(
+            Duration::from_secs(2),
+            server.tags(super::Parameters(crate::params::Tags { under: None })),
+        )
+        .await
+        .expect("tags waited on the search");
+        assert!(tags.is_ok(), "got {tags:?}");
+
+        release.send(()).unwrap();
+        searching.await.unwrap().unwrap();
+    }
+
+    /// `validate` reads the config the server captured, not the file. The
+    /// on-disk default for `chunk_min_chars` is 120, which would flag these
+    /// one-character sections.
+    #[tokio::test]
+    async fn validate_reads_the_captured_config() {
+        let mut config = crate::core::testing::test_config();
+        config.chunk_min_chars = 0;
+        let (_tmp, core) = crate::core::testing::indexed_core(
+            &[("t.md", "# T\n\n## A\n\nx\n\n## B\n\ny\n")],
+            config,
+        );
+        let server = super::KnapperServer::new(core);
+        let result = server
+            .validate(super::Parameters(crate::params::Validate {
+                path: Some("t.md".into()),
+                scope: vec![],
+                all: vec![],
+                any: vec![],
+                none: vec![],
+                strict: false,
+            }))
+            .await
+            .unwrap();
+        let text = &result
+            .content
+            .first()
+            .expect("a content block")
+            .as_text()
+            .expect("a text block")
+            .text;
+        let report: serde_json::Value = serde_json::from_str(text).unwrap();
+        let short = report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["rule"] == "short-section")
+            .count();
+        assert_eq!(short, 0, "got {report}");
     }
 }

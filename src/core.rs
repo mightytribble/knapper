@@ -119,7 +119,7 @@ impl Core {
 
     /// Assemble a core from parts a caller already holds.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn from_parts(
+    fn from_parts(
         writer: Arc<Mutex<Store>>,
         reader: Store,
         embedder: Arc<Mutex<Box<dyn EmbedModel + Send>>>,

@@ -887,17 +887,12 @@ async fn main() -> Result<()> {
                 eprintln!("No index found. Run 'knapper index <path>' first.");
                 std::process::exit(1);
             }
-            let http_opts = if http {
-                let cfg = Config::load()?;
-                Some(knapper::serve::HttpServeOpts {
-                    port: port.unwrap_or(cfg.http.port),
-                    host: host.unwrap_or(cfg.http.host.clone()),
-                    no_auth,
-                })
-            } else {
-                None
-            };
-            knapper::serve::run_serve(&data_dir, http_opts, read_only).await?;
+            let http_opts = http.then(|| knapper::serve::HttpServeOpts {
+                port: port.unwrap_or(cfg.http.port),
+                host: host.unwrap_or_else(|| cfg.http.host.clone()),
+                no_auth,
+            });
+            knapper::serve::run_serve(&data_dir, cfg, http_opts, read_only).await?;
         }
 
         Command::Create(args) => {
