@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use rmcp::handler::server::tool::ToolRouter;
@@ -21,9 +20,7 @@ use crate::store::Store;
 // Server
 // ---------------------------------------------------------------------------
 
-/// Map of recently-written file paths to their mtime.
-/// Used to tell the watcher "I just wrote this file, skip re-indexing it."
-pub type RecentWrites = Arc<Mutex<HashMap<PathBuf, SystemTime>>>;
+pub use crate::core::RecentWrites;
 
 #[derive(Clone)]
 pub struct KnapperServer {
