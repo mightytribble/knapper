@@ -105,7 +105,7 @@ permissions = "write"
 
 ## Errors
 
-Every error is a JSON body with two fields: `error`, the message, and `kind`, one word for what went wrong. The status says whose fault it is.
+Every error a handler answers is a JSON body with two fields: `error`, the message, and `kind`, one word for what went wrong. The status says whose fault it is.
 
 | status | kind | when |
 |---|---|---|

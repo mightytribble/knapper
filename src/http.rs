@@ -354,6 +354,9 @@ async fn handle_match(
     Json(body): Json<crate::params::Match>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, false)?;
+    // Checked before the scan runs: a malformed scope is the caller's own text (#60).
+    body.scope()
+        .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
     let report = state
         .core
         .with_reader(move |store| crate::matching::run(store, &body))
@@ -2052,7 +2055,7 @@ mod tests {
     }
 
     /// A write that names a note the vault does not hold is the same absent
-    /// resource, on the route that used to answer 500 for it.
+    /// resource.
     #[tokio::test]
     async fn an_update_of_a_missing_note_is_a_404() {
         let (_tmp, state) = indexed_state();
@@ -2064,6 +2067,35 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
         assert_eq!(body["kind"], "not_found");
+    }
+
+    /// A section the note does not hold is the same absent resource, and the
+    /// message names the note.
+    #[tokio::test]
+    async fn an_update_naming_a_missing_section_is_a_404() {
+        let (_tmp, state) = indexed_state();
+        let (status, body) = post_json(
+            state,
+            "/api/update",
+            r#"{"file":"rules/evocation-spells.md","edits":[{"section":"Nowhere","mode":"replace","content":"x"}]}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["kind"], "not_found");
+        assert_eq!(
+            body["error"],
+            "editing rules/evocation-spells.md: section 'Nowhere' not found"
+        );
+    }
+
+    /// A scope the parser refuses is the caller's own text, checked before
+    /// the scan runs.
+    #[tokio::test]
+    async fn a_match_with_a_scope_the_parser_refuses_is_a_400() {
+        let (_tmp, state) = indexed_state();
+        let (status, body) = post_json(state, "/api/match", r#"{"pattern":"x","all":[""]}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["kind"], "invalid_input");
     }
 
     /// `reindex-file` of a path not on disk is a 404; a path that exists and

@@ -549,7 +549,7 @@ pub fn reindex_written_file(
     settings: IndexSettings,
 ) -> Result<IndexFileResult> {
     let full_path = vault_path.join(rel_path);
-    // A path not on disk is the caller's own text naming nothing. A file that
+    // A path not on disk is an absent resource. A file that
     // is there and cannot be read is the server's, and stays an io::Error.
     if !full_path.is_file() {
         bail!(Fault::NotFound(format!("file not found: {rel_path}")));

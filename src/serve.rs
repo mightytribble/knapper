@@ -195,6 +195,8 @@ impl KnapperServer {
         params: Parameters<crate::params::Match>,
     ) -> Result<CallToolResult, McpError> {
         let p = params.0;
+        // Checked before the scan runs: a malformed scope is the caller's own text (#60).
+        p.scope().map_err(|e| invalid_params(format!("{e:#}")))?;
         let report = self
             .core
             .with_reader(move |store| crate::matching::run(store, &p))
@@ -1351,8 +1353,7 @@ mod tests {
     }
 
     /// A scope term the vault holds no match for is the caller's own text
-    /// naming nothing (#60, #65). This surface answered INTERNAL_ERROR for
-    /// it before the kind travelled with the error.
+    /// naming nothing (#60, #65).
     #[tokio::test]
     async fn a_scope_term_naming_no_tag_on_search_is_invalid_params() {
         let (_tmp, server) = indexed_server(crate::config::GroupBy::Chunk);
@@ -1434,6 +1435,46 @@ mod tests {
         assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_REQUEST, "{err:?}");
         assert_eq!(err.data.as_ref().unwrap()["kind"], "conflict");
         assert!(err.message.contains("mtime conflict"), "{}", err.message);
+    }
+
+    /// A section the note does not hold is INVALID_PARAMS with kind
+    /// `not_found`, and the message names the note.
+    #[tokio::test]
+    async fn an_update_naming_a_missing_section_is_invalid_params_with_kind_not_found() {
+        let (_tmp, server) = indexed_server(crate::config::GroupBy::Chunk);
+        let params: crate::params::Update = serde_json::from_value(serde_json::json!({
+            "file": "rules/evocation-spells.md",
+            "edits": [{"section": "Nowhere", "mode": "replace", "content": "x"}]
+        }))
+        .unwrap();
+        let err = server.update(super::Parameters(params)).await.unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
+        assert_eq!(err.data.as_ref().unwrap()["kind"], "not_found");
+        assert_eq!(
+            err.message,
+            "editing rules/evocation-spells.md: section 'Nowhere' not found"
+        );
+    }
+
+    /// A scope the parser refuses is the caller's own text, checked before
+    /// the scan runs.
+    #[tokio::test]
+    async fn a_match_with_a_scope_the_parser_refuses_is_invalid_params() {
+        let (_tmp, server) = indexed_server(crate::config::GroupBy::Chunk);
+        let params = crate::params::Match {
+            pattern: "x".into(),
+            case_sensitive: false,
+            word: false,
+            scope: vec![],
+            all: vec!["".into()],
+            any: vec![],
+            none: vec![],
+            scan: crate::params::Scan::default(),
+            limit: None,
+        };
+        let err = server.r#match(super::Parameters(params)).await.unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
+        assert_eq!(err.data.as_ref().unwrap()["kind"], "invalid_input");
     }
 
     /// The structured envelope (#35), read from `structuredContent` rather
