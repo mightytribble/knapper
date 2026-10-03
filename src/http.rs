@@ -89,12 +89,15 @@ impl RateLimiter {
 pub struct ApiError {
     pub status: StatusCode,
     pub message: String,
+    /// The fault's kind, from `Fault::kind`, or one of this transport's own:
+    /// `unauthorized`, `forbidden`, `rate_limited`, `internal`.
+    pub kind: &'static str,
     pub headers: Vec<(String, String)>,
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
-        let body = serde_json::json!({ "error": self.message });
+        let body = serde_json::json!({ "error": self.message, "kind": self.kind });
         let mut response = (self.status, Json(body)).into_response();
         for (name, value) in &self.headers {
             if let (Ok(n), Ok(v)) = (
@@ -109,46 +112,68 @@ impl IntoResponse for ApiError {
 }
 
 impl ApiError {
-    pub fn unauthorized(msg: &str) -> Self {
+    fn new(status: StatusCode, kind: &'static str, message: &str) -> Self {
         Self {
-            status: StatusCode::UNAUTHORIZED,
-            message: msg.to_string(),
+            status,
+            message: message.to_string(),
+            kind,
             headers: vec![],
         }
+    }
+    pub fn unauthorized(msg: &str) -> Self {
+        Self::new(StatusCode::UNAUTHORIZED, "unauthorized", msg)
     }
     pub fn forbidden(msg: &str) -> Self {
-        Self {
-            status: StatusCode::FORBIDDEN,
-            message: msg.to_string(),
-            headers: vec![],
-        }
+        Self::new(StatusCode::FORBIDDEN, "forbidden", msg)
     }
+    /// The handler's own parse stage: the caller's text read before any core
+    /// call. What comes out of a core call goes through `From` instead.
     pub fn bad_request(msg: &str) -> Self {
-        Self {
-            status: StatusCode::BAD_REQUEST,
-            message: msg.to_string(),
-            headers: vec![],
-        }
+        Self::new(StatusCode::BAD_REQUEST, "invalid_input", msg)
     }
     pub fn not_found(msg: &str) -> Self {
-        Self {
-            status: StatusCode::NOT_FOUND,
-            message: msg.to_string(),
-            headers: vec![],
-        }
+        Self::new(StatusCode::NOT_FOUND, "not_found", msg)
     }
     pub fn internal(msg: &str) -> Self {
-        Self {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: msg.to_string(),
-            headers: vec![],
-        }
+        Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", msg)
     }
     pub fn rate_limited(retry_after: u64) -> Self {
         Self {
             status: StatusCode::TOO_MANY_REQUESTS,
             message: format!("Rate limit exceeded. Retry after {retry_after}s"),
+            kind: "rate_limited",
             headers: vec![("retry-after".to_string(), retry_after.to_string())],
+        }
+    }
+}
+
+/// The one place an error from a core call becomes a status.
+///
+/// The kind is read once, through whatever context the pipeline added. An
+/// error with no `Fault` in its chain is the server's own, and a 500 keeps
+/// the whole chain in its body: this surface serves one local agent, and the
+/// chain is the most useful thing it can read.
+impl From<anyhow::Error> for ApiError {
+    fn from(e: anyhow::Error) -> Self {
+        use crate::fault::Fault;
+        let message = format!("{e:#}");
+        match Fault::of(&e) {
+            Some(fault) => {
+                let status = match fault {
+                    Fault::InvalidInput(_) | Fault::Ambiguous(_) => StatusCode::BAD_REQUEST,
+                    Fault::NotFound(_) => StatusCode::NOT_FOUND,
+                    Fault::Conflict(_) => StatusCode::CONFLICT,
+                    Fault::ReadOnly => StatusCode::FORBIDDEN,
+                    Fault::StaleIndex(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                };
+                Self::new(status, fault.kind(), &message)
+            }
+            // The prefix checks the handlers used to make, kept until the
+            // variants that replace them land. Deleted in Tasks 4 and 5.
+            None if is_scope_typo(&e.to_string()) || is_read_miss(&e.to_string()) => {
+                Self::bad_request(&message)
+            }
+            None => Self::internal(&message),
         }
     }
 }
@@ -342,6 +367,15 @@ fn is_scope_typo(message: &str) -> bool {
         || message.starts_with("ambiguous alias")
 }
 
+/// The `read` route's own list, kept beside `is_scope_typo` until Task 5
+/// builds the `NotFound` and `Ambiguous` variants that replace both.
+fn is_read_miss(message: &str) -> bool {
+    message.starts_with("Section not found")
+        || message.starts_with("File not found")
+        || message.starts_with("ambiguous alias")
+        || message.starts_with("--section cannot be combined")
+}
+
 async fn handle_match(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -377,16 +411,7 @@ async fn handle_search(
         .with_core(move |g| {
             search::run_query(body, scope, &config, g.store, g.embedder, g.reranker)
         })
-        .await
-        .map_err(|e| {
-            // An unknown tag or folder is a caller's typo, not a server
-            // fault (#60, #65).
-            if is_scope_typo(&e.to_string()) {
-                ApiError::bad_request(&format!("{e:#}"))
-            } else {
-                ApiError::internal(&format!("{e:#}"))
-            }
-        })?;
+        .await?;
     let value = serde_json::to_value(&env).map_err(|e| ApiError::internal(&format!("{e:#}")))?;
     Ok(Json(value))
 }
@@ -409,26 +434,7 @@ async fn handle_read(
             };
             context::context_read(&ctx, &p.file, p.section.as_deref(), p.include)
         })
-        .await
-        .map_err(|e| {
-            // A file or a section the vault does not hold, an alias more than
-            // one note carries (#142), or a `section` beside an `include`
-            // mode that answers the whole note, is the caller's own input
-            // naming nothing or asking two things at once, not a server
-            // fault (#60). The message text is the cheapest honest signal
-            // `context_read` gives a caller this far from the error's
-            // construction.
-            let message = e.to_string();
-            if message.starts_with("Section not found")
-                || message.starts_with("File not found")
-                || message.starts_with("ambiguous alias")
-                || message.starts_with("--section cannot be combined")
-            {
-                ApiError::bad_request(&format!("{e:#}"))
-            } else {
-                ApiError::internal(&format!("{e:#}"))
-            }
-        })?;
+        .await?;
     Ok(Json(serde_json::json!(result)))
 }
 
@@ -468,16 +474,7 @@ async fn handle_list(
                 params.detailed,
             )
         })
-        .await
-        .map_err(|e| {
-            // An unknown tag or folder is a caller's typo, not a server
-            // fault (#65).
-            if is_scope_typo(&e.to_string()) {
-                ApiError::bad_request(&format!("{e:#}"))
-            } else {
-                ApiError::internal(&format!("{e:#}"))
-            }
-        })?;
+        .await?;
     Ok(Json(serde_json::json!(items)))
 }
 
@@ -493,8 +490,7 @@ async fn handle_tags(
     let rows = state
         .core
         .with_reader(move |store| store.tags_under(prefix.as_ref()))
-        .await
-        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+        .await?;
     Ok(Json(serde_json::json!(rows)))
 }
 
@@ -511,8 +507,7 @@ async fn handle_properties(
     let report = state
         .core
         .with_reader(move |store| crate::properties::run(store, &vault, &params))
-        .await
-        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+        .await?;
     Ok(Json(serde_json::json!(report)))
 }
 
@@ -533,8 +528,7 @@ async fn handle_vault_map(
             };
             context::vault_map(&ctx)
         })
-        .await
-        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+        .await?;
     Ok(Json(serde_json::json!(map)))
 }
 
@@ -551,8 +545,7 @@ async fn handle_health(
     let report = state
         .core
         .with_reader(move |store| health::generate_health_report(store, &config))
-        .await
-        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+        .await?;
     Ok(Json(serde_json::json!(report)))
 }
 
@@ -574,8 +567,7 @@ async fn handle_validate(
     let report = crate::core::blocking(move || {
         crate::validate::validate_target(&vault, &target, &limits, strict)
     })
-    .await
-    .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    .await?;
     Ok(Json(serde_json::json!(report)))
 }
 
@@ -587,8 +579,7 @@ async fn handle_status(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, false)?;
-    let data_dir =
-        crate::config::Config::data_dir().map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    let data_dir = crate::config::Config::data_dir()?;
     let config = state.core.config.clone();
     let pending = state
         .core
@@ -597,8 +588,7 @@ async fn handle_status(
     let report = state
         .core
         .with_reader(move |store| search::status_json(store, &data_dir, &config, pending))
-        .await
-        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+        .await?;
     Ok(Json(report))
 }
 
@@ -647,8 +637,7 @@ async fn handle_create(
                 profile.as_ref().as_ref(),
             )
         })
-        .await
-        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+        .await?;
     state
         .core
         .record_write(&state.core.vault_path.join(&result.path))
@@ -702,8 +691,7 @@ async fn handle_update(
             })?;
             Ok(result)
         })
-        .await
-        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+        .await?;
     state
         .core
         .record_write(&state.core.vault_path.join(&result.path))
@@ -726,8 +714,7 @@ async fn handle_move(
     let result = state
         .core
         .with_core(move |g| writer::move_note(&body.file, &body.new_folder, g.store, &vault))
-        .await
-        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+        .await?;
     state
         .core
         .record_write(&state.core.vault_path.join(&result.path))
@@ -768,8 +755,7 @@ async fn handle_archive(
                 writer::archive_note(&body.file, g.store, &vault, profile.as_ref().as_ref())
             }
         })
-        .await
-        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+        .await?;
     state
         .core
         .record_write(&state.core.vault_path.join(&result.path))
@@ -801,8 +787,7 @@ async fn handle_migrate(
                 .with_reader(move |store| {
                     crate::migrate::generate_preview(store, &vault, profile.as_ref().as_ref())
                 })
-                .await
-                .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+                .await?;
             Ok(Json(serde_json::to_value(&preview).unwrap()))
         }
         "apply" => {
@@ -816,8 +801,7 @@ async fn handle_migrate(
             let result = state
                 .core
                 .with_core(move |g| crate::migrate::apply_preview(&preview, g.store, &vault))
-                .await
-                .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+                .await?;
             Ok(Json(serde_json::to_value(&result).unwrap()))
         }
         "undo" => {
@@ -829,8 +813,7 @@ async fn handle_migrate(
             let result = state
                 .core
                 .with_core(move |g| crate::migrate::undo_last(g.store, &vault))
-                .await
-                .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+                .await?;
             Ok(Json(serde_json::to_value(&result).unwrap()))
         }
         // The mode is the caller's own text, so a word that names no
@@ -866,8 +849,7 @@ async fn handle_delete(
     state
         .core
         .with_core(move |g| writer::delete_note(g.store, &vault, &file, mode, &archive_folder))
-        .await
-        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+        .await?;
     Ok(Json(serde_json::json!({
         "deleted": body.file,
         "mode": body.mode,
@@ -919,8 +901,7 @@ async fn handle_index(
                 profile.as_ref().as_ref(),
             )
         })
-        .await
-        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+        .await?;
     Ok(Json(serde_json::json!({
         "new_files": result.new_files,
         "updated_files": result.updated_files,
@@ -1003,8 +984,7 @@ async fn handle_identity(
             .core
             .with_reader(move |store| crate::identity::format_identity_block(&config, store))
             .await
-    }
-    .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    }?;
     Ok(Json(serde_json::json!({ "identity": block })))
 }
 
@@ -1017,9 +997,8 @@ async fn handle_init(
     match body.mode.as_deref() {
         Some("detect") => {
             let vault = state.core.vault_path.clone();
-            let result = crate::core::blocking(move || crate::onboarding::run_detect_json(&vault))
-                .await
-                .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+            let result =
+                crate::core::blocking(move || crate::onboarding::run_detect_json(&vault)).await?;
             Ok(Json(result))
         }
         Some("apply") => {
@@ -1031,8 +1010,7 @@ async fn handle_init(
                     "Write operations disabled in read-only mode",
                 ));
             }
-            let data_dir = crate::config::Config::data_dir()
-                .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+            let data_dir = crate::config::Config::data_dir()?;
             let flags = crate::onboarding::ApplyFlags {
                 name: body.name,
                 role: body.role,
@@ -1065,8 +1043,7 @@ async fn handle_init(
                     }
                     Ok(result)
                 })
-                .await
-                .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+                .await?;
             Ok(Json(result))
         }
         Some(other) => Err(ApiError::bad_request(&format!(
@@ -1213,6 +1190,68 @@ mod tests {
     #[test]
     fn test_check_permission_read_on_read() {
         assert!(check_permission("read", false));
+    }
+
+    /// The one mapping from a kind to a status, over every kind and the
+    /// plain `anyhow` case, read through a context layer the way a handler
+    /// receives it.
+    #[test]
+    fn each_fault_maps_to_its_status_and_kind() {
+        use crate::fault::Fault;
+        let cases: Vec<(anyhow::Error, StatusCode, &str)> = vec![
+            (
+                Fault::InvalidInput("x".into()).into(),
+                StatusCode::BAD_REQUEST,
+                "invalid_input",
+            ),
+            (
+                Fault::NotFound("x".into()).into(),
+                StatusCode::NOT_FOUND,
+                "not_found",
+            ),
+            (
+                Fault::Ambiguous("x".into()).into(),
+                StatusCode::BAD_REQUEST,
+                "ambiguous",
+            ),
+            (
+                Fault::Conflict("x".into()).into(),
+                StatusCode::CONFLICT,
+                "conflict",
+            ),
+            (
+                Fault::StaleIndex("x".into()).into(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "stale_index",
+            ),
+            (Fault::ReadOnly.into(), StatusCode::FORBIDDEN, "read_only"),
+            (
+                anyhow::anyhow!("x"),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+            ),
+        ];
+        for (err, status, kind) in cases {
+            let api = ApiError::from(err.context("under context"));
+            assert_eq!(api.status, status, "{kind}");
+            assert_eq!(api.kind, kind);
+            assert!(
+                api.message.starts_with("under context: "),
+                "{}",
+                api.message
+            );
+        }
+    }
+
+    /// Every error body names its kind beside its message, the parse-stage
+    /// ones included.
+    #[tokio::test]
+    async fn an_error_body_names_its_kind() {
+        let (_tmp, state) = test_api_state();
+        let (status, body) = post_json(state, "/api/init", r#"{}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "init needs mode=detect or mode=apply");
+        assert_eq!(body["kind"], "invalid_input");
     }
 
     #[test]
