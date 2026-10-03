@@ -11,6 +11,16 @@ Links resolve against https://github.com/mightytribble/knapper.
 - `list` now reads in pages — pass `limit`, then `after` set to the last path received — so a listing too large for one response no longer has to be split by scope (#143). ([`6e8d674`](https://github.com/mightytribble/knapper/commit/6e8d674))
 - `read`, `links_to` and `linked_from` now accept a note's alias, and `list` rows carry `aliases` (#142); run `knapper index` before `serve` to record an existing store's aliases, with no re-embed. ([`23672cd`](https://github.com/mightytribble/knapper/commit/23672cd))
 
+### Changed
+
+- `knapper serve` reads `config.toml` once, at start; a change takes effect on restart. `init --mode apply` against a running server answers `restart_required: true`. (serve-core)
+- `status` answers `pending_events`, the number of watcher events not yet applied, on every surface; the text prints `Pending:` only when it is not zero. (serve-core)
+
+### Fixed
+
+- A read tool — `read`, `list`, `tags`, `properties`, `vault_map`, `status`, `health`, `match` — no longer waits for a search, a write or the `index` tool under `serve`: reads answer from a second connection. (serve-core)
+- `serve` no longer holds every tool while it reconciles changes made while it was down. The reconciliation runs per file in the background, and `status` says how many files are pending. (serve-core)
+
 ## 0.9.11 (2026-09-11)
 
 A section's chunks carry the heading the note holds, not an invented `(cont.)`

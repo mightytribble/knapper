@@ -231,6 +231,10 @@ Taking one of the Qwen rows costs two things. The store re-indexes at the new wi
 
 `exclude` takes `.gitignore`-style globs, matched against paths relative to the vault root. A pattern with no `/` matches at any depth (`*-index.md` catches `lore/lore-index.md`); a trailing `/` means a directory and everything under it; an embedded `/` anchors the pattern to the vault root (`drafts/**`). Excluding a path that is already indexed removes it from the store — chunks, vectors, FTS entries and graph edges — on the next index run.
 
+## When a setting takes effect
+
+The CLI reads `config.toml` on every invocation. `knapper serve` reads it once, when it starts, and a change takes effect on restart: `search`, `validate`, `index` and every other tool answer from the copy the server captured. `init --mode apply` run against a server still writes the file, and its reply carries `restart_required: true`. A key marked above as a fingerprint component also needs the re-index it declares.
+
 ## Data directory
 
 All data stored in `~/.knapper/` — single SQLite database (~10MB typical), GGUF models, and vault profile. Set `KNAPPER_HOME` (used verbatim) or pass `--data-dir` to move that directory; `--data-dir` wins over the environment, which wins over the default.
