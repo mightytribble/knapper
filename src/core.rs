@@ -251,7 +251,6 @@ impl Core {
     }
 }
 
-/// Fixtures the server and watcher tests share.
 /// Run `f` off the runtime thread, holding no lock. For work that touches
 /// the disk and not the store, such as a vault walk. A panic inside `f` is
 /// the `Err`.
@@ -266,6 +265,7 @@ where
     }
 }
 
+/// Fixtures the server and watcher tests share.
 #[cfg(test)]
 pub mod testing {
     use super::*;
