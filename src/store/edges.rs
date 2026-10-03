@@ -941,11 +941,14 @@ mod tests {
             (a, b)
         };
 
-        // Put the old schema back, rows and all.
+        // Put the old schema back, rows and all. A pre-#28 store is a
+        // version-0 store, so the stamp goes back too, or the probes that
+        // widen the table never run.
         {
             let conn = rusqlite::Connection::open(&path).unwrap();
             conn.execute_batch(&format!(
-                "DROP TABLE edges;
+                "PRAGMA user_version = 0;
+                 DROP TABLE edges;
                  CREATE TABLE edges (
                      id INTEGER PRIMARY KEY,
                      from_file INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,

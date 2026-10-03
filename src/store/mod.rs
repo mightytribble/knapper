@@ -31,12 +31,12 @@ pub use identity::IdentityFact;
 pub use migration_log::MigrationEntry;
 pub use placement::PlacementCorrection;
 pub use properties::{NewProperty, PropertyCount, PropertyRow, ValueCount};
+pub use schema::SCHEMA_VERSION;
 pub use scope::{LinkIds, ListOrder, ListRow};
 pub use tags::TagCount;
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
-use schema::SCHEMA;
 use std::path::Path;
 
 /// Summary statistics for the store.
@@ -108,19 +108,19 @@ impl Store {
     }
 
     fn init(&self) -> Result<()> {
-        // Enable WAL mode for concurrent reads during writes (fixes "database is locked"
-        // errors with rapid MCP calls and parallel CLI + server access).
-        // busy_timeout makes SQLite retry for up to 5 seconds instead of failing immediately.
+        // Per-connection settings, so they are set on every open and not by a
+        // schema step. WAL lets a reader read while the writer writes, and
+        // `busy_timeout` makes a write wait for the lock rather than fail.
+        // `foreign_keys` is what makes every ON DELETE CASCADE fire, and
+        // SQLite ignores it inside a transaction, so it cannot sit in a step.
         self.conn
             .execute_batch(
                 "PRAGMA journal_mode = WAL;
-                 PRAGMA busy_timeout = 5000;",
+                 PRAGMA busy_timeout = 5000;
+                 PRAGMA foreign_keys = ON;",
             )
-            .context("failed to set WAL pragmas")?;
-        self.conn
-            .execute_batch(SCHEMA)
-            .context("failed to initialize schema")?;
-        self.migrate()?;
+            .context("failed to set the connection pragmas")?;
+        self.upgrade_to_current()?;
         self.ensure_fts_table()?;
         // The vector table's width is the embedding model's, and no model is
         // loaded here — so this must not guess (issue #12). A database that has
@@ -444,6 +444,37 @@ mod tests {
                 .insert_file("c.md", "h", 1, "ccc333", None, None)
                 .is_err(),
             "SQLite enforces the read-only contract"
+        );
+    }
+
+    #[test]
+    fn foreign_keys_are_enforced_on_a_reopened_store() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = tmp.path().join("knapper.db");
+        let file_id = {
+            let store = Store::open(&db).unwrap();
+            let id = store
+                .insert_file("a.md", "h", 1, "aaa111", None, None)
+                .unwrap();
+            store
+                .insert_chunk(&NewChunk {
+                    file_id: id,
+                    seq: 0,
+                    heading: "H",
+                    text: "text",
+                    vector_id: 1,
+                    token_count: 1,
+                    ..Default::default()
+                })
+                .unwrap();
+            id
+        };
+        let store = Store::open(&db).unwrap();
+        store.delete_file(file_id).unwrap();
+        assert_eq!(
+            store.chunk_row_count().unwrap(),
+            0,
+            "the cascade fires on a connection that ran no schema step"
         );
     }
 }

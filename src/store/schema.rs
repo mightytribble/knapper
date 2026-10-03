@@ -2,7 +2,8 @@
 
 use super::DOC_LEVEL;
 use super::Store;
-use anyhow::Result;
+use crate::fault::Fault;
+use anyhow::{Context, Result, bail};
 
 /// The `edges` table, as created fresh and as rebuilt by the #28 migration.
 ///
@@ -96,9 +97,7 @@ const ALIASES_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS aliases (
 );
 CREATE INDEX IF NOT EXISTS idx_aliases_folded ON aliases(folded);";
 
-pub(super) const SCHEMA: &str = r#"
-PRAGMA foreign_keys = ON;
-
+const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT
@@ -156,7 +155,61 @@ CREATE TABLE IF NOT EXISTS tombstones (
 
 "#;
 
+/// The schema this binary writes. A store below it is upgraded on open; one
+/// above it was written by a newer knapper and is refused.
+pub const SCHEMA_VERSION: i64 = 1;
+
+/// Step `n` upgrades a store from version `n` to `n + 1`. The array's length
+/// is the version, so a step cannot be added without bumping it and the
+/// constant cannot be bumped without a step.
+const STEPS: [fn(&Store) -> Result<()>; SCHEMA_VERSION as usize] = [Store::migrate_to_1];
+
 impl Store {
+    /// The schema version the store records. 0 for a store that records none,
+    /// which is every store written before versions and every fresh file.
+    pub(super) fn user_version(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))?)
+    }
+
+    fn set_user_version(&self, version: i64) -> Result<()> {
+        self.conn
+            .execute_batch(&format!("PRAGMA user_version = {version}"))?;
+        Ok(())
+    }
+
+    /// Bring a store at version `from` up to the version `steps` describes.
+    ///
+    /// Each step runs in its own transaction and stamps the version inside
+    /// it. SQLite rolls `user_version` back with the transaction, so a step
+    /// that fails leaves the store at the version before it, and the next
+    /// open runs it again.
+    pub(super) fn upgrade(&self, from: i64, steps: &[fn(&Store) -> Result<()>]) -> Result<()> {
+        for (i, step) in steps.iter().enumerate().skip(from.max(0) as usize) {
+            let to = i as i64 + 1;
+            self.transaction(|store| {
+                step(store)
+                    .with_context(|| format!("upgrading the index schema to version {to}"))?;
+                store.set_user_version(to)
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Refuse a store a newer knapper wrote, then run every step it is missing.
+    pub(super) fn upgrade_to_current(&self) -> Result<()> {
+        let version = self.user_version()?;
+        if version > SCHEMA_VERSION {
+            bail!(Fault::StaleIndex(format!(
+                "this index was written by a newer knapper: its schema is version \
+                 {version} and this binary reads version {SCHEMA_VERSION}. Upgrade \
+                 knapper, or delete the index and run 'knapper index'."
+            )));
+        }
+        self.upgrade(version, &STEPS)
+    }
+
     /// Whether `table` already has a column named `column`.
     fn column_exists(&self, table: &str, column: &str) -> Result<bool> {
         let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
@@ -199,8 +252,15 @@ impl Store {
         Ok(())
     }
 
-    /// Run migrations for existing databases that may be missing newer columns.
-    pub(super) fn migrate(&self) -> Result<()> {
+    /// Version 1: the schema as it stood when versions began. The base tables,
+    /// then the probes that carried every earlier store forward.
+    ///
+    /// Frozen. A fresh store and an upgraded old one are both built by this
+    /// function, so a change to a table is a `migrate_to_2`, not an edit here.
+    fn migrate_to_1(&self) -> Result<()> {
+        self.conn
+            .execute_batch(SCHEMA)
+            .context("failed to initialize schema")?;
         // The orchestrator's result cache. Nothing reads it since #59, and a
         // cache row has no expiry, so a store carried across the upgrade would
         // hold rows forever that describe a pipeline that no longer exists.
@@ -580,7 +640,7 @@ mod tests {
             .conn
             .execute_batch("CREATE TABLE llm_cache (query_hash TEXT PRIMARY KEY);")
             .unwrap();
-        store.migrate().unwrap();
+        store.migrate_to_1().unwrap();
         let present: i64 = store
             .conn
             .query_row(
@@ -623,7 +683,7 @@ mod tests {
             )
             .unwrap();
 
-        store.migrate().unwrap();
+        store.migrate_to_1().unwrap();
 
         assert_eq!(
             store.get_unresolved_links().unwrap(),
@@ -633,5 +693,186 @@ mod tests {
         // And the carried row is keyed on the file, so the cascade reaches it.
         store.delete_file(file_id).unwrap();
         assert!(store.get_unresolved_links().unwrap().is_empty());
+    }
+
+    use crate::fault::Fault;
+    use std::collections::BTreeMap;
+
+    /// The oldest shape the probes handle: `files` with a `tags` column and
+    /// no `docid`, `chunks` with no `seq`, `edges` keyed on file alone,
+    /// `unresolved_links` keyed on a path, and the two tables the probes drop.
+    const VERSION_0: &str = "
+        CREATE TABLE files (
+            id INTEGER PRIMARY KEY, path TEXT UNIQUE NOT NULL,
+            content_hash TEXT NOT NULL, mtime INTEGER NOT NULL,
+            tags TEXT NOT NULL DEFAULT '[]', indexed_at TEXT NOT NULL);
+        CREATE TABLE chunks (
+            id INTEGER PRIMARY KEY,
+            file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+            heading TEXT NOT NULL, snippet TEXT NOT NULL,
+            vector_id INTEGER UNIQUE NOT NULL, token_count INTEGER NOT NULL,
+            vector BLOB);
+        CREATE TABLE edges (
+            id INTEGER PRIMARY KEY,
+            from_file INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+            to_file INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+            edge_type TEXT NOT NULL,
+            UNIQUE(from_file, to_file, edge_type));
+        CREATE INDEX idx_edges_from ON edges(from_file);
+        CREATE INDEX idx_edges_to ON edges(to_file);
+        CREATE INDEX idx_edges_type ON edges(edge_type);
+        CREATE TABLE unresolved_links (
+            id INTEGER PRIMARY KEY, source_file TEXT NOT NULL, target TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(source_file, target));
+        CREATE INDEX idx_unresolved_source ON unresolved_links(source_file);
+        CREATE TABLE tag_registry (tag TEXT PRIMARY KEY, usage_count INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE llm_cache (query_hash TEXT PRIMARY KEY);
+        INSERT INTO files (id, path, content_hash, mtime, indexed_at)
+            VALUES (1, 'a.md', 'h', 1, 'now'), (2, 'b.md', 'h', 1, 'now');
+        INSERT INTO chunks (file_id, heading, snippet, vector_id, token_count)
+            VALUES (1, 'A0', 's', 10, 1), (1, 'A1', 's', 11, 1), (2, 'B0', 's', 12, 1);
+        INSERT INTO edges (from_file, to_file, edge_type) VALUES (1, 2, 'wikilink');
+        INSERT INTO unresolved_links (source_file, target) VALUES ('a.md', 'Nowhere');
+    ";
+
+    /// Every table with its column names, and every index, as the catalogue
+    /// reports them. Column order is not compared: a column `ALTER TABLE`
+    /// added sits last where a fresh `CREATE TABLE` puts it in place.
+    fn schema_shape(store: &Store) -> BTreeMap<String, Vec<String>> {
+        let mut stmt = store
+            .conn
+            .prepare(
+                "SELECT type, name FROM sqlite_master
+                 WHERE type IN ('table', 'index') AND name NOT LIKE 'sqlite_%'
+                 ORDER BY name",
+            )
+            .unwrap();
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let mut shape = BTreeMap::new();
+        for (kind, name) in rows {
+            let mut columns: Vec<String> = if kind == "table" {
+                let mut info = store
+                    .conn
+                    .prepare(&format!("PRAGMA table_info({name})"))
+                    .unwrap();
+                info.query_map([], |r| r.get::<_, String>(1))
+                    .unwrap()
+                    .map(|r| r.unwrap())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            columns.sort();
+            shape.insert(format!("{kind} {name}"), columns);
+        }
+        shape
+    }
+
+    #[test]
+    fn a_fresh_store_is_at_the_current_version() {
+        let store = Store::open_memory().unwrap();
+        assert_eq!(store.user_version().unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn a_version_0_store_is_upgraded_on_open() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = tmp.path().join("legacy.db");
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch(VERSION_0)
+            .unwrap();
+
+        let store = Store::open(&db).unwrap();
+        assert_eq!(store.user_version().unwrap(), SCHEMA_VERSION);
+
+        let fresh = Store::open_memory().unwrap();
+        assert_eq!(
+            schema_shape(&store),
+            schema_shape(&fresh),
+            "an upgraded store has the fresh store's tables, columns and indexes"
+        );
+
+        assert_eq!(store.file_count().unwrap(), 2, "the rows survived");
+        assert_eq!(
+            store.get_chunk_by_seq(1, 1).unwrap().unwrap().heading,
+            "A1",
+            "seq was backfilled in insertion order"
+        );
+        assert_eq!(store.wikilink_pairs().unwrap(), vec![(1, 2)]);
+        assert!(store.needs_edge_backfill().unwrap());
+        assert_eq!(
+            store.get_unresolved_links().unwrap(),
+            vec![("a.md".to_string(), "Nowhere".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_store_at_the_current_version_runs_no_migration_on_open() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = tmp.path().join("knapper.db");
+        {
+            let store = Store::open(&db).unwrap();
+            store
+                .conn
+                .execute_batch("DROP TABLE identity_facts")
+                .unwrap();
+        }
+        let store = Store::open(&db).unwrap();
+        let present: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'identity_facts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            present, 0,
+            "a store at the current version is opened as it is; migrate_to_1 would have recreated the table"
+        );
+    }
+
+    #[test]
+    fn a_store_from_a_newer_knapper_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = tmp.path().join("knapper.db");
+        {
+            let store = Store::open(&db).unwrap();
+            store.set_user_version(SCHEMA_VERSION + 1).unwrap();
+        }
+        let err = Store::open(&db).err().expect("a newer store is refused");
+        assert!(
+            matches!(Fault::of(&err), Some(Fault::StaleIndex(_))),
+            "{err:#}"
+        );
+        let text = format!("{err:#}");
+        assert!(text.contains("newer knapper"), "{text}");
+        assert!(
+            text.contains(&format!("version {}", SCHEMA_VERSION + 1)),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_step_that_fails_leaves_the_version_where_it_was() {
+        fn failing(store: &Store) -> Result<()> {
+            store.set_meta("half_done", "1")?;
+            anyhow::bail!("the step failed")
+        }
+        let store = Store::open_memory().unwrap();
+        let steps: [fn(&Store) -> Result<()>; 2] = [Store::migrate_to_1, failing];
+
+        let err = store.upgrade(SCHEMA_VERSION, &steps).unwrap_err();
+
+        assert!(format!("{err:#}").contains("the step failed"));
+        assert_eq!(store.user_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(store.get_meta("half_done").unwrap(), None);
+        assert!(store.conn.is_autocommit());
     }
 }
