@@ -9,6 +9,7 @@ pub mod core;
 pub mod docid;
 pub mod embed_api;
 pub mod exclude;
+pub mod fault;
 pub mod fingerprint;
 pub mod frontmatter;
 pub mod fts;

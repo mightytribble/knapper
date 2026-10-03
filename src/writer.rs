@@ -1,13 +1,14 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use ignore::WalkBuilder;
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
 use crate::chunker::{ChunkOptions, chunk_markdown, split_oversized_chunks};
 use crate::docid::generate_docid;
+use crate::fault::Fault;
 use crate::frontmatter::KeyPlacement;
 use crate::indexer::build_edges_for_file;
 use crate::links;
@@ -400,10 +401,10 @@ fn precompute_chunks(
 /// Returns error if final_path already exists and `allow_overwrite` is false.
 fn atomic_write(final_path: &Path, content: &str, allow_overwrite: bool) -> Result<()> {
     if !allow_overwrite && final_path.exists() {
-        bail!(
+        bail!(Fault::Conflict(format!(
             "file already exists at {}, refusing to overwrite",
             final_path.display()
-        );
+        )));
     }
 
     // Ensure parent directory exists
@@ -524,10 +525,10 @@ pub fn create_note(
 
     // Check for existing file before doing expensive work
     if final_path.exists() {
-        bail!(
+        bail!(Fault::Conflict(format!(
             "file already exists at {}; use update to change an existing note, not create",
             final_path.display()
-        );
+        )));
     }
 
     // Step 6: Pre-compute chunks + embeddings BEFORE transaction
@@ -674,8 +675,9 @@ pub fn apply_section_edit(
     mode: EditMode,
 ) -> Result<String> {
     // Find the target section
-    let section = crate::markdown::find_section(content, heading)
-        .ok_or_else(|| anyhow::anyhow!("section '{}' not found", heading))?;
+    let section = crate::markdown::find_section(content, heading).ok_or_else(|| {
+        anyhow::anyhow!(Fault::NotFound(format!("section '{}' not found", heading)))
+    })?;
 
     // `remove` takes the heading line as well as the body, because that is
     // what deleting a section means, and the section is its subtree the same
@@ -852,8 +854,9 @@ fn from_first_text_line(s: &str) -> &str {
 /// A name another section of the note already holds is refused too: two
 /// sections of one name leave both unaddressable by bare name.
 pub fn rename_section(content: &str, heading: &str, new_heading: &str) -> Result<String> {
-    let section = crate::markdown::find_section(content, heading)
-        .ok_or_else(|| anyhow::anyhow!("section '{}' not found", heading))?;
+    let section = crate::markdown::find_section(content, heading).ok_or_else(|| {
+        anyhow::anyhow!(Fault::NotFound(format!("section '{}' not found", heading)))
+    })?;
 
     let text = new_heading.trim();
     if text.is_empty() {
@@ -1242,21 +1245,17 @@ fn stale_links_for(
 /// edit calls.
 pub fn update_note(store: &Store, vault_path: &Path, input: &UpdateInput) -> Result<EditResult> {
     // Step 1: Resolve file via store
-    let file_record = store
-        .resolve_file(&input.file)?
-        .ok_or_else(|| anyhow::anyhow!("file not found: {}", input.file))?;
+    let file_record = store.require_file(&input.file)?;
 
     let full_path = vault_path.join(&file_record.path);
 
     // Step 2: Mtime conflict check — one check for the whole list
     let disk_mtime = file_mtime(&full_path)?;
     if disk_mtime != file_record.mtime {
-        bail!(
+        bail!(Fault::Conflict(format!(
             "mtime conflict: file {} was modified outside knapper (disk={}, indexed={})",
-            file_record.path,
-            disk_mtime,
-            file_record.mtime
-        );
+            file_record.path, disk_mtime, file_record.mtime
+        )));
     }
 
     // Step 3: The text the file holds, which the stale-link lookup reads as
@@ -1269,7 +1268,7 @@ pub fn update_note(store: &Store, vault_path: &Path, input: &UpdateInput) -> Res
 
     // Step 5: Apply every edit to that text
     let new_content = apply_note_edits(&content, &input.edits)
-        .map_err(|e| anyhow::anyhow!("{e} in {}", input.file))?;
+        .with_context(|| format!("editing {}", input.file))?;
 
     // Step 6: Write atomically — once
     atomic_write(&full_path, &new_content, true)?;
@@ -1308,9 +1307,7 @@ pub fn move_note(
     vault_path: &Path,
 ) -> Result<WriteResult> {
     // Step 1: Resolve file
-    let file_record = store
-        .resolve_file(file)?
-        .ok_or_else(|| anyhow::anyhow!("file not found: {}", file))?;
+    let file_record = store.require_file(file)?;
 
     let old_path = vault_path.join(&file_record.path);
     let basename = file_record
@@ -1322,7 +1319,10 @@ pub fn move_note(
     let new_full_path = vault_path.join(&new_rel_path);
 
     if new_full_path.exists() {
-        bail!("target path already exists: {}", new_full_path.display());
+        bail!(Fault::Conflict(format!(
+            "target path already exists: {}",
+            new_full_path.display()
+        )));
     }
 
     // The content does not change, so the stored hash still describes the file
@@ -1406,9 +1406,7 @@ pub fn delete_note(
     mode: DeleteMode,
     archive_folder: &str,
 ) -> Result<()> {
-    let file_record = store
-        .resolve_file(file)?
-        .ok_or_else(|| anyhow::anyhow!("file not found: {}", file))?;
+    let file_record = store.require_file(file)?;
 
     let old_path = vault_path.join(&file_record.path);
     // The notes that link to this one, read before the row moves or goes: the
@@ -1480,9 +1478,7 @@ pub fn archive_note(
     vault_path: &Path,
     profile: Option<&crate::profile::VaultProfile>,
 ) -> Result<WriteResult> {
-    let file_record = store
-        .resolve_file(file)?
-        .ok_or_else(|| anyhow::anyhow!("file not found: {}", file))?;
+    let file_record = store.require_file(file)?;
 
     let archive_folder = profile
         .and_then(|p| p.structure.folders.archive.as_deref())
@@ -1490,7 +1486,10 @@ pub fn archive_note(
 
     // Don't archive something already in the archive
     if file_record.path.starts_with(archive_folder) {
-        bail!("note is already archived: {}", file_record.path);
+        bail!(Fault::Conflict(format!(
+            "note is already archived: {}",
+            file_record.path
+        )));
     }
 
     let old_path = vault_path.join(&file_record.path);
@@ -1575,7 +1574,10 @@ pub fn unarchive_note(
     // Try resolving by direct path on disk.
     let archive_path = vault_path.join(file);
     if !archive_path.exists() {
-        bail!("archived note not found: {}", file);
+        bail!(Fault::NotFound(format!(
+            "archived note not found: {}",
+            file
+        )));
     }
 
     let content = std::fs::read_to_string(&archive_path)?;
@@ -1589,10 +1591,10 @@ pub fn unarchive_note(
     let restore_full_path = vault_path.join(&original_path);
 
     if restore_full_path.exists() {
-        bail!(
+        bail!(Fault::Conflict(format!(
             "cannot unarchive: a file already exists at {}",
             original_path
-        );
+        )));
     }
 
     block.remove("archived")?;
@@ -3350,7 +3352,7 @@ mod tests {
         };
         let err =
             update_note(&store, &vault, &input).expect_err("a remove that also renames is refused");
-        let msg = format!("{err}");
+        let msg = format!("{err:#}");
         assert!(msg.contains("removes"), "{msg}");
 
         let out = std::fs::read_to_string(vault.join("note.md")).unwrap();
@@ -3377,6 +3379,10 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("file not found"), "got {err}");
+        assert_eq!(
+            crate::fault::Fault::of(&err).map(|f| f.kind()),
+            Some("not_found")
+        );
     }
 
     /// Ported from `tests/write_pipeline.rs::test_conflict_detection`, which
@@ -3411,6 +3417,10 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("mtime conflict"), "got {err}");
+        assert_eq!(
+            crate::fault::Fault::of(&err).map(|f| f.kind()),
+            Some("conflict")
+        );
         assert_eq!(
             std::fs::read_to_string(vault.join("note.md")).unwrap(),
             outside,

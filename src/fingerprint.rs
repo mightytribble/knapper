@@ -27,6 +27,8 @@
 //!   acceptance criteria call out.
 
 use anyhow::{Context, Result};
+
+use crate::fault::Fault;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -446,11 +448,11 @@ pub fn record(store: &Store, computed: &Fingerprints) -> Result<()> {
 pub fn verify(store: &Store, computed: &Fingerprints) -> Result<()> {
     let comparison = compare(store, computed)?;
     if comparison.blocks_reads() {
-        anyhow::bail!(
+        anyhow::bail!(Fault::StaleIndex(format!(
             "the index was built by different code or configuration than is \
              running now: {}. Run 'knapper index' to bring it up to date.",
             comparison.summary()
-        );
+        )));
     }
     for mismatch in &comparison.mismatches {
         tracing::warn!(
@@ -963,7 +965,11 @@ mod tests {
         );
         assert!(comparison.blocks_reads());
 
-        assert!(verify(&store, &computed).is_err());
+        let err = verify(&store, &computed).unwrap_err();
+        assert_eq!(
+            crate::fault::Fault::of(&err).map(|f| f.kind()),
+            Some("stale_index")
+        );
         assert_eq!(
             store.get_meta(CHUNKER.name).unwrap(),
             None,

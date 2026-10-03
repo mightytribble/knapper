@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use ignore::WalkBuilder;
 use indicatif::{ProgressBar, ProgressStyle};
 use sha2::{Digest, Sha256};
@@ -12,6 +12,7 @@ use crate::chunker::{chunk_markdown, split_oversized_chunks};
 use crate::config::{Config, db_path};
 use crate::docid::generate_docid;
 use crate::exclude::ExcludeMatcher;
+use crate::fault::Fault;
 use crate::graph::{Wikilink, extract_wikilinks, resolve_link_target};
 use crate::llm::EmbedModel;
 use crate::profile::VaultProfile;
@@ -548,6 +549,11 @@ pub fn reindex_written_file(
     settings: IndexSettings,
 ) -> Result<IndexFileResult> {
     let full_path = vault_path.join(rel_path);
+    // A path not on disk is an absent resource. A file that
+    // is there and cannot be read is the server's, and stays an io::Error.
+    if !full_path.is_file() {
+        bail!(Fault::NotFound(format!("file not found: {rel_path}")));
+    }
     let content = std::fs::read_to_string(&full_path)
         .with_context(|| format!("reading written file for re-index: {rel_path}"))?;
     let content_hash = {

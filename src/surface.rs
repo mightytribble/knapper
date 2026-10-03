@@ -404,6 +404,17 @@ pub fn render_table() -> String {
     for (path, reason) in HTTP_TRANSPORT_ROUTES {
         out.push_str(&format!("| `{path}` | {reason} |\n"));
     }
+    out.push_str(
+        "\n## Errors\n\n\
+         A fault the caller can repair carries one of six kinds, built in `fault.rs` \
+         where the fault is known: `invalid_input`, `not_found`, `ambiguous`, `conflict`, \
+         `stale_index` and `read_only`. HTTP answers 400, 404, 400, 409, 500 and 403 \
+         for them in that order, with `kind` beside `error` in the body. MCP answers \
+         `INVALID_PARAMS` for the first three, `INVALID_REQUEST` for `conflict` and \
+         `read_only`, and `INTERNAL_ERROR` for `stale_index`, with `data.kind` naming \
+         the kind. The CLI prints the message and exits 1. Anything without a kind is \
+         the server's own: 500 and `INTERNAL_ERROR`.\n",
+    );
     out
 }
 

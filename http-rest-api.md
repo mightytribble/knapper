@@ -103,6 +103,25 @@ name = "web-agent"
 permissions = "write"
 ```
 
+## Errors
+
+Every error a handler answers is a JSON body with two fields: `error`, the message, and `kind`, one word for what went wrong. The status says whose fault it is.
+
+| status | kind | when |
+|---|---|---|
+| 400 | `invalid_input` | the request's own text named nothing or asked two things at once: a scope term, an `after` cursor, a `links_to` or `linked_from` name, `full` with `summaries`, a `section` beside `include=metadata`, an empty `match` pattern, a `mode` word, a malformed edit list |
+| 400 | `ambiguous` | one name, several notes: an alias more than one note carries |
+| 404 | `not_found` | the `file` or `section` the call addresses is absent, on `read`, `update`, `move`, `delete`, `archive` and `reindex-file` |
+| 409 | `conflict` | the write would clobber: the note changed on disk since it was indexed, a `create` or `move` onto an existing path, an `archive` of an archived note |
+| 403 | `read_only` | the server was started with `--read-only` |
+| 403 | `forbidden` | the key has no write permission |
+| 401 | `unauthorized` | no key, or a key the server does not hold |
+| 429 | `rate_limited` | the key's bucket is empty; `retry-after` says when |
+| 500 | `stale_index` | the index cannot answer until `knapper index` runs |
+| 500 | `internal` | anything else; the body carries the whole error chain |
+
+The rule separating 400 from 404: a scope term, cursor or link filter naming nothing is query shape, so it is 400; the note or section a call addresses naming nothing is an absent resource, so it is 404. `search` with `all: ["/nowhere.md"]` is 400 and `read?file=nowhere.md` is 404.
+
 ## Reading and editing
 
 ```bash

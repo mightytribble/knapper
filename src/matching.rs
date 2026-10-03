@@ -19,6 +19,8 @@
 use std::borrow::Cow;
 use std::collections::HashSet;
 
+use crate::fault::Fault;
+
 /// Which half of a note a row came from (#137).
 ///
 /// A frontmatter hit has no heading, and a body chunk under no heading takes
@@ -281,7 +283,9 @@ pub fn run(
     params: &crate::params::Match,
 ) -> anyhow::Result<MatchReport> {
     if params.pattern.is_empty() {
-        anyhow::bail!("pattern is empty: every line holds the empty string");
+        anyhow::bail!(Fault::InvalidInput(
+            "pattern is empty: every line holds the empty string".into()
+        ));
     }
     let scope = params.scope()?;
     let scan = params.scan;
@@ -292,11 +296,12 @@ pub fn run(
     // so never reaches `fingerprint::verify`, which is why the guard is here
     // rather than on one surface.
     if scan != crate::params::Scan::Body && store.frontmatter_unindexed(&scope)? {
-        anyhow::bail!(
+        anyhow::bail!(Fault::StaleIndex(
             "this index was built before `match` read frontmatter, so it cannot \
              say what a note's YAML holds. Run 'knapper index' to bring it up \
              to date, or pass scan=body to count the prose alone."
-        );
+                .into()
+        ));
     }
     let mut scanner = Scanner::new(
         Query::new(&params.pattern, params.case_sensitive).whole_word(params.word),

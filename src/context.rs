@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use crate::fault::Fault;
 use crate::params::Include;
 use anyhow::Result;
 use serde::Serialize;
@@ -292,24 +293,27 @@ pub fn context_read(
 ) -> Result<ReadResult> {
     if section.is_some() {
         match include {
-            Include::Metadata => anyhow::bail!(
+            Include::Metadata => anyhow::bail!(Fault::InvalidInput(
                 "--section cannot be combined with --include metadata: \
                  metadata describes the whole note"
-            ),
+                    .into()
+            )),
             // Refused rather than ignored: a caller who meant `all` would
             // otherwise be handed a plausible answer with the section they
             // named silently dropped.
-            Include::Frontmatter => anyhow::bail!(
+            Include::Frontmatter => anyhow::bail!(Fault::InvalidInput(
                 "--section cannot be combined with --include frontmatter: \
                  frontmatter is the note's own and not a section's — \
                  use --include all for both"
-            ),
+                    .into()
+            )),
             Include::Content | Include::All => {}
         }
     }
 
-    let record = resolve_file(params, file_or_docid)?
-        .ok_or_else(|| anyhow::anyhow!("File not found: {}", file_or_docid))?;
+    let record = resolve_file(params, file_or_docid)?.ok_or_else(|| {
+        anyhow::anyhow!(Fault::NotFound(format!("file not found: {file_or_docid}")))
+    })?;
 
     let full_path = params.vault_path.join(&record.path);
     let disk = std::fs::read_to_string(&full_path).ok();
@@ -385,8 +389,9 @@ pub fn context_read(
     let (content, span) = match section {
         None => (note_body(&content_str), None),
         Some(heading) => {
-            let found = crate::markdown::find_section(&content_str, heading)
-                .ok_or_else(|| anyhow::anyhow!("Section not found: {heading}"))?;
+            let found = crate::markdown::find_section(&content_str, heading).ok_or_else(|| {
+                anyhow::anyhow!(Fault::NotFound(format!("Section not found: {heading}")))
+            })?;
             let span = SectionSpan {
                 heading: found.heading.text.clone(),
                 level: (!found.heading.promoted).then_some(found.heading.level),

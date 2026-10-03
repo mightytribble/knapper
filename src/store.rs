@@ -1,3 +1,4 @@
+use crate::fault::Fault;
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::HashSet;
@@ -2203,11 +2204,11 @@ impl Store {
                     )
                     .optional()?
                     .ok_or_else(|| {
-                        anyhow::anyhow!(
+                        anyhow::anyhow!(Fault::InvalidInput(format!(
                             "no such note '{path}' for 'after'; a links_in ranking \
                              starts a page from that note's count, so start the \
                              listing again or list in path order"
-                        )
+                        )))
                     })?;
                 Some((path, count))
             }
@@ -2440,12 +2441,14 @@ impl Store {
                 return Ok(Some(f.id));
             }
             match self.resolve_file(&term.written).ok().flatten() {
-                Some(near) => anyhow::bail!(
+                Some(near) => anyhow::bail!(Fault::InvalidInput(format!(
                     "no such note '{}' for '{field}'; nearest: '{}'",
-                    term.written,
-                    near.path
-                ),
-                None => anyhow::bail!("no such note '{}' for '{field}'", term.written),
+                    term.written, near.path
+                ))),
+                None => anyhow::bail!(Fault::InvalidInput(format!(
+                    "no such note '{}' for '{field}'",
+                    term.written
+                ))),
             }
         };
         Ok(LinkIds {
@@ -2726,7 +2729,10 @@ impl Store {
     /// Rename a file's path in the store, preserving its row ID (and thus edge integrity).
     pub fn update_file_path(&self, old_path: &str, new_path: &str, new_docid: &str) -> Result<()> {
         if self.get_file(new_path)?.is_some() {
-            anyhow::bail!("target path already exists: {}", new_path);
+            anyhow::bail!(Fault::Conflict(format!(
+                "target path already exists: {}",
+                new_path
+            )));
         }
         let rows_affected = self.conn.execute(
             "UPDATE files SET path = ?1, docid = ?2 WHERE path = ?3",
@@ -2834,10 +2840,10 @@ impl Store {
         if let Some(dim) = self.vec_table_dim()?
             && dim != model_dim
         {
-            bail!(
+            bail!(Fault::StaleIndex(format!(
                 "index was built with {dim}-dimensional embeddings but the model \
                  produces {model_dim}. Run 'knapper index' to rebuild it."
-            );
+            )));
         }
         Ok(())
     }
@@ -3196,6 +3202,16 @@ impl Store {
         self.find_file_by_fuzzy(file_or_docid)
     }
 
+    /// `resolve_file`, with a miss as the caller's fault.
+    ///
+    /// The write tools address one note and refuse when it is absent; this
+    /// is the one text and the one kind they answer with.
+    pub fn require_file(&self, file_or_docid: &str) -> Result<FileRecord> {
+        self.resolve_file(file_or_docid)?.ok_or_else(|| {
+            anyhow::anyhow!(Fault::NotFound(format!("file not found: {file_or_docid}")))
+        })
+    }
+
     /// Fuzzy-match a query against all stored file basenames using Levenshtein distance.
     /// Returns the unique closest match within distance ≤ 2, or an error if ambiguous.
     fn find_file_by_fuzzy(&self, query: &str) -> Result<Option<FileRecord>> {
@@ -3287,7 +3303,7 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         match found.len() {
             0 | 1 => Ok(found.pop()),
-            _ => Err(anyhow::anyhow!(
+            _ => Err(anyhow::anyhow!(Fault::Ambiguous(format!(
                 "ambiguous alias '{}': carried by [{}]",
                 alias,
                 found
@@ -3295,7 +3311,7 @@ impl Store {
                     .map(|f| f.path.as_str())
                     .collect::<Vec<_>>()
                     .join(", ")
-            )),
+            )))),
         }
     }
 
@@ -6395,7 +6411,12 @@ mod tests {
         store.ensure_embedding_dim(256).unwrap();
 
         assert!(store.verify_embedding_dim(256).is_ok());
-        let err = store.verify_embedding_dim(768).unwrap_err().to_string();
+        let err = store.verify_embedding_dim(768).unwrap_err();
+        assert_eq!(
+            crate::fault::Fault::of(&err).map(|f| f.kind()),
+            Some("stale_index")
+        );
+        let err = err.to_string();
         assert!(err.contains("256"), "{err}");
         assert!(err.contains("768"), "{err}");
         assert!(err.contains("knapper index"), "{err}");
@@ -6544,10 +6565,41 @@ mod tests {
     }
 
     #[test]
+    fn require_file_answers_not_found_with_the_name_the_caller_gave() {
+        let store = Store::open_memory().unwrap();
+        let err = store.require_file("nowhere.md").unwrap_err();
+        assert_eq!(err.to_string(), "file not found: nowhere.md");
+        assert_eq!(
+            crate::fault::Fault::of(&err).map(|f| f.kind()),
+            Some("not_found")
+        );
+    }
+
+    #[test]
+    fn an_alias_two_notes_carry_is_ambiguous() {
+        let store = Store::open_memory().unwrap();
+        for (path, docid) in [("a.md", "aaa111"), ("b.md", "bbb222")] {
+            let id = store
+                .insert_file(path, "h", 100, docid, None, None)
+                .unwrap();
+            store.replace_file_aliases(id, &aliases(&["Twin"])).unwrap();
+        }
+        let err = store.find_file_by_alias("Twin").unwrap_err();
+        assert_eq!(
+            crate::fault::Fault::of(&err).map(|f| f.kind()),
+            Some("ambiguous")
+        );
+        assert!(
+            err.to_string().starts_with("ambiguous alias 'Twin'"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn the_write_resolver_does_not_read_aliases() {
         // `update`, `move`, `archive` and `delete` resolve through
         // `resolve_file`. A destructive call reached through a name the caller
-        // did not know was an alias fails worse than `File not found`, so the
+        // did not know was an alias fails worse than `file not found`, so the
         // alias lookup belongs to the read side alone (#142).
         let store = Store::open_memory().unwrap();
         let id = store

@@ -89,12 +89,15 @@ impl RateLimiter {
 pub struct ApiError {
     pub status: StatusCode,
     pub message: String,
+    /// The fault's kind, from `Fault::kind`, or one of this transport's own:
+    /// `unauthorized`, `forbidden`, `rate_limited`, `internal`.
+    pub kind: &'static str,
     pub headers: Vec<(String, String)>,
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
-        let body = serde_json::json!({ "error": self.message });
+        let body = serde_json::json!({ "error": self.message, "kind": self.kind });
         let mut response = (self.status, Json(body)).into_response();
         for (name, value) in &self.headers {
             if let (Ok(n), Ok(v)) = (
@@ -109,46 +112,63 @@ impl IntoResponse for ApiError {
 }
 
 impl ApiError {
-    pub fn unauthorized(msg: &str) -> Self {
+    fn new(status: StatusCode, kind: &'static str, message: &str) -> Self {
         Self {
-            status: StatusCode::UNAUTHORIZED,
-            message: msg.to_string(),
+            status,
+            message: message.to_string(),
+            kind,
             headers: vec![],
         }
+    }
+    pub fn unauthorized(msg: &str) -> Self {
+        Self::new(StatusCode::UNAUTHORIZED, "unauthorized", msg)
     }
     pub fn forbidden(msg: &str) -> Self {
-        Self {
-            status: StatusCode::FORBIDDEN,
-            message: msg.to_string(),
-            headers: vec![],
-        }
+        Self::new(StatusCode::FORBIDDEN, "forbidden", msg)
     }
+    /// The handler's own parse stage: the caller's text read before any core
+    /// call. What comes out of a core call goes through `From` instead.
     pub fn bad_request(msg: &str) -> Self {
-        Self {
-            status: StatusCode::BAD_REQUEST,
-            message: msg.to_string(),
-            headers: vec![],
-        }
+        Self::new(StatusCode::BAD_REQUEST, "invalid_input", msg)
     }
     pub fn not_found(msg: &str) -> Self {
-        Self {
-            status: StatusCode::NOT_FOUND,
-            message: msg.to_string(),
-            headers: vec![],
-        }
+        Self::new(StatusCode::NOT_FOUND, "not_found", msg)
     }
     pub fn internal(msg: &str) -> Self {
-        Self {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: msg.to_string(),
-            headers: vec![],
-        }
+        Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", msg)
     }
     pub fn rate_limited(retry_after: u64) -> Self {
         Self {
             status: StatusCode::TOO_MANY_REQUESTS,
             message: format!("Rate limit exceeded. Retry after {retry_after}s"),
+            kind: "rate_limited",
             headers: vec![("retry-after".to_string(), retry_after.to_string())],
+        }
+    }
+}
+
+/// The one place an error from a core call becomes a status.
+///
+/// The kind is read once, through whatever context the pipeline added. An
+/// error with no `Fault` in its chain is the server's own, and a 500 keeps
+/// the whole chain in its body: this surface serves one local agent, and the
+/// chain is the most useful thing it can read.
+impl From<anyhow::Error> for ApiError {
+    fn from(e: anyhow::Error) -> Self {
+        use crate::fault::Fault;
+        let message = format!("{e:#}");
+        match Fault::of(&e) {
+            Some(fault) => {
+                let status = match fault {
+                    Fault::InvalidInput(_) | Fault::Ambiguous(_) => StatusCode::BAD_REQUEST,
+                    Fault::NotFound(_) => StatusCode::NOT_FOUND,
+                    Fault::Conflict(_) => StatusCode::CONFLICT,
+                    Fault::ReadOnly => StatusCode::FORBIDDEN,
+                    Fault::StaleIndex(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                };
+                Self::new(status, fault.kind(), &message)
+            }
+            None => Self::internal(&message),
         }
     }
 }
@@ -328,33 +348,19 @@ async fn handle_plugin_manifest(State(state): State<ApiState>) -> impl IntoRespo
 // Read endpoint handlers
 // ---------------------------------------------------------------------------
 
-/// Whether an error message is a caller's own scope typo, which is a bad
-/// request rather than a server fault. `check_terms` gives the caller the
-/// nearest tag or folder in the message, and `resolve_scope_links` the
-/// nearest note for a `links_to` or `linked_from` name — the cheapest honest
-/// signal this far from where the error is built (#60, #65, #66). A name that
-/// is an alias more than one note carries is the caller's to repair as well,
-/// and the message names the candidates (#142).
-fn is_scope_typo(message: &str) -> bool {
-    message.starts_with("no such tag")
-        || message.starts_with("no such folder")
-        || message.starts_with("no such note")
-        || message.starts_with("ambiguous alias")
-}
-
 async fn handle_match(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Json(body): Json<crate::params::Match>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, false)?;
-    // An empty pattern and an unknown scope term are both the caller's own
-    // text naming nothing, so both are 400 rather than 500 (#65).
+    // Checked before the scan runs: a malformed scope is the caller's own text (#60).
+    body.scope()
+        .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
     let report = state
         .core
         .with_reader(move |store| crate::matching::run(store, &body))
-        .await
-        .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
+        .await?;
     Ok(Json(report))
 }
 
@@ -377,16 +383,7 @@ async fn handle_search(
         .with_core(move |g| {
             search::run_query(body, scope, &config, g.store, g.embedder, g.reranker)
         })
-        .await
-        .map_err(|e| {
-            // An unknown tag or folder is a caller's typo, not a server
-            // fault (#60, #65).
-            if is_scope_typo(&e.to_string()) {
-                ApiError::bad_request(&format!("{e:#}"))
-            } else {
-                ApiError::internal(&format!("{e:#}"))
-            }
-        })?;
+        .await?;
     let value = serde_json::to_value(&env).map_err(|e| ApiError::internal(&format!("{e:#}")))?;
     Ok(Json(value))
 }
@@ -409,26 +406,7 @@ async fn handle_read(
             };
             context::context_read(&ctx, &p.file, p.section.as_deref(), p.include)
         })
-        .await
-        .map_err(|e| {
-            // A file or a section the vault does not hold, an alias more than
-            // one note carries (#142), or a `section` beside an `include`
-            // mode that answers the whole note, is the caller's own input
-            // naming nothing or asking two things at once, not a server
-            // fault (#60). The message text is the cheapest honest signal
-            // `context_read` gives a caller this far from the error's
-            // construction.
-            let message = e.to_string();
-            if message.starts_with("Section not found")
-                || message.starts_with("File not found")
-                || message.starts_with("ambiguous alias")
-                || message.starts_with("--section cannot be combined")
-            {
-                ApiError::bad_request(&format!("{e:#}"))
-            } else {
-                ApiError::internal(&format!("{e:#}"))
-            }
-        })?;
+        .await?;
     Ok(Json(serde_json::json!(result)))
 }
 
@@ -468,16 +446,7 @@ async fn handle_list(
                 params.detailed,
             )
         })
-        .await
-        .map_err(|e| {
-            // An unknown tag or folder is a caller's typo, not a server
-            // fault (#65).
-            if is_scope_typo(&e.to_string()) {
-                ApiError::bad_request(&format!("{e:#}"))
-            } else {
-                ApiError::internal(&format!("{e:#}"))
-            }
-        })?;
+        .await?;
     Ok(Json(serde_json::json!(items)))
 }
 
@@ -493,8 +462,7 @@ async fn handle_tags(
     let rows = state
         .core
         .with_reader(move |store| store.tags_under(prefix.as_ref()))
-        .await
-        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+        .await?;
     Ok(Json(serde_json::json!(rows)))
 }
 
@@ -511,8 +479,7 @@ async fn handle_properties(
     let report = state
         .core
         .with_reader(move |store| crate::properties::run(store, &vault, &params))
-        .await
-        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+        .await?;
     Ok(Json(serde_json::json!(report)))
 }
 
@@ -533,8 +500,7 @@ async fn handle_vault_map(
             };
             context::vault_map(&ctx)
         })
-        .await
-        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+        .await?;
     Ok(Json(serde_json::json!(map)))
 }
 
@@ -551,8 +517,7 @@ async fn handle_health(
     let report = state
         .core
         .with_reader(move |store| health::generate_health_report(store, &config))
-        .await
-        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+        .await?;
     Ok(Json(serde_json::json!(report)))
 }
 
@@ -574,8 +539,7 @@ async fn handle_validate(
     let report = crate::core::blocking(move || {
         crate::validate::validate_target(&vault, &target, &limits, strict)
     })
-    .await
-    .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    .await?;
     Ok(Json(serde_json::json!(report)))
 }
 
@@ -587,8 +551,7 @@ async fn handle_status(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, false)?;
-    let data_dir =
-        crate::config::Config::data_dir().map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    let data_dir = crate::config::Config::data_dir()?;
     let config = state.core.config.clone();
     let pending = state
         .core
@@ -597,8 +560,7 @@ async fn handle_status(
     let report = state
         .core
         .with_reader(move |store| search::status_json(store, &data_dir, &config, pending))
-        .await
-        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+        .await?;
     Ok(Json(report))
 }
 
@@ -612,11 +574,7 @@ async fn handle_create(
     Json(body): Json<crate::params::Create>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
-    if state.core.read_only {
-        return Err(ApiError::forbidden(
-            "Write operations disabled in read-only mode",
-        ));
-    }
+    state.core.writable()?;
     // No stdin exists on this surface, so an omitted content is an error
     // here instead of the CLI's fallback read.
     let content = body
@@ -647,8 +605,7 @@ async fn handle_create(
                 profile.as_ref().as_ref(),
             )
         })
-        .await
-        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+        .await?;
     state
         .core
         .record_write(&state.core.vault_path.join(&result.path))
@@ -665,11 +622,7 @@ async fn handle_update(
     Json(body): Json<crate::params::Update>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
-    if state.core.read_only {
-        return Err(ApiError::forbidden(
-            "Write operations disabled in read-only mode",
-        ));
-    }
+    state.core.writable()?;
     let edits = body
         .to_writer_edits()
         .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
@@ -702,8 +655,7 @@ async fn handle_update(
             })?;
             Ok(result)
         })
-        .await
-        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+        .await?;
     state
         .core
         .record_write(&state.core.vault_path.join(&result.path))
@@ -717,17 +669,12 @@ async fn handle_move(
     Json(body): Json<crate::params::Move>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
-    if state.core.read_only {
-        return Err(ApiError::forbidden(
-            "Write operations disabled in read-only mode",
-        ));
-    }
+    state.core.writable()?;
     let vault = state.core.vault_path.clone();
     let result = state
         .core
         .with_core(move |g| writer::move_note(&body.file, &body.new_folder, g.store, &vault))
-        .await
-        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+        .await?;
     state
         .core
         .record_write(&state.core.vault_path.join(&result.path))
@@ -744,11 +691,7 @@ async fn handle_archive(
     Json(body): Json<crate::params::Archive>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
-    if state.core.read_only {
-        return Err(ApiError::forbidden(
-            "Write operations disabled in read-only mode",
-        ));
-    }
+    state.core.writable()?;
     let vault = state.core.vault_path.clone();
     let profile = state.core.profile.clone();
     let settings = state.core.index_settings;
@@ -768,8 +711,7 @@ async fn handle_archive(
                 writer::archive_note(&body.file, g.store, &vault, profile.as_ref().as_ref())
             }
         })
-        .await
-        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+        .await?;
     state
         .core
         .record_write(&state.core.vault_path.join(&result.path))
@@ -801,36 +743,24 @@ async fn handle_migrate(
                 .with_reader(move |store| {
                     crate::migrate::generate_preview(store, &vault, profile.as_ref().as_ref())
                 })
-                .await
-                .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+                .await?;
             Ok(Json(serde_json::to_value(&preview).unwrap()))
         }
         "apply" => {
-            if state.core.read_only {
-                return Err(ApiError::forbidden(
-                    "Write operations disabled in read-only mode",
-                ));
-            }
-            let preview = crate::migrate::resolve_preview(body.preview)
-                .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
+            state.core.writable()?;
+            let preview = crate::migrate::resolve_preview(body.preview)?;
             let result = state
                 .core
                 .with_core(move |g| crate::migrate::apply_preview(&preview, g.store, &vault))
-                .await
-                .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+                .await?;
             Ok(Json(serde_json::to_value(&result).unwrap()))
         }
         "undo" => {
-            if state.core.read_only {
-                return Err(ApiError::forbidden(
-                    "Write operations disabled in read-only mode",
-                ));
-            }
+            state.core.writable()?;
             let result = state
                 .core
                 .with_core(move |g| crate::migrate::undo_last(g.store, &vault))
-                .await
-                .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+                .await?;
             Ok(Json(serde_json::to_value(&result).unwrap()))
         }
         // The mode is the caller's own text, so a word that names no
@@ -847,11 +777,7 @@ async fn handle_delete(
     Json(body): Json<crate::params::Delete>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
-    if state.core.read_only {
-        return Err(ApiError::forbidden(
-            "Write operations disabled in read-only mode",
-        ));
-    }
+    state.core.writable()?;
     let mode = DeleteMode::from(body.mode);
     let archive_folder = state
         .core
@@ -866,8 +792,7 @@ async fn handle_delete(
     state
         .core
         .with_core(move |g| writer::delete_note(g.store, &vault, &file, mode, &archive_folder))
-        .await
-        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+        .await?;
     Ok(Json(serde_json::json!({
         "deleted": body.file,
         "mode": body.mode,
@@ -891,11 +816,7 @@ async fn handle_index(
     // A read-only server refuses it like any other write, the way MCP's
     // `index` does: `rebuild: true` discards the index before it builds one
     // again (#62).
-    if state.core.read_only {
-        return Err(ApiError::forbidden(
-            "Write operations disabled in read-only mode",
-        ));
-    }
+    state.core.writable()?;
     // The startup config, with the call's one override. The index-time
     // settings come from the session, so nothing here can be a second source
     // of the store's chunking or vector space (#55, #72).
@@ -919,8 +840,7 @@ async fn handle_index(
                 profile.as_ref().as_ref(),
             )
         })
-        .await
-        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+        .await?;
     Ok(Json(serde_json::json!({
         "new_files": result.new_files,
         "updated_files": result.updated_files,
@@ -939,18 +859,14 @@ async fn handle_reindex_file(
     let vault = state.core.vault_path.clone();
     let settings = state.core.index_settings;
     let file = body.file.clone();
-    // A file the server cannot read is the caller's own text naming nothing,
-    // which is the 400 the neighbouring handlers answer for that class (#60).
+    // A path not on disk is a Fault::NotFound from the indexer, and the
+    // classifier answers 404 for it (#60).
     let result = state
         .core
         .with_core(move |g| {
             crate::indexer::reindex_written_file(&file, g.store, g.embedder, &vault, settings)
         })
-        .await
-        .map_err(|e| match e.downcast_ref::<std::io::Error>() {
-            Some(_) => ApiError::bad_request(&format!("Cannot read file {}: {e:#}", body.file)),
-            None => ApiError::internal(&format!("{e:#}")),
-        })?;
+        .await?;
     Ok(Json(serde_json::json!({
         "file": body.file,
         "chunks": result.total_chunks,
@@ -977,10 +893,8 @@ async fn handle_identity(
     // so it takes the write permission and a read-only server refuses it; the
     // block itself is a read either way.
     authorize(&headers, &state, p.refresh)?;
-    if p.refresh && state.core.read_only {
-        return Err(ApiError::forbidden(
-            "Write operations disabled in read-only mode",
-        ));
+    if p.refresh {
+        state.core.writable()?;
     }
     let config = state.core.config.clone();
     let block = if p.refresh {
@@ -1003,8 +917,7 @@ async fn handle_identity(
             .core
             .with_reader(move |store| crate::identity::format_identity_block(&config, store))
             .await
-    }
-    .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    }?;
     Ok(Json(serde_json::json!({ "identity": block })))
 }
 
@@ -1017,22 +930,16 @@ async fn handle_init(
     match body.mode.as_deref() {
         Some("detect") => {
             let vault = state.core.vault_path.clone();
-            let result = crate::core::blocking(move || crate::onboarding::run_detect_json(&vault))
-                .await
-                .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+            let result =
+                crate::core::blocking(move || crate::onboarding::run_detect_json(&vault)).await?;
             Ok(Json(result))
         }
         Some("apply") => {
             // `apply` indexes the vault, which is the work `index` is guarded
             // against on a read-only server. The mode is read first, so
             // `detect` — which writes nothing — still runs (#62).
-            if state.core.read_only {
-                return Err(ApiError::forbidden(
-                    "Write operations disabled in read-only mode",
-                ));
-            }
-            let data_dir = crate::config::Config::data_dir()
-                .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+            state.core.writable()?;
+            let data_dir = crate::config::Config::data_dir()?;
             let flags = crate::onboarding::ApplyFlags {
                 name: body.name,
                 role: body.role,
@@ -1065,8 +972,7 @@ async fn handle_init(
                     }
                     Ok(result)
                 })
-                .await
-                .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+                .await?;
             Ok(Json(result))
         }
         Some(other) => Err(ApiError::bad_request(&format!(
@@ -1213,6 +1119,68 @@ mod tests {
     #[test]
     fn test_check_permission_read_on_read() {
         assert!(check_permission("read", false));
+    }
+
+    /// The one mapping from a kind to a status, over every kind and the
+    /// plain `anyhow` case, read through a context layer the way a handler
+    /// receives it.
+    #[test]
+    fn each_fault_maps_to_its_status_and_kind() {
+        use crate::fault::Fault;
+        let cases: Vec<(anyhow::Error, StatusCode, &str)> = vec![
+            (
+                Fault::InvalidInput("x".into()).into(),
+                StatusCode::BAD_REQUEST,
+                "invalid_input",
+            ),
+            (
+                Fault::NotFound("x".into()).into(),
+                StatusCode::NOT_FOUND,
+                "not_found",
+            ),
+            (
+                Fault::Ambiguous("x".into()).into(),
+                StatusCode::BAD_REQUEST,
+                "ambiguous",
+            ),
+            (
+                Fault::Conflict("x".into()).into(),
+                StatusCode::CONFLICT,
+                "conflict",
+            ),
+            (
+                Fault::StaleIndex("x".into()).into(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "stale_index",
+            ),
+            (Fault::ReadOnly.into(), StatusCode::FORBIDDEN, "read_only"),
+            (
+                anyhow::anyhow!("x"),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+            ),
+        ];
+        for (err, status, kind) in cases {
+            let api = ApiError::from(err.context("under context"));
+            assert_eq!(api.status, status, "{kind}");
+            assert_eq!(api.kind, kind);
+            assert!(
+                api.message.starts_with("under context: "),
+                "{}",
+                api.message
+            );
+        }
+    }
+
+    /// Every error body names its kind beside its message, the parse-stage
+    /// ones included.
+    #[tokio::test]
+    async fn an_error_body_names_its_kind() {
+        let (_tmp, state) = test_api_state();
+        let (status, body) = post_json(state, "/api/init", r#"{}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "init needs mode=detect or mode=apply");
+        assert_eq!(body["kind"], "invalid_input");
     }
 
     #[test]
@@ -1393,6 +1361,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json_body(response).await["kind"], "invalid_input");
     }
 
     #[tokio::test]
@@ -1899,13 +1868,18 @@ mod tests {
 
         let (_tmp, mut state) = test_api_state();
         state.core.read_only = true;
-        let (status, _) = post_json(
+        let (status, body) = post_json(
             state,
             "/api/migrate",
             r#"{"mode":"apply","preview":{"migration_id":"m","files":[],"uncertain":[],"skipped":0}}"#,
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["kind"], "read_only");
+        assert_eq!(
+            body["error"],
+            "write operations are disabled in read-only mode; start `serve` without --read-only to enable writes"
+        );
 
         let (_tmp, mut state) = test_api_state();
         state.core.read_only = true;
@@ -2051,12 +2025,11 @@ mod tests {
         );
     }
 
-    /// A section the note does not hold is the caller's own text naming
-    /// nothing, so it is a 400 and not the 500 every error on this route used
-    /// to answer. It is the first error an agent using the newly documented
-    /// `section` parameter meets (#60, #62).
+    /// A section the note does not hold, or a note the vault does not hold,
+    /// is the resource the call addresses being absent: a 404, with the kind
+    /// in the body (#60, #62).
     #[tokio::test]
-    async fn a_read_of_a_section_the_note_does_not_hold_is_a_bad_request() {
+    async fn a_read_of_a_section_or_a_note_the_vault_does_not_hold_is_a_404() {
         let (_tmp, state) = indexed_state();
 
         let response = get(
@@ -2071,11 +2044,113 @@ mod tests {
             "/api/read?file=rules/abjuration-spells.md&section=Nowhere",
         )
         .await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(json_body(response).await["kind"], "not_found");
 
-        // A file the vault does not hold is the same class of mistake.
         let response = get(state, "/api/read?file=nowhere.md").await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = json_body(response).await;
+        assert_eq!(body["kind"], "not_found");
+        assert_eq!(body["error"], "file not found: nowhere.md");
+    }
+
+    /// A write that names a note the vault does not hold is the same absent
+    /// resource.
+    #[tokio::test]
+    async fn an_update_of_a_missing_note_is_a_404() {
+        let (_tmp, state) = indexed_state();
+        let (status, body) = post_json(
+            state,
+            "/api/update",
+            r#"{"file":"nowhere.md","edits":[{"mode":"append","content":"x"}]}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["kind"], "not_found");
+    }
+
+    /// A section the note does not hold is the same absent resource, and the
+    /// message names the note.
+    #[tokio::test]
+    async fn an_update_naming_a_missing_section_is_a_404() {
+        let (_tmp, state) = indexed_state();
+        let (status, body) = post_json(
+            state,
+            "/api/update",
+            r#"{"file":"rules/evocation-spells.md","edits":[{"section":"Nowhere","mode":"replace","content":"x"}]}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["kind"], "not_found");
+        assert_eq!(
+            body["error"],
+            "editing rules/evocation-spells.md: section 'Nowhere' not found"
+        );
+    }
+
+    /// A scope the parser refuses is the caller's own text, checked before
+    /// the scan runs.
+    #[tokio::test]
+    async fn a_match_with_a_scope_the_parser_refuses_is_a_400() {
+        let (_tmp, state) = indexed_state();
+        let (status, body) = post_json(state, "/api/match", r#"{"pattern":"x","all":[""]}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["kind"], "invalid_input");
+    }
+
+    /// `reindex-file` of a path not on disk is a 404; a path that exists and
+    /// cannot be read stays a 500, which no fixture can provoke without
+    /// changing permissions, so only the first is asserted.
+    #[tokio::test]
+    async fn a_reindex_file_of_a_path_not_on_disk_is_a_404() {
+        let (_tmp, state) = indexed_state();
+        let (status, body) =
+            post_json(state, "/api/reindex-file", r#"{"file":"nowhere.md"}"#).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["kind"], "not_found");
+    }
+
+    /// Set a file's mtime two minutes ahead of what the index recorded, which
+    /// is what a note edited outside knapper looks like to `update_note`.
+    fn touch_forward(path: &std::path::Path) {
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(120))
+            .unwrap();
+    }
+
+    /// The note moved under the caller: the write is refused and the status
+    /// says the caller's view is stale, not that the server failed.
+    #[tokio::test]
+    async fn an_update_of_a_note_changed_on_disk_is_a_409() {
+        let (_tmp, state) = indexed_state();
+        touch_forward(&state.core.vault_path.join("rules/evocation-spells.md"));
+        let (status, body) = post_json(
+            state,
+            "/api/update",
+            r#"{"file":"rules/evocation-spells.md","edits":[{"mode":"append","content":"\nMore.\n"}]}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["kind"], "conflict");
+        assert!(
+            body["error"].as_str().unwrap().contains("mtime conflict"),
+            "{body}"
+        );
+    }
+
+    /// A create over a path that exists is refused before anything is
+    /// embedded, and it is a conflict with the vault, not a server fault.
+    #[tokio::test]
+    async fn a_create_over_an_existing_note_is_a_409() {
+        let (_tmp, state) = indexed_state();
+        let (status, body) = post_json(
+            state,
+            "/api/create",
+            r##"{"content":"# Evocation\n\nAgain.\n","filename":"evocation-spells","folder":"rules"}"##,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["kind"], "conflict");
     }
 
     /// `archive` and `archive {undo: true}` are one operation and its reverse
@@ -2406,6 +2481,7 @@ mod tests {
         }
         let response = get(state.clone(), "/api/read?file=Twin").await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json_body(response).await["kind"], "ambiguous");
         let response = get(state, "/api/list?links_to=Twin").await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
