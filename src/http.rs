@@ -2111,6 +2111,49 @@ mod tests {
         assert_eq!(body["kind"], "not_found");
     }
 
+    /// Set a file's mtime two minutes ahead of what the index recorded, which
+    /// is what a note edited outside knapper looks like to `update_note`.
+    fn touch_forward(path: &std::path::Path) {
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(120))
+            .unwrap();
+    }
+
+    /// The note moved under the caller: the write is refused and the status
+    /// says the caller's view is stale, not that the server failed.
+    #[tokio::test]
+    async fn an_update_of_a_note_changed_on_disk_is_a_409() {
+        let (_tmp, state) = indexed_state();
+        touch_forward(&state.core.vault_path.join("rules/evocation-spells.md"));
+        let (status, body) = post_json(
+            state,
+            "/api/update",
+            r#"{"file":"rules/evocation-spells.md","edits":[{"mode":"append","content":"\nMore.\n"}]}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["kind"], "conflict");
+        assert!(
+            body["error"].as_str().unwrap().contains("mtime conflict"),
+            "{body}"
+        );
+    }
+
+    /// A create over a path that exists is refused before anything is
+    /// embedded, and it is a conflict with the vault, not a server fault.
+    #[tokio::test]
+    async fn a_create_over_an_existing_note_is_a_409() {
+        let (_tmp, state) = indexed_state();
+        let (status, body) = post_json(
+            state,
+            "/api/create",
+            r##"{"content":"# Evocation\n\nAgain.\n","filename":"evocation-spells","folder":"rules"}"##,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["kind"], "conflict");
+    }
+
     /// `archive` and `archive {undo: true}` are one operation and its reverse
     /// (#62). The handler's own branch chooses `archive_note` against
     /// `unarchive_note`, and nothing else covers it — an inverted branch would

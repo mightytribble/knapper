@@ -401,10 +401,10 @@ fn precompute_chunks(
 /// Returns error if final_path already exists and `allow_overwrite` is false.
 fn atomic_write(final_path: &Path, content: &str, allow_overwrite: bool) -> Result<()> {
     if !allow_overwrite && final_path.exists() {
-        bail!(
+        bail!(Fault::Conflict(format!(
             "file already exists at {}, refusing to overwrite",
             final_path.display()
-        );
+        )));
     }
 
     // Ensure parent directory exists
@@ -525,10 +525,10 @@ pub fn create_note(
 
     // Check for existing file before doing expensive work
     if final_path.exists() {
-        bail!(
+        bail!(Fault::Conflict(format!(
             "file already exists at {}; use update to change an existing note, not create",
             final_path.display()
-        );
+        )));
     }
 
     // Step 6: Pre-compute chunks + embeddings BEFORE transaction
@@ -1252,12 +1252,10 @@ pub fn update_note(store: &Store, vault_path: &Path, input: &UpdateInput) -> Res
     // Step 2: Mtime conflict check — one check for the whole list
     let disk_mtime = file_mtime(&full_path)?;
     if disk_mtime != file_record.mtime {
-        bail!(
+        bail!(Fault::Conflict(format!(
             "mtime conflict: file {} was modified outside knapper (disk={}, indexed={})",
-            file_record.path,
-            disk_mtime,
-            file_record.mtime
-        );
+            file_record.path, disk_mtime, file_record.mtime
+        )));
     }
 
     // Step 3: The text the file holds, which the stale-link lookup reads as
@@ -1321,7 +1319,10 @@ pub fn move_note(
     let new_full_path = vault_path.join(&new_rel_path);
 
     if new_full_path.exists() {
-        bail!("target path already exists: {}", new_full_path.display());
+        bail!(Fault::Conflict(format!(
+            "target path already exists: {}",
+            new_full_path.display()
+        )));
     }
 
     // The content does not change, so the stored hash still describes the file
@@ -1485,7 +1486,10 @@ pub fn archive_note(
 
     // Don't archive something already in the archive
     if file_record.path.starts_with(archive_folder) {
-        bail!("note is already archived: {}", file_record.path);
+        bail!(Fault::Conflict(format!(
+            "note is already archived: {}",
+            file_record.path
+        )));
     }
 
     let old_path = vault_path.join(&file_record.path);
@@ -1587,10 +1591,10 @@ pub fn unarchive_note(
     let restore_full_path = vault_path.join(&original_path);
 
     if restore_full_path.exists() {
-        bail!(
+        bail!(Fault::Conflict(format!(
             "cannot unarchive: a file already exists at {}",
             original_path
-        );
+        )));
     }
 
     block.remove("archived")?;
@@ -3413,6 +3417,10 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("mtime conflict"), "got {err}");
+        assert_eq!(
+            crate::fault::Fault::of(&err).map(|f| f.kind()),
+            Some("conflict")
+        );
         assert_eq!(
             std::fs::read_to_string(vault.join("note.md")).unwrap(),
             outside,

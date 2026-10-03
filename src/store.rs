@@ -2729,7 +2729,10 @@ impl Store {
     /// Rename a file's path in the store, preserving its row ID (and thus edge integrity).
     pub fn update_file_path(&self, old_path: &str, new_path: &str, new_docid: &str) -> Result<()> {
         if self.get_file(new_path)?.is_some() {
-            anyhow::bail!("target path already exists: {}", new_path);
+            anyhow::bail!(Fault::Conflict(format!(
+                "target path already exists: {}",
+                new_path
+            )));
         }
         let rows_affected = self.conn.execute(
             "UPDATE files SET path = ?1, docid = ?2 WHERE path = ?3",
@@ -2837,10 +2840,10 @@ impl Store {
         if let Some(dim) = self.vec_table_dim()?
             && dim != model_dim
         {
-            bail!(
+            bail!(Fault::StaleIndex(format!(
                 "index was built with {dim}-dimensional embeddings but the model \
                  produces {model_dim}. Run 'knapper index' to rebuild it."
-            );
+            )));
         }
         Ok(())
     }
@@ -6408,7 +6411,12 @@ mod tests {
         store.ensure_embedding_dim(256).unwrap();
 
         assert!(store.verify_embedding_dim(256).is_ok());
-        let err = store.verify_embedding_dim(768).unwrap_err().to_string();
+        let err = store.verify_embedding_dim(768).unwrap_err();
+        assert_eq!(
+            crate::fault::Fault::of(&err).map(|f| f.kind()),
+            Some("stale_index")
+        );
+        let err = err.to_string();
         assert!(err.contains("256"), "{err}");
         assert!(err.contains("768"), "{err}");
         assert!(err.contains("knapper index"), "{err}");

@@ -296,11 +296,12 @@ pub fn run(
     // so never reaches `fingerprint::verify`, which is why the guard is here
     // rather than on one surface.
     if scan != crate::params::Scan::Body && store.frontmatter_unindexed(&scope)? {
-        anyhow::bail!(
+        anyhow::bail!(Fault::StaleIndex(
             "this index was built before `match` read frontmatter, so it cannot \
              say what a note's YAML holds. Run 'knapper index' to bring it up \
              to date, or pass scan=body to count the prose alone."
-        );
+                .into()
+        ));
     }
     let mut scanner = Scanner::new(
         Query::new(&params.pattern, params.case_sensitive).whole_word(params.word),

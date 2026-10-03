@@ -1444,6 +1444,26 @@ mod tests {
         assert_eq!(err.data.as_ref().unwrap()["kind"], "not_found");
     }
 
+    /// A note changed outside knapper is this surface's INVALID_REQUEST: the
+    /// call was well formed, and the vault's state refused it.
+    #[tokio::test]
+    async fn an_update_of_a_note_changed_on_disk_is_invalid_request() {
+        let (_tmp, server) = indexed_server(crate::config::GroupBy::Chunk);
+        let path = server.core.vault_path.join("rules/evocation-spells.md");
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(120))
+            .unwrap();
+        let params: crate::params::Update = serde_json::from_value(serde_json::json!({
+            "file": "rules/evocation-spells.md",
+            "edits": [{"mode": "append", "content": "\nMore.\n"}]
+        }))
+        .unwrap();
+        let err = server.update(super::Parameters(params)).await.unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_REQUEST, "{err:?}");
+        assert_eq!(err.data.as_ref().unwrap()["kind"], "conflict");
+        assert!(err.message.contains("mtime conflict"), "{}", err.message);
+    }
+
     /// The structured envelope (#35), read from `structuredContent` rather
     /// than a text content block.
     fn envelope(result: &rmcp::model::CallToolResult) -> serde_json::Value {
