@@ -544,9 +544,8 @@ pub fn create_note(
     let temp_path = final_path.with_extension("md.tmp");
     std::fs::write(&temp_path, &full_content)?;
 
-    // Step 7: BEGIN IMMEDIATE transaction
-    store.begin_transaction()?;
-    let result = (|| -> Result<i64> {
+    // Step 7: write the rows, or leave the store and the disk as they were
+    if let Err(e) = store.transaction(|store| -> Result<()> {
         let mtime = file_mtime(&temp_path).unwrap_or(0);
         let file_id = store.insert_file(
             &rel_path,
@@ -581,52 +580,43 @@ pub fn create_note(
         // here exactly as they are on the index path.
         store.reconcile_file_tags(file_id, &crate::tags::extract(&full_content))?;
 
-        Ok(file_id)
-    })();
+        Ok(())
+    }) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(e);
+    }
 
-    match result {
-        Ok(_) => {
-            // Step 8: COMMIT
-            store.commit()?;
-            // Step 9: Atomic rename temp → final
-            std::fs::rename(&temp_path, &final_path)?;
-            // Update stored mtime to match the actual file after rename
-            // (OS may adjust mtime during rename)
-            let actual_mtime = file_mtime(&final_path).unwrap_or(0);
-            store.insert_file(
-                &rel_path,
-                &content_hash,
-                actual_mtime,
-                &docid,
-                Some(&input.created_by),
-                None,
-            )?;
+    // Step 8: Atomic rename temp → final
+    std::fs::rename(&temp_path, &final_path)?;
+    // Update stored mtime to match the actual file after rename
+    // (OS may adjust mtime during rename)
+    let actual_mtime = file_mtime(&final_path).unwrap_or(0);
+    store.insert_file(
+        &rel_path,
+        &content_hash,
+        actual_mtime,
+        &docid,
+        Some(&input.created_by),
+        None,
+    )?;
 
-            // Incrementally update folder centroid with new note's mean vector
-            {
-                let folder = &placement_result.folder;
-                let new_vecs: Vec<&[f32]> =
-                    chunk_data.iter().map(|c| c.vector.as_slice()).collect();
-                if !new_vecs.is_empty() {
-                    let dim = new_vecs[0].len();
-                    let mut mean_vec = vec![0.0f32; dim];
-                    for v in &new_vecs {
-                        for (i, val) in v.iter().enumerate() {
-                            mean_vec[i] += val;
-                        }
-                    }
-                    let n = new_vecs.len() as f32;
-                    for val in &mut mean_vec {
-                        *val /= n;
-                    }
-                    let _ = store.adjust_folder_centroid(folder, &mean_vec, true);
+    // Incrementally update folder centroid with new note's mean vector
+    {
+        let folder = &placement_result.folder;
+        let new_vecs: Vec<&[f32]> = chunk_data.iter().map(|c| c.vector.as_slice()).collect();
+        if !new_vecs.is_empty() {
+            let dim = new_vecs[0].len();
+            let mut mean_vec = vec![0.0f32; dim];
+            for v in &new_vecs {
+                for (i, val) in v.iter().enumerate() {
+                    mean_vec[i] += val;
                 }
             }
-        }
-        Err(e) => {
-            let _ = store.rollback();
-            let _ = std::fs::remove_file(&temp_path);
-            return Err(e);
+            let n = new_vecs.len() as f32;
+            for val in &mut mean_vec {
+                *val /= n;
+            }
+            let _ = store.adjust_folder_centroid(folder, &mean_vec, true);
         }
     }
 
@@ -1348,26 +1338,14 @@ pub fn move_note(
     // them, leaving a moved note indexed but unsearchable (issue #27).
     // `update_file_path` is the primitive that exists for exactly this: it
     // keeps the id, so chunks, vectors, FTS rows and edges all follow.
-    store.begin_transaction()?;
-    let result = (|| -> Result<()> {
+    store.transaction(|store| {
         store.update_file_path(&file_record.path, &new_rel_path, &new_docid)?;
         let mtime = file_mtime(&old_path)?;
-        store.update_file_mtime(&new_rel_path, mtime)?;
-        Ok(())
-    })();
-
-    match result {
-        Ok(()) => {
-            store.commit()?;
-            // Step 3: Rename file on disk
-            std::fs::rename(&old_path, &new_full_path)?;
-            crate::indexer::reconcile_links(store, vault_path, &linking)?;
-        }
-        Err(e) => {
-            let _ = store.rollback();
-            return Err(e);
-        }
-    }
+        store.update_file_mtime(&new_rel_path, mtime)
+    })?;
+    // Step 3: Rename file on disk
+    std::fs::rename(&old_path, &new_full_path)?;
+    crate::indexer::reconcile_links(store, vault_path, &linking)?;
 
     Ok(WriteResult {
         path: new_rel_path,
@@ -1637,8 +1615,7 @@ pub fn unarchive_note(
     let docid = generate_docid(&original_path);
     let mtime = file_mtime(&restore_full_path).unwrap_or(0);
 
-    store.begin_transaction()?;
-    let result = (|| -> Result<()> {
+    if let Err(e) = store.transaction(|store| -> Result<()> {
         let file_id = store.insert_file(
             &original_path,
             &content_hash,
@@ -1668,15 +1645,9 @@ pub fn unarchive_note(
         store.reconcile_file_tags(file_id, &crate::tags::extract(&restored_content))?;
 
         Ok(())
-    })();
-
-    match result {
-        Ok(()) => store.commit()?,
-        Err(e) => {
-            let _ = store.rollback();
-            let _ = std::fs::remove_file(&restore_full_path);
-            return Err(e);
-        }
+    }) {
+        let _ = std::fs::remove_file(&restore_full_path);
+        return Err(e);
     }
 
     // Remove archived file

@@ -1,6 +1,6 @@
 // FTS5 search support.
 //
-// The `FtsResult` struct and `fts_search` method live on `Store` (in store.rs)
+// The `FtsResult` struct and `fts_search` method live on `Store` (in store/fts.rs)
 // since the store owns the database connection. We re-export `FtsResult` here
 // so downstream code can import it from either location.
 //

@@ -31,7 +31,7 @@ cargo test --lib    # 225 tests, no network required
 The codebase is 20 Rust modules behind a lib crate. See `CLAUDE.md` for detailed architecture documentation — it's designed for AI-assisted development but serves as a thorough codebase guide for human contributors too.
 
 Key modules:
-- `store.rs` — SQLite persistence (all tables, queries, migrations)
+- `store/` — SQLite persistence, one file per table family; `schema.rs` holds the tables and the version ladder
 - `indexer.rs` — vault walking, chunking, embedding, index updates
 - `serve.rs` — MCP server with 13 tools
 - `watcher.rs` — file change detection and real-time re-indexing
