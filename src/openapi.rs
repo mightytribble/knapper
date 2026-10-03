@@ -388,7 +388,7 @@ fn build_index() -> serde_json::Value {
         "post": {
             "operationId": "indexVault",
             "summary": "Index the server's vault: walk it, diff it against the store, and re-embed what changed.",
-            "description": "The vault is the one the server was started on; no path is taken here. Send {} to index with no options. A single file is cheaper through /api/reindex-file. The call runs to completion once it starts: it holds the store and the embedder while it runs, so every other request waits on it, and a graceful shutdown will not interrupt it. On a large vault a rebuild takes minutes. A read-only server refuses it.",
+            "description": "The vault is the one the server was started on; no path is taken here. Send {} to index with no options. A single file is cheaper through /api/reindex-file. The call runs to completion once it starts: it holds the store and the embedder while it runs, so search and every write wait on it while reads keep answering, and a graceful shutdown will not interrupt it. On a large vault a rebuild takes minutes. A read-only server refuses it.",
             "requestBody": {
                 "required": true,
                 "content": { "application/json": { "schema": {
@@ -408,7 +408,7 @@ fn build_status() -> serde_json::Value {
     serde_json::json!({
         "get": {
             "operationId": "getStatus",
-            "summary": "What the index holds: file and chunk counts, edge and connectivity counts, date coverage, index size, and whether intelligence is enabled.",
+            "summary": "What the index holds: file and chunk counts, edge and connectivity counts, date coverage, index size, whether intelligence is enabled, and pending_events, the watcher events not yet applied.",
             "responses": { "200": { "description": "Index status fields" } }
         }
     })
@@ -455,7 +455,7 @@ fn build_init_endpoint() -> serde_json::Value {
     serde_json::json!({
         "post": {
             "operationId": "init",
-            "summary": "Run first-time setup or update identity. Use 'detect' to inspect, 'apply' to configure.",
+            "summary": "Run first-time setup or update identity. Use 'detect' to inspect, 'apply' to configure. The apply reply carries restart_required: true, because the server reads config.toml once, at start.",
             "requestBody": {
                 "required": true,
                 "content": { "application/json": { "schema": {

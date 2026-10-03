@@ -262,35 +262,14 @@ async fn main() -> Result<()> {
         }
 
         Command::Search(args) => {
-            cfg.merge_top_n(args.top_n);
-            let group_by = args.group_by.unwrap_or(cfg.group_by);
-            let all_terms = knapper::tags::merge_scope_alias(args.scope, args.all);
-            let scope = knapper::tags::Scope::parse(&all_terms, &args.any, &args.none)?
-                .with_filters(
-                    args.property.as_deref(),
-                    args.links_to.as_deref(),
-                    args.linked_from.as_deref(),
-                )?;
+            let scope = knapper::search::parse_scope(&args)?;
 
             if !index_exists(&data_dir) {
                 eprintln!("No index found. Run 'knapper index <path>' first.");
                 std::process::exit(1);
             }
 
-            search::run_search(
-                &args.query,
-                cfg.top_n,
-                cli.json,
-                args.explain,
-                args.budget_tokens,
-                args.full,
-                args.summaries,
-                args.scores,
-                group_by,
-                &scope,
-                &data_dir,
-                &cfg,
-            )?;
+            search::run_search(args, scope, cli.json, &data_dir, &cfg)?;
         }
 
         Command::Match(args) => {
@@ -908,17 +887,12 @@ async fn main() -> Result<()> {
                 eprintln!("No index found. Run 'knapper index <path>' first.");
                 std::process::exit(1);
             }
-            let http_opts = if http {
-                let cfg = Config::load()?;
-                Some(knapper::serve::HttpServeOpts {
-                    port: port.unwrap_or(cfg.http.port),
-                    host: host.unwrap_or(cfg.http.host.clone()),
-                    no_auth,
-                })
-            } else {
-                None
-            };
-            knapper::serve::run_serve(&data_dir, http_opts, read_only).await?;
+            let http_opts = http.then(|| knapper::serve::HttpServeOpts {
+                port: port.unwrap_or(cfg.http.port),
+                host: host.unwrap_or_else(|| cfg.http.host.clone()),
+                no_auth,
+            });
+            knapper::serve::run_serve(&data_dir, cfg, http_opts, read_only).await?;
         }
 
         Command::Create(args) => {

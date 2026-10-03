@@ -588,6 +588,30 @@ impl Store {
         Ok(store)
     }
 
+    /// A second connection that reads and never writes.
+    ///
+    /// `serve` holds one of these beside its writer so a read does not wait
+    /// for a search, a write or a re-index. It opens read-only, so SQLite
+    /// refuses a write rather than convention. It runs no schema, migration or
+    /// keyword-index reconciliation: the writer opened first and did that. WAL
+    /// mode is persisted in the file, so this connection reads a committed
+    /// snapshot while the writer is inside a transaction. On a filesystem
+    /// where WAL is unavailable it is a rollback-journal reader, and a read
+    /// can wait up to `busy_timeout` while a long write holds the file.
+    pub fn open_reader(path: &Path) -> Result<Self> {
+        use rusqlite::OpenFlags;
+        crate::vecstore::init_sqlite_vec();
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_URI;
+        let conn = Connection::open_with_flags(path, flags)
+            .with_context(|| format!("failed to open reader at {}", path.display()))?;
+        rusqlite::vtab::array::load_module(&conn).context("registering rarray")?;
+        conn.execute_batch("PRAGMA busy_timeout = 5000;")
+            .context("failed to set the reader's busy_timeout")?;
+        Ok(Self { conn })
+    }
+
     fn init(&self) -> Result<()> {
         // Enable WAL mode for concurrent reads during writes (fixes "database is locked"
         // errors with rapid MCP calls and parallel CLI + server access).
@@ -8965,5 +8989,40 @@ mod tests {
             .unwrap();
         let err = store.files_in_scope(&scope).unwrap_err().to_string();
         assert_eq!(err, "no such note 'zzzzzz' for 'linked_from'");
+    }
+
+    /// A second connection reads what the first commits and cannot write
+    /// (serve-core spec). WAL is a property of the file, so the reader sees a
+    /// committed snapshot while the writer is inside a transaction.
+    #[test]
+    fn a_reader_sees_the_writers_commits_and_cannot_write() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = tmp.path().join("knapper.db");
+        let writer = Store::open(&db).unwrap();
+        let reader = Store::open_reader(&db).unwrap();
+
+        writer
+            .insert_file("a.md", "h", 1, "aaa111", None, None)
+            .unwrap();
+        assert_eq!(reader.file_count().unwrap(), 1);
+
+        writer.begin_transaction().unwrap();
+        writer
+            .insert_file("b.md", "h", 1, "bbb222", None, None)
+            .unwrap();
+        assert_eq!(
+            reader.file_count().unwrap(),
+            1,
+            "an uncommitted row is not visible"
+        );
+        writer.commit().unwrap();
+        assert_eq!(reader.file_count().unwrap(), 2);
+
+        assert!(
+            reader
+                .insert_file("c.md", "h", 1, "ccc333", None, None)
+                .is_err(),
+            "SQLite enforces the read-only contract"
+        );
     }
 }

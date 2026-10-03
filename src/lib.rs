@@ -5,6 +5,7 @@ pub mod cli;
 pub mod coalesce;
 pub mod config;
 pub mod context;
+pub mod core;
 pub mod docid;
 pub mod embed_api;
 pub mod exclude;

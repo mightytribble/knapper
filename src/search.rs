@@ -1630,28 +1630,88 @@ fn merge_seeds(semantic: &[RankedResult], fts: &[RankedResult]) -> Vec<RankedRes
     seeds.into_iter().map(|(r, _)| r).collect()
 }
 
-/// Run a search query and print the envelope (#35).
+/// The scope a `search` request names, parsed the way every surface parses it.
 ///
-/// Performs both semantic (sqlite-vec) and keyword (FTS5) search, then fuses
-/// results using Reciprocal Rank Fusion, packages the ranked results into a
-/// `SearchEnvelope`, and renders it: JSON for `--json`, text otherwise. When
-/// `explain` is true, the per-lane score breakdown prints after the text
-/// rendering — clap's `conflicts_with` keeps it from ever running with `json`.
-#[allow(clippy::too_many_arguments)]
+/// Kept apart from [`run_query`] because each surface classifies a parse
+/// error its own way: the HTTP route answers 400, the CLI exits 1.
+pub fn parse_scope(req: &crate::params::Search) -> Result<crate::tags::Scope> {
+    let all_terms = crate::tags::merge_scope_alias(req.scope.clone(), req.all.clone());
+    crate::tags::Scope::parse(&all_terms, &req.any, &req.none)?.with_filters(
+        req.property.as_deref(),
+        req.links_to.as_deref(),
+        req.linked_from.as_deref(),
+    )
+}
+
+/// The one search body the three surfaces share (#62).
+///
+/// It takes the request's per-call values with `config` behind each —
+/// `top_n`, `group_by`, `budget_tokens` — runs the pipeline, and assembles the
+/// envelope with the scores and the explain report the caller asked for.
+/// The CLI renders the envelope as text; MCP and HTTP serialize it.
+pub fn run_query<'a>(
+    req: crate::params::Search,
+    scope: crate::tags::Scope,
+    config: &crate::config::Config,
+    store: &'a Store,
+    embedder: &mut impl EmbedModel,
+    reranker: Option<&'a mut dyn RerankModel>,
+) -> Result<crate::packaging::SearchEnvelope> {
+    // `full` and `summaries` both name the whole result set and disagree on
+    // its shape, so asking for both is a usage error rather than one flag
+    // silently winning (#35).
+    if req.full && req.summaries {
+        anyhow::bail!("--full and --summaries are mutually exclusive");
+    }
+    let top_n = req.top_n.unwrap_or(config.top_n);
+    let mut search_config = SearchConfig {
+        reranker,
+        group_by: req.group_by.unwrap_or(config.group_by),
+        scope,
+        ..SearchConfig::new(store, config)
+    };
+    let output = search_with_intelligence(&req.query, top_n, embedder, &mut search_config)?;
+
+    let budget = req.budget_tokens.unwrap_or(config.output.budget_tokens);
+    let mut env = crate::packaging::assemble(
+        &output.results,
+        crate::packaging::AssembleParams {
+            budget_tokens: budget,
+            full: req.full,
+            summaries: req.summaries,
+            degraded: output.degraded,
+            per_note_cap: config.ranking.per_note_cap,
+            top_n,
+            less_relevant: &output.less_relevant,
+            answer_floor: output.answer_floor,
+        },
+    );
+    // A number invites a caller to trust it as ground truth rather than as a
+    // reranker's opinion, so it ships only when asked (#35).
+    if req.scores {
+        crate::packaging::apply_scores(&mut env, &output.results);
+    }
+    // The per-lane detail rides in the envelope on every surface (#126).
+    if req.explain {
+        crate::packaging::apply_explain(&mut env, explain_report(&output, top_n));
+    }
+    Ok(env)
+}
+
+/// The CLI's `search`: load the models, verify the store, run the one query
+/// body, and print the envelope as text or JSON.
 pub fn run_search(
-    query: &str,
-    top_n: usize,
+    req: crate::params::Search,
+    scope: crate::tags::Scope,
     json: bool,
-    explain: bool,
-    budget_tokens: Option<u32>,
-    full: bool,
-    summaries: bool,
-    scores: bool,
-    group_by: GroupBy,
-    scope: &crate::tags::Scope,
     data_dir: &Path,
     config: &crate::config::Config,
 ) -> Result<()> {
+    // Checked before a model loads, so a typo fails in milliseconds (#35).
+    if req.full && req.summaries {
+        anyhow::bail!("--full and --summaries are mutually exclusive");
+    }
+
     let models_dir = data_dir.join("models");
     let mut embedder =
         crate::llm::load_embedder(&models_dir, config).context("loading embedder")?;
@@ -1674,8 +1734,6 @@ pub fn run_search(
     };
 
     // Refuse to answer from an index this build did not produce (issue #31).
-    // A stale index and a real effect are indistinguishable in a result list,
-    // which is the whole reason the check is here rather than in a log line.
     {
         let fingerprints = crate::fingerprint::Fingerprints::compute(
             config,
@@ -1685,60 +1743,29 @@ pub fn run_search(
         crate::fingerprint::verify(&store, &fingerprints)?;
     }
 
-    let output = {
-        let mut search_config = SearchConfig {
-            reranker: reranker_model
-                .as_mut()
-                .map(|r| r.as_mut() as &mut dyn llm::RerankModel),
-            group_by,
-            scope: scope.clone(),
-            ..SearchConfig::new(&store, config)
-        };
-        search_with_intelligence(query, top_n, &mut embedder, &mut search_config)?
-    };
-
-    // `full` and `summaries` both name the whole result set and disagree on
-    // its shape, so asking for both is a usage error rather than one flag
-    // silently winning (#35).
-    if full && summaries {
-        anyhow::bail!("--full and --summaries are mutually exclusive");
-    }
-
-    // Per call, with the configured default behind it, the same pattern
-    // `top_n` follows (#35, #62).
-    let budget = budget_tokens.unwrap_or(config.output.budget_tokens);
-    let mut env = crate::packaging::assemble(
-        &output.results,
-        crate::packaging::AssembleParams {
-            budget_tokens: budget,
-            full,
-            summaries,
-            degraded: output.degraded,
-            per_note_cap: config.ranking.per_note_cap,
-            top_n,
-            less_relevant: &output.less_relevant,
-            answer_floor: output.answer_floor,
-        },
-    );
-    // A number invites a caller to trust it as ground truth rather than as a
-    // reranker's opinion, so it ships only when asked (#35).
-    if scores {
-        crate::packaging::apply_scores(&mut env, &output.results);
-    }
+    let scores = req.scores;
+    let env = run_query(
+        req,
+        scope,
+        config,
+        &store,
+        &mut embedder,
+        reranker_model
+            .as_mut()
+            .map(|r| r.as_mut() as &mut dyn llm::RerankModel),
+    )?;
 
     // JSON is the CLI's machine channel and carries the envelope alone; the
-    // text rendering — including the degraded banner — is design §9.3's form
-    // and is what `--explain` appends to (#35, #62).
+    // text rendering is design §9.3's form, with the explain report after it
+    // when one was asked for (#35, #62).
     let mut out = if json {
         format!("{}\n", serde_json::to_string_pretty(&env)?)
     } else {
         crate::packaging::render_text(&env, scores)
     };
-
-    if explain && !json {
-        out.push_str(&explain_report(&output, top_n));
+    if !json && let Some(report) = &env.explain {
+        out.push_str(report);
     }
-
     print!("{out}");
     Ok(())
 }
@@ -1771,14 +1798,21 @@ struct StatusInputs {
     model_name: String,
     intelligence: &'static str,
     date_count: usize,
+    pending_events: usize,
 }
 
 /// The status fields, read from a store the caller supplies.
 ///
 /// The three reads are separate statements, so a writer that commits between
 /// them would give an answer mixing two snapshots. A server passes the store
-/// it already holds the lock on, which is what stops that (#62).
-fn collect_status(store: &Store, data_dir: &Path) -> Result<StatusInputs> {
+/// it already holds, which is what stops that (#62). `config` is the caller's
+/// own: the CLI loads it, a server hands over the one it captured at start.
+fn collect_status(
+    store: &Store,
+    data_dir: &Path,
+    config: &crate::config::Config,
+    pending_events: usize,
+) -> Result<StatusInputs> {
     let stats = store.stats()?;
     let edges = store.get_edge_stats()?;
     let date_count = store.count_files_with_dates().unwrap_or(0);
@@ -1788,26 +1822,27 @@ fn collect_status(store: &Store, data_dir: &Path) -> Result<StatusInputs> {
         .map(|m| m.len())
         .unwrap_or(0);
 
-    let config = crate::config::Config::load().unwrap_or_default();
     Ok(StatusInputs {
         stats,
         edges,
         index_size,
-        model_name: crate::llm::embed_model_display(&config),
+        model_name: crate::llm::embed_model_display(config),
         intelligence: if config.intelligence_enabled() {
             "enabled"
         } else {
             "disabled"
         },
         date_count,
+        pending_events,
     })
 }
 
 /// Run the status command and print index information. The CLI holds no
-/// store, so this opens one.
+/// store and no watcher, so this opens one and reports no pending events.
 pub fn run_status(json: bool, data_dir: &Path) -> Result<()> {
     let store = Store::open(&db_path(data_dir)).context("opening store")?;
-    let s = collect_status(&store, data_dir)?;
+    let config = crate::config::Config::load().unwrap_or_default();
+    let s = collect_status(&store, data_dir, &config, 0)?;
     let output = format_status(
         &s.stats,
         &s.edges,
@@ -1815,6 +1850,7 @@ pub fn run_status(json: bool, data_dir: &Path) -> Result<()> {
         &s.model_name,
         s.intelligence,
         s.date_count,
+        s.pending_events,
         json,
     );
     print!("{output}");
@@ -1823,14 +1859,17 @@ pub fn run_status(json: bool, data_dir: &Path) -> Result<()> {
 
 /// What `status` reports, as the object the JSON channel names.
 ///
-/// `run_status` prints; this is what the two servers answer with, and they
-/// pass the store they already hold rather than opening a second connection:
-/// `Store::open` runs the schema batch and the migrations again, which would
-/// wait out the busy timeout against the server's own writer and then fail
-/// the call. Both routes compose the fields through `status_object`, so the
-/// three surfaces report the same ones and cannot drift apart (#62).
-pub fn status_json(store: &Store, data_dir: &Path) -> Result<serde_json::Value> {
-    let s = collect_status(store, data_dir)?;
+/// `run_status` prints; this is what the two servers answer with, from the
+/// reader they already hold and the config they captured at start. Both
+/// routes compose the fields through `status_object`, so the three surfaces
+/// report the same ones (#62).
+pub fn status_json(
+    store: &Store,
+    data_dir: &Path,
+    config: &crate::config::Config,
+    pending_events: usize,
+) -> Result<serde_json::Value> {
+    let s = collect_status(store, data_dir, config, pending_events)?;
     Ok(status_object(
         &s.stats,
         &s.edges,
@@ -1838,6 +1877,7 @@ pub fn status_json(store: &Store, data_dir: &Path) -> Result<serde_json::Value> 
         &s.model_name,
         s.intelligence,
         s.date_count,
+        s.pending_events,
     ))
 }
 
@@ -1852,6 +1892,7 @@ pub fn status_object(
     model_name: &str,
     intelligence: &str,
     date_count: usize,
+    pending_events: usize,
 ) -> serde_json::Value {
     let vault = stats.vault_path.as_deref().unwrap_or("<not set>");
     let last_indexed = stats.last_indexed_at.as_deref().unwrap_or("never");
@@ -1869,6 +1910,7 @@ pub fn status_object(
         "model": model_name,
         "intelligence": intelligence,
         "files_with_dates": date_count,
+        "pending_events": pending_events,
         "edges": edges.total_edges,
         "wikilink_edges": edges.wikilink_count,
         "wikilink_pairs": edges.wikilink_count / 2,
@@ -1882,6 +1924,7 @@ pub fn status_object(
 /// `edges` folds in `graph stats` (#62): `status` is what answers "what is in
 /// the index", so the connectivity counts belong beside the file and chunk
 /// counts rather than behind a second command.
+#[allow(clippy::too_many_arguments)]
 pub fn format_status(
     stats: &StoreStats,
     edges: &EdgeStats,
@@ -1889,6 +1932,7 @@ pub fn format_status(
     model_name: &str,
     intelligence: &str,
     date_count: usize,
+    pending_events: usize,
     json: bool,
 ) -> String {
     let vault = stats.vault_path.as_deref().unwrap_or("<not set>");
@@ -1909,6 +1953,7 @@ pub fn format_status(
             model_name,
             intelligence,
             date_count,
+            pending_events,
         );
         format!("{}\n", serde_json::to_string_pretty(&obj).unwrap())
     } else {
@@ -1934,6 +1979,9 @@ pub fn format_status(
             "  Isolated files:  {}\n",
             edges.isolated_file_count
         ));
+        if pending_events > 0 {
+            out.push_str(&format!("Pending:    {pending_events} events\n"));
+        }
         out.push_str(&format!(
             "Dates:      {}/{} files\n\
              Tombstones: {} (pending cleanup)\n\
@@ -1999,6 +2047,7 @@ mod tests {
             "all-MiniLM-L6-v2",
             "disabled",
             30,
+            0,
             false,
         );
 
@@ -2031,6 +2080,7 @@ mod tests {
             "all-MiniLM-L6-v2",
             "disabled",
             10,
+            0,
             false,
         );
 
@@ -2059,6 +2109,7 @@ mod tests {
             "all-MiniLM-L6-v2",
             "enabled",
             30,
+            0,
             true,
         );
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
@@ -2083,6 +2134,45 @@ mod tests {
         // them.
         assert_eq!(parsed["edges"], 10);
         assert_eq!(parsed["wikilink_edges"], 6);
+    }
+
+    /// `status` says how many watcher events are not yet applied. The text
+    /// prints the line only when there are some; the JSON always carries it.
+    #[test]
+    fn status_prints_pending_events_only_when_nonzero() {
+        let stats = StoreStats {
+            file_count: 1,
+            chunk_count: 1,
+            tombstone_count: 0,
+            last_indexed_at: None,
+            vault_path: None,
+        };
+        let quiet = format_status(
+            &stats,
+            &sample_edge_stats(),
+            0,
+            "m",
+            "disabled",
+            0,
+            0,
+            false,
+        );
+        assert!(!quiet.contains("Pending:"), "got {quiet}");
+        let busy = format_status(
+            &stats,
+            &sample_edge_stats(),
+            0,
+            "m",
+            "disabled",
+            0,
+            7,
+            false,
+        );
+        assert!(busy.contains("Pending:    7 events"), "got {busy}");
+
+        let json = format_status(&stats, &sample_edge_stats(), 0, "m", "disabled", 0, 0, true);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["pending_events"], 0);
     }
 
     #[test]

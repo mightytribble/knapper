@@ -143,7 +143,18 @@ pub fn diff_vault(
     vault_root: &Path,
     store: &Store,
 ) -> Result<(Vec<PathBuf>, Vec<PathBuf>, Vec<FileRecord>)> {
-    let stored_files = store.get_all_files()?;
+    diff_files(files, vault_root, store.get_all_files()?)
+}
+
+/// Compare vault files against the file records a store holds. Hashes each
+/// file the records know, and touches no store.
+///
+/// Returns `(new_files, changed_files, deleted_file_records)`.
+pub fn diff_files(
+    files: &[PathBuf],
+    vault_root: &Path,
+    stored_files: Vec<FileRecord>,
+) -> Result<(Vec<PathBuf>, Vec<PathBuf>, Vec<FileRecord>)> {
     let stored_map: HashMap<String, &FileRecord> =
         stored_files.iter().map(|f| (f.path.clone(), f)).collect();
 
@@ -1218,6 +1229,49 @@ fn run_index_inner(
     })
 }
 
+/// Every edge as `"source#seq -> target#seq (type)"`, so two stores can be
+/// compared without depending on file ids matching. Chunk seqs included:
+/// they are half the table since #28.
+#[cfg(test)]
+pub(crate) fn edge_snapshot(store: &Store) -> Vec<String> {
+    let paths: HashMap<i64, String> = store
+        .get_all_files()
+        .unwrap()
+        .into_iter()
+        .map(|f| (f.id, f.path))
+        .collect();
+    let name = |id: i64, seq: i64| {
+        let path = paths.get(&id).cloned().unwrap_or_else(|| format!("?{id}"));
+        if seq == DOC_LEVEL {
+            path
+        } else {
+            format!("{path}#{seq}")
+        }
+    };
+    let mut stmt = store
+        .conn()
+        .prepare("SELECT from_file, from_chunk_seq, to_file, to_chunk_seq, edge_type FROM edges")
+        .unwrap();
+    let mut edges: Vec<String> = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })
+        .unwrap()
+        .map(|r| {
+            let (from, from_seq, to, to_seq, kind) = r.unwrap();
+            format!("{} -> {} ({kind})", name(from, from_seq), name(to, to_seq))
+        })
+        .collect();
+    edges.sort();
+    edges
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1539,50 +1593,6 @@ mod tests {
             vec!["keeper.md".to_string()],
             "the excluded file's unresolved links should be gone"
         );
-    }
-
-    /// Every edge as `"source#seq -> target#seq (type)"`, so two stores can be
-    /// compared without depending on file ids matching. Chunk seqs included:
-    /// they are half the table since #28.
-    fn edge_snapshot(store: &Store) -> Vec<String> {
-        let paths: HashMap<i64, String> = store
-            .get_all_files()
-            .unwrap()
-            .into_iter()
-            .map(|f| (f.id, f.path))
-            .collect();
-        let name = |id: i64, seq: i64| {
-            let path = paths.get(&id).cloned().unwrap_or_else(|| format!("?{id}"));
-            if seq == DOC_LEVEL {
-                path
-            } else {
-                format!("{path}#{seq}")
-            }
-        };
-        let mut stmt = store
-            .conn()
-            .prepare(
-                "SELECT from_file, from_chunk_seq, to_file, to_chunk_seq, edge_type FROM edges",
-            )
-            .unwrap();
-        let mut edges: Vec<String> = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, String>(4)?,
-                ))
-            })
-            .unwrap()
-            .map(|r| {
-                let (from, from_seq, to, to_seq, kind) = r.unwrap();
-                format!("{} -> {} ({kind})", name(from, from_seq), name(to, to_seq))
-            })
-            .collect();
-        edges.sort();
-        edges
     }
 
     #[test]
