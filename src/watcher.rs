@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use notify::{PollWatcher, RecursiveMode, Watcher};
@@ -8,17 +9,14 @@ use notify_debouncer_full::{
     DebounceEventResult, DebouncedEvent, Debouncer, FileIdCache, RecommendedCache, new_debouncer,
     new_debouncer_opt,
 };
-use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
 use crate::config::{Config, WatcherBackend};
+use crate::core::{Core, CoreGuards, RecentWrites};
 use crate::exclude::ExcludeMatcher;
 use crate::indexer;
-use crate::llm::EmbedModel;
 use crate::placement;
-use crate::profile::VaultProfile;
-use crate::serve::RecentWrites;
 use crate::store::Store;
 
 /// The concrete watcher backend after config, env, and filesystem are resolved.
@@ -100,79 +98,106 @@ fn fs_needs_poll(_path: &Path) -> Option<bool> {
     None
 }
 
-/// Start the file watcher and consumer. Returns a thread handle for the producer
-/// and a shutdown sender. On startup, runs a reconciliation index to catch any
-/// changes that occurred while the server was down, then begins watching for
-/// real-time file changes.
+/// Start the file watcher and consumer. Returns a thread handle for the
+/// producer and a shutdown sender.
+///
+/// Three tasks: the producer thread watches the vault; one task diffs the
+/// vault against the store and queues what changed while the server was
+/// down, per file, so the handshake answers at once and a read answers
+/// throughout; the consumer applies events one file at a time.
 pub fn start_watcher(
-    store: Arc<Mutex<Store>>,
-    embedder: Arc<Mutex<Box<dyn EmbedModel + Send>>>,
-    vault_path: Arc<PathBuf>,
-    profile: Arc<Option<VaultProfile>>,
-    config: Config,
+    core: Core,
     exclude: Vec<String>,
-    recent_writes: RecentWrites,
 ) -> anyhow::Result<(std::thread::JoinHandle<()>, oneshot::Sender<()>)> {
     let (tx, rx) = mpsc::channel::<Vec<WatchEvent>>(64);
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
-    // Compile the exclude globs once, here, so a bad pattern fails server startup
-    // rather than every event batch.
+    // Compile the exclude globs once, here, so a bad pattern fails server
+    // startup rather than every event batch.
     let matcher = ExcludeMatcher::new(&exclude)?;
 
-    // Start producer (begins buffering events immediately)
     let producer_handle = start_producer(
-        vault_path.as_ref().clone(),
+        core.vault_path.as_ref().clone(),
         matcher,
-        tx,
+        tx.clone(),
         shutdown_rx,
-        config.watcher.backend,
-        Duration::from_secs(config.watcher.poll_interval_secs),
+        core.config.watcher.backend,
+        Duration::from_secs(core.config.watcher.poll_interval_secs),
+        core.pending_events.clone(),
     );
 
-    // Spawn consumer task
-    let store_clone = store.clone();
-    let embedder_clone = embedder.clone();
-    let vault_clone = vault_path.clone();
-    let profile_clone = profile.clone();
-    let config_clone = config.clone();
-    tokio::spawn(async move {
-        // Startup reconciliation: run index to catch changes since last shutdown
-        {
-            let store_lock = store_clone.lock().await;
-            let mut embedder_lock = embedder_clone.lock().await;
-            // The startup config is the session's own, captured once and never
-            // reloaded, so reading the index-time settings off it here yields
-            // the same values `knapper serve` captured — not a fresh load that
-            // could drift (#72).
-            let settings = crate::indexer::IndexSettings::from_config(&config_clone);
-            if let Err(e) = crate::indexer::run_index_shared(
-                &vault_clone,
-                &config_clone,
-                settings,
-                &store_lock,
-                &mut *embedder_lock,
-                false,
-                profile_clone.as_ref().as_ref(),
-            ) {
+    {
+        let core = core.clone();
+        let exclude = exclude.clone();
+        tokio::spawn(async move {
+            // A failed diff sent nothing, so the counter holds nothing of it.
+            if let Err(e) = enqueue_diff(&core, &exclude, &tx).await {
                 tracing::warn!("Startup reconciliation failed: {:#}", e);
             }
-        }
+        });
+    }
 
-        // Then consume events
-        run_consumer(
-            rx,
-            store_clone,
-            embedder_clone,
-            vault_clone,
-            profile_clone,
-            config_clone,
-            recent_writes,
-        )
-        .await;
+    tokio::spawn(async move {
+        run_consumer(rx, core, exclude).await;
     });
 
     Ok((producer_handle, shutdown_tx))
+}
+
+/// What the vault holds that the store does not, as the events the consumer
+/// applies: a `Deleted` for each record the disk no longer holds, a `Changed`
+/// for each new or changed path. Reads the store through the reader, so a
+/// search in flight does not delay it.
+pub async fn diff_events(core: &Core, exclude: &[String]) -> anyhow::Result<Vec<WatchEvent>> {
+    let vault = core.vault_path.clone();
+    let exclude = exclude.to_vec();
+    let respect_gitignore = core.config.respect_gitignore;
+    core.with_reader(move |store| {
+        let files = indexer::walk_vault(&vault, &exclude, respect_gitignore)?;
+        let (new_files, changed_files, deleted) = indexer::diff_vault(&files, &vault, store)?;
+        let mut events = Vec::with_capacity(new_files.len() + changed_files.len() + deleted.len());
+        events.extend(
+            deleted
+                .into_iter()
+                .map(|record| WatchEvent::Deleted(vault.join(&record.path))),
+        );
+        events.extend(
+            new_files
+                .into_iter()
+                .chain(changed_files)
+                .map(WatchEvent::Changed),
+        );
+        Ok(events)
+    })
+    .await
+}
+
+/// Queue the vault diff for the consumer, in batches of at most 64 events,
+/// counting each batch into `pending_events` before it is sent.
+pub async fn enqueue_diff(
+    core: &Core,
+    exclude: &[String],
+    tx: &mpsc::Sender<Vec<WatchEvent>>,
+) -> anyhow::Result<()> {
+    let events = diff_events(core, exclude).await?;
+    tracing::info!(events = events.len(), "startup reconciliation queued");
+    for batch in events.chunks(64) {
+        core.pending_events
+            .fetch_add(batch.len(), Ordering::Relaxed);
+        if tx.send(batch.to_vec()).await.is_err() {
+            settle(&core.pending_events, batch.len());
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Take `k` applied or dropped events off the counter. Saturates at zero, so
+/// a sender that did not count cannot wrap it.
+fn settle(pending: &AtomicUsize, k: usize) {
+    let _ = pending.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+        Some(n.saturating_sub(k))
+    });
 }
 
 /// Events sent from the watcher producer to the consumer.
@@ -197,6 +222,7 @@ pub fn start_producer(
     shutdown_rx: oneshot::Receiver<()>,
     backend: WatcherBackend,
     poll_interval: Duration,
+    pending: Arc<AtomicUsize>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         // Create std channel for debouncer events
@@ -223,7 +249,15 @@ pub fn start_producer(
         match resolved {
             ResolvedWatcher::Native => {
                 match new_debouncer(Duration::from_secs(2), None, debouncer_tx) {
-                    Ok(d) => drive_producer(d, vault_path, exclude, tx, shutdown_rx, debouncer_rx),
+                    Ok(d) => drive_producer(
+                        d,
+                        vault_path,
+                        exclude,
+                        tx,
+                        shutdown_rx,
+                        debouncer_rx,
+                        pending,
+                    ),
                     Err(e) => tracing::error!("Failed to create file watcher: {}", e),
                 }
             }
@@ -236,7 +270,15 @@ pub fn start_producer(
                     RecommendedCache::new(),
                     cfg,
                 ) {
-                    Ok(d) => drive_producer(d, vault_path, exclude, tx, shutdown_rx, debouncer_rx),
+                    Ok(d) => drive_producer(
+                        d,
+                        vault_path,
+                        exclude,
+                        tx,
+                        shutdown_rx,
+                        debouncer_rx,
+                        pending,
+                    ),
                     Err(e) => tracing::error!("Failed to create poll watcher: {}", e),
                 }
             }
@@ -255,6 +297,7 @@ fn drive_producer<T, C>(
     tx: mpsc::Sender<Vec<WatchEvent>>,
     mut shutdown_rx: oneshot::Receiver<()>,
     debouncer_rx: std::sync::mpsc::Receiver<DebounceEventResult>,
+    pending: Arc<AtomicUsize>,
 ) where
     T: Watcher,
     C: FileIdCache + Send + 'static,
@@ -276,7 +319,13 @@ fn drive_producer<T, C>(
         match debouncer_rx.recv_timeout(Duration::from_millis(500)) {
             Ok(Ok(events)) => {
                 let watch_events = process_debounced_events(&events, &vault_path, &exclude);
-                if !watch_events.is_empty() && tx.blocking_send(watch_events).is_err() {
+                if watch_events.is_empty() {
+                    continue;
+                }
+                let sent = watch_events.len();
+                pending.fetch_add(sent, Ordering::Relaxed);
+                if tx.blocking_send(watch_events).is_err() {
+                    settle(&pending, sent);
                     tracing::info!("Consumer gone, watcher exiting");
                     break;
                 }
@@ -442,384 +491,303 @@ async fn is_recent_write(recent_writes: &RecentWrites, path: &Path) -> bool {
     false
 }
 
-/// Consumer async task that processes batches of watch events.
+/// How many sent events one applied event accounts for. A `Moved` replaced a
+/// `Deleted` and a `Changed` in `detect_moves`.
+fn credits(event: &WatchEvent) -> usize {
+    match event {
+        WatchEvent::Moved { .. } => 2,
+        _ => 1,
+    }
+}
+
+fn rel_of(vault_path: &Path, path: &Path) -> String {
+    path.strip_prefix(vault_path)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .to_string()
+}
+
+fn folder_of(rel: &str) -> String {
+    Path::new(rel)
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default()
+}
+
+fn mean_vector(vectors: &[Vec<f32>]) -> Vec<f32> {
+    let dim = vectors[0].len();
+    let mut mean = vec![0.0f32; dim];
+    for v in vectors {
+        for (i, val) in v.iter().enumerate() {
+            mean[i] += val;
+        }
+    }
+    let n = vectors.len() as f32;
+    for val in &mut mean {
+        *val /= n;
+    }
+    mean
+}
+
+fn unix_now() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .to_string()
+}
+
+/// Index one changed or new file and, for a new one, move its folder's
+/// centroid toward it. Returns the file's id for the edge pass.
+fn index_changed_file(
+    g: CoreGuards<'_>,
+    rel: &str,
+    content: &str,
+    hash: &str,
+    vault_path: &Path,
+    config: &Config,
+) -> anyhow::Result<i64> {
+    let is_new_file = g.store.get_file(rel).ok().flatten().is_none();
+    let result = indexer::index_file(rel, content, hash, g.store, g.embedder, vault_path, config)?;
+    if is_new_file
+        && let Ok(vectors) = g.store.get_chunk_vectors_for_file(result.file_id)
+        && !vectors.is_empty()
+        && let Err(e) =
+            g.store
+                .adjust_folder_centroid(&folder_of(rel), &mean_vector(&vectors), true)
+    {
+        tracing::warn!(path = %rel, error = %e, "failed to adjust centroid for new file");
+    }
+    Ok(result.file_id)
+}
+
+/// Remove a deleted file and move its folder's centroid away from it.
+fn remove_deleted_file(g: CoreGuards<'_>, rel: &str, vault_path: &Path) -> anyhow::Result<()> {
+    let centroid = g.store.get_file(rel).ok().flatten().and_then(|file| {
+        let vectors = g.store.get_chunk_vectors_for_file(file.id).ok()?;
+        if vectors.is_empty() {
+            return None;
+        }
+        Some((mean_vector(&vectors), folder_of(rel)))
+    });
+    indexer::remove_file(rel, g.store, vault_path)?;
+    if let Some((mean, folder)) = centroid
+        && let Err(e) = g.store.adjust_folder_centroid(&folder, &mean, false)
+    {
+        tracing::warn!(path = %rel, error = %e, "failed to adjust centroid for deleted file");
+    }
+    Ok(())
+}
+
+/// Rename a moved file in the index and learn from the move. Returns the
+/// file's id for the edge pass, and the note's text with the placement
+/// frontmatter stripped when that write is owed; the write happens outside
+/// the lock.
+fn rename_moved_file(
+    g: CoreGuards<'_>,
+    old_rel: &str,
+    new_rel: &str,
+    to: &Path,
+    vault_path: &Path,
+) -> anyhow::Result<(Option<i64>, Option<String>)> {
+    indexer::rename_file(old_rel, new_rel, g.store, vault_path)?;
+    let file_id = g.store.get_file(new_rel)?.map(|record| record.id);
+    let Ok(content) = std::fs::read_to_string(to) else {
+        return Ok((file_id, None));
+    };
+    let actual_folder = folder_of(new_rel);
+    let stripped = match placement::detect_correction_from_frontmatter(&content, &actual_folder) {
+        Some(correction) => {
+            tracing::info!(
+                file = %new_rel,
+                suggested = %correction.suggested_folder,
+                actual = %correction.actual_folder,
+                "placement correction detected"
+            );
+            if let Some(file) = g.store.get_file(new_rel)?
+                && let Ok(vectors) = g.store.get_chunk_vectors_for_file(file.id)
+                && !vectors.is_empty()
+            {
+                let mean = mean_vector(&vectors);
+                if let Err(e) =
+                    g.store
+                        .adjust_folder_centroid(&correction.actual_folder, &mean, true)
+                {
+                    tracing::warn!(error = %e, "failed to adjust actual folder centroid");
+                }
+                if let Err(e) =
+                    g.store
+                        .adjust_folder_centroid(&correction.suggested_folder, &mean, false)
+                {
+                    tracing::warn!(error = %e, "failed to adjust suggested folder centroid");
+                }
+            }
+            if let Err(e) = g.store.insert_placement_correction(
+                new_rel,
+                &correction.suggested_folder,
+                &correction.actual_folder,
+            ) {
+                tracing::warn!(error = %e, "failed to log placement correction");
+            }
+            let stripped = placement::strip_placement_frontmatter(&content);
+            (stripped != content).then_some(stripped)
+        }
+        None if content.contains("suggested_folder:") => {
+            let stripped = placement::strip_placement_frontmatter(&content);
+            (stripped != content).then_some(stripped)
+        }
+        None => None,
+    };
+    Ok((file_id, stripped))
+}
+
+/// Apply one event. Returns the file id the edge pass should revisit.
+async fn apply_event(core: &Core, event: WatchEvent) -> anyhow::Result<Option<i64>> {
+    match event {
+        WatchEvent::Changed(path) => {
+            if is_recent_write(&core.recent_writes, &path).await {
+                tracing::debug!(path = %path.display(), "skipping re-index for a file the pipeline wrote");
+                return Ok(None);
+            }
+            let rel = rel_of(&core.vault_path, &path);
+            let content = std::fs::read_to_string(&path)
+                .map_err(|e| anyhow::anyhow!("failed to read changed file: {e}"))?;
+            let hash = indexer::compute_file_hash(&path)?;
+            let vault = core.vault_path.clone();
+            let config = core.config.clone();
+            let rel_for_call = rel.clone();
+            let file_id = core
+                .with_core(move |g| {
+                    index_changed_file(g, &rel_for_call, &content, &hash, &vault, &config)
+                })
+                .await?;
+            tracing::info!(path = %rel, file_id, "indexed changed file");
+            Ok(Some(file_id))
+        }
+        WatchEvent::Deleted(path) => {
+            let rel = rel_of(&core.vault_path, &path);
+            let vault = core.vault_path.clone();
+            let rel_for_call = rel.clone();
+            core.with_core(move |g| remove_deleted_file(g, &rel_for_call, &vault))
+                .await?;
+            tracing::info!(path = %rel, "removed deleted file from index");
+            Ok(None)
+        }
+        WatchEvent::Moved { from, to } => {
+            let old_rel = rel_of(&core.vault_path, &from);
+            let new_rel = rel_of(&core.vault_path, &to);
+            let vault = core.vault_path.clone();
+            let (old_for_call, new_for_call, to_for_call) =
+                (old_rel.clone(), new_rel.clone(), to.clone());
+            let (file_id, stripped) = core
+                .with_core(move |g| {
+                    rename_moved_file(g, &old_for_call, &new_for_call, &to_for_call, &vault)
+                })
+                .await?;
+            tracing::info!(from = %old_rel, to = %new_rel, "renamed file in index");
+            // The frontmatter write happens outside the lock. It raises a
+            // `Changed` event that re-indexes the note.
+            if let Some(stripped) = stripped {
+                let tmp = to.with_extension("md.tmp");
+                if let Err(e) =
+                    std::fs::write(&tmp, &stripped).and_then(|_| std::fs::rename(&tmp, &to))
+                {
+                    tracing::warn!(error = %e, "failed to strip placement frontmatter");
+                    let _ = std::fs::remove_file(&tmp);
+                }
+            }
+            Ok(file_id)
+        }
+        // Replaced by the vault diff before this is reached.
+        WatchEvent::FullRescan => Ok(None),
+    }
+}
+
+/// Consumer task: applies batches of watch events one file at a time.
 ///
-/// Two-pass processing:
-/// - Pass 1: Apply mutations (index/remove/rename files)
-/// - Pass 2: Rebuild edges for affected files
+/// Two passes per batch: mutations, then an edge rebuild for the files the
+/// batch touched. A batch that carries a `FullRescan` is replaced by the vault
+/// diff, which covers every event beside it.
 pub async fn run_consumer(
     mut rx: mpsc::Receiver<Vec<WatchEvent>>,
-    store: Arc<Mutex<Store>>,
-    embedder: Arc<Mutex<Box<dyn EmbedModel + Send>>>,
-    vault_path: Arc<PathBuf>,
-    profile: Arc<Option<VaultProfile>>,
-    config: Config,
-    recent_writes: RecentWrites,
+    core: Core,
+    exclude: Vec<String>,
 ) {
     tracing::info!("Watcher consumer started");
 
     while let Some(mut events) = rx.recv().await {
         tracing::info!(count = events.len(), "processing event batch");
 
-        // Move detection (needs store lock briefly)
+        if events.iter().any(|e| matches!(e, WatchEvent::FullRescan)) {
+            tracing::info!("performing full rescan");
+            settle(&core.pending_events, events.len());
+            events = match diff_events(&core, &exclude).await {
+                Ok(diff) => diff,
+                Err(e) => {
+                    tracing::warn!(error = %e, "full rescan failed");
+                    continue;
+                }
+            };
+            core.pending_events
+                .fetch_add(events.len(), Ordering::Relaxed);
+        }
+
+        // Move detection reads the store and nothing else.
+        let sent = events.len();
+        let vault = core.vault_path.clone();
+        let events = match core
+            .with_reader(move |store| {
+                let mut events = events;
+                detect_moves(&mut events, store, &vault);
+                Ok(events)
+            })
+            .await
         {
-            let store_guard = store.lock().await;
-            detect_moves(&mut events, &store_guard, &vault_path);
-        }
-
-        let mut affected_file_ids: Vec<i64> = Vec::new();
-        let mut had_full_rescan = false;
-
-        // Pass 1: mutations (one event at a time)
-        for event in &events {
-            match event {
-                WatchEvent::Changed(path) => {
-                    // Skip files recently written by MCP tools to avoid redundant re-indexing
-                    if is_recent_write(&recent_writes, path).await {
-                        tracing::debug!(path = %path.display(), "skipping re-index for MCP-written file");
-                        continue;
-                    }
-
-                    let rel = path
-                        .strip_prefix(vault_path.as_ref())
-                        .unwrap_or(path)
-                        .to_string_lossy()
-                        .to_string();
-
-                    let content = match std::fs::read_to_string(path) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            tracing::warn!(path = %path.display(), error = %e, "failed to read changed file, skipping");
-                            continue;
-                        }
-                    };
-
-                    let content_hash = match indexer::compute_file_hash(path) {
-                        Ok(h) => h,
-                        Err(e) => {
-                            tracing::warn!(path = %path.display(), error = %e, "failed to hash changed file, skipping");
-                            continue;
-                        }
-                    };
-
-                    let store_guard = store.lock().await;
-                    // Check if file is new (not yet in store) before indexing
-                    let is_new_file = store_guard.get_file(&rel).ok().flatten().is_none();
-
-                    let mut embedder_guard = embedder.lock().await;
-                    match indexer::index_file(
-                        &rel,
-                        &content,
-                        &content_hash,
-                        &store_guard,
-                        &mut *embedder_guard,
-                        &vault_path,
-                        &config,
-                    ) {
-                        Ok(result) => {
-                            tracing::info!(
-                                path = %rel,
-                                file_id = result.file_id,
-                                chunks = result.total_chunks,
-                                "indexed changed file"
-                            );
-                            affected_file_ids.push(result.file_id);
-
-                            // Adjust folder centroid for newly added files
-                            if is_new_file
-                                && let Ok(vectors) =
-                                    store_guard.get_chunk_vectors_for_file(result.file_id)
-                                && !vectors.is_empty()
-                            {
-                                let dim = vectors[0].len();
-                                let mut mean = vec![0.0f32; dim];
-                                for v in &vectors {
-                                    for (i, val) in v.iter().enumerate() {
-                                        mean[i] += val;
-                                    }
-                                }
-                                let n = vectors.len() as f32;
-                                for val in &mut mean {
-                                    *val /= n;
-                                }
-
-                                let folder = std::path::Path::new(&rel)
-                                    .parent()
-                                    .map(|p| p.to_string_lossy().to_string())
-                                    .unwrap_or_default();
-                                if let Err(e) =
-                                    store_guard.adjust_folder_centroid(&folder, &mean, true)
-                                {
-                                    tracing::warn!(
-                                        path = %rel,
-                                        error = %e,
-                                        "failed to adjust centroid for new file"
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(path = %rel, error = %e, "failed to index changed file");
-                        }
-                    }
-                    drop(embedder_guard);
-                    drop(store_guard);
-                }
-
-                WatchEvent::Deleted(path) => {
-                    let rel = path
-                        .strip_prefix(vault_path.as_ref())
-                        .unwrap_or(path)
-                        .to_string_lossy()
-                        .to_string();
-
-                    let store_guard = store.lock().await;
-
-                    // Capture mean vector BEFORE removal for centroid adjustment
-                    let mean_vec_and_folder =
-                        store_guard.get_file(&rel).ok().flatten().and_then(|file| {
-                            let vectors = store_guard.get_chunk_vectors_for_file(file.id).ok()?;
-                            if vectors.is_empty() {
-                                return None;
-                            }
-                            let dim = vectors[0].len();
-                            let mut mean = vec![0.0f32; dim];
-                            for v in &vectors {
-                                for (i, val) in v.iter().enumerate() {
-                                    mean[i] += val;
-                                }
-                            }
-                            let n = vectors.len() as f32;
-                            for val in &mut mean {
-                                *val /= n;
-                            }
-                            let folder = std::path::Path::new(&rel)
-                                .parent()
-                                .map(|p| p.to_string_lossy().to_string())
-                                .unwrap_or_default();
-                            Some((mean, folder))
-                        });
-
-                    match indexer::remove_file(&rel, &store_guard, &vault_path) {
-                        Ok(()) => {
-                            tracing::info!(path = %rel, "removed deleted file from index");
-
-                            // Adjust folder centroid after successful removal
-                            if let Some((mean, folder)) = mean_vec_and_folder
-                                && let Err(e) =
-                                    store_guard.adjust_folder_centroid(&folder, &mean, false)
-                            {
-                                tracing::warn!(
-                                    path = %rel,
-                                    error = %e,
-                                    "failed to adjust centroid for deleted file"
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(path = %rel, error = %e, "failed to remove deleted file");
-                        }
-                    }
-                    drop(store_guard);
-                }
-
-                WatchEvent::Moved { from, to } => {
-                    let old_rel = from
-                        .strip_prefix(vault_path.as_ref())
-                        .unwrap_or(from)
-                        .to_string_lossy()
-                        .to_string();
-                    let new_rel = to
-                        .strip_prefix(vault_path.as_ref())
-                        .unwrap_or(to)
-                        .to_string_lossy()
-                        .to_string();
-
-                    // Phase 1: Store operations under lock
-                    let needs_frontmatter_strip = {
-                        let store_guard = store.lock().await;
-                        match indexer::rename_file(&old_rel, &new_rel, &store_guard, &vault_path) {
-                            Ok(()) => {
-                                tracing::info!(from = %old_rel, to = %new_rel, "renamed file in index");
-                                // Track the file_id for edge rebuild
-                                if let Ok(Some(record)) = store_guard.get_file(&new_rel) {
-                                    affected_file_ids.push(record.id);
-                                }
-
-                                // Placement correction detection
-                                if let Ok(content) = std::fs::read_to_string(to) {
-                                    let actual_folder = std::path::Path::new(&new_rel)
-                                        .parent()
-                                        .map(|p| p.to_string_lossy().to_string())
-                                        .unwrap_or_default();
-
-                                    match placement::detect_correction_from_frontmatter(
-                                        &content,
-                                        &actual_folder,
-                                    ) {
-                                        Some(correction) => {
-                                            tracing::info!(
-                                                file = %new_rel,
-                                                suggested = %correction.suggested_folder,
-                                                actual = %correction.actual_folder,
-                                                "placement correction detected"
-                                            );
-
-                                            // Compute mean vector from file chunks
-                                            if let Ok(Some(file)) = store_guard.get_file(&new_rel)
-                                                && let Ok(vectors) =
-                                                    store_guard.get_chunk_vectors_for_file(file.id)
-                                                && !vectors.is_empty()
-                                            {
-                                                let dim = vectors[0].len();
-                                                let mut mean = vec![0.0f32; dim];
-                                                for v in &vectors {
-                                                    for (i, val) in v.iter().enumerate() {
-                                                        mean[i] += val;
-                                                    }
-                                                }
-                                                let n = vectors.len() as f32;
-                                                for val in &mut mean {
-                                                    *val /= n;
-                                                }
-
-                                                // Adjust centroids: boost actual, decay suggested
-                                                if let Err(e) = store_guard.adjust_folder_centroid(
-                                                    &correction.actual_folder,
-                                                    &mean,
-                                                    true,
-                                                ) {
-                                                    tracing::warn!(error = %e, "failed to adjust actual folder centroid");
-                                                }
-                                                if let Err(e) = store_guard.adjust_folder_centroid(
-                                                    &correction.suggested_folder,
-                                                    &mean,
-                                                    false,
-                                                ) {
-                                                    tracing::warn!(error = %e, "failed to adjust suggested folder centroid");
-                                                }
-                                            }
-
-                                            // Log the correction
-                                            if let Err(e) = store_guard.insert_placement_correction(
-                                                &new_rel,
-                                                &correction.suggested_folder,
-                                                &correction.actual_folder,
-                                            ) {
-                                                tracing::warn!(error = %e, "failed to log placement correction");
-                                            }
-
-                                            // Signal that frontmatter strip is needed (done outside lock)
-                                            let stripped =
-                                                placement::strip_placement_frontmatter(&content);
-                                            if stripped != content {
-                                                Some(stripped)
-                                            } else {
-                                                None
-                                            }
-                                        }
-                                        None => {
-                                            // Check if it's a confirmation (suggested == actual) — just strip
-                                            let has_suggested =
-                                                content.contains("suggested_folder:");
-                                            if has_suggested {
-                                                let stripped =
-                                                    placement::strip_placement_frontmatter(
-                                                        &content,
-                                                    );
-                                                if stripped != content {
-                                                    Some(stripped)
-                                                } else {
-                                                    None
-                                                }
-                                            } else {
-                                                None
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    None
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(from = %old_rel, to = %new_rel, error = %e, "failed to rename file");
-                                None
-                            }
-                        }
-                    }; // store_guard dropped here
-
-                    // Phase 2: Frontmatter file I/O without store lock.
-                    // The write triggers a Changed event that gets re-indexed anyway.
-                    if let Some(stripped) = needs_frontmatter_strip {
-                        let tmp = to.with_extension("md.tmp");
-                        if let Err(e) =
-                            std::fs::write(&tmp, &stripped).and_then(|_| std::fs::rename(&tmp, to))
-                        {
-                            tracing::warn!(error = %e, "failed to strip placement frontmatter");
-                            let _ = std::fs::remove_file(&tmp);
-                        }
-                    }
-                }
-
-                WatchEvent::FullRescan => {
-                    // FullRescan: holds both locks for the entire rescan duration.
-                    // This blocks MCP tool calls but is acceptable since FullRescan
-                    // is rare (macOS FSEvents buffer overflow). Future optimization:
-                    // process files one-at-a-time with per-file lock release.
-                    tracing::info!("performing full rescan");
-                    let store_guard = store.lock().await;
-                    let mut embedder_guard = embedder.lock().await;
-                    // Off the session's own startup config, not a fresh load —
-                    // the same settings `knapper serve` captured (#72).
-                    let settings = crate::indexer::IndexSettings::from_config(&config);
-                    match indexer::run_index_shared(
-                        &vault_path,
-                        &config,
-                        settings,
-                        &store_guard,
-                        &mut *embedder_guard,
-                        false,
-                        profile.as_ref().as_ref(),
-                    ) {
-                        Ok(result) => {
-                            tracing::info!(
-                                new = result.new_files,
-                                updated = result.updated_files,
-                                deleted = result.deleted_files,
-                                chunks = result.total_chunks,
-                                duration_secs = result.duration.as_secs_f64(),
-                                "full rescan complete"
-                            );
-                            had_full_rescan = true;
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "full rescan failed");
-                        }
-                    }
-                    drop(embedder_guard);
-                    drop(store_guard);
-                }
+            Ok(events) => events,
+            Err(e) => {
+                tracing::warn!(error = %e, "move detection failed; batch dropped");
+                settle(&core.pending_events, sent);
+                continue;
             }
+        };
+
+        // Pass 1: mutations, one file per lock.
+        let mut affected_file_ids: Vec<i64> = Vec::new();
+        for event in events {
+            let credit = credits(&event);
+            match apply_event(&core, event).await {
+                Ok(Some(file_id)) => affected_file_ids.push(file_id),
+                Ok(None) => {}
+                Err(e) => tracing::warn!(error = %e, "failed to apply watch event"),
+            }
+            settle(&core.pending_events, credit);
         }
 
-        // Pass 2: edge rebuild for affected files (skip if full rescan already rebuilt everything)
-        //
-        // The files this batch touched, and the notes whose broken links those
-        // files now satisfy: a note that arrives resolves the links other notes
-        // wrote before it existed, and those notes did not change, so nothing
-        // else revisits them (#108). A deletion repairs itself inside
-        // `indexer::remove_file`.
-        if !had_full_rescan && !affected_file_ids.is_empty() {
+        // Pass 2: the files this batch touched, and the notes whose broken
+        // links those files now satisfy (#108). A deletion repairs itself
+        // inside `indexer::remove_file`.
+        if !affected_file_ids.is_empty() {
             tracing::info!(
                 count = affected_file_ids.len(),
                 "rebuilding edges for affected files"
             );
-            let store_guard = store.lock().await;
-            if let Err(e) = indexer::reconcile_links(&store_guard, &vault_path, &affected_file_ids)
+            let vault = core.vault_path.clone();
+            if let Err(e) = core
+                .with_core(move |g| {
+                    indexer::reconcile_links(g.store, &vault, &affected_file_ids).map(|_| ())
+                })
+                .await
             {
                 tracing::warn!(error = %e, "failed to rebuild edges");
             }
-            drop(store_guard);
+        }
+
+        if core.pending_events.load(Ordering::Relaxed) == 0
+            && let Err(e) = core
+                .with_core(|g| g.store.set_meta("last_indexed_at", &unix_now()))
+                .await
+        {
+            tracing::warn!(error = %e, "failed to record last_indexed_at");
         }
 
         tracing::info!("batch processing complete");
@@ -843,53 +811,48 @@ mod tests {
     async fn a_file_the_watcher_indexes_resolves_the_links_that_waited_for_it() {
         use super::{WatchEvent, run_consumer};
         use crate::config::Config;
-        use crate::llm::{EmbedModel, MockLlm};
+        use crate::llm::MockLlm;
         use crate::store::Store;
-        use std::collections::HashMap;
-        use std::sync::Arc;
-        use tokio::sync::{Mutex, mpsc};
+        use std::sync::atomic::Ordering;
+        use tokio::sync::mpsc;
 
         let tmp = tempfile::tempdir().unwrap();
         let vault = tmp.path().to_path_buf();
         std::fs::write(vault.join("a.md"), "# A\n\nSee [[b]].\n").unwrap();
 
-        let store = Store::open_memory().unwrap();
+        let db = tmp.path().join("knapper.db");
         let config = Config::default();
-        crate::indexer::run_index_shared(
-            &vault,
-            &config,
-            crate::indexer::IndexSettings::from_config(&config),
-            &store,
-            &mut MockLlm::new(256),
-            false,
-            None,
-        )
-        .unwrap();
-        assert_eq!(store.get_unresolved_links().unwrap().len(), 1);
+        {
+            let store = Store::open(&db).unwrap();
+            crate::indexer::run_index_shared(
+                &vault,
+                &config,
+                crate::indexer::IndexSettings::from_config(&config),
+                &store,
+                &mut MockLlm::new(256),
+                false,
+                None,
+            )
+            .unwrap();
+            assert_eq!(store.get_unresolved_links().unwrap().len(), 1);
+        }
 
         std::fs::write(vault.join("b.md"), "# B\n\nBody.\n").unwrap();
 
-        let store = Arc::new(Mutex::new(store));
-        let embedder: Arc<Mutex<Box<dyn EmbedModel + Send>>> =
-            Arc::new(Mutex::new(Box::new(MockLlm::new(256))));
+        let core =
+            crate::core::Core::for_test(&db, Box::new(MockLlm::new(256)), config, vault.clone());
         let (tx, rx) = mpsc::channel(4);
+        core.pending_events.fetch_add(1, Ordering::Relaxed);
         tx.send(vec![WatchEvent::Changed(vault.join("b.md"))])
             .await
             .unwrap();
         drop(tx);
 
-        run_consumer(
-            rx,
-            store.clone(),
-            embedder,
-            Arc::new(vault.clone()),
-            Arc::new(None),
-            config,
-            Arc::new(Mutex::new(HashMap::new())),
-        )
-        .await;
+        run_consumer(rx, core.clone(), Vec::new()).await;
+        assert_eq!(core.pending_events.load(Ordering::Relaxed), 0);
 
-        let store = store.lock().await;
+        let writer = core.writer();
+        let store = writer.lock().await;
         assert!(
             store.get_unresolved_links().unwrap().is_empty(),
             "the link A wrote resolves now that B is indexed: {:?}",
@@ -911,11 +874,10 @@ mod tests {
     async fn a_move_the_watcher_sees_records_the_path_shaped_links_it_breaks() {
         use super::{WatchEvent, run_consumer};
         use crate::config::Config;
-        use crate::llm::{EmbedModel, MockLlm};
+        use crate::llm::MockLlm;
         use crate::store::Store;
-        use std::collections::HashMap;
-        use std::sync::Arc;
-        use tokio::sync::{Mutex, mpsc};
+        use std::sync::atomic::Ordering;
+        use tokio::sync::mpsc;
 
         let tmp = tempfile::tempdir().unwrap();
         let vault = tmp.path().to_path_buf();
@@ -924,26 +886,31 @@ mod tests {
         std::fs::write(vault.join("a.md"), "# A\n\nSee [[inbox/n]].\n").unwrap();
         std::fs::write(vault.join("inbox/n.md"), "# N\n\nBody.\n").unwrap();
 
-        let store = Store::open_memory().unwrap();
+        let db = tmp.path().join("knapper.db");
         let config = Config::default();
-        crate::indexer::run_index_shared(
-            &vault,
-            &config,
-            crate::indexer::IndexSettings::from_config(&config),
-            &store,
-            &mut MockLlm::new(256),
-            false,
-            None,
-        )
-        .unwrap();
-        assert!(store.get_unresolved_links().unwrap().is_empty());
+        {
+            let store = Store::open(&db).unwrap();
+            crate::indexer::run_index_shared(
+                &vault,
+                &config,
+                crate::indexer::IndexSettings::from_config(&config),
+                &store,
+                &mut MockLlm::new(256),
+                false,
+                None,
+            )
+            .unwrap();
+            assert!(store.get_unresolved_links().unwrap().is_empty());
+        }
 
         std::fs::rename(vault.join("inbox/n.md"), vault.join("lore/n.md")).unwrap();
 
-        let store = Arc::new(Mutex::new(store));
-        let embedder: Arc<Mutex<Box<dyn EmbedModel + Send>>> =
-            Arc::new(Mutex::new(Box::new(MockLlm::new(256))));
+        let core =
+            crate::core::Core::for_test(&db, Box::new(MockLlm::new(256)), config, vault.clone());
         let (tx, rx) = mpsc::channel(4);
+        // The sender counts the one event it sends. The consumer credits a
+        // `Moved` as two, and the counter stops at zero.
+        core.pending_events.fetch_add(1, Ordering::Relaxed);
         tx.send(vec![WatchEvent::Moved {
             from: vault.join("inbox/n.md"),
             to: vault.join("lore/n.md"),
@@ -952,18 +919,11 @@ mod tests {
         .unwrap();
         drop(tx);
 
-        run_consumer(
-            rx,
-            store.clone(),
-            embedder,
-            Arc::new(vault.clone()),
-            Arc::new(None),
-            config,
-            Arc::new(Mutex::new(HashMap::new())),
-        )
-        .await;
+        run_consumer(rx, core.clone(), Vec::new()).await;
+        assert_eq!(core.pending_events.load(Ordering::Relaxed), 0);
 
-        let store = store.lock().await;
+        let writer = core.writer();
+        let store = writer.lock().await;
         assert_eq!(
             store.get_unresolved_links().unwrap(),
             vec![("a.md".to_string(), "inbox/n".to_string())],
@@ -1064,6 +1024,7 @@ mod tests {
             shutdown_rx,
             WatcherBackend::Native,
             Duration::from_millis(200),
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         );
         tokio::time::sleep(Duration::from_millis(1500)).await;
 
@@ -1143,5 +1104,138 @@ mod tests {
             matches!(events.as_slice(), [WatchEvent::Deleted(p)] if p == &gone),
             "only the path that is gone is a deletion: {events:?}"
         );
+    }
+
+    /// Startup reconciliation runs per file through the consumer: a read
+    /// answers while it runs, and the tables it leaves equal a full index of
+    /// the same vault (serve-core spec).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_reconciliation_indexes_per_file() {
+        use super::{diff_events, enqueue_diff, run_consumer};
+        use crate::core::Core;
+        use crate::core::testing::{GatedEmbed, indexed_vault, test_config};
+        use crate::indexer::edge_snapshot;
+        use crate::llm::MockLlm;
+        use crate::store::Store;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+        use tokio::sync::mpsc;
+
+        let config = test_config();
+        let mut notes: Vec<(String, String)> = (0..10)
+            .map(|i| {
+                (
+                    format!("n{i}.md"),
+                    format!(
+                        "# Note {i}\n\nThe body of note {i}, long enough to be its own chunk and then some more words.\n"
+                    ),
+                )
+            })
+            .collect();
+        notes[1].1.push_str("See [[n2]].\n");
+        notes[3].1.push_str("See [[n4]].\n");
+        let borrowed: Vec<(&str, &str)> = notes
+            .iter()
+            .map(|(p, b)| (p.as_str(), b.as_str()))
+            .collect();
+        let (tmp, vault, db) = indexed_vault(&borrowed, &config);
+
+        // The server is "down": three notes change, one goes, one arrives.
+        for i in [1, 2, 3] {
+            std::fs::write(
+                vault.join(format!("n{i}.md")),
+                format!(
+                    "# Note {i}\n\nRewritten while the server was down, still long enough to be a chunk of its own.\n"
+                ),
+            )
+            .unwrap();
+        }
+        std::fs::remove_file(vault.join("n4.md")).unwrap();
+        std::fs::write(
+            vault.join("n10.md"),
+            "# Note 10\n\nA new note that links to [[n0]] and is long enough to be a chunk.\n",
+        )
+        .unwrap();
+
+        let (embed, release, entered) = GatedEmbed::new(256);
+        let core = Core::for_test(&db, Box::new(embed), config.clone(), vault.clone());
+
+        let diff = diff_events(&core, &[]).await.unwrap();
+        assert_eq!(diff.len(), 5, "3 changed + 1 new + 1 deleted, got {diff:?}");
+
+        let (tx, rx) = mpsc::channel(64);
+        enqueue_diff(&core, &[], &tx).await.unwrap();
+        drop(tx);
+        assert_eq!(core.pending_events.load(Ordering::Relaxed), 5);
+
+        let consumer = {
+            let core = core.clone();
+            tokio::spawn(async move { run_consumer(rx, core, Vec::new()).await })
+        };
+        tokio::task::spawn_blocking(move || entered.recv_timeout(Duration::from_secs(5)))
+            .await
+            .unwrap()
+            .expect("the consumer reached the embedder");
+
+        // The first file is parked on the embedder; a read still answers.
+        let count = tokio::time::timeout(
+            Duration::from_secs(2),
+            core.with_reader(|store| store.file_count()),
+        )
+        .await
+        .expect("a read waited on the reconciliation")
+        .unwrap();
+        assert!(count >= 9, "got {count}");
+        assert!(core.pending_events.load(Ordering::Relaxed) > 0);
+
+        release.send(()).unwrap();
+        consumer.await.unwrap();
+        assert_eq!(core.pending_events.load(Ordering::Relaxed), 0);
+
+        // What the per-file path left equals a full index of the same vault.
+        let fresh_db = tmp.path().join("fresh.db");
+        let fresh = Store::open(&fresh_db).unwrap();
+        crate::indexer::run_index_shared(
+            &vault,
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &fresh,
+            &mut MockLlm::new(256),
+            false,
+            None,
+        )
+        .unwrap();
+
+        type Snapshot = (
+            Vec<(String, String)>,
+            Vec<(String, i64, String)>,
+            Vec<String>,
+        );
+        fn snapshot(store: &Store) -> Snapshot {
+            let mut files: Vec<(String, String)> = store
+                .get_all_files()
+                .unwrap()
+                .into_iter()
+                .map(|f| (f.path, f.content_hash))
+                .collect();
+            files.sort();
+            let mut chunks = Vec::new();
+            for f in store.get_all_files().unwrap() {
+                for c in store.get_chunks_by_file(f.id).unwrap() {
+                    chunks.push((f.path.clone(), c.seq, c.text));
+                }
+            }
+            chunks.sort();
+            (files, chunks, edge_snapshot(store))
+        }
+        let reconciled = {
+            let writer = core.writer();
+            let store = writer.lock().await;
+            snapshot(&store)
+        };
+        let full = snapshot(&fresh);
+        assert_eq!(reconciled.0, full.0, "files differ");
+        assert_eq!(reconciled.1, full.1, "chunks differ");
+        assert_eq!(reconciled.2, full.2, "edges differ");
     }
 }

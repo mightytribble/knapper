@@ -1151,7 +1151,7 @@ pub async fn run_serve(
             exclude.push(pattern);
         }
     }
-    // Capture retrieval settings before the watcher takes ownership of `config`.
+    // The retrieval settings the MCP server answers with, off the startup config.
     let max_chunks_per_file = config.max_chunks_per_file;
     let group_by = config.group_by;
     let top_n = config.top_n;
@@ -1166,15 +1166,18 @@ pub async fn run_serve(
     let index_settings = crate::indexer::IndexSettings::from_config(&config);
     let output = config.output.clone();
 
-    let (watcher_handle, watcher_shutdown) = crate::watcher::start_watcher(
+    let core = crate::core::Core::from_parts(
         store_arc.clone(),
+        Store::open_reader(&db_path)?,
         embedder_arc.clone(),
+        reranker.as_ref().map(Arc::clone),
+        config.clone(),
         vault_path_arc.clone(),
         profile_arc.clone(),
-        config,
-        exclude,
         recent_writes.clone(),
-    )?;
+        read_only,
+    );
+    let (watcher_handle, watcher_shutdown) = crate::watcher::start_watcher(core, exclude)?;
 
     if read_only {
         eprintln!("Read-only mode: write tools disabled");
@@ -1206,7 +1209,6 @@ pub async fn run_serve(
 
     // Spawn HTTP server as a background task (before MCP blocks on stdio)
     if let Some(ref opts) = http_opts {
-        let config = Config::load()?;
         let api_state = crate::http::ApiState {
             store: http_store,
             embedder: http_embedder,
