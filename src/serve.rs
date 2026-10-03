@@ -43,11 +43,33 @@ fn read_only_err() -> McpError {
     )
 }
 
-fn mcp_err(e: &anyhow::Error) -> McpError {
+/// The one place an error from a core call becomes a code.
+///
+/// The kind is read once, through whatever context the pipeline added, and
+/// `data.kind` names it, since `INVALID_PARAMS` covers three kinds. An error
+/// with no `Fault` in its chain is the server's own.
+fn mcp_err(e: anyhow::Error) -> McpError {
+    use crate::fault::Fault;
+    use rmcp::model::ErrorCode;
+    let message = format!("{e:#}");
+    let (code, kind) = match Fault::of(&e) {
+        Some(f @ (Fault::InvalidInput(_) | Fault::NotFound(_) | Fault::Ambiguous(_))) => {
+            (ErrorCode::INVALID_PARAMS, f.kind())
+        }
+        Some(f @ (Fault::Conflict(_) | Fault::ReadOnly)) => (ErrorCode::INVALID_REQUEST, f.kind()),
+        Some(f @ Fault::StaleIndex(_)) => (ErrorCode::INTERNAL_ERROR, f.kind()),
+        None => (ErrorCode::INTERNAL_ERROR, "internal"),
+    };
+    McpError::new(code, message, Some(serde_json::json!({ "kind": kind })))
+}
+
+/// The handler's own parse stage: the caller's text read before any core
+/// call. What comes out of a core call goes through `mcp_err` instead.
+fn invalid_params(message: String) -> McpError {
     McpError::new(
-        rmcp::model::ErrorCode::INTERNAL_ERROR,
-        format!("{e:#}"),
-        None::<serde_json::Value>,
+        rmcp::model::ErrorCode::INVALID_PARAMS,
+        message,
+        Some(serde_json::json!({ "kind": "invalid_input" })),
     )
 }
 
@@ -56,13 +78,7 @@ fn mcp_err(e: &anyhow::Error) -> McpError {
 /// caller pays for and no reader of this channel is human (#127). The CLI
 /// pretty-prints its own `--json`, where a person reads it.
 fn to_json_result<T: serde::Serialize>(value: &T) -> Result<CallToolResult, McpError> {
-    let json = serde_json::to_string(value).map_err(|e| {
-        McpError::new(
-            rmcp::model::ErrorCode::INTERNAL_ERROR,
-            e.to_string(),
-            None::<serde_json::Value>,
-        )
-    })?;
+    let json = serde_json::to_string(value).map_err(|e| mcp_err(e.into()))?;
     Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
 }
 
@@ -79,11 +95,11 @@ impl KnapperServer {
         let req = params.0;
         // Checked before the pipeline runs, so a typo fails fast (#35).
         if req.full && req.summaries {
-            return Err(mcp_err(&anyhow::anyhow!(
-                "--full and --summaries are mutually exclusive"
-            )));
+            return Err(invalid_params(
+                "--full and --summaries are mutually exclusive".into(),
+            ));
         }
-        let scope = search::parse_scope(&req).map_err(|e| mcp_err(&e))?;
+        let scope = search::parse_scope(&req).map_err(|e| invalid_params(format!("{e:#}")))?;
         let scores = req.scores;
         let config = self.core.config.clone();
         let env = self
@@ -92,8 +108,8 @@ impl KnapperServer {
                 search::run_query(req, scope, &config, g.store, g.embedder, g.reranker)
             })
             .await
-            .map_err(|e| mcp_err(&e))?;
-        let value = serde_json::to_value(&env).map_err(|e| mcp_err(&anyhow::anyhow!(e)))?;
+            .map_err(mcp_err)?;
+        let value = serde_json::to_value(&env).map_err(|e| mcp_err(e.into()))?;
 
         // The text rendering is a convenience for a client that reads content
         // blocks and not `structuredContent` (#35).
@@ -130,7 +146,7 @@ impl KnapperServer {
                 context::context_read(&ctx, &p.file, p.section.as_deref(), p.include)
             })
             .await
-            .map_err(|e| mcp_err(&e))?;
+            .map_err(mcp_err)?;
         to_json_result(&result)
     }
 
@@ -152,7 +168,7 @@ impl KnapperServer {
                     p.linked_from.as_deref(),
                 )
             })
-            .map_err(|e| mcp_err(&e))?;
+            .map_err(|e| invalid_params(format!("{e:#}")))?;
         let vault = self.core.vault_path.clone();
         let profile = self.core.profile.clone();
         let items = self
@@ -174,7 +190,7 @@ impl KnapperServer {
                 )
             })
             .await
-            .map_err(|e| mcp_err(&e))?;
+            .map_err(mcp_err)?;
         to_json_result(&items)
     }
 
@@ -191,7 +207,7 @@ impl KnapperServer {
             .core
             .with_reader(move |store| crate::matching::run(store, &p))
             .await
-            .map_err(|e| mcp_err(&e))?;
+            .map_err(mcp_err)?;
         to_json_result(&report)
     }
 
@@ -208,7 +224,7 @@ impl KnapperServer {
             .core
             .with_reader(move |store| store.tags_under(prefix.as_ref()))
             .await
-            .map_err(|e| mcp_err(&e))?;
+            .map_err(mcp_err)?;
         to_json_result(&rows)
     }
 
@@ -226,7 +242,7 @@ impl KnapperServer {
             .core
             .with_reader(move |store| crate::properties::run(store, &vault, &p))
             .await
-            .map_err(|e| mcp_err(&e))?;
+            .map_err(mcp_err)?;
         to_json_result(&report)
     }
 
@@ -248,7 +264,7 @@ impl KnapperServer {
                 context::vault_map(&ctx)
             })
             .await
-            .map_err(|e| mcp_err(&e))?;
+            .map_err(mcp_err)?;
         to_json_result(&map)
     }
 
@@ -265,13 +281,10 @@ impl KnapperServer {
         }
         // No stdin exists on this surface, so an omitted content is an
         // error here instead of the CLI's fallback read.
-        let content = params.0.content.ok_or_else(|| {
-            McpError::new(
-                rmcp::model::ErrorCode::INVALID_PARAMS,
-                "content is required",
-                None::<serde_json::Value>,
-            )
-        })?;
+        let content = params
+            .0
+            .content
+            .ok_or_else(|| invalid_params("content is required".into()))?;
         let input = crate::writer::CreateNoteInput {
             content,
             filename: params.0.filename,
@@ -298,7 +311,7 @@ impl KnapperServer {
                 )
             })
             .await
-            .map_err(|e| mcp_err(&e))?;
+            .map_err(mcp_err)?;
         to_json_result(&result)
     }
 
@@ -325,13 +338,10 @@ impl KnapperServer {
             return Err(read_only_err());
         }
         // The whole list is read before anything is written (#62).
-        let edits = params.0.to_writer_edits().map_err(|e| {
-            McpError::new(
-                rmcp::model::ErrorCode::INVALID_PARAMS,
-                format!("{e:#}"),
-                None::<serde_json::Value>,
-            )
-        })?;
+        let edits = params
+            .0
+            .to_writer_edits()
+            .map_err(|e| invalid_params(format!("{e:#}")))?;
         let input = crate::writer::UpdateInput {
             file: params.0.file,
             edits,
@@ -362,7 +372,7 @@ impl KnapperServer {
                 Ok(result)
             })
             .await
-            .map_err(|e| mcp_err(&e))?;
+            .map_err(mcp_err)?;
         self.core
             .record_write(&self.core.vault_path.join(&result.path))
             .await;
@@ -388,7 +398,7 @@ impl KnapperServer {
             .core
             .with_core(move |g| crate::writer::move_note(&p.file, &p.new_folder, g.store, &vault))
             .await
-            .map_err(|e| mcp_err(&e))?;
+            .map_err(mcp_err)?;
         to_json_result(&result)
     }
 
@@ -425,7 +435,7 @@ impl KnapperServer {
                 }
             })
             .await
-            .map_err(|e| mcp_err(&e))?;
+            .map_err(mcp_err)?;
         to_json_result(&result)
     }
 
@@ -446,7 +456,7 @@ impl KnapperServer {
             .core
             .with_reader(move |store| crate::health::generate_health_report(store, &config))
             .await
-            .map_err(|e| mcp_err(&e))?;
+            .map_err(mcp_err)?;
         to_json_result(&report)
     }
 
@@ -458,7 +468,10 @@ impl KnapperServer {
         &self,
         params: Parameters<crate::params::Validate>,
     ) -> Result<CallToolResult, McpError> {
-        let target = params.0.target().map_err(|e| mcp_err(&e))?;
+        let target = params
+            .0
+            .target()
+            .map_err(|e| invalid_params(format!("{e:#}")))?;
         let limits = crate::validate::ChunkLimits {
             min_chars: self.core.config.chunk_min_chars,
             target_tokens: crate::chunker::limits::TARGET_TOKENS,
@@ -469,7 +482,7 @@ impl KnapperServer {
             crate::validate::validate_target(&vault, &target, &limits, strict)
         })
         .await
-        .map_err(|e| mcp_err(&e))?;
+        .map_err(mcp_err)?;
         to_json_result(&report)
     }
 
@@ -491,7 +504,7 @@ impl KnapperServer {
                         crate::migrate::generate_preview(store, &vault, profile.as_ref().as_ref())
                     })
                     .await
-                    .map_err(|e| mcp_err(&e))?;
+                    .map_err(mcp_err)?;
                 to_json_result(&preview)
             }
             "apply" => {
@@ -500,18 +513,13 @@ impl KnapperServer {
                 }
                 // The preview is required here: a dropped key must not
                 // silently apply an unrelated plan (#62).
-                let preview = crate::migrate::resolve_preview(params.0.preview).map_err(|e| {
-                    McpError::new(
-                        rmcp::model::ErrorCode::INVALID_PARAMS,
-                        format!("{e:#}"),
-                        None::<serde_json::Value>,
-                    )
-                })?;
+                let preview = crate::migrate::resolve_preview(params.0.preview)
+                    .map_err(|e| invalid_params(format!("{e:#}")))?;
                 let result = self
                     .core
                     .with_core(move |g| crate::migrate::apply_preview(&preview, g.store, &vault))
                     .await
-                    .map_err(|e| mcp_err(&e))?;
+                    .map_err(mcp_err)?;
                 to_json_result(&result)
             }
             "undo" => {
@@ -522,14 +530,12 @@ impl KnapperServer {
                     .core
                     .with_core(move |g| crate::migrate::undo_last(g.store, &vault))
                     .await
-                    .map_err(|e| mcp_err(&e))?;
+                    .map_err(mcp_err)?;
                 to_json_result(&result)
             }
-            other => Err(McpError::new(
-                rmcp::model::ErrorCode::INVALID_PARAMS,
-                format!("Unknown mode: {other}. Use 'preview', 'apply' or 'undo'."),
-                None::<serde_json::Value>,
-            )),
+            other => Err(invalid_params(format!(
+                "Unknown mode: {other}. Use 'preview', 'apply' or 'undo'."
+            ))),
         }
     }
 
@@ -561,7 +567,7 @@ impl KnapperServer {
                 crate::writer::delete_note(g.store, &vault, &file, mode, &archive_folder)
             })
             .await
-            .map_err(|e| mcp_err(&e))?;
+            .map_err(mcp_err)?;
         let result = serde_json::json!({
             "deleted": p.file,
             "mode": p.mode,
@@ -590,12 +596,8 @@ impl KnapperServer {
             })
             .await
             .map_err(|e| match e.downcast_ref::<std::io::Error>() {
-                Some(_) => McpError::new(
-                    rmcp::model::ErrorCode::INVALID_PARAMS,
-                    format!("Cannot read file {rel_path}: {e:#}"),
-                    None::<serde_json::Value>,
-                ),
-                None => mcp_err(&e),
+                Some(_) => invalid_params(format!("Cannot read file {rel_path}: {e:#}")),
+                None => mcp_err(e),
             })?;
         let output = serde_json::json!({
             "file": rel_path,
@@ -640,7 +642,7 @@ impl KnapperServer {
                 )
             })
             .await
-            .map_err(|e| mcp_err(&e))?;
+            .map_err(mcp_err)?;
         to_json_result(&serde_json::json!({
             "new_files": result.new_files,
             "updated_files": result.updated_files,
@@ -658,7 +660,7 @@ impl KnapperServer {
         &self,
         _params: Parameters<crate::params::Status>,
     ) -> Result<CallToolResult, McpError> {
-        let data_dir = crate::config::Config::data_dir().map_err(|e| mcp_err(&e))?;
+        let data_dir = crate::config::Config::data_dir().map_err(mcp_err)?;
         let config = self.core.config.clone();
         let pending = self
             .core
@@ -668,7 +670,7 @@ impl KnapperServer {
             .core
             .with_reader(move |store| search::status_json(store, &data_dir, &config, pending))
             .await
-            .map_err(|e| mcp_err(&e))?;
+            .map_err(mcp_err)?;
         to_json_result(&report)
     }
 
@@ -690,7 +692,7 @@ impl KnapperServer {
                 return Err(McpError::new(
                     rmcp::model::ErrorCode::INVALID_REQUEST,
                     "No vault profile found. Run `knapper init` first.",
-                    None::<serde_json::Value>,
+                    Some(serde_json::json!({ "kind": "invalid_input" })),
                 ));
             }
             let profile = self.core.profile.clone();
@@ -706,7 +708,7 @@ impl KnapperServer {
                 .with_reader(move |store| crate::identity::format_identity_block(&config, store))
                 .await
         }
-        .map_err(|e| mcp_err(&e))?;
+        .map_err(mcp_err)?;
         Ok(CallToolResult::success(vec![ContentBlock::text(block)]))
     }
 
@@ -724,14 +726,14 @@ impl KnapperServer {
                 let result =
                     crate::core::blocking(move || crate::onboarding::run_detect_json(&vault))
                         .await
-                        .map_err(|e| mcp_err(&e))?;
+                        .map_err(mcp_err)?;
                 to_json_result(&result)
             }
             Some("apply") => {
                 if self.core.read_only {
                     return Err(read_only_err());
                 }
-                let data_dir = crate::config::Config::data_dir().map_err(|e| mcp_err(&e))?;
+                let data_dir = crate::config::Config::data_dir().map_err(mcp_err)?;
                 let flags = crate::onboarding::ApplyFlags {
                     name: params.0.name,
                     role: params.0.role,
@@ -764,18 +766,14 @@ impl KnapperServer {
                         Ok(result)
                     })
                     .await
-                    .map_err(|e| mcp_err(&e))?;
+                    .map_err(mcp_err)?;
                 to_json_result(&result)
             }
-            Some(other) => Err(McpError::new(
-                rmcp::model::ErrorCode::INVALID_PARAMS,
-                format!("Unknown mode: {other}. Use 'detect' or 'apply'."),
-                None::<serde_json::Value>,
-            )),
-            None => Err(McpError::new(
-                rmcp::model::ErrorCode::INVALID_PARAMS,
-                "init needs mode=detect or mode=apply",
-                None::<serde_json::Value>,
+            Some(other) => Err(invalid_params(format!(
+                "Unknown mode: {other}. Use 'detect' or 'apply'."
+            ))),
+            None => Err(invalid_params(
+                "init needs mode=detect or mode=apply".into(),
             )),
         }
     }
@@ -1320,6 +1318,70 @@ mod tests {
         }
     }
 
+    /// The one mapping from a kind to a code, over every kind and the plain
+    /// `anyhow` case, read through a context layer the way a handler
+    /// receives it.
+    #[test]
+    fn each_fault_maps_to_its_code_and_kind() {
+        use crate::fault::Fault;
+        use rmcp::model::ErrorCode;
+        let cases: Vec<(anyhow::Error, ErrorCode, &str)> = vec![
+            (
+                Fault::InvalidInput("x".into()).into(),
+                ErrorCode::INVALID_PARAMS,
+                "invalid_input",
+            ),
+            (
+                Fault::NotFound("x".into()).into(),
+                ErrorCode::INVALID_PARAMS,
+                "not_found",
+            ),
+            (
+                Fault::Ambiguous("x".into()).into(),
+                ErrorCode::INVALID_PARAMS,
+                "ambiguous",
+            ),
+            (
+                Fault::Conflict("x".into()).into(),
+                ErrorCode::INVALID_REQUEST,
+                "conflict",
+            ),
+            (
+                Fault::StaleIndex("x".into()).into(),
+                ErrorCode::INTERNAL_ERROR,
+                "stale_index",
+            ),
+            (
+                Fault::ReadOnly.into(),
+                ErrorCode::INVALID_REQUEST,
+                "read_only",
+            ),
+            (anyhow::anyhow!("x"), ErrorCode::INTERNAL_ERROR, "internal"),
+        ];
+        for (err, code, kind) in cases {
+            let mapped = super::mcp_err(err.context("under context"));
+            assert_eq!(mapped.code, code, "{kind}");
+            assert_eq!(mapped.data.as_ref().unwrap()["kind"], kind);
+            assert!(
+                mapped.message.starts_with("under context: "),
+                "{}",
+                mapped.message
+            );
+        }
+    }
+
+    /// A scope the parser refuses is the caller's own text, so it is this
+    /// surface's INVALID_PARAMS, as it is HTTP's 400.
+    #[tokio::test]
+    async fn a_scope_the_parser_refuses_on_search_is_invalid_params() {
+        let (_tmp, server) = indexed_server(crate::config::GroupBy::Chunk);
+        let mut params = search_params(None, false);
+        params.all = vec!["".into()];
+        let err = server.search(super::Parameters(params)).await.unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
+        assert_eq!(err.data.as_ref().unwrap()["kind"], "invalid_input");
+    }
+
     /// The structured envelope (#35), read from `structuredContent` rather
     /// than a text content block.
     fn envelope(result: &rmcp::model::CallToolResult) -> serde_json::Value {
@@ -1590,6 +1652,8 @@ mod tests {
         params.summaries = true;
         let err = server.search(super::Parameters(params)).await.unwrap_err();
         assert!(err.message.contains("mutually exclusive"), "got {err:?}");
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert_eq!(err.data.as_ref().unwrap()["kind"], "invalid_input");
     }
 
     /// The design's promise on the MCP surface: a search parked on the
