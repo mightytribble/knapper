@@ -150,7 +150,9 @@ pub fn start_watcher(
 /// the walk and a `Deleted` otherwise. A file on disk that the walk left out
 /// is excluded, gitignored or hidden, and `index` drops its row too. Reads the
 /// file records through the reader, then walks and hashes the vault holding no
-/// lock, so a read is not delayed by the walk.
+/// lock, so a read is not delayed by the walk. A note deleted and restored
+/// entirely during the walk is classed `Evicted`; if the restore's live change
+/// applies first, the note stays out of the index until its next edit.
 pub async fn diff_events(core: &Core, exclude: &[String]) -> anyhow::Result<Vec<WatchEvent>> {
     let stored = core.with_reader(|store| store.get_all_files()).await?;
     let vault = core.vault_path.clone();
@@ -226,7 +228,9 @@ pub enum WatchEvent {
     /// A stored note the vault diff did not admit while its file stayed on
     /// disk: excluded, gitignored or hidden. Its row is removed whether or not
     /// the file exists. Move detection never pairs it, because the file did
-    /// not move.
+    /// not move. A note deleted and restored entirely during the walk lands
+    /// here too, and stays out of the index until its next edit if the
+    /// restore's live change applied first.
     Evicted(PathBuf),
     /// File was moved/renamed (detected via content hash or inode tracking).
     Moved { from: PathBuf, to: PathBuf },
@@ -663,6 +667,21 @@ fn rename_moved_file(
     Ok((file_id, stripped))
 }
 
+/// Remove one file's row; `reason` says whether it was deleted or evicted.
+async fn remove_from_index(
+    core: &Core,
+    path: &Path,
+    reason: &'static str,
+) -> anyhow::Result<Option<i64>> {
+    let rel = rel_of(&core.vault_path, path);
+    let vault = core.vault_path.clone();
+    let rel_for_call = rel.clone();
+    core.with_core(move |g| remove_deleted_file(g, &rel_for_call, &vault))
+        .await?;
+    tracing::info!(path = %rel, reason, "removed file from index");
+    Ok(None)
+}
+
 /// Apply one event. Returns the file id the edge pass should revisit.
 async fn apply_event(core: &Core, event: WatchEvent) -> anyhow::Result<Option<i64>> {
     match event {
@@ -693,16 +712,9 @@ async fn apply_event(core: &Core, event: WatchEvent) -> anyhow::Result<Option<i6
             tracing::debug!(path = %path.display(), "skipping deletion for a file on disk");
             Ok(None)
         }
+        WatchEvent::Deleted(path) => remove_from_index(core, &path, "deleted").await,
         // An `Evicted` file is on disk by definition, so it takes no guard.
-        WatchEvent::Deleted(path) | WatchEvent::Evicted(path) => {
-            let rel = rel_of(&core.vault_path, &path);
-            let vault = core.vault_path.clone();
-            let rel_for_call = rel.clone();
-            core.with_core(move |g| remove_deleted_file(g, &rel_for_call, &vault))
-                .await?;
-            tracing::info!(path = %rel, "removed file from index");
-            Ok(None)
-        }
+        WatchEvent::Evicted(path) => remove_from_index(core, &path, "evicted").await,
         WatchEvent::Moved { from, to } => {
             let old_rel = rel_of(&core.vault_path, &from);
             let new_rel = rel_of(&core.vault_path, &to);
@@ -835,6 +847,11 @@ pub async fn run_consumer(
 mod tests {
     use super::{ResolvedWatcher, fs_magic_needs_poll, requested_backend, resolve_watcher};
     use crate::config::WatcherBackend;
+
+    /// A note body long enough to be a chunk of its own.
+    fn body(n: &str) -> String {
+        format!("# {n}\n\nThe body of note {n}, long enough to be its own chunk and then some.\n")
+    }
 
     /// A note the watcher indexes resolves the links other notes wrote before
     /// it existed (#108).
@@ -1313,11 +1330,6 @@ mod tests {
         use std::sync::atomic::Ordering;
         use tokio::sync::mpsc;
 
-        let body = |n: &str| {
-            format!(
-                "# {n}\n\nThe body of note {n}, long enough to be its own chunk and then some.\n"
-            )
-        };
         let (_tmp, core) = indexed_core(
             &[
                 ("a.md", &body("a")),
@@ -1396,15 +1408,16 @@ mod tests {
         use std::sync::atomic::Ordering;
         use tokio::sync::mpsc;
 
-        let body = |n: &str| {
-            format!(
-                "# {n}\n\nThe body of note {n}, long enough to be its own chunk and then some.\n"
-            )
-        };
         let (_tmp, core) = indexed_core(
-            &[("a.md", &body("a")), ("archive/b.md", &body("b"))],
+            &[
+                ("a.md", &body("a")),
+                ("archive/b.md", &body("b")),
+                ("c.md", &body("c")),
+            ],
             test_config(),
         );
+        let vault = core.vault_path.as_ref().clone();
+        std::fs::write(vault.join("c.md"), body("c, rewritten")).unwrap();
 
         let (tx, rx) = mpsc::channel(4);
         core.pending_events.fetch_add(1, Ordering::Relaxed);
@@ -1413,11 +1426,24 @@ mod tests {
         run_consumer(rx, core.clone(), vec!["archive/".to_string()]).await;
         assert_eq!(core.pending_events.load(Ordering::Relaxed), 0);
 
-        let row = core
-            .with_reader(|store| store.get_file("archive/b.md"))
+        let (a, b, c) = core
+            .with_reader(|store| {
+                Ok((
+                    store.get_file("a.md")?,
+                    store.get_file("archive/b.md")?,
+                    store.get_file("c.md")?,
+                ))
+            })
             .await
             .unwrap();
-        assert!(row.is_none(), "the excluded note is evicted");
+        assert!(b.is_none(), "the excluded note is evicted");
+        assert!(a.is_some(), "the unchanged note keeps its row");
+        let c_hash = crate::indexer::compute_file_hash(&vault.join("c.md")).unwrap();
+        assert_eq!(
+            c.expect("the changed note keeps its row").content_hash,
+            c_hash,
+            "the changed note is re-indexed"
+        );
     }
 
     /// A batch that carries a `FullRescan` is replaced by the vault diff: the
@@ -1429,11 +1455,6 @@ mod tests {
         use std::sync::atomic::Ordering;
         use tokio::sync::mpsc;
 
-        let body = |n: &str| {
-            format!(
-                "# {n}\n\nThe body of note {n}, long enough to be its own chunk and then some.\n"
-            )
-        };
         let (_tmp, core) =
             indexed_core(&[("a.md", &body("a")), ("b.md", &body("b"))], test_config());
         let vault = core.vault_path.as_ref().clone();
