@@ -595,7 +595,9 @@ impl Store {
     /// refuses a write rather than convention. It runs no schema, migration or
     /// keyword-index reconciliation: the writer opened first and did that. WAL
     /// mode is persisted in the file, so this connection reads a committed
-    /// snapshot while the writer is inside a transaction.
+    /// snapshot while the writer is inside a transaction. On a filesystem
+    /// where WAL is unavailable it is a rollback-journal reader, and a read
+    /// can wait up to `busy_timeout` while a long write holds the file.
     pub fn open_reader(path: &Path) -> Result<Self> {
         use rusqlite::OpenFlags;
         crate::vecstore::init_sqlite_vec();

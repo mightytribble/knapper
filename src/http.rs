@@ -569,9 +569,13 @@ async fn handle_validate(
         min_chars: state.core.config.chunk_min_chars,
         target_tokens: crate::chunker::limits::TARGET_TOKENS,
     };
-    let report =
-        crate::validate::validate_target(&state.core.vault_path, &target, &limits, body.strict)
-            .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    let vault = state.core.vault_path.clone();
+    let strict = body.strict;
+    let report = crate::core::blocking(move || {
+        crate::validate::validate_target(&vault, &target, &limits, strict)
+    })
+    .await
+    .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
     Ok(Json(serde_json::json!(report)))
 }
 
@@ -1012,7 +1016,9 @@ async fn handle_init(
     authorize(&headers, &state, true)?;
     match body.mode.as_deref() {
         Some("detect") => {
-            let result = crate::onboarding::run_detect_json(&state.core.vault_path)
+            let vault = state.core.vault_path.clone();
+            let result = crate::core::blocking(move || crate::onboarding::run_detect_json(&vault))
+                .await
                 .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
             Ok(Json(result))
         }

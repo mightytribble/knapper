@@ -143,7 +143,18 @@ pub fn diff_vault(
     vault_root: &Path,
     store: &Store,
 ) -> Result<(Vec<PathBuf>, Vec<PathBuf>, Vec<FileRecord>)> {
-    let stored_files = store.get_all_files()?;
+    diff_files(files, vault_root, store.get_all_files()?)
+}
+
+/// Compare vault files against the file records a store holds. Hashes each
+/// file the records know, and touches no store.
+///
+/// Returns `(new_files, changed_files, deleted_file_records)`.
+pub fn diff_files(
+    files: &[PathBuf],
+    vault_root: &Path,
+    stored_files: Vec<FileRecord>,
+) -> Result<(Vec<PathBuf>, Vec<PathBuf>, Vec<FileRecord>)> {
     let stored_map: HashMap<String, &FileRecord> =
         stored_files.iter().map(|f| (f.path.clone(), f)).collect();
 

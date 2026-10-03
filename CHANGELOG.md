@@ -19,7 +19,7 @@ Links resolve against https://github.com/mightytribble/knapper.
 ### Fixed
 
 - A read tool — `read`, `list`, `tags`, `properties`, `vault_map`, `status`, `health`, `match` — no longer waits for a search, a write or the `index` tool under `serve`: reads answer from a second connection. (serve-core)
-- `serve` no longer holds every tool while it reconciles changes made while it was down. The reconciliation runs per file in the background, and `status` says how many files are pending. (serve-core)
+- `serve` no longer holds every tool while it reconciles changes made while it was down. The reconciliation runs per file in the background, and `status` says how many events are pending. `last_indexed_at` advances only when the watcher applies events, so a vault unchanged at startup leaves it as it was. (serve-core)
 
 ## 0.9.11 (2026-09-11)
 

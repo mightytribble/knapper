@@ -463,12 +463,12 @@ impl KnapperServer {
             min_chars: self.core.config.chunk_min_chars,
             target_tokens: crate::chunker::limits::TARGET_TOKENS,
         };
-        let report = crate::validate::validate_target(
-            &self.core.vault_path,
-            &target,
-            &limits,
-            params.0.strict,
-        )
+        let vault = self.core.vault_path.clone();
+        let strict = params.0.strict;
+        let report = crate::core::blocking(move || {
+            crate::validate::validate_target(&vault, &target, &limits, strict)
+        })
+        .await
         .map_err(|e| mcp_err(&e))?;
         to_json_result(&report)
     }
@@ -720,8 +720,11 @@ impl KnapperServer {
     ) -> Result<CallToolResult, McpError> {
         match params.0.mode.as_deref() {
             Some("detect") => {
-                let result = crate::onboarding::run_detect_json(&self.core.vault_path)
-                    .map_err(|e| mcp_err(&e))?;
+                let vault = self.core.vault_path.clone();
+                let result =
+                    crate::core::blocking(move || crate::onboarding::run_detect_json(&vault))
+                        .await
+                        .map_err(|e| mcp_err(&e))?;
                 to_json_result(&result)
             }
             Some("apply") => {
@@ -741,6 +744,8 @@ impl KnapperServer {
                 // `apply` writes `config.toml`, so it is the one handler that
                 // loads the file: it edits it. The running server keeps the
                 // config it started with, which the reply says.
+                // `run_apply_json` opens its own store, so the core call is
+                // taken for exclusion only.
                 let result = self
                     .core
                     .with_core(move |g| {

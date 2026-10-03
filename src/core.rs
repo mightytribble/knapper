@@ -252,6 +252,20 @@ impl Core {
 }
 
 /// Fixtures the server and watcher tests share.
+/// Run `f` off the runtime thread, holding no lock. For work that touches
+/// the disk and not the store, such as a vault walk. A panic inside `f` is
+/// the `Err`.
+pub async fn blocking<R, F>(f: F) -> Result<R>
+where
+    R: Send + 'static,
+    F: FnOnce() -> Result<R> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(result) => result,
+        Err(e) => Err(anyhow::anyhow!("blocking call panicked: {e}")),
+    }
+}
+
 #[cfg(test)]
 pub mod testing {
     use super::*;
@@ -458,6 +472,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("panicked"), "got {err:#}");
+        assert!(err.to_string().contains("boom"), "got {err:#}");
         assert_eq!(
             core.with_reader(|store| store.file_count()).await.unwrap(),
             0

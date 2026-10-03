@@ -146,15 +146,17 @@ pub fn start_watcher(
 
 /// What the vault holds that the store does not, as the events the consumer
 /// applies: a `Deleted` for each record the disk no longer holds, a `Changed`
-/// for each new or changed path. Reads the store through the reader, so a
-/// search in flight does not delay it.
+/// for each new or changed path. Reads the file records through the reader,
+/// then walks and hashes the vault holding no lock, so a read is not delayed
+/// by the walk.
 pub async fn diff_events(core: &Core, exclude: &[String]) -> anyhow::Result<Vec<WatchEvent>> {
+    let stored = core.with_reader(|store| store.get_all_files()).await?;
     let vault = core.vault_path.clone();
     let exclude = exclude.to_vec();
     let respect_gitignore = core.config.respect_gitignore;
-    core.with_reader(move |store| {
+    crate::core::blocking(move || {
         let files = indexer::walk_vault(&vault, &exclude, respect_gitignore)?;
-        let (new_files, changed_files, deleted) = indexer::diff_vault(&files, &vault, store)?;
+        let (new_files, changed_files, deleted) = indexer::diff_files(&files, &vault, stored)?;
         let mut events = Vec::with_capacity(new_files.len() + changed_files.len() + deleted.len());
         events.extend(
             deleted
@@ -172,8 +174,10 @@ pub async fn diff_events(core: &Core, exclude: &[String]) -> anyhow::Result<Vec<
     .await
 }
 
-/// Queue the vault diff for the consumer, in batches of at most 64 events,
-/// counting each batch into `pending_events` before it is sent.
+/// Queue the vault diff for the consumer, in batches of at most 64 events.
+/// The whole diff is counted into `pending_events` before the first send, so
+/// the counter does not reach zero between batches. A failed send settles
+/// every event not yet sent.
 pub async fn enqueue_diff(
     core: &Core,
     exclude: &[String],
@@ -181,13 +185,15 @@ pub async fn enqueue_diff(
 ) -> anyhow::Result<()> {
     let events = diff_events(core, exclude).await?;
     tracing::info!(events = events.len(), "startup reconciliation queued");
+    core.pending_events
+        .fetch_add(events.len(), Ordering::Relaxed);
+    let mut sent = 0;
     for batch in events.chunks(64) {
-        core.pending_events
-            .fetch_add(batch.len(), Ordering::Relaxed);
         if tx.send(batch.to_vec()).await.is_err() {
-            settle(&core.pending_events, batch.len());
+            settle(&core.pending_events, events.len() - sent);
             break;
         }
+        sent += batch.len();
     }
     Ok(())
 }
@@ -665,6 +671,13 @@ async fn apply_event(core: &Core, event: WatchEvent) -> anyhow::Result<Option<i6
             Ok(Some(file_id))
         }
         WatchEvent::Deleted(path) => {
+            // A path on disk is not deleted. The startup diff runs beside the
+            // live watcher, so its `Deleted` can arrive after a `Changed` that
+            // restored the note (#93).
+            if path.exists() {
+                tracing::debug!(path = %path.display(), "skipping deletion for a file on disk");
+                return Ok(None);
+            }
             let rel = rel_of(&core.vault_path, &path);
             let vault = core.vault_path.clone();
             let rel_for_call = rel.clone();
@@ -720,16 +733,21 @@ pub async fn run_consumer(
 
         if events.iter().any(|e| matches!(e, WatchEvent::FullRescan)) {
             tracing::info!("performing full rescan");
-            settle(&core.pending_events, events.len());
-            events = match diff_events(&core, &exclude).await {
-                Ok(diff) => diff,
+            // The diff is counted before the batch is settled, so the counter
+            // does not pass through zero.
+            let replaced = events.len();
+            match diff_events(&core, &exclude).await {
+                Ok(diff) => {
+                    core.pending_events.fetch_add(diff.len(), Ordering::Relaxed);
+                    settle(&core.pending_events, replaced);
+                    events = diff;
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, "full rescan failed");
+                    settle(&core.pending_events, replaced);
                     continue;
                 }
-            };
-            core.pending_events
-                .fetch_add(events.len(), Ordering::Relaxed);
+            }
         }
 
         // Move detection reads the store and nothing else.
@@ -1237,5 +1255,87 @@ mod tests {
         assert_eq!(reconciled.0, full.0, "files differ");
         assert_eq!(reconciled.1, full.1, "chunks differ");
         assert_eq!(reconciled.2, full.2, "edges differ");
+    }
+
+    /// A `Deleted` for a path that is on disk leaves the row alone. The
+    /// startup diff runs beside the consumer, so a live `Changed` for a
+    /// restored note can land before the diff's stale `Deleted`.
+    #[tokio::test]
+    async fn a_deletion_for_a_note_on_disk_keeps_its_row() {
+        use super::{WatchEvent, run_consumer};
+        use crate::core::testing::{indexed_core, test_config};
+        use std::sync::atomic::Ordering;
+        use tokio::sync::mpsc;
+
+        let body = "# A\n\nA note that is long enough to be a chunk of its own and then some.\n";
+        let (_tmp, core) = indexed_core(&[("a.md", body)], test_config());
+        let note = core.vault_path.join("a.md");
+        assert!(note.exists());
+
+        let (tx, rx) = mpsc::channel(4);
+        core.pending_events.fetch_add(1, Ordering::Relaxed);
+        tx.send(vec![WatchEvent::Deleted(note)]).await.unwrap();
+        drop(tx);
+
+        run_consumer(rx, core.clone(), Vec::new()).await;
+        assert_eq!(core.pending_events.load(Ordering::Relaxed), 0);
+        let row = core
+            .with_reader(|store| store.get_file("a.md"))
+            .await
+            .unwrap();
+        assert!(row.is_some(), "the note on disk keeps its row");
+    }
+
+    /// A batch that carries a `FullRescan` is replaced by the vault diff: the
+    /// counter ends at zero and the store matches the vault.
+    #[tokio::test]
+    async fn a_full_rescan_settles_the_counter_and_matches_the_vault() {
+        use super::{WatchEvent, run_consumer};
+        use crate::core::testing::{indexed_core, test_config};
+        use std::sync::atomic::Ordering;
+        use tokio::sync::mpsc;
+
+        let body = |n: &str| {
+            format!(
+                "# {n}\n\nThe body of note {n}, long enough to be its own chunk and then some.\n"
+            )
+        };
+        let (_tmp, core) =
+            indexed_core(&[("a.md", &body("a")), ("b.md", &body("b"))], test_config());
+        let vault = core.vault_path.as_ref().clone();
+        std::fs::write(vault.join("a.md"), body("a, rewritten")).unwrap();
+        std::fs::remove_file(vault.join("b.md")).unwrap();
+        std::fs::write(vault.join("c.md"), body("c")).unwrap();
+
+        let (tx, rx) = mpsc::channel(4);
+        core.pending_events.fetch_add(2, Ordering::Relaxed);
+        tx.send(vec![
+            WatchEvent::FullRescan,
+            WatchEvent::Changed(vault.join("c.md")),
+        ])
+        .await
+        .unwrap();
+        drop(tx);
+
+        run_consumer(rx, core.clone(), Vec::new()).await;
+        assert_eq!(core.pending_events.load(Ordering::Relaxed), 0);
+
+        let files = core
+            .with_reader(|store| store.get_all_files())
+            .await
+            .unwrap();
+        let mut stored: Vec<(String, String)> = files
+            .into_iter()
+            .map(|f| (f.path, f.content_hash))
+            .collect();
+        stored.sort();
+        let on_disk: Vec<(String, String)> = ["a.md", "c.md"]
+            .iter()
+            .map(|rel| {
+                let hash = crate::indexer::compute_file_hash(&vault.join(rel)).unwrap();
+                (rel.to_string(), hash)
+            })
+            .collect();
+        assert_eq!(stored, on_disk);
     }
 }
