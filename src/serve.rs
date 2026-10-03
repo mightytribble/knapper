@@ -1133,14 +1133,6 @@ pub async fn run_serve(
     let profile_arc = Arc::new(profile);
     let recent_writes: RecentWrites = Arc::new(Mutex::new(HashMap::new()));
 
-    // Clone Arcs for HTTP server before MCP consumes them
-    let http_store = store_arc.clone();
-    let http_embedder = embedder_arc.clone();
-    let http_vault_path = vault_path_arc.clone();
-    let http_profile = profile_arc.clone();
-    let http_reranker = reranker.as_ref().map(Arc::clone);
-    let http_recent_writes = recent_writes.clone();
-
     // Start file watcher for real-time index updates
     let mut exclude = config.exclude.clone();
     if let Some(ref prof) = *profile_arc
@@ -1177,7 +1169,7 @@ pub async fn run_serve(
         recent_writes.clone(),
         read_only,
     );
-    let (watcher_handle, watcher_shutdown) = crate::watcher::start_watcher(core, exclude)?;
+    let (watcher_handle, watcher_shutdown) = crate::watcher::start_watcher(core.clone(), exclude)?;
 
     if read_only {
         eprintln!("Read-only mode: write tools disabled");
@@ -1199,9 +1191,9 @@ pub async fn run_serve(
         ranking,
         lane_weights,
         fts,
-        calibrated: calibrated.clone(),
+        calibrated,
         index_settings,
-        output: output.clone(),
+        output,
     };
 
     // Cancellation token for coordinated shutdown of HTTP + MCP
@@ -1210,26 +1202,10 @@ pub async fn run_serve(
     // Spawn HTTP server as a background task (before MCP blocks on stdio)
     if let Some(ref opts) = http_opts {
         let api_state = crate::http::ApiState {
-            store: http_store,
-            embedder: http_embedder,
-            vault_path: http_vault_path,
-            profile: http_profile,
-            reranker: http_reranker,
+            core: core.clone(),
             http_config: Arc::new(config.http.clone()),
             no_auth: opts.no_auth,
-            recent_writes: http_recent_writes,
             rate_limiter: Arc::new(crate::http::RateLimiter::new(config.http.rate_limit)),
-            read_only,
-            max_chunks_per_file,
-            group_by,
-            top_n,
-            rerank,
-            ranking,
-            lane_weights,
-            fts,
-            calibrated,
-            index_settings,
-            output,
         };
         let router = crate::http::build_router(api_state);
         let addr = format!("{}:{}", opts.host, opts.port);
