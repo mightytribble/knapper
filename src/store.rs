@@ -1,3 +1,4 @@
+use crate::fault::Fault;
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::HashSet;
@@ -2203,11 +2204,11 @@ impl Store {
                     )
                     .optional()?
                     .ok_or_else(|| {
-                        anyhow::anyhow!(
+                        anyhow::anyhow!(Fault::InvalidInput(format!(
                             "no such note '{path}' for 'after'; a links_in ranking \
                              starts a page from that note's count, so start the \
                              listing again or list in path order"
-                        )
+                        )))
                     })?;
                 Some((path, count))
             }
@@ -2440,12 +2441,14 @@ impl Store {
                 return Ok(Some(f.id));
             }
             match self.resolve_file(&term.written).ok().flatten() {
-                Some(near) => anyhow::bail!(
+                Some(near) => anyhow::bail!(Fault::InvalidInput(format!(
                     "no such note '{}' for '{field}'; nearest: '{}'",
-                    term.written,
-                    near.path
-                ),
-                None => anyhow::bail!("no such note '{}' for '{field}'", term.written),
+                    term.written, near.path
+                ))),
+                None => anyhow::bail!(Fault::InvalidInput(format!(
+                    "no such note '{}' for '{field}'",
+                    term.written
+                ))),
             }
         };
         Ok(LinkIds {

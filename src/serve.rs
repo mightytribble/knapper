@@ -513,8 +513,7 @@ impl KnapperServer {
                 }
                 // The preview is required here: a dropped key must not
                 // silently apply an unrelated plan (#62).
-                let preview = crate::migrate::resolve_preview(params.0.preview)
-                    .map_err(|e| invalid_params(format!("{e:#}")))?;
+                let preview = crate::migrate::resolve_preview(params.0.preview).map_err(mcp_err)?;
                 let result = self
                     .core
                     .with_core(move |g| crate::migrate::apply_preview(&preview, g.store, &vault))
@@ -1378,6 +1377,41 @@ mod tests {
         let mut params = search_params(None, false);
         params.all = vec!["".into()];
         let err = server.search(super::Parameters(params)).await.unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
+        assert_eq!(err.data.as_ref().unwrap()["kind"], "invalid_input");
+    }
+
+    /// A scope term the vault holds no match for is the caller's own text
+    /// naming nothing (#60, #65). This surface answered INTERNAL_ERROR for
+    /// it before the kind travelled with the error.
+    #[tokio::test]
+    async fn a_scope_term_naming_no_tag_on_search_is_invalid_params() {
+        let (_tmp, server) = indexed_server(crate::config::GroupBy::Chunk);
+        let mut params = search_params(None, false);
+        params.all = vec!["type/undead".into()];
+        let err = server.search(super::Parameters(params)).await.unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
+        assert_eq!(err.data.as_ref().unwrap()["kind"], "invalid_input");
+        assert!(err.message.contains("no such tag"), "{}", err.message);
+    }
+
+    /// An empty pattern answers the whole vault and says nothing, so
+    /// `matching::run` refuses it as the caller's own mistake.
+    #[tokio::test]
+    async fn an_empty_match_pattern_is_invalid_params() {
+        let (_tmp, server) = indexed_server(crate::config::GroupBy::Chunk);
+        let params = crate::params::Match {
+            pattern: String::new(),
+            case_sensitive: false,
+            word: false,
+            scope: vec![],
+            all: vec![],
+            any: vec![],
+            none: vec![],
+            scan: crate::params::Scan::default(),
+            limit: None,
+        };
+        let err = server.r#match(super::Parameters(params)).await.unwrap_err();
         assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
         assert_eq!(err.data.as_ref().unwrap()["kind"], "invalid_input");
     }

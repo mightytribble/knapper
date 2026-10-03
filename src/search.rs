@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use serde_json::json;
 
 use crate::config::{GroupBy, RankingMode, db_path};
+use crate::fault::Fault;
 use crate::fusion::{self, FusedResult, RankedResult};
 use crate::graph;
 use crate::llm::{self, EmbedModel, RerankModel};
@@ -1661,7 +1662,9 @@ pub fn run_query<'a>(
     // its shape, so asking for both is a usage error rather than one flag
     // silently winning (#35).
     if req.full && req.summaries {
-        anyhow::bail!("--full and --summaries are mutually exclusive");
+        anyhow::bail!(Fault::InvalidInput(
+            "--full and --summaries are mutually exclusive".into()
+        ));
     }
     let top_n = req.top_n.unwrap_or(config.top_n);
     let mut search_config = SearchConfig {

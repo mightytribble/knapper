@@ -168,11 +168,9 @@ impl From<anyhow::Error> for ApiError {
                 };
                 Self::new(status, fault.kind(), &message)
             }
-            // The prefix checks the handlers used to make, kept until the
-            // variants that replace them land. Deleted in Tasks 4 and 5.
-            None if is_scope_typo(&e.to_string()) || is_read_miss(&e.to_string()) => {
-                Self::bad_request(&message)
-            }
+            // The prefix check the `read` route used to make, kept until the
+            // variants that replace it land. Deleted in Task 5.
+            None if is_read_miss(&e.to_string()) => Self::bad_request(&message),
             None => Self::internal(&message),
         }
     }
@@ -353,22 +351,8 @@ async fn handle_plugin_manifest(State(state): State<ApiState>) -> impl IntoRespo
 // Read endpoint handlers
 // ---------------------------------------------------------------------------
 
-/// Whether an error message is a caller's own scope typo, which is a bad
-/// request rather than a server fault. `check_terms` gives the caller the
-/// nearest tag or folder in the message, and `resolve_scope_links` the
-/// nearest note for a `links_to` or `linked_from` name — the cheapest honest
-/// signal this far from where the error is built (#60, #65, #66). A name that
-/// is an alias more than one note carries is the caller's to repair as well,
-/// and the message names the candidates (#142).
-fn is_scope_typo(message: &str) -> bool {
-    message.starts_with("no such tag")
-        || message.starts_with("no such folder")
-        || message.starts_with("no such note")
-        || message.starts_with("ambiguous alias")
-}
-
-/// The `read` route's own list, kept beside `is_scope_typo` until Task 5
-/// builds the `NotFound` and `Ambiguous` variants that replace both.
+/// The `read` route's own list, kept until Task 5 builds the `NotFound` and
+/// `Ambiguous` variants that replace it.
 fn is_read_miss(message: &str) -> bool {
     message.starts_with("Section not found")
         || message.starts_with("File not found")
@@ -382,13 +366,10 @@ async fn handle_match(
     Json(body): Json<crate::params::Match>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, false)?;
-    // An empty pattern and an unknown scope term are both the caller's own
-    // text naming nothing, so both are 400 rather than 500 (#65).
     let report = state
         .core
         .with_reader(move |store| crate::matching::run(store, &body))
-        .await
-        .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
+        .await?;
     Ok(Json(report))
 }
 
@@ -796,8 +777,7 @@ async fn handle_migrate(
                     "Write operations disabled in read-only mode",
                 ));
             }
-            let preview = crate::migrate::resolve_preview(body.preview)
-                .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
+            let preview = crate::migrate::resolve_preview(body.preview)?;
             let result = state
                 .core
                 .with_core(move |g| crate::migrate::apply_preview(&preview, g.store, &vault))
@@ -1432,6 +1412,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json_body(response).await["kind"], "invalid_input");
     }
 
     #[tokio::test]

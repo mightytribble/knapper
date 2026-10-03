@@ -6,6 +6,7 @@
 
 use std::path::Path;
 
+use crate::fault::Fault;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -565,12 +566,14 @@ pub fn save_preview(preview: &MigrationPreview, data_dir: &Path) -> Result<()> {
 /// `load_preview` (#62).
 pub fn resolve_preview(supplied: Option<serde_json::Value>) -> Result<MigrationPreview> {
     let value = supplied.ok_or_else(|| {
-        anyhow::anyhow!(
+        anyhow::anyhow!(Fault::InvalidInput(
             "apply needs a preview: send the one that `mode: preview` returned. \
              The saved copy on the server's disk is not read."
-        )
+                .into()
+        ))
     })?;
-    serde_json::from_value(value).map_err(|e| anyhow::anyhow!("Invalid preview JSON: {e}"))
+    serde_json::from_value(value)
+        .map_err(|e| anyhow::anyhow!(Fault::InvalidInput(format!("Invalid preview JSON: {e}"))))
 }
 
 /// Load a previously saved migration preview from disk.

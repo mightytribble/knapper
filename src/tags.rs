@@ -1,3 +1,4 @@
+use crate::fault::Fault;
 use anyhow::Result;
 use rusqlite::{Connection, params};
 use std::collections::HashSet;
@@ -485,8 +486,10 @@ pub fn check_terms(conn: &Connection, terms: &[&ScopeTerm]) -> Result<()> {
                     },
                 };
                 match nearest {
-                    Some(near) => anyhow::bail!("no such tag '{tag}'; nearest: '{near}'"),
-                    None => anyhow::bail!("no such tag '{tag}'"),
+                    Some(near) => anyhow::bail!(Fault::InvalidInput(format!(
+                        "no such tag '{tag}'; nearest: '{near}'"
+                    ))),
+                    None => anyhow::bail!(Fault::InvalidInput(format!("no such tag '{tag}'"))),
                 }
             }
             ScopeTerm::Folder(folder) => {
@@ -502,8 +505,12 @@ pub fn check_terms(conn: &Connection, terms: &[&ScopeTerm]) -> Result<()> {
                     _ => longest_existing_folder_ancestor(conn, folder.path())?,
                 };
                 match nearest {
-                    Some(near) => anyhow::bail!("no such folder '{folder}'; nearest: '{near}'"),
-                    None => anyhow::bail!("no such folder '{folder}'"),
+                    Some(near) => anyhow::bail!(Fault::InvalidInput(format!(
+                        "no such folder '{folder}'; nearest: '{near}'"
+                    ))),
+                    None => {
+                        anyhow::bail!(Fault::InvalidInput(format!("no such folder '{folder}'")))
+                    }
                 }
             }
             ScopeTerm::File(path) => {
@@ -511,8 +518,10 @@ pub fn check_terms(conn: &Connection, terms: &[&ScopeTerm]) -> Result<()> {
                     continue;
                 }
                 match nearest_note(conn, path)? {
-                    Some(near) => anyhow::bail!("no such note '{term}'; nearest: '{near}'"),
-                    None => anyhow::bail!("no such note '{term}'"),
+                    Some(near) => anyhow::bail!(Fault::InvalidInput(format!(
+                        "no such note '{term}'; nearest: '{near}'"
+                    ))),
+                    None => anyhow::bail!(Fault::InvalidInput(format!("no such note '{term}'"))),
                 }
             }
         }

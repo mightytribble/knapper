@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use crate::fault::Fault;
 use crate::params::Include;
 use anyhow::Result;
 use serde::Serialize;
@@ -292,18 +293,20 @@ pub fn context_read(
 ) -> Result<ReadResult> {
     if section.is_some() {
         match include {
-            Include::Metadata => anyhow::bail!(
+            Include::Metadata => anyhow::bail!(Fault::InvalidInput(
                 "--section cannot be combined with --include metadata: \
                  metadata describes the whole note"
-            ),
+                    .into()
+            )),
             // Refused rather than ignored: a caller who meant `all` would
             // otherwise be handed a plausible answer with the section they
             // named silently dropped.
-            Include::Frontmatter => anyhow::bail!(
+            Include::Frontmatter => anyhow::bail!(Fault::InvalidInput(
                 "--section cannot be combined with --include frontmatter: \
                  frontmatter is the note's own and not a section's — \
                  use --include all for both"
-            ),
+                    .into()
+            )),
             Include::Content | Include::All => {}
         }
     }
