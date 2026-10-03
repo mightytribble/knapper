@@ -13,13 +13,13 @@ Links resolve against https://github.com/mightytribble/knapper.
 
 ### Changed
 
-- `knapper serve` reads `config.toml` once, at start; a change takes effect on restart. `init --mode apply` against a running server answers `restart_required: true`. (serve-core)
-- `status` answers `pending_events`, the number of watcher events not yet applied, on every surface; the text prints `Pending:` only when it is not zero. (serve-core)
+- `knapper serve` reads `config.toml` once, at start; a change takes effect on restart. `init --mode apply` against a running server answers `restart_required: true`. ([`7506a7c`](https://github.com/mightytribble/knapper/commit/7506a7c), [`fa976ab`](https://github.com/mightytribble/knapper/commit/fa976ab))
+- `status` answers `pending_events`, the number of watcher events not yet applied, on every surface; the text prints `Pending:` only when it is not zero. ([`af9d7a2`](https://github.com/mightytribble/knapper/commit/af9d7a2), [`5167c16`](https://github.com/mightytribble/knapper/commit/5167c16))
 
 ### Fixed
 
-- A read tool — `read`, `list`, `tags`, `properties`, `vault_map`, `status`, `health`, `match` — no longer waits for a search, a write or the `index` tool under `serve`: reads answer from a second connection. (serve-core)
-- `serve` no longer holds every tool while it reconciles changes made while it was down. The reconciliation runs per file in the background, and `status` says how many events are pending. `last_indexed_at` advances only when the watcher applies events, so a vault unchanged at startup leaves it as it was. (serve-core)
+- A read tool — `read`, `list`, `tags`, `properties`, `vault_map`, `status`, `health`, `match` — no longer waits for a search, a write or the `index` tool under `serve`: reads answer from a second connection. ([`7506a7c`](https://github.com/mightytribble/knapper/commit/7506a7c), [`fa976ab`](https://github.com/mightytribble/knapper/commit/fa976ab))
+- `serve` no longer holds every tool while it reconciles changes made while it was down. The reconciliation runs per file in the background, and `status` says how many events are pending. `last_indexed_at` advances only when the watcher applies events, so a vault unchanged at startup leaves it as it was. ([`5167c16`](https://github.com/mightytribble/knapper/commit/5167c16), [`34cf462`](https://github.com/mightytribble/knapper/commit/34cf462))
 
 ## 0.9.11 (2026-09-11)
 
