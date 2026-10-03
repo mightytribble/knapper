@@ -35,14 +35,6 @@ impl KnapperServer {
     }
 }
 
-fn read_only_err() -> McpError {
-    McpError::new(
-        rmcp::model::ErrorCode::INVALID_REQUEST,
-        "Write operations disabled in read-only mode. Start server without --read-only to enable writes.".to_string(),
-        None::<serde_json::Value>,
-    )
-}
-
 /// The one place an error from a core call becomes a code.
 ///
 /// The kind is read once, through whatever context the pipeline added, and
@@ -276,9 +268,7 @@ impl KnapperServer {
         &self,
         params: Parameters<crate::params::Create>,
     ) -> Result<CallToolResult, McpError> {
-        if self.core.read_only {
-            return Err(read_only_err());
-        }
+        self.core.writable().map_err(mcp_err)?;
         // No stdin exists on this surface, so an omitted content is an
         // error here instead of the CLI's fallback read.
         let content = params
@@ -334,9 +324,7 @@ impl KnapperServer {
         &self,
         params: Parameters<crate::params::Update>,
     ) -> Result<CallToolResult, McpError> {
-        if self.core.read_only {
-            return Err(read_only_err());
-        }
+        self.core.writable().map_err(mcp_err)?;
         // The whole list is read before anything is written (#62).
         let edits = params
             .0
@@ -389,9 +377,7 @@ impl KnapperServer {
         &self,
         params: Parameters<crate::params::Move>,
     ) -> Result<CallToolResult, McpError> {
-        if self.core.read_only {
-            return Err(read_only_err());
-        }
+        self.core.writable().map_err(mcp_err)?;
         let p = params.0;
         let vault = self.core.vault_path.clone();
         let result = self
@@ -410,9 +396,7 @@ impl KnapperServer {
         &self,
         params: Parameters<crate::params::Archive>,
     ) -> Result<CallToolResult, McpError> {
-        if self.core.read_only {
-            return Err(read_only_err());
-        }
+        self.core.writable().map_err(mcp_err)?;
         let p = params.0;
         let vault = self.core.vault_path.clone();
         let profile = self.core.profile.clone();
@@ -508,9 +492,7 @@ impl KnapperServer {
                 to_json_result(&preview)
             }
             "apply" => {
-                if self.core.read_only {
-                    return Err(read_only_err());
-                }
+                self.core.writable().map_err(mcp_err)?;
                 // The preview is required here: a dropped key must not
                 // silently apply an unrelated plan (#62).
                 let preview = crate::migrate::resolve_preview(params.0.preview).map_err(mcp_err)?;
@@ -522,9 +504,7 @@ impl KnapperServer {
                 to_json_result(&result)
             }
             "undo" => {
-                if self.core.read_only {
-                    return Err(read_only_err());
-                }
+                self.core.writable().map_err(mcp_err)?;
                 let result = self
                     .core
                     .with_core(move |g| crate::migrate::undo_last(g.store, &vault))
@@ -546,9 +526,7 @@ impl KnapperServer {
         &self,
         params: Parameters<crate::params::Delete>,
     ) -> Result<CallToolResult, McpError> {
-        if self.core.read_only {
-            return Err(read_only_err());
-        }
+        self.core.writable().map_err(mcp_err)?;
         let p = params.0;
         let mode = crate::writer::DeleteMode::from(p.mode);
         let archive_folder = self
@@ -612,9 +590,7 @@ impl KnapperServer {
         &self,
         params: Parameters<crate::params::Index>,
     ) -> Result<CallToolResult, McpError> {
-        if self.core.read_only {
-            return Err(read_only_err());
-        }
+        self.core.writable().map_err(mcp_err)?;
         // The startup config, with the call's one override (#55, #72).
         let mut config = (*self.core.config).clone();
         if params.0.no_gitignore {
@@ -681,9 +657,7 @@ impl KnapperServer {
         let config = self.core.config.clone();
         let block = if params.0.refresh {
             // A write of derived state, so a read-only server refuses it.
-            if self.core.read_only {
-                return Err(read_only_err());
-            }
+            self.core.writable().map_err(mcp_err)?;
             if self.core.profile.is_none() {
                 return Err(McpError::new(
                     rmcp::model::ErrorCode::INVALID_REQUEST,
@@ -726,9 +700,7 @@ impl KnapperServer {
                 to_json_result(&result)
             }
             Some("apply") => {
-                if self.core.read_only {
-                    return Err(read_only_err());
-                }
+                self.core.writable().map_err(mcp_err)?;
                 let data_dir = crate::config::Config::data_dir().map_err(mcp_err)?;
                 let flags = crate::onboarding::ApplyFlags {
                     name: params.0.name,
@@ -1238,12 +1210,12 @@ mod tests {
         server.core.profile = std::sync::Arc::new(Some(test_profile(&root)));
         server.core.read_only = true;
 
-        assert!(
-            server
-                .identity(super::Parameters(crate::params::Identity { refresh: true }))
-                .await
-                .is_err()
-        );
+        let err = server
+            .identity(super::Parameters(crate::params::Identity { refresh: true }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_REQUEST, "{err:?}");
+        assert_eq!(err.data.as_ref().unwrap()["kind"], "read_only");
         assert!(
             server
                 .identity(super::Parameters(crate::params::Identity {

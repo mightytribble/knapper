@@ -13,6 +13,7 @@ use anyhow::Result;
 use tokio::sync::Mutex;
 
 use crate::config::{Config, db_path};
+use crate::fault::Fault;
 use crate::indexer::IndexSettings;
 use crate::llm::{EmbedModel, RerankModel};
 use crate::profile::VaultProfile;
@@ -195,6 +196,19 @@ impl Core {
             Ok(result) => result,
             Err(e) => Err(anyhow::anyhow!("core call panicked: {e}")),
         }
+    }
+
+    /// Refuse a write on a server started with `--read-only`.
+    ///
+    /// Every handler that writes the vault, the store or derived state calls
+    /// this first, so one text answers on both servers. `migrate` and `init`
+    /// read their `mode` before calling it, so `preview` and `detect` run on
+    /// a read-only server.
+    pub fn writable(&self) -> Result<()> {
+        if self.read_only {
+            return Err(Fault::ReadOnly.into());
+        }
+        Ok(())
     }
 
     /// Record a path the pipeline just wrote, with its mtime, so the watcher
@@ -459,6 +473,18 @@ mod tests {
                 .await
                 .unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn a_read_only_core_refuses_a_write_with_kind_read_only() {
+        let (_tmp, mut core) = testing::indexed_core(&[], testing::test_config());
+        assert!(core.writable().is_ok());
+        core.read_only = true;
+        let err = core.writable().unwrap_err();
+        assert_eq!(
+            crate::fault::Fault::of(&err).map(|f| f.kind()),
+            Some("read_only")
         );
     }
 

@@ -571,11 +571,7 @@ async fn handle_create(
     Json(body): Json<crate::params::Create>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
-    if state.core.read_only {
-        return Err(ApiError::forbidden(
-            "Write operations disabled in read-only mode",
-        ));
-    }
+    state.core.writable()?;
     // No stdin exists on this surface, so an omitted content is an error
     // here instead of the CLI's fallback read.
     let content = body
@@ -623,11 +619,7 @@ async fn handle_update(
     Json(body): Json<crate::params::Update>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
-    if state.core.read_only {
-        return Err(ApiError::forbidden(
-            "Write operations disabled in read-only mode",
-        ));
-    }
+    state.core.writable()?;
     let edits = body
         .to_writer_edits()
         .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
@@ -674,11 +666,7 @@ async fn handle_move(
     Json(body): Json<crate::params::Move>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
-    if state.core.read_only {
-        return Err(ApiError::forbidden(
-            "Write operations disabled in read-only mode",
-        ));
-    }
+    state.core.writable()?;
     let vault = state.core.vault_path.clone();
     let result = state
         .core
@@ -700,11 +688,7 @@ async fn handle_archive(
     Json(body): Json<crate::params::Archive>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
-    if state.core.read_only {
-        return Err(ApiError::forbidden(
-            "Write operations disabled in read-only mode",
-        ));
-    }
+    state.core.writable()?;
     let vault = state.core.vault_path.clone();
     let profile = state.core.profile.clone();
     let settings = state.core.index_settings;
@@ -760,11 +744,7 @@ async fn handle_migrate(
             Ok(Json(serde_json::to_value(&preview).unwrap()))
         }
         "apply" => {
-            if state.core.read_only {
-                return Err(ApiError::forbidden(
-                    "Write operations disabled in read-only mode",
-                ));
-            }
+            state.core.writable()?;
             let preview = crate::migrate::resolve_preview(body.preview)?;
             let result = state
                 .core
@@ -773,11 +753,7 @@ async fn handle_migrate(
             Ok(Json(serde_json::to_value(&result).unwrap()))
         }
         "undo" => {
-            if state.core.read_only {
-                return Err(ApiError::forbidden(
-                    "Write operations disabled in read-only mode",
-                ));
-            }
+            state.core.writable()?;
             let result = state
                 .core
                 .with_core(move |g| crate::migrate::undo_last(g.store, &vault))
@@ -798,11 +774,7 @@ async fn handle_delete(
     Json(body): Json<crate::params::Delete>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
-    if state.core.read_only {
-        return Err(ApiError::forbidden(
-            "Write operations disabled in read-only mode",
-        ));
-    }
+    state.core.writable()?;
     let mode = DeleteMode::from(body.mode);
     let archive_folder = state
         .core
@@ -841,11 +813,7 @@ async fn handle_index(
     // A read-only server refuses it like any other write, the way MCP's
     // `index` does: `rebuild: true` discards the index before it builds one
     // again (#62).
-    if state.core.read_only {
-        return Err(ApiError::forbidden(
-            "Write operations disabled in read-only mode",
-        ));
-    }
+    state.core.writable()?;
     // The startup config, with the call's one override. The index-time
     // settings come from the session, so nothing here can be a second source
     // of the store's chunking or vector space (#55, #72).
@@ -922,10 +890,8 @@ async fn handle_identity(
     // so it takes the write permission and a read-only server refuses it; the
     // block itself is a read either way.
     authorize(&headers, &state, p.refresh)?;
-    if p.refresh && state.core.read_only {
-        return Err(ApiError::forbidden(
-            "Write operations disabled in read-only mode",
-        ));
+    if p.refresh {
+        state.core.writable()?;
     }
     let config = state.core.config.clone();
     let block = if p.refresh {
@@ -969,11 +935,7 @@ async fn handle_init(
             // `apply` indexes the vault, which is the work `index` is guarded
             // against on a read-only server. The mode is read first, so
             // `detect` — which writes nothing — still runs (#62).
-            if state.core.read_only {
-                return Err(ApiError::forbidden(
-                    "Write operations disabled in read-only mode",
-                ));
-            }
+            state.core.writable()?;
             let data_dir = crate::config::Config::data_dir()?;
             let flags = crate::onboarding::ApplyFlags {
                 name: body.name,
@@ -1903,13 +1865,18 @@ mod tests {
 
         let (_tmp, mut state) = test_api_state();
         state.core.read_only = true;
-        let (status, _) = post_json(
+        let (status, body) = post_json(
             state,
             "/api/migrate",
             r#"{"mode":"apply","preview":{"migration_id":"m","files":[],"uncertain":[],"skipped":0}}"#,
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["kind"], "read_only");
+        assert_eq!(
+            body["error"],
+            "write operations are disabled in read-only mode; start `serve` without --read-only to enable writes"
+        );
 
         let (_tmp, mut state) = test_api_state();
         state.core.read_only = true;
