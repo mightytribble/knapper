@@ -3199,6 +3199,16 @@ impl Store {
         self.find_file_by_fuzzy(file_or_docid)
     }
 
+    /// `resolve_file`, with a miss as the caller's fault.
+    ///
+    /// The write tools address one note and refuse when it is absent; this
+    /// is the one text and the one kind they answer with.
+    pub fn require_file(&self, file_or_docid: &str) -> Result<FileRecord> {
+        self.resolve_file(file_or_docid)?.ok_or_else(|| {
+            anyhow::anyhow!(Fault::NotFound(format!("file not found: {file_or_docid}")))
+        })
+    }
+
     /// Fuzzy-match a query against all stored file basenames using Levenshtein distance.
     /// Returns the unique closest match within distance ≤ 2, or an error if ambiguous.
     fn find_file_by_fuzzy(&self, query: &str) -> Result<Option<FileRecord>> {
@@ -3290,7 +3300,7 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         match found.len() {
             0 | 1 => Ok(found.pop()),
-            _ => Err(anyhow::anyhow!(
+            _ => Err(anyhow::anyhow!(Fault::Ambiguous(format!(
                 "ambiguous alias '{}': carried by [{}]",
                 alias,
                 found
@@ -3298,7 +3308,7 @@ impl Store {
                     .map(|f| f.path.as_str())
                     .collect::<Vec<_>>()
                     .join(", ")
-            )),
+            )))),
         }
     }
 
@@ -6547,10 +6557,41 @@ mod tests {
     }
 
     #[test]
+    fn require_file_answers_not_found_with_the_name_the_caller_gave() {
+        let store = Store::open_memory().unwrap();
+        let err = store.require_file("nowhere.md").unwrap_err();
+        assert_eq!(err.to_string(), "file not found: nowhere.md");
+        assert_eq!(
+            crate::fault::Fault::of(&err).map(|f| f.kind()),
+            Some("not_found")
+        );
+    }
+
+    #[test]
+    fn an_alias_two_notes_carry_is_ambiguous() {
+        let store = Store::open_memory().unwrap();
+        for (path, docid) in [("a.md", "aaa111"), ("b.md", "bbb222")] {
+            let id = store
+                .insert_file(path, "h", 100, docid, None, None)
+                .unwrap();
+            store.replace_file_aliases(id, &aliases(&["Twin"])).unwrap();
+        }
+        let err = store.find_file_by_alias("Twin").unwrap_err();
+        assert_eq!(
+            crate::fault::Fault::of(&err).map(|f| f.kind()),
+            Some("ambiguous")
+        );
+        assert!(
+            err.to_string().starts_with("ambiguous alias 'Twin'"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn the_write_resolver_does_not_read_aliases() {
         // `update`, `move`, `archive` and `delete` resolve through
         // `resolve_file`. A destructive call reached through a name the caller
-        // did not know was an alias fails worse than `File not found`, so the
+        // did not know was an alias fails worse than `file not found`, so the
         // alias lookup belongs to the read side alone (#142).
         let store = Store::open_memory().unwrap();
         let id = store

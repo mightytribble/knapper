@@ -586,18 +586,15 @@ impl KnapperServer {
         let vault = self.core.vault_path.clone();
         let settings = self.core.index_settings;
         let file = rel_path.clone();
-        // A file the server cannot read is the caller's own text naming
-        // nothing, which is this surface's INVALID_PARAMS (#62).
+        // A path not on disk is a Fault::NotFound from the indexer, which is
+        // this surface's INVALID_PARAMS (#62).
         let result = self
             .core
             .with_core(move |g| {
                 crate::indexer::reindex_written_file(&file, g.store, g.embedder, &vault, settings)
             })
             .await
-            .map_err(|e| match e.downcast_ref::<std::io::Error>() {
-                Some(_) => invalid_params(format!("Cannot read file {rel_path}: {e:#}")),
-                None => mcp_err(e),
-            })?;
+            .map_err(mcp_err)?;
         let output = serde_json::json!({
             "file": rel_path,
             "chunks": result.total_chunks,
@@ -1414,6 +1411,37 @@ mod tests {
         let err = server.r#match(super::Parameters(params)).await.unwrap_err();
         assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
         assert_eq!(err.data.as_ref().unwrap()["kind"], "invalid_input");
+    }
+
+    /// A note the vault does not hold is INVALID_PARAMS on this surface, and
+    /// `data.kind` says which of the three kinds under that code it is.
+    #[tokio::test]
+    async fn a_read_of_a_missing_note_is_invalid_params_with_kind_not_found() {
+        let (_tmp, server) = indexed_server(crate::config::GroupBy::Chunk);
+        let err = server
+            .read(super::Parameters(crate::params::Read {
+                file: "nowhere.md".into(),
+                section: None,
+                include: crate::params::Include::default(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
+        assert_eq!(err.data.as_ref().unwrap()["kind"], "not_found");
+        assert_eq!(err.message, "file not found: nowhere.md");
+    }
+
+    #[tokio::test]
+    async fn a_reindex_file_of_a_path_not_on_disk_is_invalid_params() {
+        let (_tmp, server) = indexed_server(crate::config::GroupBy::Chunk);
+        let err = server
+            .reindex_file(super::Parameters(crate::params::ReindexFile {
+                file: "nowhere.md".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
+        assert_eq!(err.data.as_ref().unwrap()["kind"], "not_found");
     }
 
     /// The structured envelope (#35), read from `structuredContent` rather

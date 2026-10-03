@@ -168,9 +168,6 @@ impl From<anyhow::Error> for ApiError {
                 };
                 Self::new(status, fault.kind(), &message)
             }
-            // The prefix check the `read` route used to make, kept until the
-            // variants that replace it land. Deleted in Task 5.
-            None if is_read_miss(&e.to_string()) => Self::bad_request(&message),
             None => Self::internal(&message),
         }
     }
@@ -350,15 +347,6 @@ async fn handle_plugin_manifest(State(state): State<ApiState>) -> impl IntoRespo
 // ---------------------------------------------------------------------------
 // Read endpoint handlers
 // ---------------------------------------------------------------------------
-
-/// The `read` route's own list, kept until Task 5 builds the `NotFound` and
-/// `Ambiguous` variants that replace it.
-fn is_read_miss(message: &str) -> bool {
-    message.starts_with("Section not found")
-        || message.starts_with("File not found")
-        || message.starts_with("ambiguous alias")
-        || message.starts_with("--section cannot be combined")
-}
 
 async fn handle_match(
     State(state): State<ApiState>,
@@ -900,18 +888,14 @@ async fn handle_reindex_file(
     let vault = state.core.vault_path.clone();
     let settings = state.core.index_settings;
     let file = body.file.clone();
-    // A file the server cannot read is the caller's own text naming nothing,
-    // which is the 400 the neighbouring handlers answer for that class (#60).
+    // A path not on disk is a Fault::NotFound from the indexer, and the
+    // classifier answers 404 for it (#60).
     let result = state
         .core
         .with_core(move |g| {
             crate::indexer::reindex_written_file(&file, g.store, g.embedder, &vault, settings)
         })
-        .await
-        .map_err(|e| match e.downcast_ref::<std::io::Error>() {
-            Some(_) => ApiError::bad_request(&format!("Cannot read file {}: {e:#}", body.file)),
-            None => ApiError::internal(&format!("{e:#}")),
-        })?;
+        .await?;
     Ok(Json(serde_json::json!({
         "file": body.file,
         "chunks": result.total_chunks,
@@ -2071,12 +2055,11 @@ mod tests {
         );
     }
 
-    /// A section the note does not hold is the caller's own text naming
-    /// nothing, so it is a 400 and not the 500 every error on this route used
-    /// to answer. It is the first error an agent using the newly documented
-    /// `section` parameter meets (#60, #62).
+    /// A section the note does not hold, or a note the vault does not hold,
+    /// is the resource the call addresses being absent: a 404, with the kind
+    /// in the body (#60, #62).
     #[tokio::test]
-    async fn a_read_of_a_section_the_note_does_not_hold_is_a_bad_request() {
+    async fn a_read_of_a_section_or_a_note_the_vault_does_not_hold_is_a_404() {
         let (_tmp, state) = indexed_state();
 
         let response = get(
@@ -2091,11 +2074,41 @@ mod tests {
             "/api/read?file=rules/abjuration-spells.md&section=Nowhere",
         )
         .await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(json_body(response).await["kind"], "not_found");
 
-        // A file the vault does not hold is the same class of mistake.
         let response = get(state, "/api/read?file=nowhere.md").await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = json_body(response).await;
+        assert_eq!(body["kind"], "not_found");
+        assert_eq!(body["error"], "file not found: nowhere.md");
+    }
+
+    /// A write that names a note the vault does not hold is the same absent
+    /// resource, on the route that used to answer 500 for it.
+    #[tokio::test]
+    async fn an_update_of_a_missing_note_is_a_404() {
+        let (_tmp, state) = indexed_state();
+        let (status, body) = post_json(
+            state,
+            "/api/update",
+            r#"{"file":"nowhere.md","edits":[{"mode":"append","content":"x"}]}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["kind"], "not_found");
+    }
+
+    /// `reindex-file` of a path not on disk is a 404; a path that exists and
+    /// cannot be read stays a 500, which no fixture can provoke without
+    /// changing permissions, so only the first is asserted.
+    #[tokio::test]
+    async fn a_reindex_file_of_a_path_not_on_disk_is_a_404() {
+        let (_tmp, state) = indexed_state();
+        let (status, body) =
+            post_json(state, "/api/reindex-file", r#"{"file":"nowhere.md"}"#).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["kind"], "not_found");
     }
 
     /// `archive` and `archive {undo: true}` are one operation and its reverse
@@ -2426,6 +2439,7 @@ mod tests {
         }
         let response = get(state.clone(), "/api/read?file=Twin").await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json_body(response).await["kind"], "ambiguous");
         let response = get(state, "/api/list?links_to=Twin").await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
