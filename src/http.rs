@@ -112,6 +112,11 @@ impl IntoResponse for ApiError {
 }
 
 impl ApiError {
+    /// The kinds this transport builds itself, with no `Fault` behind them.
+    /// With `Fault::KINDS` it is every word the `kind` field can hold.
+    pub const TRANSPORT_KINDS: &'static [&'static str] =
+        &["unauthorized", "forbidden", "rate_limited", "internal"];
+
     fn new(status: StatusCode, kind: &'static str, message: &str) -> Self {
         Self {
             status,

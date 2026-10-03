@@ -45,9 +45,7 @@ pub fn build_openapi_spec(server_url: &str) -> Value {
         let mut operation = json!({
             "operationId": row.id,
             "summary": row.summary,
-            "responses": {
-                "200": { "description": row.response },
-            },
+            "responses": operation_responses(row.response),
         });
         match capability.http {
             Http::Get => {
@@ -71,6 +69,9 @@ pub fn build_openapi_spec(server_url: &str) -> Value {
     }
 
     let schemas = generator.take_definitions(true);
+    let mut schemas = schemas;
+    let (error, responses) = error_components();
+    schemas.insert("Error".into(), error);
 
     json!({
         "openapi": "3.1.0",
@@ -83,6 +84,7 @@ pub fn build_openapi_spec(server_url: &str) -> Value {
         "security": [{ "bearerAuth": [] }],
         "components": {
             "schemas": schemas,
+            "responses": responses,
             "securitySchemes": {
                 "bearerAuth": { "type": "http", "scheme": "bearer" }
             }
@@ -106,6 +108,91 @@ fn health_check_operation() -> Value {
             }
         }
     })
+}
+
+/// One row per status the classifier answers, with the kinds it carries,
+/// in the words of http-rest-api.md's table. The test
+/// `each_kind_is_listed_under_the_status_the_classifier_answers` holds each
+/// kind to the status `From<anyhow::Error> for ApiError` gives it.
+const ERROR_RESPONSES: &[(&str, &str)] = &[
+    (
+        "400",
+        "The request's own text named nothing or asked two things at once: a scope term, an after cursor, a links_to or linked_from name, full with summaries, a section beside include=metadata, an empty match pattern, a mode word, a malformed edit list (kind invalid_input); or one name matched several notes, such as an alias more than one note carries (kind ambiguous).",
+    ),
+    (
+        "401",
+        "No key, or a key the server does not hold (kind unauthorized).",
+    ),
+    (
+        "403",
+        "The key has no write permission (kind forbidden), or the server was started with --read-only (kind read_only).",
+    ),
+    (
+        "404",
+        "The file or section the call addresses is absent (kind not_found).",
+    ),
+    (
+        "409",
+        "The write would clobber: the note changed on disk since it was indexed, a create or move onto an existing path, an archive of an archived note (kind conflict).",
+    ),
+    (
+        "429",
+        "The key's bucket is empty; the retry-after header says when (kind rate_limited).",
+    ),
+    (
+        "500",
+        "The index cannot answer until knapper index runs (kind stale_index), or anything else, with the whole error chain in error (kind internal).",
+    ),
+];
+
+/// `components.schemas.Error` and `components.responses`, built from the
+/// kinds the two classifiers declare.
+fn error_components() -> (Value, serde_json::Map<String, Value>) {
+    let kinds: Vec<&str> = crate::fault::Fault::KINDS
+        .iter()
+        .chain(crate::http::ApiError::TRANSPORT_KINDS)
+        .copied()
+        .collect();
+    let error = json!({
+        "type": "object",
+        "required": ["error", "kind"],
+        "properties": {
+            "error": {
+                "type": "string",
+                "description": "The message. A 500 carries the whole error chain."
+            },
+            "kind": {
+                "type": "string",
+                "enum": kinds,
+                "description": "One word for what went wrong. The status says whose fault it is."
+            }
+        }
+    });
+    let mut responses = serde_json::Map::new();
+    for (status, description) in ERROR_RESPONSES {
+        responses.insert(
+            (*status).to_string(),
+            json!({
+                "description": description,
+                "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+            }),
+        );
+    }
+    (error, responses)
+}
+
+/// The `responses` of a capability operation: the 200 and a reference to
+/// every error status.
+fn operation_responses(response: &str) -> Value {
+    let mut responses = serde_json::Map::new();
+    responses.insert("200".into(), json!({ "description": response }));
+    for (status, _) in ERROR_RESPONSES {
+        responses.insert(
+            (*status).to_string(),
+            json!({ "$ref": format!("#/components/responses/{status}") }),
+        );
+    }
+    Value::Object(responses)
 }
 
 /// The schema of the `params` struct a capability reads, or `None` for a
@@ -192,14 +279,6 @@ fn query_schema(mut schema: Value, description: &mut String) -> Value {
         return schema;
     };
 
-    if object.get("type") == Some(&json!("array")) {
-        if !description.is_empty() {
-            description.push(' ');
-        }
-        description.push_str("Comma-separated.");
-        return json!({ "type": "string" });
-    }
-
     if let Some(types) = object.get("type").and_then(Value::as_array).cloned() {
         let kept: Vec<Value> = types.into_iter().filter(|t| *t != "null").collect();
         let one = match kept.as_slice() {
@@ -207,9 +286,6 @@ fn query_schema(mut schema: Value, description: &mut String) -> Value {
             _ => Value::Array(kept),
         };
         object.insert("type".into(), one);
-        if object.get("default") == Some(&Value::Null) {
-            object.remove("default");
-        }
     }
 
     if let Some(any_of) = object.get("anyOf").and_then(Value::as_array).cloned()
@@ -222,6 +298,18 @@ fn query_schema(mut schema: Value, description: &mut String) -> Value {
                 object.insert(k.clone(), v.clone());
             }
         }
+    }
+
+    if object.get("default") == Some(&Value::Null) {
+        object.remove("default");
+    }
+
+    if object.get("type") == Some(&json!("array")) {
+        if !description.is_empty() {
+            description.push(' ');
+        }
+        description.push_str("Comma-separated.");
+        return json!({ "type": "string" });
     }
 
     schema
@@ -469,6 +557,55 @@ mod tests {
         assert!(limit["schema"].get("default").is_none());
     }
 
+    /// The GET rule holds for the two shapes no struct has yet: an optional
+    /// list is still one comma-separated string, and an optional enum with a
+    /// default loses the null and the null default both.
+    #[test]
+    fn the_get_rule_reads_an_optional_list_and_an_optional_enum() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "tags": {
+                    "description": "Tags.",
+                    "type": ["array", "null"],
+                    "items": { "type": "string" },
+                    "default": null
+                },
+                "mode": {
+                    "anyOf": [{ "$ref": "#/components/schemas/Mode" }, { "type": "null" }],
+                    "default": null
+                },
+                "either": {
+                    "anyOf": [{ "type": "string" }, { "type": "integer" }]
+                }
+            }
+        });
+        let parameters = query_parameters(&schema);
+        let by_name = |name: &str| {
+            parameters
+                .iter()
+                .find(|p| p["name"] == name)
+                .unwrap_or_else(|| panic!("no parameter {name}"))
+        };
+
+        let tags = by_name("tags");
+        assert_eq!(tags["schema"], serde_json::json!({ "type": "string" }));
+        assert_eq!(tags["description"], "Tags. Comma-separated.");
+        assert_eq!(tags["required"], false);
+
+        let mode = by_name("mode");
+        assert_eq!(
+            mode["schema"],
+            serde_json::json!({ "$ref": "#/components/schemas/Mode" })
+        );
+
+        let either = by_name("either");
+        assert_eq!(
+            either["schema"]["anyOf"],
+            serde_json::json!([{ "type": "string" }, { "type": "integer" }])
+        );
+    }
+
     /// Nested types are hoisted to `components.schemas`, where OpenAPI puts
     /// them; nothing from the standalone JSON Schema dialect is left behind.
     #[test]
@@ -546,6 +683,126 @@ mod tests {
         assert_eq!(op["security"], serde_json::json!([]));
         assert!(op["responses"]["200"]["content"]["text/plain"].is_object());
         assert!(op.get("parameters").is_none());
+    }
+
+    /// Every capability operation documents the error body under every
+    /// status the classifier can answer. The classifier is one function and
+    /// which status a call reaches depends on its arguments, so the set is
+    /// the same on every route.
+    #[test]
+    fn every_operation_answers_the_error_body() {
+        use crate::surface::{CAPABILITIES, Http};
+
+        let spec = build_openapi_spec("http://localhost:3000");
+        let statuses = ["400", "401", "403", "404", "409", "429", "500"];
+
+        for status in statuses {
+            let response = &spec["components"]["responses"][status];
+            assert!(
+                response["description"]
+                    .as_str()
+                    .is_some_and(|d| !d.is_empty()),
+                "components.responses.{status} has no description"
+            );
+            assert_eq!(
+                response["content"]["application/json"]["schema"]["$ref"],
+                "#/components/schemas/Error",
+                "{status}"
+            );
+        }
+
+        let error = &spec["components"]["schemas"]["Error"];
+        assert_eq!(error["type"], "object");
+        assert_eq!(error["required"], serde_json::json!(["error", "kind"]));
+        assert_eq!(error["properties"]["error"]["type"], "string");
+        let kinds: BTreeSet<&str> = error["properties"]["kind"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|k| k.as_str().unwrap())
+            .collect();
+        let want: BTreeSet<&str> = crate::fault::Fault::KINDS
+            .iter()
+            .chain(crate::http::ApiError::TRANSPORT_KINDS)
+            .copied()
+            .collect();
+        assert_eq!(kinds, want);
+
+        for capability in CAPABILITIES {
+            let method = match capability.http {
+                Http::Get => "get",
+                Http::Post => "post",
+                Http::Exempt(_) => continue,
+            };
+            let responses = &spec["paths"][&capability.http_path()][method]["responses"];
+            for status in statuses {
+                assert_eq!(
+                    responses[status]["$ref"],
+                    format!("#/components/responses/{status}"),
+                    "{} {method} {status}",
+                    capability.name
+                );
+            }
+        }
+
+        let health = &spec["paths"]["/api/health-check"]["get"]["responses"];
+        assert_eq!(
+            health.as_object().unwrap().len(),
+            1,
+            "health-check answers 200 alone"
+        );
+    }
+
+    /// The description under each status names the kinds the classifier
+    /// answers with that status, so the document and `From<anyhow::Error>
+    /// for ApiError` cannot say different things.
+    #[test]
+    fn each_kind_is_listed_under_the_status_the_classifier_answers() {
+        use crate::fault::Fault;
+        use crate::http::ApiError;
+
+        let spec = build_openapi_spec("http://localhost:3000");
+        let description_of = |status: u16| -> String {
+            spec["components"]["responses"][status.to_string()]["description"]
+                .as_str()
+                .unwrap_or_else(|| panic!("no response for {status}"))
+                .to_string()
+        };
+
+        let faults = [
+            Fault::InvalidInput("x".into()),
+            Fault::NotFound("x".into()),
+            Fault::Ambiguous("x".into()),
+            Fault::Conflict("x".into()),
+            Fault::StaleIndex("x".into()),
+            Fault::ReadOnly,
+        ];
+        for fault in faults {
+            let kind = fault.kind();
+            let api = ApiError::from(anyhow::Error::from(fault));
+            let description = description_of(api.status.as_u16());
+            assert!(
+                description.contains(kind),
+                "{kind} answers {} but that response's description does not name it: {description}",
+                api.status
+            );
+        }
+
+        let transport = [
+            ApiError::unauthorized("x"),
+            ApiError::forbidden("x"),
+            ApiError::rate_limited(1),
+            ApiError::internal("x"),
+        ];
+        for api in transport {
+            let description = description_of(api.status.as_u16());
+            assert!(
+                description.contains(api.kind),
+                "{} answers {} but that response's description does not name it: {description}",
+                api.kind,
+                api.status
+            );
+        }
     }
 
     #[test]

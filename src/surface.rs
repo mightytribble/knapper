@@ -401,7 +401,7 @@ pub const OPERATIONS: &[Operation] = &[
     Operation {
         name: "index",
         id: "indexVault",
-        summary: "Index the server's vault: walk it, diff it against the store, and re-embed what changed.",
+        summary: "Index the server's vault: walk it, diff it against the store, and re-embed what changed. Send {} for the defaults; one file is cheaper through /api/reindex-file. It runs to completion holding the store and the embedder, so searches and writes wait while reads answer; a rebuild takes minutes.",
         response: "Counts of new, updated and deleted files, total chunks and the elapsed seconds",
     },
     Operation {
