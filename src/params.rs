@@ -30,12 +30,11 @@ pub struct Search {
     /// ceiling rather than the number asked for.
     #[arg(short = 'n', long)]
     pub top_n: Option<usize>,
-    /// Show the per-lane score breakdown for each result.
-    ///
-    /// The breakdown is text, and `run_search` prints it only when the output
-    /// is not JSON. Asking for both is a usage error rather than a flag that
-    /// is silently dropped, which is what the CLI answered before the command
-    /// took this struct (#62).
+    /// Show the per-lane score breakdown for each result. On the servers the
+    /// breakdown rides beside the envelope as `explain`; the CLI prints it as
+    /// text (#62).
+    // The CLI refuses `--explain` with `--json`, since the breakdown is text
+    // there: a usage error rather than a flag silently dropped.
     #[arg(long, conflicts_with = "json")]
     #[serde(default)]
     pub explain: bool,
@@ -140,8 +139,8 @@ pub struct Read {
     /// before a `replace` of it, because the replace writes over all of that
     /// (#116).
     ///
-    /// It combines with `--include content` and `--include all`. The other
-    /// two modes answer the whole note and refuse it (#130).
+    /// It combines with `include` set to `content` or `all`. The other two
+    /// modes answer the whole note and refuse it (#130).
     #[arg(long)]
     pub section: Option<String>,
     /// What the read answers (#130). `content`, the default, is the note's
@@ -152,7 +151,7 @@ pub struct Read {
     /// does not repeat. `metadata` is everything that is not prose: the
     /// frontmatter, the inbound and outbound links, the properties and the
     /// size. `frontmatter` and `metadata` answer the whole note, so neither
-    /// combines with `--section`; `all` does.
+    /// combines with `section`; `all` does.
     #[arg(long, value_enum, default_value_t = Include::Content)]
     #[serde(default)]
     pub include: Include,
@@ -462,7 +461,8 @@ where
 /// the note's own `tags` list; no other key is written.
 #[derive(Debug, Args, Deserialize, JsonSchema)]
 pub struct Create {
-    /// Note content. The CLI reads stdin when this is omitted.
+    /// Note content. Required on the servers; the CLI reads stdin when it is
+    /// omitted.
     #[arg(long)]
     pub content: Option<String>,
     /// Filename for the note. A bare name gets `.md` appended; a name that
@@ -926,8 +926,8 @@ pub struct Migrate {
     /// The preview `apply` acts on. This is the one argument the servers
     /// take and the CLI does not: a server caller holds the JSON that
     /// `preview` returned it and passes it back, while the CLI's `preview`
-    /// saves the plan itself and its `apply` reads that copy. `#[arg(skip)]`
-    /// is what keeps it off the command line, where JSON has no spelling.
+    /// saves the plan itself and its `apply` reads that copy.
+    // `#[arg(skip)]` keeps it off the command line, where JSON has no spelling.
     #[arg(skip)]
     #[serde(default)]
     pub preview: Option<serde_json::Value>,
@@ -960,7 +960,8 @@ pub struct Validate {
     #[arg(long, value_delimiter = ',')]
     #[serde(default, deserialize_with = "deserialize_tag_list")]
     pub none: Vec<String>,
-    /// Treat warnings as gating: exit non-zero when any warning is present.
+    /// Treat warnings as gating: the report's `ok` is false when any warning
+    /// is present, and the CLI exits non-zero.
     #[arg(long)]
     #[serde(default)]
     pub strict: bool,

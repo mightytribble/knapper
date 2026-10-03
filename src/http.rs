@@ -112,6 +112,11 @@ impl IntoResponse for ApiError {
 }
 
 impl ApiError {
+    /// The kinds this transport builds itself, with no `Fault` behind them.
+    /// With `Fault::KINDS` it is every word the `kind` field can hold.
+    pub const TRANSPORT_KINDS: &'static [&'static str] =
+        &["unauthorized", "forbidden", "rate_limited", "internal"];
+
     fn new(status: StatusCode, kind: &'static str, message: &str) -> Self {
         Self {
             status,
@@ -295,9 +300,8 @@ pub fn routes() -> Vec<(&'static str, MethodRouter<ApiState>)> {
         ("/api/init", post(handle_init)),
         // Migration endpoints
         ("/api/migrate", post(handle_migrate)),
-        // OpenAPI / ChatGPT plugin discovery (no auth required)
+        // The transport describing itself (no auth required)
         ("/openapi.json", get(handle_openapi)),
-        ("/.well-known/ai-plugin.json", get(handle_plugin_manifest)),
     ]
 }
 
@@ -321,27 +325,10 @@ async fn handle_openapi(State(state): State<ApiState>) -> impl IntoResponse {
     );
     let server_url = state
         .http_config
-        .plugin
         .public_url
         .as_deref()
         .unwrap_or(&default_url);
-    let spec = crate::openapi::build_openapi_spec(server_url);
-    Json(spec)
-}
-
-async fn handle_plugin_manifest(State(state): State<ApiState>) -> impl IntoResponse {
-    let default_url = format!(
-        "http://{}:{}",
-        state.http_config.host, state.http_config.port
-    );
-    let server_url = state
-        .http_config
-        .plugin
-        .public_url
-        .as_deref()
-        .unwrap_or(&default_url);
-    let manifest = crate::openapi::build_plugin_manifest(&state.http_config, server_url);
-    Json(manifest)
+    Json(crate::openapi::build_openapi_spec(server_url))
 }
 
 // ---------------------------------------------------------------------------
@@ -1018,7 +1005,7 @@ mod tests {
                     permissions: "write".into(),
                 },
             ],
-            plugin: crate::config::PluginConfig::default(),
+            public_url: None,
         }
     }
 
@@ -1753,7 +1740,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // OpenAPI / Plugin manifest tests (no auth required)
+    // OpenAPI document (no auth required)
     // -----------------------------------------------------------------------
 
     #[tokio::test]
@@ -1773,7 +1760,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_plugin_manifest_no_auth_required() {
+    async fn the_well_known_route_is_gone() {
         let (_tmp, state) = test_api_state();
         let app = build_router(state);
         let response = app
@@ -1785,7 +1772,32 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// `[http] public_url` is the document's server URL when set.
+    #[tokio::test]
+    async fn the_document_names_the_public_url_when_one_is_set() {
+        let (_tmp, mut state) = test_api_state();
+        let mut config = (*state.http_config).clone();
+        config.public_url = Some("https://abc.trycloudflare.com".into());
+        state.http_config = Arc::new(config);
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/openapi.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let spec: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(spec["servers"][0]["url"], "https://abc.trycloudflare.com");
     }
 
     // -----------------------------------------------------------------------

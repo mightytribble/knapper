@@ -16,9 +16,16 @@ Every capability is one route, and the route is the CLI command's name under
 surfaces; [faq.md](faq.md) and [configuration.md](configuration.md) explain
 what the parameters mean.
 
+`GET /openapi.json` is the OpenAPI 3.1 document for every route below, and it
+takes no key. It is generated from the same parameter declarations the CLI and
+MCP read, so a parameter it names is one the server reads, and the `kind` enum
+under `components.schemas.Error` is the one the Errors section lists. Set
+`public_url` under `[http]` in `config.toml` when the server is reached
+through a tunnel; the document names it as its server.
+
 | Method | Endpoint | Permission | Description |
 |--------|----------|------------|-------------|
-| GET | `/api/health-check` | read | Server health check |
+| GET | `/api/health-check` | none | Server health check |
 | POST | `/api/search` | read | Hybrid search (semantic + FTS5 + graph + reranker + temporal), scoped by tag or directory terms — a leading `/` reads a term as a directory path (`scope`/`all`, `any`, `none`), and `property`, `links_to`, `linked_from` (one value each) |
 | POST | `/api/match` | read | Find every note whose text holds a literal string, and count them — scoped the same way. For verification, not discovery: `notes: 0` means nothing in scope says it |
 | GET | `/api/read` | read | Read a note (`file`), or one of its sections (`section`) |
@@ -105,7 +112,7 @@ permissions = "write"
 
 ## Errors
 
-Every error a handler answers is a JSON body with two fields: `error`, the message, and `kind`, one word for what went wrong. The status says whose fault it is.
+Every error a handler answers is a JSON body with two fields: `error`, the message, and `kind`, one word for what went wrong. The status says whose fault it is. The OpenAPI document carries the same table: every operation references `components.responses` for each status, and the body is `components.schemas.Error`.
 
 | status | kind | when |
 |---|---|---|

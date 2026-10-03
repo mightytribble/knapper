@@ -1,49 +1,88 @@
-use crate::config::HttpConfig;
+//! The OpenAPI 3.1 document for the HTTP surface, generated rather than
+//! written.
+//!
+//! Every parameter comes from the capability's `params` struct, through the
+//! `JsonSchema` it already derives for MCP, so the document cannot name a
+//! parameter the server does not read. The three things a struct cannot say
+//! — the operation's id, its summary and what its 200 reply holds — come
+//! from `surface::OPERATIONS`. schemars emits the 2020-12 dialect, which
+//! OpenAPI 3.1 embeds as is; the one transform is `query_parameters`, for
+//! the GET routes (#62).
 
-/// Build the OpenAPI 3.1.0 specification for all HTTP endpoints.
-pub fn build_openapi_spec(server_url: &str) -> serde_json::Value {
+use rmcp::schemars::JsonSchema;
+use rmcp::schemars::generate::{SchemaGenerator, SchemaSettings};
+use serde_json::{Value, json};
+
+use crate::surface::{CAPABILITIES, Http, OPERATIONS};
+
+/// Build the OpenAPI 3.1 document for every route under `/api/`.
+///
+/// `server_url` is `[http] public_url` when set, else the bound address.
+pub fn build_openapi_spec(server_url: &str) -> Value {
+    let settings = SchemaSettings::draft2020_12().with(|s| {
+        s.definitions_path = "/components/schemas".into();
+        s.meta_schema = None;
+    });
+    let mut generator = settings.into_generator();
+
     let mut paths = serde_json::Map::new();
+    paths.insert("/api/health-check".into(), health_check_operation());
 
-    // Read endpoints
-    paths.insert("/api/health-check".into(), build_health_check());
-    paths.insert("/api/search".into(), build_search());
-    paths.insert("/api/match".into(), build_match());
-    paths.insert("/api/read".into(), build_read());
-    paths.insert("/api/list".into(), build_list());
-    paths.insert("/api/tags".into(), build_tags());
-    paths.insert("/api/properties".into(), build_properties());
-    paths.insert("/api/vault-map".into(), build_vault_map());
-    paths.insert("/api/health".into(), build_health());
-    paths.insert("/api/validate".into(), build_validate());
-    paths.insert("/api/status".into(), build_status());
+    for capability in CAPABILITIES {
+        let method = match capability.http {
+            Http::Get => "get",
+            Http::Post => "post",
+            Http::Exempt(_) => continue,
+        };
+        let row = OPERATIONS
+            .iter()
+            .find(|o| o.name == capability.name)
+            .unwrap_or_else(|| panic!("{} has no operation row", capability.name));
+        let schema = params_schema(capability.name, &mut generator)
+            .unwrap_or_else(|| panic!("{} has no params struct", capability.name));
 
-    // Write endpoints
-    paths.insert("/api/create".into(), build_create());
-    paths.insert("/api/update".into(), build_update());
-    paths.insert("/api/move".into(), build_move());
-    paths.insert("/api/archive".into(), build_archive());
-    paths.insert("/api/delete".into(), build_delete());
-    paths.insert("/api/index".into(), build_index());
-    paths.insert("/api/reindex-file".into(), build_reindex_file());
+        let mut operation = json!({
+            "operationId": row.id,
+            "summary": row.summary,
+            "responses": operation_responses(row.response),
+        });
+        match capability.http {
+            Http::Get => {
+                let parameters = query_parameters(&schema);
+                if !parameters.is_empty() {
+                    operation["parameters"] = Value::Array(parameters);
+                }
+            }
+            Http::Post => {
+                operation["requestBody"] = json!({
+                    "required": true,
+                    "content": { "application/json": { "schema": schema } },
+                });
+            }
+            Http::Exempt(_) => unreachable!(),
+        }
 
-    // Identity endpoints
-    paths.insert("/api/identity".into(), build_identity_endpoint());
-    paths.insert("/api/init".into(), build_init_endpoint());
+        let mut item = serde_json::Map::new();
+        item.insert(method.to_string(), operation);
+        paths.insert(capability.http_path(), Value::Object(item));
+    }
 
-    // Migration endpoints
-    paths.insert("/api/migrate".into(), build_migrate());
+    let mut schemas = generator.take_definitions(true);
+    let (error, responses) = error_components();
+    schemas.insert("Error".into(), error);
 
-    serde_json::json!({
+    json!({
         "openapi": "3.1.0",
         "info": {
             "title": "knapper",
-            "version": "1.6.0",
-            "description": "AI-powered semantic search and management API for Obsidian vaults."
+            "version": env!("CARGO_PKG_VERSION"),
+            "description": env!("CARGO_PKG_DESCRIPTION"),
         },
         "servers": [{ "url": server_url }],
         "security": [{ "bearerAuth": [] }],
         "components": {
-            "schemas": {},
+            "schemas": schemas,
+            "responses": responses,
             "securitySchemes": {
                 "bearerAuth": { "type": "http", "scheme": "bearer" }
             }
@@ -52,476 +91,233 @@ pub fn build_openapi_spec(server_url: &str) -> serde_json::Value {
     })
 }
 
-// ---------------------------------------------------------------------------
-// Path builders — each returns one path item to keep macro recursion shallow
-// ---------------------------------------------------------------------------
-
-fn build_health_check() -> serde_json::Value {
-    serde_json::json!({
+/// The liveness probe. Not a capability: it takes no key and no parameters.
+fn health_check_operation() -> Value {
+    json!({
         "get": {
             "operationId": "healthCheck",
-            "summary": "Simple liveness check. Returns 'ok' when the server is running.",
+            "summary": "Liveness check. Answers the text ok while the server is running.",
+            "security": [],
             "responses": {
-                "200": { "description": "Server is alive" }
+                "200": {
+                    "description": "Server is alive",
+                    "content": { "text/plain": { "schema": { "type": "string" } } }
+                }
             }
         }
     })
 }
 
-fn build_search() -> serde_json::Value {
-    serde_json::json!({
-        "post": {
-            "operationId": "searchVault",
-            "summary": "Hybrid semantic + full-text search across the vault. A query pairs with a filter: {\"query\": \"the disagreement over the schedule\", \"links_to\": \"project-atlas\"} cuts the pool to the notes linking that note and ranks the query inside them, which is how to ask about two notes at once. The scope resolves before anything is embedded, so the filter runs first and the ranking runs inside it.",
-            "requestBody": {
-                "required": true,
-                "content": { "application/json": { "schema": {
-                    "type": "object",
-                    "required": ["query"],
-                    "properties": {
-                        "query": { "type": "string", "description": "Search query text" },
-                        "top_n": { "type": "integer", "description": "Number of results, counting a merged block as one. Defaults to the configured top_n, the same number on every surface. Fewer come back only when the vault holds fewer: candidates are capped by the ranking pool and the answer floor" },
-                        "explain": { "type": "boolean", "description": "Return the per-lane score breakdown in the response's explain field" },
-                        "group_by": { "type": "string", "enum": ["chunk", "file"], "description": "One result per matching section, or one per document. Defaults to the server's setting" },
-                        "scope": { "type": "array", "items": { "type": "string" }, "description": "Tag terms; a trailing / matches the tag and its descendants. A term starting with / is a directory path from the vault root instead, case-sensitive, with a trailing / its subtree and a path ending in .md one note. Alias of all" },
-                        "all": { "type": "array", "items": { "type": "string" }, "description": "Tag terms a note carries every one of, or directory terms (starting with /, case-sensitive, a trailing / its subtree, a path ending in .md one note) it lies under" },
-                        "any": { "type": "array", "items": { "type": "string" }, "description": "Tag terms a note carries at least one of, or directory terms (starting with /, case-sensitive, a trailing / its subtree, a path ending in .md one note) it lies under" },
-                        "none": { "type": "array", "items": { "type": "string" }, "description": "Tag terms a note carries none of, or directory terms (starting with /, case-sensitive, a trailing / its subtree, a path ending in .md one note) it does not lie under" },
-                        "property": { "type": "string", "description": "Answer from notes carrying a custom property: NAME, or NAME=VALUE for one value compared as text. One per call; GET /api/properties lists the names and values" },
-                        "links_to": { "type": "string", "description": "Answer from notes that link to this note, named the way a wikilink names it, or by one of its aliases. With property, only links filed under that property count. An unknown note is a 400 naming the nearest one" },
-                        "linked_from": { "type": "string", "description": "Answer from the notes this note links to, named the way a wikilink names it, or by one of its aliases. With property, only links filed under that property count. An unknown note is a 400 naming the nearest one" },
-                        "budget_tokens": { "type": "integer", "description": "Token budget for the returned text. Fill is greedy in rank order and the first result is always included. Defaults to the configured output budget" },
-                        "full": { "type": "boolean", "description": "Return every result's full text, ignoring the token budget. Conflicts with summaries" },
-                        "summaries": { "type": "boolean", "description": "Return breadcrumb and lanes only, no text, for every result. The rows are answers, so they arrive in blocks with the text key absent, and overflow stays empty — nothing was held back. Conflicts with full" },
-                        "scores": { "type": "boolean", "description": "Include the cross-encoder's relevance score on each block and overflow row. Absent by default; the field itself is omitted on a degraded row, which has no probability to report" }
-                    }
-                }}}
+/// One row per status the classifier answers, with the kinds it carries,
+/// in the words of http-rest-api.md's table. The test
+/// `each_kind_is_listed_under_the_status_the_classifier_answers` holds each
+/// kind to the status `From<anyhow::Error> for ApiError` gives it.
+const ERROR_RESPONSES: &[(&str, &str)] = &[
+    (
+        "400",
+        "The request's own text named nothing or asked two things at once: a scope term, an after cursor, a links_to or linked_from name, full with summaries, a section beside include=metadata, an empty match pattern, a mode word, a malformed edit list (kind invalid_input); or one name matched several notes, such as an alias more than one note carries (kind ambiguous).",
+    ),
+    (
+        "401",
+        "No key, or a key the server does not hold (kind unauthorized).",
+    ),
+    (
+        "403",
+        "The key has no write permission (kind forbidden), or the server was started with --read-only (kind read_only).",
+    ),
+    (
+        "404",
+        "The file or section the call addresses is absent (kind not_found).",
+    ),
+    (
+        "409",
+        "The write would clobber: the note changed on disk since it was indexed, a create or move onto an existing path, an archive of an archived note (kind conflict).",
+    ),
+    (
+        "429",
+        "The key's bucket is empty; the retry-after header says when (kind rate_limited).",
+    ),
+    (
+        "500",
+        "The index cannot answer until knapper index runs (kind stale_index), or anything else, with the whole error chain in error (kind internal).",
+    ),
+];
+
+/// `components.schemas.Error` and `components.responses`, built from the
+/// kinds the two classifiers declare.
+fn error_components() -> (Value, serde_json::Map<String, Value>) {
+    let kinds: Vec<&str> = crate::fault::Fault::KINDS
+        .iter()
+        .chain(crate::http::ApiError::TRANSPORT_KINDS)
+        .copied()
+        .collect();
+    let error = json!({
+        "type": "object",
+        "required": ["error", "kind"],
+        "properties": {
+            "error": {
+                "type": "string",
+                "description": "The message. A 500 carries the whole error chain."
             },
-            "responses": { "200": { "description": "An envelope: status ('ok' or 'no_results'); degraded (bool, true when no cross-encoder ranked the results); warnings (array of strings); notes, each answering note's frontmatter properties keyed by path, as a name-to-value map — a value carries its own JSON type, so a number is a number, a checkbox a bool, a key with no value null, a wikilink {link, path} with path present when it resolves, and a name the note carries more than once an array — omitted when no answering note carries a property; blocks, the results that answered, each {id, path, heading_path, lanes (the lanes that account for the result, any of 'semantic', 'keyword', 'linked'), text, untrusted_content, truncated, and score when scores was requested}, with a block's properties read from notes under its path — text is absent on a row the caller asked no text for, which is every row under summaries; overflow, the results the budget excluded, each {id, path, heading_path, lanes, and score when requested} with no text; and less_relevant, the candidates the answer floor rejected, in whatever slots top_n had left after the answers, each carrying its score whether or not scores was requested, beside answer_floor, the floor they missed, on the same 0-100 scale — both omitted when the floor rejected nothing, and a no_results reply that carries them is still no_results. explain, the per-lane breakdown, rides beside the envelope when the request asked for it" } }
+            "kind": {
+                "type": "string",
+                "enum": kinds,
+                "description": "One word for what went wrong. The status says whose fault it is."
+            }
         }
+    });
+    let mut responses = serde_json::Map::new();
+    for (status, description) in ERROR_RESPONSES {
+        responses.insert(
+            (*status).to_string(),
+            json!({
+                "description": description,
+                "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+            }),
+        );
+    }
+    (error, responses)
+}
+
+/// The `responses` of a capability operation: the 200 and a reference to
+/// every error status.
+fn operation_responses(response: &str) -> Value {
+    let mut responses = serde_json::Map::new();
+    responses.insert("200".into(), json!({ "description": response }));
+    for (status, _) in ERROR_RESPONSES {
+        responses.insert(
+            (*status).to_string(),
+            json!({ "$ref": format!("#/components/responses/{status}") }),
+        );
+    }
+    Value::Object(responses)
+}
+
+/// The schema of the `params` struct a capability reads, or `None` for a
+/// name that is not a capability.
+///
+/// This is the one match from a name to a type. The handler's extractor
+/// names the type a second time and `serve.rs`'s tool a third; the test
+/// `every_operations_parameters_are_the_mcp_tools_properties` holds this
+/// match to the third.
+fn params_schema(name: &str, generator: &mut SchemaGenerator) -> Option<Value> {
+    use crate::params as p;
+
+    fn of<T: JsonSchema>(generator: &mut SchemaGenerator) -> Value {
+        <T as JsonSchema>::json_schema(generator).to_value()
+    }
+
+    Some(match name {
+        "search" => of::<p::Search>(generator),
+        "match" => of::<p::Match>(generator),
+        "read" => of::<p::Read>(generator),
+        "list" => of::<p::List>(generator),
+        "tags" => of::<p::Tags>(generator),
+        "properties" => of::<p::Properties>(generator),
+        "vault-map" => of::<p::VaultMap>(generator),
+        "create" => of::<p::Create>(generator),
+        "update" => of::<p::Update>(generator),
+        "delete" => of::<p::Delete>(generator),
+        "move" => of::<p::Move>(generator),
+        "archive" => of::<p::Archive>(generator),
+        "index" => of::<p::Index>(generator),
+        "reindex-file" => of::<p::ReindexFile>(generator),
+        "status" => of::<p::Status>(generator),
+        "health" => of::<p::Health>(generator),
+        "validate" => of::<p::Validate>(generator),
+        "identity" => of::<p::Identity>(generator),
+        "init" => of::<p::Init>(generator),
+        "migrate" => of::<p::Migrate>(generator),
+        _ => return None,
     })
 }
 
-fn build_match() -> serde_json::Value {
-    serde_json::json!({
-        "post": {
-            "operationId": "matchLiteral",
-            "summary": "Confirm whether a literal string still appears in the vault's note text, and count the notes holding it.",
-            "requestBody": {
-                "required": true,
-                "content": { "application/json": { "schema": {
-                    "type": "object",
-                    "required": ["pattern"],
-                    "properties": {
-                        "pattern": { "type": "string", "description": "The literal string to look for. Text and not a regex: . * and [ are themselves. An empty pattern is a 400" },
-                        "case_sensitive": { "type": "boolean", "description": "Compare exactly. The default folds case, which is what the keyword index does" },
-                        "word": { "type": "boolean", "description": "Count a hit only where the pattern stands as its own word — the characters either side of it are not letters, digits or underscores. DNA then answers DNA, DNA-based and DNA's, and not kidnapped, mRNA or DNA2. An edge the pattern itself spells with punctuation is not tested, so \"(DNA)\" stays matchable. A script that does not space its words rejects nearly every hit" },
-                        "scope": { "type": "array", "items": { "type": "string" }, "description": "Tag terms; a trailing / matches the tag and its descendants. A term starting with / is a directory path from the vault root instead, case-sensitive, with a trailing / its subtree and a path ending in .md one note. Alias of all" },
-                        "all": { "type": "array", "items": { "type": "string" }, "description": "Tag terms a note carries every one of, or directory terms (starting with /, case-sensitive, a trailing / its subtree, a path ending in .md one note) it lies under" },
-                        "any": { "type": "array", "items": { "type": "string" }, "description": "Tag terms a note carries at least one of, or directory terms (starting with /, case-sensitive, a trailing / its subtree, a path ending in .md one note) it lies under" },
-                        "none": { "type": "array", "items": { "type": "string" }, "description": "Tag terms a note carries none of, or directory terms (starting with /, case-sensitive, a trailing / its subtree, a path ending in .md one note) it does not lie under" },
-                        "scan": { "type": "string", "enum": ["all", "body", "frontmatter"], "description": "Which half of a note to read. all, the default, reads the prose and the frontmatter both. body is the prose alone, which is the check a rename wants where the YAML deliberately keeps an old name. frontmatter is the YAML alone" },
-                        "limit": { "type": "integer", "description": "Maximum matched lines to report. Absent, every one comes back; 0 reports none. The notes and lines counts are whole whatever this says" }
-                    }
-                }}}
-            },
-            "responses": { "200": { "description": "{pattern, notes (how many notes hold it — 0 means nothing in scope says it), lines (distinct matched lines across every note), hits (the matched lines, capped by limit, each {file, in, heading_path, line})}. The scan is exhaustive and unranked over a note's prose and its frontmatter both; `in` names which half a hit came from, and `scan` narrows the reading to one of them. A wikilink is compared as its display text as well as its markup, so a phrase spanning one is found; the reported line is the note as written." } }
-        }
-    })
+/// The GET rule: one query parameter per property of the struct schema.
+///
+/// A GET route reads its struct from the query string, where
+/// `serde_urlencoded` reads no sequence and no null (#61). So an `array`
+/// property is one comma-separated `string`, and the `null` a body may send
+/// is a parameter's absence. This is the one place that rule is written.
+fn query_parameters(schema: &Value) -> Vec<Value> {
+    let required: Vec<&str> = schema["required"]
+        .as_array()
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let Some(properties) = schema["properties"].as_object() else {
+        return Vec::new();
+    };
+
+    properties
+        .iter()
+        .map(|(name, property)| {
+            let mut property = property.clone();
+            let mut description = property
+                .as_object_mut()
+                .and_then(|o| o.remove("description"))
+                .and_then(|d| d.as_str().map(String::from))
+                .unwrap_or_default();
+            let schema = query_schema(property, &mut description);
+            let mut parameter = json!({
+                "name": name,
+                "in": "query",
+                "required": required.contains(&name.as_str()),
+                "schema": schema,
+            });
+            if !description.is_empty() {
+                parameter["description"] = Value::String(description);
+            }
+            parameter
+        })
+        .collect()
 }
 
-fn build_read() -> serde_json::Value {
-    serde_json::json!({
-        "get": {
-            "operationId": "readNote",
-            "summary": "Read a note's content, its frontmatter, both, or its metadata, chosen with include.",
-            "parameters": [
-                {
-                    "name": "file", "in": "query", "required": true,
-                    "description": "File path, basename, alias, or #docid. An alias is tried last, so a filename wins over another note's alias, and an alias two notes list is refused",
-                    "schema": { "type": "string" }
-                },
-                {
-                    "name": "section", "in": "query", "required": false,
-                    "description": "Read one section by its heading. The content is the section's body; its heading and level come back beside it, so this output can be written straight back through update. Omit for the whole note. The heading is one heading's own text, or its full path from the top heading down joined with ' > ', and the match folds case, so 'spells' finds '## Spells'. Combines with include=content and include=all; the other two modes answer the whole note and refuse it.",
-                    "schema": { "type": "string" }
-                },
-                {
-                    "name": "include", "in": "query", "required": false,
-                    "description": "What the read answers. content (the default) is the note's prose alone. frontmatter is the note's YAML alone, with no link graph — the cheap per-note property check. all is the prose and the frontmatter in one call. metadata is everything that is not prose: the frontmatter, the inbound and outbound links, the properties and the size. frontmatter and metadata describe the whole note and cannot be combined with section.",
-                    "schema": { "type": "string", "enum": ["content", "frontmatter", "all", "metadata"], "default": "content" }
-                }
-            ],
-            "responses": { "200": { "description": "content returns {path, docid, content, and section when a section was read, which is {heading, level, line_start, line_end} — level absent for a promoted bold line}. all returns that plus frontmatter, the note's YAML without its --- fences and present even when the note has none, in which case it is an empty string. frontmatter returns {path, docid, frontmatter} and nothing else. metadata returns {path, docid, frontmatter, byte_count, properties (every property row the note holds), and outgoing_links/incoming_links as arrays of {path, docid, properties} — properties names the custom properties that link is filed under, empty for a plain wikilink}." } }
-        }
-    })
-}
+/// One property schema, as a query string can carry it.
+fn query_schema(mut schema: Value, description: &mut String) -> Value {
+    let Some(object) = schema.as_object_mut() else {
+        return schema;
+    };
 
-fn build_list() -> serde_json::Value {
-    serde_json::json!({
-        "get": {
-            "operationId": "listNotes",
-            "summary": "List notes by scope operators, creator or limit, or with no filter at all to enumerate the whole vault.",
-            "parameters": [
-                { "name": "scope", "in": "query", "required": false, "description": "Comma-separated tag terms; a trailing / matches the tag and its descendants. A term starting with / is a directory path from the vault root instead, case-sensitive, with a trailing / its subtree and a path ending in .md one note. Alias of all", "schema": { "type": "string" } },
-                { "name": "all", "in": "query", "required": false, "description": "Comma-separated tag terms a note carries every one of, or directory terms (starting with /, case-sensitive, a trailing / its subtree, a path ending in .md one note) it lies under", "schema": { "type": "string" } },
-                { "name": "any", "in": "query", "required": false, "description": "Comma-separated tag terms a note carries at least one of, or directory terms (starting with /, case-sensitive, a trailing / its subtree, a path ending in .md one note) it lies under", "schema": { "type": "string" } },
-                { "name": "none", "in": "query", "required": false, "description": "Comma-separated tag terms a note carries none of, or directory terms (starting with /, case-sensitive, a trailing / its subtree, a path ending in .md one note) it does not lie under", "schema": { "type": "string" } },
-                { "name": "property", "in": "query", "required": false, "description": "Notes carrying a custom property: NAME, or NAME=VALUE for one value compared as text, URL-encoded. One per call; /api/properties lists the names and values", "schema": { "type": "string" } },
-                { "name": "links_to", "in": "query", "required": false, "description": "Notes that link to this note, named the way a wikilink names it, or by one of its aliases. With property, only links filed under that property count. An unknown note is a 400 naming the nearest one", "schema": { "type": "string" } },
-                { "name": "linked_from", "in": "query", "required": false, "description": "The notes this note links to, named the way a wikilink names it, or by one of its aliases. With property, only links filed under that property count. An unknown note is a 400 naming the nearest one", "schema": { "type": "string" } },
-                { "name": "created_by", "in": "query", "required": false, "description": "Agent filter", "schema": { "type": "string" } },
-                { "name": "limit", "in": "query", "required": false, "description": "Maximum notes to answer. Absent, every note the scope admits", "schema": { "type": "integer" } },
-                { "name": "after", "in": "query", "required": false, "description": "Start after the note at this path, the last path the previous page answered. With limit it reads the listing in pages; a page shorter than limit is the last. A note created or deleted between two pages repeats or skips no other note. In path order the path need not be a note the vault still holds; under a links_in sort it must be, or the answer is a 400, and a link edit between two pages can still move a note across the boundary", "schema": { "type": "string" } },
-                { "name": "sort", "in": "query", "required": false, "description": "Order of the answer: path (default) is the vault's own order, links_in ranks the notes the most other notes link to, links_in_asc the fewest. The ranking runs over the whole listing, so it composes with limit", "schema": { "type": "string", "enum": ["path", "links_in", "links_in_asc"] } },
-                { "name": "detailed", "in": "query", "required": false, "description": "detailed=true answers each note's heading outline beside its path. The value is required; a bare `detailed` does not parse", "schema": { "type": "boolean" } }
-            ],
-            "responses": { "200": { "description": "Array of note summaries, each with aliases, the names the note's frontmatter lists, which read, links_to and linked_from accept in place of its path; links_in, the number of distinct notes that link to it counted over the whole vault, and two sizes from the index: chunk_count, how many units search can return the note as, and token_count, the note's indexed size in tokens. Read the sizes against links_in — a note many others point at that holds little is underwritten, and a long note of few chunks needs sectioning. Under a property filter each note also carries properties, the rows that term matched — narrowed to the links that name the note when links_to is set beside it, and omitted under linked_from, where the matched row belongs to the naming note" } }
-        }
-    })
-}
+    if let Some(types) = object.get("type").and_then(Value::as_array).cloned() {
+        let kept: Vec<Value> = types.into_iter().filter(|t| *t != "null").collect();
+        let one = match kept.as_slice() {
+            [one] => one.clone(),
+            _ => Value::Array(kept),
+        };
+        object.insert("type".into(), one);
+    }
 
-fn build_tags() -> serde_json::Value {
-    serde_json::json!({
-        "get": {
-            "operationId": "listTags",
-            "summary": "The vault's tag vocabulary, whole or under one term, each tag with the notes carrying it.",
-            "parameters": [
-                { "name": "under", "in": "query", "required": false, "description": "One tag term; the rows returned are that tag and its descendants. Omit for the whole vocabulary", "schema": { "type": "string" } }
-            ],
-            "responses": { "200": { "description": "Array of tag rows: path, note_count, and display where the vault spells the tag differently from its path" } }
+    // schemars writes an optional enum as `[inner, {"type": "null"}]`, null last.
+    if let Some(any_of) = object.get("anyOf").and_then(Value::as_array).cloned()
+        && let [inner, null] = any_of.as_slice()
+        && *null == json!({ "type": "null" })
+    {
+        object.remove("anyOf");
+        if let Some(inner) = inner.as_object() {
+            for (k, v) in inner {
+                object.insert(k.clone(), v.clone());
+            }
         }
-    })
-}
+    }
 
-fn build_properties() -> serde_json::Value {
-    serde_json::json!({
-        "get": {
-            "operationId": "listProperties",
-            "summary": "The vault's custom properties: every name with its note count, the kinds seen and Obsidian's declared type, or one property's values.",
-            "parameters": [
-                { "name": "name", "in": "query", "required": false, "description": "One property name; the rows returned are its distinct values, each with its kind and note count. Omit for the registry", "schema": { "type": "string" } }
-            ],
-            "responses": { "200": { "description": "Without name, an array of {name, note_count, kinds, declared_type}; with name, an array of {value, kind, note_count}" } }
+    if object.get("default") == Some(&Value::Null) {
+        object.remove("default");
+    }
+
+    if object.get("type") == Some(&json!("array")) {
+        if !description.is_empty() {
+            description.push(' ');
         }
-    })
-}
+        description.push_str("Comma-separated.");
+        return json!({ "type": "string" });
+    }
 
-fn build_vault_map() -> serde_json::Value {
-    serde_json::json!({
-        "get": {
-            "operationId": "getVaultMap",
-            "summary": "Get vault structure overview: folders, counts, the tag vocabulary and the share of notes it covers, the most-linked notes, and recently changed files.",
-            "responses": { "200": { "description": "Vault structure map" } }
-        }
-    })
-}
-
-fn build_health() -> serde_json::Value {
-    serde_json::json!({
-        "get": {
-            "operationId": "getHealth",
-            "summary": "Get vault health report with orphans, broken links, stale notes, and inbox status.",
-            "responses": { "200": { "description": "Vault health report" } }
-        }
-    })
-}
-
-fn build_validate() -> serde_json::Value {
-    serde_json::json!({
-        "post": {
-            "operationId": "validateVault",
-            "summary": "Check vault markdown for structural and indexing-quality problems.",
-            "requestBody": {
-                "required": false,
-                "content": { "application/json": { "schema": {
-                    "type": "object",
-                    "properties": {
-                        "path": { "type": "string", "description": "A vault-relative note reference to check one file. Mutually exclusive with the scope filters" },
-                        "scope": { "type": "array", "items": { "type": "string" }, "description": "Alias of all. Tag terms, or directory terms starting with / (case-sensitive, trailing / for the subtree, a path ending in .md for one note)" },
-                        "all": { "type": "array", "items": { "type": "string" }, "description": "Check only notes carrying every term (tag or directory term)" },
-                        "any": { "type": "array", "items": { "type": "string" }, "description": "Check only notes carrying at least one term" },
-                        "none": { "type": "array", "items": { "type": "string" }, "description": "Skip notes carrying any term" },
-                        "strict": { "type": "boolean", "description": "Treat warnings as gating in the ok field" }
-                    }
-                }}}
-            },
-            "responses": { "200": { "description": "A report: findings (each {file, line, severity, rule, message}), files_checked, error_count, warning_count, and ok" } }
-        }
-    })
-}
-
-fn build_create() -> serde_json::Value {
-    serde_json::json!({
-        "post": {
-            "operationId": "createNote",
-            "summary": "Create a new note with automatic placement and frontmatter generation.",
-            "requestBody": {
-                "required": true,
-                "content": { "application/json": { "schema": {
-                    "type": "object",
-                    "required": ["content", "filename"],
-                    "properties": {
-                        "content": { "type": "string", "description": "Note content (markdown)" },
-                        "filename": { "type": "string", "description": "Filename for the note: a bare name, or one ending in .md. Becomes the note's breadcrumb root." },
-                        "type_hint": { "type": "string", "description": "Type hint for placement" },
-                        "tags": { "type": "array", "items": { "type": "string" }, "description": "Tags to apply" },
-                        "folder": { "type": "string", "description": "Explicit folder (skips auto-placement)" },
-                        "auto_link": { "type": "boolean", "description": "Set to false to skip automatic wikilink resolution. Defaults to true." }
-                    }
-                }}}
-            },
-            "responses": { "200": { "description": "Created note path and metadata" } }
-        }
-    })
-}
-
-fn build_update() -> serde_json::Value {
-    serde_json::json!({
-        "post": {
-            "operationId": "updateNote",
-            "summary": "Change an existing note. Applies a list of edits in order, in one write.",
-            "description": "Each edit names its target: `section` for one heading, `property` for one frontmatter key, and neither for the note's body. An edit naming both is an error. `content` is a string, or a list of strings for a list-valued property such as tags or aliases; a body edit and a section edit take a string. A section edit's content is the body below the heading — content opening with a heading at or above the section's own level is refused, since such a line ends the section rather than fills it — and `heading` is how a section is renamed. A body edit always keeps the note's frontmatter, so change the frontmatter with `property` edits in the same list. Three things differ from the append/edit/rewrite/edit-frontmatter/update-metadata calls this replaces. A note changed outside knapper and not yet re-indexed fails with an mtime conflict. Replacing a note's frontmatter wholesale has no spelling here: rewrite's `preserve_frontmatter: false` is gone rather than renamed, and the new frontmatter is written with `property` edits instead. A whole-note tag or alias replacement no longer stamps a `modified_by` property on the note.",
-            "requestBody": {
-                "required": true,
-                "content": { "application/json": { "schema": {
-                    "type": "object",
-                    "required": ["file", "edits"],
-                    "additionalProperties": false,
-                    "properties": {
-                        "file": { "type": "string", "description": "Target note (path, basename, or #docid)" },
-                        "edits": {
-                            "type": "array",
-                            "description": "Edits to apply, in order, in one write",
-                            "items": {
-                                "type": "object",
-                                "required": ["mode"],
-                                "additionalProperties": false,
-                                "properties": {
-                                    "section": { "type": "string", "description": "Heading of the section to edit. Omit this and property to edit the body" },
-                                    "property": { "type": "string", "description": "Frontmatter property to edit. Naming a section as well is an error" },
-                                    "heading": { "type": "string", "description": "New heading text for the section this edit names, which renames it. The note keeps the heading's markup, content is optional beside it, and a name another section already holds is refused" },
-                                    "mode": { "type": "string", "enum": ["replace", "prepend", "append", "remove"], "description": "What the edit does. remove deletes a property key, or a section with its heading and its subsections" },
-                                    "content": {
-                                        "description": "A string, or a list of strings to set a list-valued property",
-                                        "oneOf": [
-                                            { "type": "string" },
-                                            { "type": "array", "items": { "type": "string" } }
-                                        ]
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }}}
-            },
-            "responses": { "200": { "description": "Updated note path" } }
-        }
-    })
-}
-
-fn build_move() -> serde_json::Value {
-    serde_json::json!({
-        "post": {
-            "operationId": "moveNote",
-            "summary": "Move a note to a different folder within the vault.",
-            "requestBody": {
-                "required": true,
-                "content": { "application/json": { "schema": {
-                    "type": "object",
-                    "required": ["file", "new_folder"],
-                    "properties": {
-                        "file": { "type": "string", "description": "Target note (path, basename, or #docid)" },
-                        "new_folder": { "type": "string", "description": "Destination folder path" }
-                    }
-                }}}
-            },
-            "responses": { "200": { "description": "New note path" } }
-        }
-    })
-}
-
-fn build_archive() -> serde_json::Value {
-    serde_json::json!({
-        "post": {
-            "operationId": "archiveNote",
-            "summary": "Archive a note (soft delete), or restore one previously archived with `undo: true`. Archiving moves the note to the archive folder and removes it from the index; `undo` reverses that and re-indexes it.",
-            "requestBody": {
-                "required": true,
-                "content": { "application/json": { "schema": {
-                    "type": "object",
-                    "required": ["file"],
-                    "properties": {
-                        "file": { "type": "string", "description": "Target note (path, basename, or #docid); an archived note's path when undoing" },
-                        "undo": { "type": "boolean", "description": "Restore the note instead of archiving it (default false)" }
-                    }
-                }}}
-            },
-            "responses": { "200": { "description": "Archived (or restored) note path" } }
-        }
-    })
-}
-
-fn build_delete() -> serde_json::Value {
-    serde_json::json!({
-        "post": {
-            "operationId": "deleteNote",
-            "summary": "Delete a note. Supports soft (archive) and hard (permanent) modes.",
-            "requestBody": {
-                "required": true,
-                "content": { "application/json": { "schema": {
-                    "type": "object",
-                    "required": ["file"],
-                    "properties": {
-                        "file": { "type": "string", "description": "Target note (path, basename, or #docid)" },
-                        "mode": { "type": "string", "enum": ["soft", "hard"], "description": "'soft' (default) archives the note; 'hard' removes it permanently. A word outside the two is refused." }
-                    }
-                }}}
-            },
-            "responses": { "200": { "description": "Deletion confirmation" } }
-        }
-    })
-}
-
-fn build_index() -> serde_json::Value {
-    serde_json::json!({
-        "post": {
-            "operationId": "indexVault",
-            "summary": "Index the server's vault: walk it, diff it against the store, and re-embed what changed.",
-            "description": "The vault is the one the server was started on; no path is taken here. Send {} to index with no options. A single file is cheaper through /api/reindex-file. The call runs to completion once it starts: it holds the store and the embedder while it runs, so search and every write wait on it while reads keep answering, and a graceful shutdown will not interrupt it. On a large vault a rebuild takes minutes. A read-only server refuses it.",
-            "requestBody": {
-                "required": true,
-                "content": { "application/json": { "schema": {
-                    "type": "object",
-                    "properties": {
-                        "rebuild": { "type": "boolean", "description": "Discard the index and build it again from nothing" },
-                        "no_gitignore": { "type": "boolean", "description": "Index files that .gitignore or .ignore would exclude" }
-                    }
-                }}}
-            },
-            "responses": { "200": { "description": "Counts of new, updated and deleted files, total chunks and the elapsed seconds" } }
-        }
-    })
-}
-
-fn build_status() -> serde_json::Value {
-    serde_json::json!({
-        "get": {
-            "operationId": "getStatus",
-            "summary": "What the index holds: file and chunk counts, edge and connectivity counts, date coverage, index size, whether intelligence is enabled, and pending_events, the watcher events not yet applied.",
-            "responses": { "200": { "description": "Index status fields" } }
-        }
-    })
-}
-
-fn build_reindex_file() -> serde_json::Value {
-    serde_json::json!({
-        "post": {
-            "operationId": "reindexFile",
-            "summary": "Re-index a single file after external edits. Re-reads, re-embeds, and updates search index.",
-            "requestBody": {
-                "required": true,
-                "content": { "application/json": { "schema": {
-                    "type": "object",
-                    "required": ["file"],
-                    "properties": {
-                        "file": { "type": "string", "description": "File path relative to vault root" }
-                    }
-                }}}
-            },
-            "responses": { "200": { "description": "Re-indexed file info (chunks, docid)" } }
-        }
-    })
-}
-
-fn build_identity_endpoint() -> serde_json::Value {
-    serde_json::json!({
-        "get": {
-            "operationId": "getIdentity",
-            "summary": "Returns compact user identity (L0) and current context (L1).",
-            "parameters": [
-                {
-                    "name": "refresh", "in": "query", "required": false,
-                    "description": "Re-extract the L1 facts from the index before answering, without a full re-index. It rewrites the identity_facts rows, so it takes a write key and a read-only server refuses it.",
-                    "schema": { "type": "boolean" }
-                }
-            ],
-            "responses": { "200": { "description": "Identity block as JSON with 'identity' key" } }
-        }
-    })
-}
-
-fn build_init_endpoint() -> serde_json::Value {
-    serde_json::json!({
-        "post": {
-            "operationId": "init",
-            "summary": "Run first-time setup or update identity. Use 'detect' to inspect, 'apply' to configure. The apply reply carries restart_required: true, because the server reads config.toml once, at start.",
-            "requestBody": {
-                "required": true,
-                "content": { "application/json": { "schema": {
-                    "type": "object",
-                    "required": ["mode"],
-                    "properties": {
-                        "mode": { "type": "string", "enum": ["detect", "apply"], "description": "'detect' inspects the vault and writes nothing; 'apply' configures identity and indexes. A read-only server refuses 'apply', because it reaches the same indexing work /api/index is guarded against." },
-                        "name": { "type": "string", "description": "User name (apply mode)" },
-                        "role": { "type": "string", "description": "User role (apply mode)" },
-                        "purpose": { "type": "string", "description": "Vault purpose (apply mode)" }
-                    }
-                }}}
-            },
-            "responses": { "200": { "description": "Setup result as JSON" } }
-        }
-    })
-}
-
-fn build_migrate() -> serde_json::Value {
-    serde_json::json!({
-        "post": {
-            "operationId": "migrate",
-            "summary": "Restructure the vault into PARA. 'preview' classifies notes and suggests folder moves, 'apply' performs them, 'undo' restores the last migration.",
-            "requestBody": {
-                "required": true,
-                "content": { "application/json": { "schema": {
-                    "type": "object",
-                    "required": ["mode"],
-                    "properties": {
-                        "mode": { "type": "string", "description": "'preview', 'apply' or 'undo'" },
-                        "preview": { "type": "object", "description": "The preview to apply. Required for 'apply' mode: send back the plan that 'preview' returned. There is no fallback to a plan saved on the server's disk, because a dropped key would then apply a plan this caller never saw." }
-                    }
-                }}}
-            },
-            "responses": { "200": { "description": "Migration preview, migration result or undo result, per mode" } }
-        }
-    })
-}
-
-/// Build the ChatGPT plugin manifest (ai-plugin.json).
-pub fn build_plugin_manifest(config: &HttpConfig, server_url: &str) -> serde_json::Value {
-    serde_json::json!({
-        "schema_version": "v1",
-        "name_for_human": config.plugin.name.as_deref().unwrap_or("knapper"),
-        "name_for_model": "knapper",
-        "description_for_human": config.plugin.description.as_deref()
-            .unwrap_or("Search and manage your Obsidian vault with AI-powered hybrid search."),
-        "description_for_model": "Access an Obsidian knowledge vault. Use search to find notes by content or time, match to find a literal string or learn that no note holds one, read for a note's content or one of its sections, and list to filter notes by tag or folder. Write tools create, update, and organize notes.",
-        "auth": {
-            "type": "service_http",
-            "authorization_type": "bearer",
-            "verification_tokens": {}
-        },
-        "api": {
-            "type": "openapi",
-            "url": format!("{}/openapi.json", server_url)
-        },
-        "logo_url": "",
-        "contact_email": config.plugin.contact_email.as_deref().unwrap_or(""),
-        "legal_info_url": ""
-    })
+    schema
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     #[test]
     fn test_openapi_spec_structure() {
@@ -529,9 +325,7 @@ mod tests {
         assert_eq!(spec["openapi"], "3.1.0");
         // How many paths there are is the router's business, and
         // `the_spec_describes_every_route_the_router_serves` reads it from
-        // there. A count here is a second declaration that falls out of step
-        // every time one name absorbs another (#62). Assert the shape
-        // instead: every path item declares a method.
+        // there. Assert the shape instead: every path item declares a method.
         let paths = spec["paths"].as_object().unwrap();
         assert!(!paths.is_empty());
         for (path, item) in paths {
@@ -548,161 +342,7 @@ mod tests {
     fn test_openapi_has_security() {
         let spec = build_openapi_spec("http://localhost:3000");
         assert!(spec["components"]["securitySchemes"]["bearerAuth"].is_object());
-    }
-
-    #[test]
-    fn test_plugin_manifest() {
-        let config = crate::config::HttpConfig::default();
-        let manifest = build_plugin_manifest(&config, "https://vault.example.com");
-        assert_eq!(manifest["schema_version"], "v1");
-        assert_eq!(manifest["name_for_model"], "knapper");
-        assert!(
-            manifest["api"]["url"]
-                .as_str()
-                .unwrap()
-                .contains("openapi.json")
-        );
-    }
-
-    /// The tag filter is one capability on three surfaces (#61), so the
-    /// spec names every operator the CLI and MCP take.
-    #[test]
-    fn test_list_documents_every_tag_operator() {
-        let spec = build_openapi_spec("http://localhost:3000");
-        let named: Vec<&str> = spec["paths"]["/api/list"]["get"]["parameters"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|p| p["name"].as_str().unwrap())
-            .collect();
-        for operator in ["scope", "all", "any", "none"] {
-            assert!(named.contains(&operator), "missing parameter: {operator}");
-        }
-    }
-
-    /// The outline is a documented parameter of the HTTP surface, not a
-    /// CLI-only flag (#68).
-    #[test]
-    fn test_list_documents_detailed() {
-        let spec = build_openapi_spec("http://localhost:3000");
-        let named: Vec<&str> = spec["paths"]["/api/list"]["get"]["parameters"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|p| p["name"].as_str().unwrap())
-            .collect();
-        assert!(named.contains(&"detailed"), "missing parameter: detailed");
-    }
-
-    /// Paging is a documented parameter of the HTTP surface (#143).
-    #[test]
-    fn test_list_documents_after() {
-        let spec = build_openapi_spec("http://localhost:3000");
-        let named: Vec<&str> = spec["paths"]["/api/list"]["get"]["parameters"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|p| p["name"].as_str().unwrap())
-            .collect();
-        assert!(named.contains(&"after"), "missing parameter: after");
-    }
-
-    #[test]
-    fn test_tags_documents_under() {
-        let spec = build_openapi_spec("http://localhost:3000");
-        let named: Vec<&str> = spec["paths"]["/api/tags"]["get"]["parameters"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|p| p["name"].as_str().unwrap())
-            .collect();
-        assert_eq!(named, vec!["under"]);
-    }
-
-    #[test]
-    fn test_properties_documents_name() {
-        let spec = build_openapi_spec("http://localhost:3000");
-        let named: Vec<&str> = spec["paths"]["/api/properties"]["get"]["parameters"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|p| p["name"].as_str().unwrap())
-            .collect();
-        assert_eq!(named, vec!["name"]);
-    }
-
-    /// `read` absorbed `graph show`'s docid fact (#62). Every endpoint here
-    /// is description-only, with no per-field schema to keep it honest, so
-    /// the shape change has to be said in the one line that exists.
-    #[test]
-    fn test_read_documents_the_link_shape() {
-        let spec = build_openapi_spec("http://localhost:3000");
-        let description = spec["paths"]["/api/read"]["get"]["responses"]["200"]["description"]
-            .as_str()
-            .unwrap();
-        assert!(
-            description.contains("docid"),
-            "the response description doesn't say what a link looks like: {description}"
-        );
-    }
-
-    /// The set the spec publishes is the set named here — equal, not merely
-    /// contained. A containment check in one direction lets an `operationId`
-    /// be lost with the suite still green, and `reindexFile` and `getIdentity`
-    /// were both absent from the list (#62).
-    #[test]
-    fn test_openapi_has_all_operation_ids() {
-        use std::collections::BTreeSet;
-
-        let spec = build_openapi_spec("http://localhost:3000");
-        let paths = spec["paths"].as_object().unwrap();
-        let mut op_ids: BTreeSet<String> = BTreeSet::new();
-        for (path, methods) in paths {
-            for (method, details) in methods.as_object().unwrap() {
-                let id = details
-                    .get("operationId")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_else(|| panic!("{method} {path} has no operationId"));
-                assert!(
-                    op_ids.insert(id.to_string()),
-                    "{method} {path} repeats operationId {id}"
-                );
-            }
-        }
-        let expected: BTreeSet<String> = [
-            "healthCheck",
-            "searchVault",
-            "matchLiteral",
-            "readNote",
-            "listNotes",
-            "listTags",
-            "listProperties",
-            "getVaultMap",
-            "getHealth",
-            "validateVault",
-            "getStatus",
-            "createNote",
-            "updateNote",
-            "moveNote",
-            "archiveNote",
-            "deleteNote",
-            "indexVault",
-            "reindexFile",
-            "getIdentity",
-            "init",
-            "migrate",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-
-        assert_eq!(
-            op_ids,
-            expected,
-            "\nonly in the spec: {:?}\nonly in the list: {:?}",
-            op_ids.difference(&expected).collect::<Vec<_>>(),
-            expected.difference(&op_ids).collect::<Vec<_>>()
-        );
+        assert_eq!(spec["security"], serde_json::json!([{ "bearerAuth": [] }]));
     }
 
     #[test]
@@ -712,45 +352,436 @@ mod tests {
     }
 
     #[test]
-    fn test_plugin_manifest_custom_config() {
-        let mut config = crate::config::HttpConfig::default();
-        config.plugin.name = Some("my-vault".into());
-        config.plugin.contact_email = Some("test@example.com".into());
-        let manifest = build_plugin_manifest(&config, "https://example.com");
-        assert_eq!(manifest["name_for_human"], "my-vault");
-        assert_eq!(manifest["contact_email"], "test@example.com");
-    }
-
-    #[test]
     fn the_spec_describes_every_route_the_router_serves() {
         let spec = build_openapi_spec("http://localhost:7777");
-        let described: std::collections::BTreeSet<String> =
+        let described: BTreeSet<String> =
             spec["paths"].as_object().unwrap().keys().cloned().collect();
 
-        // The router writes a wildcard as `{*file}`; OpenAPI writes `{file}`.
-        let served: std::collections::BTreeSet<String> = crate::http::routes()
+        let served: BTreeSet<String> = crate::http::routes()
             .into_iter()
-            .map(|(p, _)| p.replace("{*", "{"))
+            .map(|(p, _)| p.to_string())
             .filter(|p| p.starts_with("/api/"))
             .collect();
 
         assert_eq!(served, described, "the spec and the router disagree");
     }
 
+    /// The names an operation publishes — GET parameters or POST body
+    /// properties — are the names the MCP tool publishes for the same
+    /// capability. The tool list registers each `params` struct through
+    /// `serve.rs`, so this holds `params_schema`'s match to the handlers'
+    /// extractors by way of a third registration, and it is the one test
+    /// that replaces the per-field ones (#62).
     #[test]
-    fn test_list_and_search_document_the_property_filters() {
+    fn every_operations_parameters_are_the_mcp_tools_properties() {
+        use crate::surface::{CAPABILITIES, Http};
+
         let spec = build_openapi_spec("http://localhost:3000");
-        let list: Vec<&str> = spec["paths"]["/api/list"]["get"]["parameters"]
+        let tools = crate::serve::KnapperServer::tool_router().list_all();
+        let mut checked = 0;
+
+        for capability in CAPABILITIES {
+            let path = capability.http_path();
+            let (method, published): (&str, BTreeSet<String>) =
+                match capability.http {
+                    Http::Get => (
+                        "get",
+                        spec["paths"][&path]["get"]["parameters"]
+                            .as_array()
+                            .cloned()
+                            .unwrap_or_default()
+                            .iter()
+                            .map(|p| p["name"].as_str().unwrap().to_string())
+                            .collect(),
+                    ),
+                    Http::Post => (
+                        "post",
+                        spec["paths"][&path]["post"]["requestBody"]["content"]["application/json"]
+                            ["schema"]["properties"]
+                            .as_object()
+                            .cloned()
+                            .unwrap_or_default()
+                            .keys()
+                            .cloned()
+                            .collect(),
+                    ),
+                    Http::Exempt(_) => continue,
+                };
+
+            let tool = tools
+                .iter()
+                .find(|t| t.name == capability.mcp_name())
+                .unwrap_or_else(|| panic!("{} is not an MCP tool", capability.name));
+            let mcp: BTreeSet<String> = tool
+                .input_schema
+                .get("properties")
+                .and_then(|p| p.as_object())
+                .map(|o| o.keys().cloned().collect())
+                .unwrap_or_default();
+
+            assert_eq!(
+                published,
+                mcp,
+                "\n{method} {path}: only in the document: {:?}\n{method} {path}: only in the tool: {:?}",
+                published.difference(&mcp).collect::<Vec<_>>(),
+                mcp.difference(&published).collect::<Vec<_>>()
+            );
+            checked += 1;
+        }
+
+        assert_eq!(checked, CAPABILITIES.len(), "a capability was skipped");
+    }
+
+    /// Every operation carries the id and summary its table row gives it.
+    #[test]
+    fn every_operation_carries_its_rows_id_and_summary() {
+        use crate::surface::{CAPABILITIES, Http, OPERATIONS};
+
+        let spec = build_openapi_spec("http://localhost:3000");
+        for capability in CAPABILITIES {
+            let method = match capability.http {
+                Http::Get => "get",
+                Http::Post => "post",
+                Http::Exempt(_) => continue,
+            };
+            let row = OPERATIONS
+                .iter()
+                .find(|o| o.name == capability.name)
+                .unwrap();
+            let operation = &spec["paths"][&capability.http_path()][method];
+            assert_eq!(operation["operationId"], row.id, "{}", capability.name);
+            assert_eq!(operation["summary"], row.summary, "{}", capability.name);
+            assert_eq!(
+                operation["responses"]["200"]["description"], row.response,
+                "{}",
+                capability.name
+            );
+        }
+    }
+
+    /// A GET route reads its struct from the query string, where
+    /// `serde_urlencoded` reads no sequence, so a list is one comma-separated
+    /// value (#61). A POST body keeps the array.
+    #[test]
+    fn a_get_routes_list_parameter_is_a_comma_separated_string() {
+        let spec = build_openapi_spec("http://localhost:3000");
+        let all = spec["paths"]["/api/list"]["get"]["parameters"]
             .as_array()
             .unwrap()
             .iter()
-            .map(|p| p["name"].as_str().unwrap())
-            .collect();
-        let search = &spec["paths"]["/api/search"]["post"]["requestBody"]["content"]["application/json"]
-            ["schema"]["properties"];
-        for name in ["property", "links_to", "linked_from"] {
-            assert!(list.contains(&name), "list is missing {name}");
-            assert!(search.get(name).is_some(), "search is missing {name}");
+            .find(|p| p["name"] == "all")
+            .expect("/api/list takes all");
+        assert_eq!(all["schema"], serde_json::json!({ "type": "string" }));
+        assert!(
+            all["description"]
+                .as_str()
+                .unwrap()
+                .ends_with(" Comma-separated."),
+            "{}",
+            all["description"]
+        );
+
+        let body_all = &spec["paths"]["/api/search"]["post"]["requestBody"]["content"]["application/json"]
+            ["schema"]["properties"]["all"];
+        assert_eq!(body_all["type"], "array");
+        assert_eq!(body_all["items"], serde_json::json!({ "type": "string" }));
+    }
+
+    /// A query string carries no null: an absent parameter is the null a
+    /// body may send. So the `null` schemars adds for an `Option` is dropped,
+    /// a one-of-two `anyOf` collapses to its one schema, and `required` says
+    /// what is optional.
+    #[test]
+    fn a_query_parameter_carries_no_null() {
+        let spec = build_openapi_spec("http://localhost:3000");
+        let read = spec["paths"]["/api/read"]["get"]["parameters"]
+            .as_array()
+            .unwrap();
+        let by_name = |name: &str| {
+            read.iter()
+                .find(|p| p["name"] == name)
+                .unwrap_or_else(|| panic!("/api/read takes {name}"))
+        };
+
+        let file = by_name("file");
+        assert_eq!(file["required"], true);
+        assert_eq!(file["schema"], serde_json::json!({ "type": "string" }));
+
+        let section = by_name("section");
+        assert_eq!(section["required"], false);
+        assert_eq!(section["schema"], serde_json::json!({ "type": "string" }));
+        assert!(
+            section["description"]
+                .as_str()
+                .unwrap()
+                .starts_with("Read one section")
+        );
+
+        let include = by_name("include");
+        assert_eq!(include["required"], false);
+        assert_eq!(include["schema"]["$ref"], "#/components/schemas/Include");
+
+        let limit = spec["paths"]["/api/list"]["get"]["parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == "limit")
+            .unwrap();
+        assert_eq!(limit["schema"]["type"], "integer");
+        assert!(limit["schema"].get("default").is_none());
+    }
+
+    /// The GET rule holds for the two shapes no struct has yet: an optional
+    /// list is still one comma-separated string, and an optional enum with a
+    /// default loses the null and the null default both.
+    #[test]
+    fn the_get_rule_reads_an_optional_list_and_an_optional_enum() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "tags": {
+                    "description": "Tags.",
+                    "type": ["array", "null"],
+                    "items": { "type": "string" },
+                    "default": null
+                },
+                "mode": {
+                    "anyOf": [{ "$ref": "#/components/schemas/Mode" }, { "type": "null" }],
+                    "default": null
+                },
+                "either": {
+                    "anyOf": [{ "type": "string" }, { "type": "integer" }]
+                }
+            }
+        });
+        let parameters = query_parameters(&schema);
+        let by_name = |name: &str| {
+            parameters
+                .iter()
+                .find(|p| p["name"] == name)
+                .unwrap_or_else(|| panic!("no parameter {name}"))
+        };
+
+        let tags = by_name("tags");
+        assert_eq!(tags["schema"], serde_json::json!({ "type": "string" }));
+        assert_eq!(tags["description"], "Tags. Comma-separated.");
+        assert_eq!(tags["required"], false);
+
+        let mode = by_name("mode");
+        assert_eq!(
+            mode["schema"],
+            serde_json::json!({ "$ref": "#/components/schemas/Mode" })
+        );
+
+        let either = by_name("either");
+        assert_eq!(
+            either["schema"]["anyOf"],
+            serde_json::json!([{ "type": "string" }, { "type": "integer" }])
+        );
+    }
+
+    /// Nested types are hoisted to `components.schemas`, where OpenAPI puts
+    /// them; nothing from the standalone JSON Schema dialect is left behind.
+    #[test]
+    fn nested_types_live_under_components() {
+        let spec = build_openapi_spec("http://localhost:3000");
+        let edits = &spec["paths"]["/api/update"]["post"]["requestBody"]["content"]["application/json"]
+            ["schema"]["properties"]["edits"];
+        assert_eq!(edits["items"]["$ref"], "#/components/schemas/Edit");
+        assert!(spec["components"]["schemas"]["Edit"]["properties"]["mode"].is_object());
+        assert_eq!(
+            spec["components"]["schemas"]["Edit"]["properties"]["mode"]["$ref"],
+            "#/components/schemas/EditMode"
+        );
+        for name in [
+            "Edit",
+            "EditContent",
+            "EditMode",
+            "Include",
+            "Sort",
+            "Scan",
+            "DeleteMode",
+            "GroupBy",
+        ] {
+            assert!(
+                spec["components"]["schemas"][name].is_object(),
+                "components.schemas has no {name}"
+            );
         }
+
+        fn walk(value: &serde_json::Value, path: &str, found: &mut Vec<String>) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    for (k, v) in map {
+                        if k == "$defs" || k == "$schema" || k == "title" {
+                            found.push(format!("{path}/{k}"));
+                        }
+                        walk(v, &format!("{path}/{k}"), found);
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for (i, v) in items.iter().enumerate() {
+                        walk(v, &format!("{path}/{i}"), found);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut found = Vec::new();
+        walk(&spec["paths"], "paths", &mut found);
+        walk(
+            &spec["components"]["schemas"],
+            "components/schemas",
+            &mut found,
+        );
+        assert!(
+            found.is_empty(),
+            "standalone-dialect keys in the document: {found:?}"
+        );
+    }
+
+    #[test]
+    fn the_version_is_the_crates_own() {
+        let spec = build_openapi_spec("http://localhost:3000");
+        assert_eq!(spec["info"]["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(spec["info"]["description"], env!("CARGO_PKG_DESCRIPTION"));
+    }
+
+    /// The liveness probe is the transport's own route. It takes no key, and
+    /// the document says so.
+    #[test]
+    fn health_check_takes_no_key() {
+        let spec = build_openapi_spec("http://localhost:3000");
+        let op = &spec["paths"]["/api/health-check"]["get"];
+        assert_eq!(op["operationId"], "healthCheck");
+        assert_eq!(op["security"], serde_json::json!([]));
+        assert!(op["responses"]["200"]["content"]["text/plain"].is_object());
+        assert!(op.get("parameters").is_none());
+    }
+
+    /// Every capability operation documents the error body under every
+    /// status the classifier can answer. The classifier is one function and
+    /// which status a call reaches depends on its arguments, so the set is
+    /// the same on every route.
+    #[test]
+    fn every_operation_answers_the_error_body() {
+        use crate::surface::{CAPABILITIES, Http};
+
+        let spec = build_openapi_spec("http://localhost:3000");
+        let statuses = ["400", "401", "403", "404", "409", "429", "500"];
+
+        for status in statuses {
+            let response = &spec["components"]["responses"][status];
+            assert!(
+                response["description"]
+                    .as_str()
+                    .is_some_and(|d| !d.is_empty()),
+                "components.responses.{status} has no description"
+            );
+            assert_eq!(
+                response["content"]["application/json"]["schema"]["$ref"],
+                "#/components/schemas/Error",
+                "{status}"
+            );
+        }
+
+        let error = &spec["components"]["schemas"]["Error"];
+        assert_eq!(error["type"], "object");
+        assert_eq!(error["required"], serde_json::json!(["error", "kind"]));
+        assert_eq!(error["properties"]["error"]["type"], "string");
+        let kinds: BTreeSet<&str> = error["properties"]["kind"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|k| k.as_str().unwrap())
+            .collect();
+        let want: BTreeSet<&str> = crate::fault::Fault::KINDS
+            .iter()
+            .chain(crate::http::ApiError::TRANSPORT_KINDS)
+            .copied()
+            .collect();
+        assert_eq!(kinds, want);
+
+        for capability in CAPABILITIES {
+            let method = match capability.http {
+                Http::Get => "get",
+                Http::Post => "post",
+                Http::Exempt(_) => continue,
+            };
+            let responses = &spec["paths"][&capability.http_path()][method]["responses"];
+            for status in statuses {
+                assert_eq!(
+                    responses[status]["$ref"],
+                    format!("#/components/responses/{status}"),
+                    "{} {method} {status}",
+                    capability.name
+                );
+            }
+        }
+
+        let health = &spec["paths"]["/api/health-check"]["get"]["responses"];
+        assert_eq!(
+            health.as_object().unwrap().len(),
+            1,
+            "health-check answers 200 alone"
+        );
+    }
+
+    /// The description under each status names the kinds the classifier
+    /// answers with that status, so the document and `From<anyhow::Error>
+    /// for ApiError` cannot say different things.
+    #[test]
+    fn each_kind_is_listed_under_the_status_the_classifier_answers() {
+        use crate::fault::Fault;
+        use crate::http::ApiError;
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let spec = build_openapi_spec("http://localhost:3000");
+
+        // What the classifier answers: status → the kinds it gives that status.
+        let mut classified: BTreeMap<u16, BTreeSet<&str>> = BTreeMap::new();
+        let faults = [
+            Fault::InvalidInput("x".into()),
+            Fault::NotFound("x".into()),
+            Fault::Ambiguous("x".into()),
+            Fault::Conflict("x".into()),
+            Fault::StaleIndex("x".into()),
+            Fault::ReadOnly,
+        ];
+        for fault in faults {
+            let kind = fault.kind();
+            let api = ApiError::from(anyhow::Error::from(fault));
+            classified
+                .entry(api.status.as_u16())
+                .or_default()
+                .insert(kind);
+        }
+        for api in [
+            ApiError::unauthorized("x"),
+            ApiError::forbidden("x"),
+            ApiError::rate_limited(1),
+            ApiError::internal("x"),
+        ] {
+            classified
+                .entry(api.status.as_u16())
+                .or_default()
+                .insert(api.kind);
+        }
+
+        // What the document says: status → the kinds its description names,
+        // each written as `(kind <word>)`.
+        let responses = spec["components"]["responses"].as_object().unwrap();
+        let mut documented: BTreeMap<u16, BTreeSet<&str>> = BTreeMap::new();
+        for (status, response) in responses {
+            let description = response["description"].as_str().unwrap();
+            let kinds: BTreeSet<&str> = description
+                .split("(kind ")
+                .skip(1)
+                .map(|rest| rest.split(')').next().unwrap())
+                .collect();
+            documented.insert(status.parse().unwrap(), kinds);
+        }
+
+        assert_eq!(documented, classified);
     }
 }

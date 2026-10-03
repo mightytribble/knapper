@@ -37,6 +37,17 @@ pub enum Fault {
 }
 
 impl Fault {
+    /// Every kind, in variant order. The OpenAPI document's `kind` enum
+    /// reads it, so it agrees with `kind()` by test.
+    pub const KINDS: &'static [&'static str] = &[
+        "invalid_input",
+        "not_found",
+        "ambiguous",
+        "conflict",
+        "stale_index",
+        "read_only",
+    ];
+
     /// The kind as a snake_case word, for the `kind` field of an error body.
     pub fn kind(&self) -> &'static str {
         match self {
@@ -105,6 +116,37 @@ mod tests {
         ];
         for (fault, kind) in cases {
             assert_eq!(fault.kind(), kind, "{fault:?}");
+        }
+    }
+
+    /// `KINDS` is what the OpenAPI document publishes as the `kind` enum, so
+    /// it has to agree with `kind()`.
+    #[test]
+    fn kinds_lists_every_variant_once() {
+        let variants = [
+            Fault::InvalidInput("x".into()),
+            Fault::NotFound("x".into()),
+            Fault::Ambiguous("x".into()),
+            Fault::Conflict("x".into()),
+            Fault::StaleIndex("x".into()),
+            Fault::ReadOnly,
+        ];
+        assert_eq!(Fault::KINDS.len(), variants.len());
+        for (i, fault) in variants.iter().enumerate() {
+            assert_eq!(Fault::KINDS[i], fault.kind(), "{fault:?}");
+        }
+
+        // A new variant must be added to `variants` above and to `KINDS`.
+        // This match has no wildcard, so adding one is a compile error here.
+        for fault in &variants {
+            match fault {
+                Fault::InvalidInput(_)
+                | Fault::NotFound(_)
+                | Fault::Ambiguous(_)
+                | Fault::Conflict(_)
+                | Fault::StaleIndex(_)
+                | Fault::ReadOnly => {}
+            }
         }
     }
 

@@ -19,12 +19,22 @@ Links resolve against https://github.com/mightytribble/knapper.
 - An `update` of a note changed on disk since it was indexed, a `create` or `move` onto an existing path, or an `archive` of an archived note answers 409 on HTTP, where it answered 500. ([`8625935`](https://github.com/mightytribble/knapper/commit/8625935))
 - Four texts: `read`'s `File not found:` is now `file not found:`, the same text the write tools answer. `update`'s edit error is `editing <file>: <error>`, where it was `<error> in <file>`. The read-only refusal is one sentence on both servers. `reindex-file` of a path not on disk answers `file not found: <path>` on the CLI and both servers, where it answered an `io::Error` chain. ([`2414607`](https://github.com/mightytribble/knapper/commit/2414607), [`b5810d1`](https://github.com/mightytribble/knapper/commit/b5810d1))
 - `match` on an index built before frontmatter indexing, and `reindex-file` of a file that exists but cannot be read, answer 500 on HTTP where they answered 400. Neither is the caller's fault. ([`8625935`](https://github.com/mightytribble/knapper/commit/8625935), [`2414607`](https://github.com/mightytribble/knapper/commit/2414607))
+- `GET /openapi.json` is generated from the parameter declarations the CLI and MCP read, so every parameter it names is one the server reads and every description is the same text an MCP client sees. GET parameters carry their types, nested types sit under `components.schemas`, `operationId`s are unchanged. ([`f52f2db`](https://github.com/mightytribble/knapper/commit/f52f2db))
+- The OpenAPI document carries the error body: `components.schemas.Error` is `{error, kind}`, and every capability operation lists 400, 401, 403, 404, 409, 429 and 500 with the kinds each carries. ([`215016f`](https://github.com/mightytribble/knapper/commit/215016f))
+- `[http.plugin] public_url` is `[http] public_url`. A config that still holds the old table loads, and its `public_url` has no effect until it is moved. ([`0917b5c`](https://github.com/mightytribble/knapper/commit/0917b5c))
+- `knapper configure --setup-chatgpt` no longer prompts for a public URL, and it allows `https://chatgpt.com` beside `https://chat.openai.com`. ([`0917b5c`](https://github.com/mightytribble/knapper/commit/0917b5c))
+
+### Removed
+
+- `GET /.well-known/ai-plugin.json`, the ChatGPT plugin manifest OpenAI retired, and the `[http.plugin]` keys `name`, `description` and `contact_email` that filled it. GPT Actions import reads `/openapi.json` alone. ([`0917b5c`](https://github.com/mightytribble/knapper/commit/0917b5c))
 
 ### Fixed
 
 - A read tool — `read`, `list`, `tags`, `properties`, `vault_map`, `status`, `health`, `match` — no longer waits for a search, a write or the `index` tool under `serve`: reads answer from a second connection. ([`7506a7c`](https://github.com/mightytribble/knapper/commit/7506a7c), [`fa976ab`](https://github.com/mightytribble/knapper/commit/fa976ab))
 - `serve` no longer holds every tool while it reconciles changes made while it was down. The reconciliation runs per file in the background, and `status` says how many events are pending. `last_indexed_at` advances only when the watcher applies events, so a vault unchanged at startup leaves it as it was. ([`5167c16`](https://github.com/mightytribble/knapper/commit/5167c16), [`34cf462`](https://github.com/mightytribble/knapper/commit/34cf462))
 - MCP answers `INVALID_PARAMS` for a scope term, cursor or filter naming nothing, a missing note or section, an alias two notes carry and an empty `match` pattern, and `INVALID_REQUEST` for a conflict — a note changed on disk, a `create` or `move` onto an existing path, an `archive` of an archived note — and for a read-only server, where it answered `INTERNAL_ERROR` for all of them; `data.kind` names the kind. ([`acc87b9`](https://github.com/mightytribble/knapper/commit/acc87b9), [`2414607`](https://github.com/mightytribble/knapper/commit/2414607))
+- The `search` operation's summary in `/openapi.json` was 412 characters, over the 300 ChatGPT's Actions importer accepts (#87); every summary is now held under the cap by a test. ([`4fa6b28`](https://github.com/mightytribble/knapper/commit/4fa6b28))
+- `/openapi.json` reported `"version": "1.6.0"`; it now reports the crate version. ([`f52f2db`](https://github.com/mightytribble/knapper/commit/f52f2db))
 
 ## 0.9.11 (2026-09-11)
 
