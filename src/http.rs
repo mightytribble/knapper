@@ -669,8 +669,13 @@ async fn handle_status(
     // The store is this server's own, so the reads see one snapshot and no
     // second connection runs the schema batch against the writer.
     let store = state.store.lock().await;
-    let report = search::status_json(&store, &data_dir)
-        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    let report = search::status_json(
+        &store,
+        &data_dir,
+        &crate::config::Config::load().unwrap_or_default(),
+        0,
+    )
+    .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
     Ok(Json(report))
 }
 
