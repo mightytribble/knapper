@@ -306,6 +306,148 @@ pub const CAPABILITIES: &[Capability] = &[
     },
 ];
 
+/// What a capability's HTTP operation says about itself in the OpenAPI
+/// document `openapi.rs` generates.
+///
+/// The parameters are not here: they come from the capability's `params`
+/// struct. This table holds the three things a struct cannot say — the
+/// operation's id, one summary, and what the 200 reply holds.
+pub struct Operation {
+    /// The capability name, as `CAPABILITIES` spells it.
+    pub name: &'static str,
+    /// The `operationId`. A client configured against it keeps working, so
+    /// it does not change when the summary does.
+    pub id: &'static str,
+    /// At most 300 characters. ChatGPT's Actions importer refuses more (#87).
+    pub summary: &'static str,
+    /// What the 200 reply holds. Handlers build their replies as
+    /// `serde_json::Value`, so there is no struct to derive this from.
+    pub response: &'static str,
+}
+
+pub const OPERATIONS: &[Operation] = &[
+    Operation {
+        name: "search",
+        id: "searchVault",
+        summary: "Hybrid semantic + full-text search across the vault. A query pairs with a filter: {\"query\": \"the disagreement over the schedule\", \"links_to\": \"project-atlas\"} cuts the pool to the notes linking that note and ranks the query inside them. The filter runs first; the ranking runs inside it.",
+        response: "An envelope: status ('ok' or 'no_results'); degraded (bool, true when no cross-encoder ranked the results); warnings (array of strings); notes, each answering note's frontmatter properties keyed by path, as a name-to-value map — a value carries its own JSON type, so a number is a number, a checkbox a bool, a key with no value null, a wikilink {link, path} with path present when it resolves, and a name the note carries more than once an array — omitted when no answering note carries a property; blocks, the results that answered, each {id, path, heading_path, lanes (the lanes that account for the result, any of 'semantic', 'keyword', 'linked'), text, untrusted_content, truncated, and score when scores was requested}, with a block's properties read from notes under its path — text is absent on a row the caller asked no text for, which is every row under summaries; overflow, the results the budget excluded, each {id, path, heading_path, lanes, and score when requested} with no text; and less_relevant, the candidates the answer floor rejected, in whatever slots top_n had left after the answers, each carrying its score whether or not scores was requested, beside answer_floor, the floor they missed, on the same 0-100 scale — both omitted when the floor rejected nothing, and a no_results reply that carries them is still no_results. explain, the per-lane breakdown, rides beside the envelope when the request asked for it",
+    },
+    Operation {
+        name: "match",
+        id: "matchLiteral",
+        summary: "Confirm whether a literal string still appears in the vault's note text, and count the notes holding it.",
+        response: "{pattern, notes (how many notes hold it — 0 means nothing in scope says it), lines (distinct matched lines across every note), hits (the matched lines, capped by limit, each {file, in, heading_path, line})}. The scan is exhaustive and unranked over a note's prose and its frontmatter both; `in` names which half a hit came from, and `scan` narrows the reading to one of them. A wikilink is compared as its display text as well as its markup, so a phrase spanning one is found; the reported line is the note as written.",
+    },
+    Operation {
+        name: "read",
+        id: "readNote",
+        summary: "Read a note's content, its frontmatter, both, or its metadata, chosen with include.",
+        response: "content returns {path, docid, content, and section when a section was read, which is {heading, level, line_start, line_end} — level absent for a promoted bold line}. all returns that plus frontmatter, the note's YAML without its --- fences and present even when the note has none, in which case it is an empty string. frontmatter returns {path, docid, frontmatter} and nothing else. metadata returns {path, docid, frontmatter, byte_count, properties (every property row the note holds), and outgoing_links/incoming_links as arrays of {path, docid, properties} — properties names the custom properties that link is filed under, empty for a plain wikilink}.",
+    },
+    Operation {
+        name: "list",
+        id: "listNotes",
+        summary: "List notes by scope operators, creator or limit, or with no filter at all to enumerate the whole vault.",
+        response: "Array of note summaries, each with aliases, the names the note's frontmatter lists, which read, links_to and linked_from accept in place of its path; links_in, the number of distinct notes that link to it counted over the whole vault, and two sizes from the index: chunk_count, how many units search can return the note as, and token_count, the note's indexed size in tokens. Read the sizes against links_in — a note many others point at that holds little is underwritten, and a long note of few chunks needs sectioning. Under a property filter each note also carries properties, the rows that term matched — narrowed to the links that name the note when links_to is set beside it, and omitted under linked_from, where the matched row belongs to the naming note",
+    },
+    Operation {
+        name: "tags",
+        id: "listTags",
+        summary: "The vault's tag vocabulary, whole or under one term, each tag with the notes carrying it.",
+        response: "Array of tag rows: path, note_count, and display where the vault spells the tag differently from its path",
+    },
+    Operation {
+        name: "properties",
+        id: "listProperties",
+        summary: "The vault's custom properties: every name with its note count, the kinds seen and Obsidian's declared type, or one property's values.",
+        response: "Without name, an array of {name, note_count, kinds, declared_type}; with name, an array of {value, kind, note_count}",
+    },
+    Operation {
+        name: "vault-map",
+        id: "getVaultMap",
+        summary: "Get vault structure overview: folders, counts, the tag vocabulary and the share of notes it covers, the most-linked notes, and recently changed files.",
+        response: "Vault structure map",
+    },
+    Operation {
+        name: "create",
+        id: "createNote",
+        summary: "Create a new note with automatic placement and frontmatter generation.",
+        response: "Created note path and metadata",
+    },
+    Operation {
+        name: "update",
+        id: "updateNote",
+        summary: "Change an existing note. Applies a list of edits in order, in one write.",
+        response: "Updated note path",
+    },
+    Operation {
+        name: "delete",
+        id: "deleteNote",
+        summary: "Delete a note. Supports soft (archive) and hard (permanent) modes.",
+        response: "Deletion confirmation",
+    },
+    Operation {
+        name: "move",
+        id: "moveNote",
+        summary: "Move a note to a different folder within the vault.",
+        response: "New note path",
+    },
+    Operation {
+        name: "archive",
+        id: "archiveNote",
+        summary: "Archive a note (soft delete), or restore one previously archived with `undo: true`. Archiving moves the note to the archive folder and removes it from the index; `undo` reverses that and re-indexes it.",
+        response: "Archived (or restored) note path",
+    },
+    Operation {
+        name: "index",
+        id: "indexVault",
+        summary: "Index the server's vault: walk it, diff it against the store, and re-embed what changed.",
+        response: "Counts of new, updated and deleted files, total chunks and the elapsed seconds",
+    },
+    Operation {
+        name: "reindex-file",
+        id: "reindexFile",
+        summary: "Re-index a single file after external edits. Re-reads, re-embeds, and updates search index.",
+        response: "Re-indexed file info (chunks, docid)",
+    },
+    Operation {
+        name: "status",
+        id: "getStatus",
+        summary: "What the index holds: file and chunk counts, edge and connectivity counts, date coverage, index size, whether intelligence is enabled, and pending_events, the watcher events not yet applied.",
+        response: "Index status fields",
+    },
+    Operation {
+        name: "health",
+        id: "getHealth",
+        summary: "Get vault health report with orphans, broken links, stale notes, and inbox status.",
+        response: "Vault health report",
+    },
+    Operation {
+        name: "validate",
+        id: "validateVault",
+        summary: "Check vault markdown for structural and indexing-quality problems.",
+        response: "A report: findings (each {file, line, severity, rule, message}), files_checked, error_count, warning_count, and ok",
+    },
+    Operation {
+        name: "identity",
+        id: "getIdentity",
+        summary: "Returns compact user identity (L0) and current context (L1).",
+        response: "Identity block as JSON with 'identity' key",
+    },
+    Operation {
+        name: "init",
+        id: "init",
+        summary: "Run first-time setup or update identity. Use 'detect' to inspect, 'apply' to configure. The apply reply carries restart_required: true, because the server reads config.toml once, at start.",
+        response: "Setup result as JSON",
+    },
+    Operation {
+        name: "migrate",
+        id: "migrate",
+        summary: "Restructure the vault into PARA. 'preview' classifies notes and suggests folder moves, 'apply' performs them, 'undo' restores the last migration.",
+        response: "Migration preview, migration result or undo result, per mode",
+    },
+];
+
 /// What the CLI has yet to bring onto the table (#62). Empty: every
 /// capability the table names is one top-level command.
 pub const PENDING_CLI: &[Pending] = &[];
@@ -853,6 +995,61 @@ mod tests {
     #[test]
     fn there_are_twenty_capabilities() {
         assert_eq!(CAPABILITIES.len(), 20);
+    }
+
+    /// The operation table is one row per capability the HTTP surface
+    /// serves: a capability without a row has no `operationId`, and a row
+    /// without a capability describes a route that does not exist.
+    #[test]
+    fn every_http_capability_has_one_operation_and_no_operation_is_an_orphan() {
+        let capabilities: BTreeSet<&str> = CAPABILITIES
+            .iter()
+            .filter(|c| !matches!(c.http, Http::Exempt(_)))
+            .map(|c| c.name)
+            .collect();
+        let rows: Vec<&str> = OPERATIONS.iter().map(|o| o.name).collect();
+        let distinct: BTreeSet<&str> = rows.iter().copied().collect();
+        assert_eq!(
+            rows.len(),
+            distinct.len(),
+            "a capability has two rows: {rows:?}"
+        );
+        assert_eq!(
+            distinct,
+            capabilities,
+            "\nrows with no capability: {:?}\ncapabilities with no row: {:?}",
+            distinct.difference(&capabilities).collect::<Vec<_>>(),
+            capabilities.difference(&distinct).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn operation_ids_are_unique() {
+        let mut seen = BTreeSet::new();
+        for o in OPERATIONS {
+            assert!(seen.insert(o.id), "{} repeats operationId {}", o.name, o.id);
+        }
+    }
+
+    /// ChatGPT's Actions importer refuses a summary over 300 characters, and
+    /// the hand-written spec shipped one of 412 (#87). The cap is a test so
+    /// the next long summary fails here and not at import.
+    #[test]
+    fn no_summary_exceeds_300_characters() {
+        for o in OPERATIONS {
+            let len = o.summary.chars().count();
+            assert!(
+                len <= 300,
+                "{}: the summary is {len} characters; the cap is 300",
+                o.name
+            );
+            assert!(!o.summary.is_empty(), "{}: the summary is empty", o.name);
+            assert!(
+                !o.response.is_empty(),
+                "{}: the 200 description is empty",
+                o.name
+            );
+        }
     }
 
     #[test]
