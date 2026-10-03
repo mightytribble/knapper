@@ -145,24 +145,34 @@ pub fn start_watcher(
 }
 
 /// What the vault holds that the store does not, as the events the consumer
-/// applies: a `Deleted` for each record the disk no longer holds, a `Changed`
-/// for each new or changed path. Reads the file records through the reader,
-/// then walks and hashes the vault holding no lock, so a read is not delayed
-/// by the walk.
+/// applies: a `Changed` for each new or changed path, and for each record the
+/// walk did not admit, an `Evicted` when its file is on disk before and after
+/// the walk and a `Deleted` otherwise. A file on disk that the walk left out
+/// is excluded, gitignored or hidden, and `index` drops its row too. Reads the
+/// file records through the reader, then walks and hashes the vault holding no
+/// lock, so a read is not delayed by the walk.
 pub async fn diff_events(core: &Core, exclude: &[String]) -> anyhow::Result<Vec<WatchEvent>> {
     let stored = core.with_reader(|store| store.get_all_files()).await?;
     let vault = core.vault_path.clone();
     let exclude = exclude.to_vec();
     let respect_gitignore = core.config.respect_gitignore;
     crate::core::blocking(move || {
+        let on_disk_before: std::collections::HashSet<String> = stored
+            .iter()
+            .filter(|record| vault.join(&record.path).exists())
+            .map(|record| record.path.clone())
+            .collect();
         let files = indexer::walk_vault(&vault, &exclude, respect_gitignore)?;
         let (new_files, changed_files, deleted) = indexer::diff_files(&files, &vault, stored)?;
         let mut events = Vec::with_capacity(new_files.len() + changed_files.len() + deleted.len());
-        events.extend(
-            deleted
-                .into_iter()
-                .map(|record| WatchEvent::Deleted(vault.join(&record.path))),
-        );
+        events.extend(deleted.into_iter().map(|record| {
+            let path = vault.join(&record.path);
+            if on_disk_before.contains(&record.path) && path.exists() {
+                WatchEvent::Evicted(path)
+            } else {
+                WatchEvent::Deleted(path)
+            }
+        }));
         events.extend(
             new_files
                 .into_iter()
@@ -211,8 +221,13 @@ fn settle(pending: &AtomicUsize, k: usize) {
 pub enum WatchEvent {
     /// File content was modified or a new file was created.
     Changed(PathBuf),
-    /// File was deleted.
+    /// File was deleted. Skipped when the path holds a file at apply time.
     Deleted(PathBuf),
+    /// A stored note the vault diff did not admit while its file stayed on
+    /// disk: excluded, gitignored or hidden. Its row is removed whether or not
+    /// the file exists. Move detection never pairs it, because the file did
+    /// not move.
+    Evicted(PathBuf),
     /// File was moved/renamed (detected via content hash or inode tracking).
     Moved { from: PathBuf, to: PathBuf },
     /// macOS FSEvents buffer overflow — full rescan needed.
@@ -409,7 +424,8 @@ fn process_debounced_events(
 /// When a file is moved, the OS reports a delete at the old path and a create at
 /// the new path. We match these by comparing the stored content hash (for the
 /// deleted file) against the on-disk content hash (for the new file). Matched
-/// pairs are replaced with `Moved { from, to }` events.
+/// pairs are replaced with `Moved { from, to }` events. An `Evicted` is not a
+/// candidate: its file is still at its own path.
 fn detect_moves(events: &mut Vec<WatchEvent>, store: &Store, vault_path: &Path) {
     // Collect deletion paths and their stored content hashes.
     let mut deletion_hashes: HashMap<String, PathBuf> = HashMap::new();
@@ -670,20 +686,21 @@ async fn apply_event(core: &Core, event: WatchEvent) -> anyhow::Result<Option<i6
             tracing::info!(path = %rel, file_id, "indexed changed file");
             Ok(Some(file_id))
         }
-        WatchEvent::Deleted(path) => {
-            // A path on disk is not deleted. The startup diff runs beside the
-            // live watcher, so its `Deleted` can arrive after a `Changed` that
-            // restored the note (#93).
-            if path.exists() {
-                tracing::debug!(path = %path.display(), "skipping deletion for a file on disk");
-                return Ok(None);
-            }
+        // A path on disk is not deleted. The startup diff runs beside the live
+        // watcher, so its `Deleted` can arrive after a `Changed` that restored
+        // the note (#93).
+        WatchEvent::Deleted(path) if path.exists() => {
+            tracing::debug!(path = %path.display(), "skipping deletion for a file on disk");
+            Ok(None)
+        }
+        // An `Evicted` file is on disk by definition, so it takes no guard.
+        WatchEvent::Deleted(path) | WatchEvent::Evicted(path) => {
             let rel = rel_of(&core.vault_path, &path);
             let vault = core.vault_path.clone();
             let rel_for_call = rel.clone();
             core.with_core(move |g| remove_deleted_file(g, &rel_for_call, &vault))
                 .await?;
-            tracing::info!(path = %rel, "removed deleted file from index");
+            tracing::info!(path = %rel, "removed file from index");
             Ok(None)
         }
         WatchEvent::Moved { from, to } => {
@@ -1284,6 +1301,123 @@ mod tests {
             .await
             .unwrap();
         assert!(row.is_some(), "the note on disk keeps its row");
+    }
+
+    /// Reconciliation drops a stored note the walk no longer admits even
+    /// though its file is on disk, as `index` does. Here one note is under an
+    /// excluded folder, one is gitignored and one is gone from disk.
+    #[tokio::test]
+    async fn reconciliation_evicts_a_note_that_is_now_excluded() {
+        use super::{WatchEvent, diff_events, enqueue_diff, rel_of, run_consumer};
+        use crate::core::testing::{indexed_core, test_config};
+        use std::sync::atomic::Ordering;
+        use tokio::sync::mpsc;
+
+        let body = |n: &str| {
+            format!(
+                "# {n}\n\nThe body of note {n}, long enough to be its own chunk and then some.\n"
+            )
+        };
+        let (_tmp, core) = indexed_core(
+            &[
+                ("a.md", &body("a")),
+                ("archive/b.md", &body("b")),
+                ("c.md", &body("c")),
+                ("d.md", &body("d")),
+            ],
+            test_config(),
+        );
+        let vault = core.vault_path.as_ref().clone();
+        std::fs::create_dir(vault.join(".git")).unwrap();
+        std::fs::write(vault.join(".gitignore"), "c.md\n").unwrap();
+        std::fs::remove_file(vault.join("d.md")).unwrap();
+        let exclude = vec!["archive/".to_string()];
+
+        // On disk and not admitted is an eviction; gone from disk keeps the
+        // guarded deletion.
+        let mut kinds: Vec<(String, &str)> = diff_events(&core, &exclude)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| match e {
+                WatchEvent::Evicted(p) => (rel_of(&vault, &p), "evicted"),
+                WatchEvent::Deleted(p) => (rel_of(&vault, &p), "deleted"),
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        kinds.sort();
+        assert_eq!(
+            kinds,
+            vec![
+                ("archive/b.md".to_string(), "evicted"),
+                ("c.md".to_string(), "evicted"),
+                ("d.md".to_string(), "deleted"),
+            ]
+        );
+
+        let (tx, rx) = mpsc::channel(4);
+        enqueue_diff(&core, &exclude, &tx).await.unwrap();
+        drop(tx);
+        run_consumer(rx, core.clone(), exclude).await;
+        assert_eq!(core.pending_events.load(Ordering::Relaxed), 0);
+
+        let (paths, chunks) = core
+            .with_reader(|store| {
+                let files = store.get_all_files()?;
+                let mut chunks = 0;
+                for f in &files {
+                    chunks += store.get_chunks_by_file(f.id)?.len();
+                }
+                let mut paths: Vec<String> = files.into_iter().map(|f| f.path).collect();
+                paths.sort();
+                Ok((paths, chunks))
+            })
+            .await
+            .unwrap();
+        assert_eq!(paths, vec!["a.md".to_string()]);
+        let a_chunks = core
+            .with_reader(|store| {
+                let id = store.get_file("a.md")?.unwrap().id;
+                Ok(store.get_chunks_by_file(id)?.len())
+            })
+            .await
+            .unwrap();
+        assert_eq!(chunks, a_chunks, "only a.md's chunks remain");
+        assert!(vault.join("archive/b.md").exists());
+        assert!(vault.join("c.md").exists());
+    }
+
+    /// A rescan with an excluded note on disk evicts it, while the vault's
+    /// other changes still apply.
+    #[tokio::test]
+    async fn a_full_rescan_evicts_an_excluded_note() {
+        use super::{WatchEvent, run_consumer};
+        use crate::core::testing::{indexed_core, test_config};
+        use std::sync::atomic::Ordering;
+        use tokio::sync::mpsc;
+
+        let body = |n: &str| {
+            format!(
+                "# {n}\n\nThe body of note {n}, long enough to be its own chunk and then some.\n"
+            )
+        };
+        let (_tmp, core) = indexed_core(
+            &[("a.md", &body("a")), ("archive/b.md", &body("b"))],
+            test_config(),
+        );
+
+        let (tx, rx) = mpsc::channel(4);
+        core.pending_events.fetch_add(1, Ordering::Relaxed);
+        tx.send(vec![WatchEvent::FullRescan]).await.unwrap();
+        drop(tx);
+        run_consumer(rx, core.clone(), vec!["archive/".to_string()]).await;
+        assert_eq!(core.pending_events.load(Ordering::Relaxed), 0);
+
+        let row = core
+            .with_reader(|store| store.get_file("archive/b.md"))
+            .await
+            .unwrap();
+        assert!(row.is_none(), "the excluded note is evicted");
     }
 
     /// A batch that carries a `FullRescan` is replaced by the vault diff: the
