@@ -595,18 +595,12 @@ async fn main() -> Result<()> {
         Command::Init {
             args,
             path,
-            identity,
             reindex,
             detect,
             json,
             quiet,
         } => {
-            let knapper::params::Init {
-                mode,
-                name,
-                role,
-                purpose,
-            } = args;
+            let knapper::params::Init { mode } = args;
             // `--mode` is the name the servers call these two paths by;
             // `--detect` and `--json` are the CLI's older spelling of the
             // same two, and both reach the same code (#62).
@@ -643,10 +637,6 @@ async fn main() -> Result<()> {
 
             if json {
                 let flags = knapper::onboarding::ApplyFlags {
-                    name,
-                    role,
-                    purpose,
-                    identity_only: identity,
                     reindex_only: reindex,
                 };
                 let settings = knapper::indexer::IndexSettings::from_config(&cfg);
@@ -662,58 +652,10 @@ async fn main() -> Result<()> {
             }
 
             let flags = knapper::onboarding::InteractiveFlags {
-                name,
-                role,
-                purpose,
-                identity_only: identity,
                 reindex_only: reindex,
                 quiet,
             };
             knapper::onboarding::run_interactive(&vault_path, &mut cfg, &data_dir, flags)?;
-        }
-
-        Command::Identity(args) => {
-            let json = cli.json;
-            let db_path = config::db_path(&data_dir);
-            if !db_path.exists() {
-                anyhow::bail!("No index found. Run `knapper init` first.");
-            }
-            let store = knapper::store::Store::open(&db_path)?;
-            if args.refresh {
-                let profile = knapper::config::Config::load_vault_profile()?;
-                match profile {
-                    Some(ref p) => {
-                        knapper::identity::extract_l1_facts(&store, p)?;
-                        eprintln!("L1 facts refreshed.");
-                    }
-                    None => {
-                        anyhow::bail!("No vault profile found. Run `knapper init` first.");
-                    }
-                }
-            }
-            if json {
-                // L0 comes from config (not the identity_facts table)
-                let id = &cfg.identity;
-                let mut l0_entries = Vec::new();
-                if let Some(name) = &id.name {
-                    l0_entries.push(serde_json::json!({"key": "name", "value": name}));
-                }
-                if let Some(role) = &id.role {
-                    l0_entries.push(serde_json::json!({"key": "role", "value": role}));
-                }
-                if let Some(purpose) = &id.vault_purpose {
-                    l0_entries.push(serde_json::json!({"key": "vault_purpose", "value": purpose}));
-                }
-                let l1 = store.get_identity_facts(1)?;
-                let result = serde_json::json!({
-                    "l0": l0_entries,
-                    "l1": l1.iter().map(|f| serde_json::json!({"key": &f.key, "value": &f.value, "source": &f.source, "updated_at": &f.updated_at})).collect::<Vec<_>>(),
-                });
-                println!("{}", serde_json::to_string_pretty(&result)?);
-            } else {
-                let block = knapper::identity::format_identity_block(&cfg, &store)?;
-                println!("{}", block);
-            }
         }
 
         Command::Configure {

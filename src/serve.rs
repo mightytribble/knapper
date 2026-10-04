@@ -649,44 +649,8 @@ impl KnapperServer {
     }
 
     #[tool(
-        name = "identity",
-        description = "Returns compact user identity and current context. Call at session start for instant context. L0 = static identity (~50 tokens), L1 = dynamic state (~120 tokens). `refresh: true` re-extracts the L1 facts from the index first, without a full re-index."
-    )]
-    async fn identity(
-        &self,
-        params: Parameters<crate::params::Identity>,
-    ) -> Result<CallToolResult, McpError> {
-        let config = self.core.config.clone();
-        let block = if params.0.refresh {
-            // A write of derived state, so a read-only server refuses it.
-            self.core.writable().map_err(mcp_err)?;
-            if self.core.profile.is_none() {
-                return Err(McpError::new(
-                    rmcp::model::ErrorCode::INVALID_REQUEST,
-                    "No vault profile found. Run `knapper init` first.",
-                    Some(serde_json::json!({ "kind": "invalid_input" })),
-                ));
-            }
-            let profile = self.core.profile.clone();
-            self.core
-                .with_core(move |g| {
-                    let profile = profile.as_ref().as_ref().expect("checked above");
-                    crate::identity::extract_l1_facts(g.store, profile)?;
-                    crate::identity::format_identity_block(&config, g.store)
-                })
-                .await
-        } else {
-            self.core
-                .with_reader(move |store| crate::identity::format_identity_block(&config, store))
-                .await
-        }
-        .map_err(mcp_err)?;
-        Ok(CallToolResult::success(vec![ContentBlock::text(block)]))
-    }
-
-    #[tool(
         name = "init",
-        description = "Run first-time setup or update identity. Use 'detect' mode to inspect the vault without changes, 'apply' mode to configure identity and index. Returns JSON."
+        description = "Run first-time setup. Use 'detect' mode to inspect the vault without changes, 'apply' mode to write the vault profile and index. Returns JSON."
     )]
     async fn init(
         &self,
@@ -705,10 +669,6 @@ impl KnapperServer {
                 self.core.writable().map_err(mcp_err)?;
                 let data_dir = crate::config::Config::data_dir().map_err(mcp_err)?;
                 let flags = crate::onboarding::ApplyFlags {
-                    name: params.0.name,
-                    role: params.0.role,
-                    purpose: params.0.purpose,
-                    identity_only: false,
                     reindex_only: false,
                 };
                 let vault = self.core.vault_path.clone();
@@ -877,14 +837,9 @@ pub const ORIENTATION: &[Orientation] = &[
         clause: "for the markdown and property problems a note carries, read from the files on disk",
     },
     Orientation {
-        capability: "identity",
-        group: "Identity",
-        clause: "for user context at session start",
-    },
-    Orientation {
         capability: "init",
-        group: "Identity",
-        clause: "to run first-time onboarding (`mode: detect` or `mode: apply`)",
+        group: "Setup",
+        clause: "to write the vault profile and index (`mode: detect` or `mode: apply`)",
     },
     Orientation {
         capability: "migrate",
@@ -1112,19 +1067,6 @@ mod tests {
         (tmp, super::KnapperServer::new(core))
     }
 
-    /// A PARA profile over `root`, for the calls that need one.
-    fn test_profile(root: &std::path::Path) -> crate::profile::VaultProfile {
-        crate::profile::VaultProfile {
-            vault_path: root.to_path_buf(),
-            vault_type: crate::profile::VaultType::Obsidian,
-            structure: crate::profile::StructureDetection {
-                method: crate::profile::StructureMethod::Para,
-                folders: crate::profile::FolderMap::default(),
-            },
-            stats: crate::profile::VaultStats::default(),
-        }
-    }
-
     /// `archive` and `archive {undo: true}` are one operation and its reverse
     /// (#62). The handler's own branch chooses `archive_note` against
     /// `unarchive_note`, and nothing else covers it — an inverted branch would
@@ -1158,76 +1100,6 @@ mod tests {
         assert!(!archived.exists(), "undo: true must restore");
     }
 
-    /// `identity` takes `refresh` on every surface (#62). Before this the
-    /// tool declared no parameters at all, so the flag the CLI honoured had no
-    /// spelling here. `extract_l1_facts` clears tier 1 before it derives it
-    /// again, so a stale fact seeded first is what proves the call was made.
-    #[tokio::test]
-    async fn identity_refresh_re_extracts_the_l1_facts() {
-        let (_tmp, mut server) = indexed_server(crate::config::GroupBy::Chunk);
-        let root = server.core.vault_path.as_ref().clone();
-        server.core.profile = std::sync::Arc::new(Some(test_profile(&root)));
-
-        let stale = || {
-            let writer = server.core.writer();
-            let store = writer.try_lock().expect("uncontended");
-            store
-                .get_identity_facts(1)
-                .unwrap()
-                .into_iter()
-                .any(|f| f.key == "stale")
-        };
-        {
-            let writer = server.core.writer();
-            let store = writer.try_lock().expect("uncontended");
-            store
-                .upsert_identity_fact(1, "stale", "from an older session", None)
-                .unwrap();
-        }
-        assert!(stale());
-
-        // No refresh: the facts are answered as they stand.
-        server
-            .identity(super::Parameters(crate::params::Identity {
-                refresh: false,
-            }))
-            .await
-            .unwrap();
-        assert!(stale(), "a call that did not ask must re-extract nothing");
-
-        server
-            .identity(super::Parameters(crate::params::Identity { refresh: true }))
-            .await
-            .unwrap();
-        assert!(!stale(), "refresh: true must re-derive tier 1");
-    }
-
-    /// A read-only server refuses every call that writes derived state, and
-    /// `identity {refresh: true}` is one: it clears the `identity_facts` rows
-    /// (#62).
-    #[tokio::test]
-    async fn a_read_only_server_refuses_an_identity_refresh_and_answers_a_plain_one() {
-        let (_tmp, mut server) = indexed_server(crate::config::GroupBy::Chunk);
-        let root = server.core.vault_path.as_ref().clone();
-        server.core.profile = std::sync::Arc::new(Some(test_profile(&root)));
-        server.core.read_only = true;
-
-        let err = server
-            .identity(super::Parameters(crate::params::Identity { refresh: true }))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_REQUEST, "{err:?}");
-        assert_eq!(err.data.as_ref().unwrap()["kind"], "read_only");
-        assert!(
-            server
-                .identity(super::Parameters(crate::params::Identity {
-                    refresh: false,
-                }))
-                .await
-                .is_ok()
-        );
-    }
-
     /// `init {mode: apply}` indexes the vault, which is the work `index` is
     /// guarded against. `detect` writes nothing and still runs (#62).
     #[tokio::test]
@@ -1237,9 +1109,6 @@ mod tests {
 
         let init = |mode: &str| crate::params::Init {
             mode: Some(mode.to_string()),
-            name: None,
-            role: None,
-            purpose: None,
         };
         assert!(server.init(super::Parameters(init("apply"))).await.is_err());
         assert!(server.init(super::Parameters(init("detect"))).await.is_ok());

@@ -17,7 +17,6 @@ pub mod fusion;
 pub mod graph;
 pub mod health;
 pub mod http;
-pub mod identity;
 pub mod indexer;
 pub mod links;
 pub mod llm;

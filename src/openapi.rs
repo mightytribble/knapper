@@ -225,7 +225,6 @@ fn params_schema(name: &str, generator: &mut SchemaGenerator) -> Option<Value> {
         "status" => of::<p::Status>(generator),
         "health" => of::<p::Health>(generator),
         "validate" => of::<p::Validate>(generator),
-        "identity" => of::<p::Identity>(generator),
         "init" => of::<p::Init>(generator),
         "migrate" => of::<p::Migrate>(generator),
         _ => return None,

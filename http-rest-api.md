@@ -43,7 +43,6 @@ through a tunnel; the document names it as its server.
 | POST | `/api/delete` | write | Delete note (soft or hard) |
 | POST | `/api/index` | write | Index the configured vault |
 | POST | `/api/reindex-file` | write | Re-index a single file after external edits |
-| GET | `/api/identity` | read | User identity (L0) and current context (L1). `?refresh=true` re-extracts the L1 facts and takes a write key |
 | POST | `/api/init` | write | First-time onboarding setup (`mode`: detect or apply) |
 | POST | `/api/migrate` | write | PARA migration (`mode`: preview, apply or undo). `apply` requires the `preview` that `preview` returned |
 

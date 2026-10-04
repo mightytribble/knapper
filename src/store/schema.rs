@@ -506,8 +506,10 @@ impl Store {
     /// the cleanup branch is unmerged; frozen at merge, when a later change
     /// is step 3.
     fn migrate_to_2(&self) -> Result<()> {
-        self.conn
-            .execute_batch("DROP TABLE IF EXISTS cli_events;")?;
+        self.conn.execute_batch(
+            "DROP TABLE IF EXISTS cli_events;
+             DROP TABLE IF EXISTS identity_facts;",
+        )?;
         Ok(())
     }
 }
@@ -862,7 +864,7 @@ mod tests {
 
     /// The tables step 2 drops. A table is appended here in the task that
     /// removes its subsystem, beside its `DROP` in `migrate_to_2`.
-    const DROPPED_BY_STEP_2: &[&str] = &["cli_events"];
+    const DROPPED_BY_STEP_2: &[&str] = &["cli_events", "identity_facts"];
 
     #[test]
     fn a_version_1_store_is_upgraded_on_open() {

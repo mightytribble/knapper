@@ -361,8 +361,7 @@ pub fn routes() -> Vec<(&'static str, MethodRouter<ApiState>)> {
         // Index maintenance
         ("/api/index", post(handle_index)),
         ("/api/reindex-file", post(handle_reindex_file)),
-        // Identity endpoints
-        ("/api/identity", get(handle_identity)),
+        // Setup
         ("/api/init", post(handle_init)),
         // Migration endpoints
         ("/api/migrate", post(handle_migrate)),
@@ -932,51 +931,8 @@ async fn handle_reindex_file(
 }
 
 // ---------------------------------------------------------------------------
-// Identity / init endpoint handlers
+// Init endpoint handler
 // ---------------------------------------------------------------------------
-
-/// The identity block, optionally re-extracted first.
-///
-/// `refresh` is a parameter of the capability on every surface (#62). It
-/// re-reads the L1 facts from the store the server already holds, so an agent
-/// whose session started before the last write can ask for current ones
-/// without a full re-index.
-async fn handle_identity(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    ApiQuery(p): ApiQuery<crate::params::Identity>,
-) -> Result<impl IntoResponse, ApiError> {
-    // Re-extraction clears the `identity_facts` rows and derives them again,
-    // so it takes the write permission and a read-only server refuses it; the
-    // block itself is a read either way.
-    authorize(&headers, &state, p.refresh)?;
-    if p.refresh {
-        state.core.writable()?;
-    }
-    let config = state.core.config.clone();
-    let block = if p.refresh {
-        if state.core.profile.is_none() {
-            return Err(ApiError::bad_request(
-                "No vault profile found. Run `knapper init` first.",
-            ));
-        }
-        let profile = state.core.profile.clone();
-        state
-            .core
-            .with_core(move |g| {
-                let profile = profile.as_ref().as_ref().expect("checked above");
-                crate::identity::extract_l1_facts(g.store, profile)?;
-                crate::identity::format_identity_block(&config, g.store)
-            })
-            .await
-    } else {
-        state
-            .core
-            .with_reader(move |store| crate::identity::format_identity_block(&config, store))
-            .await
-    }?;
-    Ok(Json(serde_json::json!({ "identity": block })))
-}
 
 async fn handle_init(
     State(state): State<ApiState>,
@@ -998,10 +954,6 @@ async fn handle_init(
             state.core.writable()?;
             let data_dir = crate::config::Config::data_dir()?;
             let flags = crate::onboarding::ApplyFlags {
-                name: body.name,
-                role: body.role,
-                purpose: body.purpose,
-                identity_only: false,
                 reindex_only: false,
             };
             let vault = state.core.vault_path.clone();
@@ -2390,66 +2342,6 @@ mod tests {
         let (status, body) = get_json(state, "/api/delete").await;
         assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{body}");
         assert_eq!(body["kind"], "invalid_input");
-    }
-
-    /// `identity` takes `refresh` on every surface (#62). Before this the
-    /// route had no extractor at all, so the flag the CLI honoured had no
-    /// spelling here. `extract_l1_facts` clears tier 1 before it derives it
-    /// again, so a stale fact seeded first is what proves the call was made.
-    #[tokio::test]
-    async fn identity_refresh_re_extracts_the_l1_facts() {
-        let (_tmp, mut state) = indexed_state();
-        let root = state.core.vault_path.as_ref().clone();
-        state.core.profile = Arc::new(Some(crate::profile::VaultProfile {
-            vault_path: root,
-            vault_type: crate::profile::VaultType::Obsidian,
-            structure: crate::profile::StructureDetection {
-                method: crate::profile::StructureMethod::Para,
-                folders: crate::profile::FolderMap::default(),
-            },
-            stats: crate::profile::VaultStats::default(),
-        }));
-
-        let stale = |state: &ApiState| {
-            let writer = state.core.writer();
-            let store = writer.try_lock().expect("uncontended");
-            store
-                .get_identity_facts(1)
-                .unwrap()
-                .into_iter()
-                .any(|f| f.key == "stale")
-        };
-        {
-            let writer = state.core.writer();
-            let store = writer.try_lock().expect("uncontended");
-            store
-                .upsert_identity_fact(1, "stale", "from an older session", None)
-                .unwrap();
-        }
-        assert!(stale(&state));
-
-        // A read key reaches the block itself and no re-extraction happens.
-        let response = get(state.clone(), "/api/identity").await;
-        assert_eq!(response.status(), StatusCode::OK);
-        assert!(stale(&state), "a call that did not ask re-extracts nothing");
-
-        // Re-extraction writes rows, so a read key is refused.
-        let response = get(state.clone(), "/api/identity?refresh=true").await;
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        assert!(stale(&state));
-
-        let response = build_router(state.clone())
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri("/api/identity?refresh=true")
-                    .header("authorization", "Bearer kn_writekey")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        assert!(!stale(&state), "refresh=true must re-derive tier 1");
     }
 
     /// Five notes that all answer one query. Five is more than the `top_n` the

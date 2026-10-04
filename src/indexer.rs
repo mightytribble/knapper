@@ -1173,13 +1173,6 @@ fn run_index_inner(
         store.upsert_folder_centroid(folder, &centroid, vectors.len())?;
     }
 
-    // Extract L1 identity facts from the freshly indexed vault
-    if let Some(p) = profile
-        && let Err(e) = crate::identity::extract_l1_facts(store, p)
-    {
-        tracing::warn!("L1 identity extraction failed (non-fatal): {e:#}");
-    }
-
     // Last, and only on the way out (issue #31). A crash anywhere above leaves
     // the previous fingerprints standing, so the next run repeats the work — a
     // store never claims to match code that never finished running against it.

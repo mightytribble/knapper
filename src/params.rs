@@ -889,29 +889,12 @@ pub struct Status {}
 pub struct Health {}
 
 #[derive(Debug, Args, Deserialize, JsonSchema)]
-pub struct Identity {
-    /// Re-extract the L1 facts without a full re-index.
-    #[arg(long)]
-    #[serde(default)]
-    pub refresh: bool,
-}
-
-#[derive(Debug, Args, Deserialize, JsonSchema)]
 pub struct Init {
-    /// `detect` inspects the vault and writes nothing; `apply` configures
-    /// identity and indexes. The CLI runs its interactive flow when this is
-    /// omitted, which is the one thing the other surfaces cannot do.
+    /// `detect` inspects the vault and writes nothing; `apply` writes the
+    /// vault profile and indexes. The CLI runs its interactive flow when this
+    /// is omitted, which is the one thing the other surfaces cannot do.
     #[arg(long)]
     pub mode: Option<String>,
-    /// User name, for `apply`.
-    #[arg(long)]
-    pub name: Option<String>,
-    /// User role, for `apply`.
-    #[arg(long)]
-    pub role: Option<String>,
-    /// Vault purpose, for `apply`.
-    #[arg(long)]
-    pub purpose: Option<String>,
 }
 
 /// `apply` moves files, and it moves them against the preview named here. A

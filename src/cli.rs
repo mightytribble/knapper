@@ -173,7 +173,7 @@ pub enum Command {
         all: bool,
     },
 
-    /// Initialize vault profile, identity, and search index.
+    /// Initialize the vault profile and the search index.
     // `group(skip)` for the reason `index` gives: the flattened struct
     // declares the group this variant would declare again.
     #[group(skip)]
@@ -182,10 +182,7 @@ pub enum Command {
         args: crate::params::Init,
         /// Path to vault directory.
         path: Option<PathBuf>,
-        /// Only run identity setup (skip indexing).
-        #[arg(long)]
-        identity: bool,
-        /// Only re-index (skip identity prompts).
+        /// Only re-index.
         #[arg(long)]
         reindex: bool,
         /// Detect vault without writing anything (agent mode).
@@ -198,9 +195,6 @@ pub enum Command {
         #[arg(long)]
         quiet: bool,
     },
-
-    /// Print identity block (L0 + L1 context for AI agents).
-    Identity(crate::params::Identity),
 
     /// Configure knapper settings.
     Configure {

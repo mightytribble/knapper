@@ -64,15 +64,6 @@ impl Default for EmbedApiConfig {
     }
 }
 
-/// User identity for AI agent context.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(default)]
-pub struct IdentityConfig {
-    pub name: Option<String>,
-    pub role: Option<String>,
-    pub vault_purpose: Option<String>,
-}
-
 /// Memory layer feature flags.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -919,8 +910,6 @@ pub struct Config {
     #[serde(default = "default_carry_orphan_headings")]
     pub carry_orphan_headings: bool,
     #[serde(default)]
-    pub identity: IdentityConfig,
-    #[serde(default)]
     pub memory: MemoryConfig,
     #[serde(default)]
     pub output: OutputConfig,
@@ -1004,7 +993,6 @@ impl Default for Config {
             fts: FtsConfig::default(),
             calibrated: CalibratedConfig::default(),
             http: HttpConfig::default(),
-            identity: IdentityConfig::default(),
             memory: MemoryConfig::default(),
             output: OutputConfig::default(),
             watcher: WatcherConfig::default(),
@@ -2127,27 +2115,6 @@ public_url = "https://vault.example.com"
             text.contains("public_url = \"https://abc.trycloudflare.com\""),
             "{text}"
         );
-    }
-
-    #[test]
-    fn test_identity_config_deserializes() {
-        let toml_str = r#"
-[identity]
-name = "Test User"
-role = "Developer"
-vault_purpose = "notes"
-"#;
-        let config: Config = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.identity.name, Some("Test User".into()));
-        assert_eq!(config.identity.role, Some("Developer".into()));
-        assert_eq!(config.identity.vault_purpose, Some("notes".into()));
-    }
-
-    #[test]
-    fn test_identity_config_defaults_to_empty() {
-        let config = Config::default();
-        assert!(config.identity.name.is_none());
-        assert!(config.identity.role.is_none());
     }
 
     #[test]

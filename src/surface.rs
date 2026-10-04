@@ -265,21 +265,12 @@ pub const CAPABILITIES: &[Capability] = &[
         server_only_args: &[],
     },
     Capability {
-        name: "identity",
-        cli: Presence::On,
-        mcp: Presence::On,
-        http: Http::Get,
-        cli_only_args: &[],
-        server_only_args: &[],
-    },
-    Capability {
         name: "init",
         cli: Presence::On,
         mcp: Presence::On,
         http: Http::Post,
         cli_only_args: &[
             ("path", "a running server is bound to its configured vault"),
-            ("identity", "the interactive flow the CLI alone can run"),
             ("reindex", "the interactive flow the CLI alone can run"),
             (
                 "detect",
@@ -429,15 +420,9 @@ pub const OPERATIONS: &[Operation] = &[
         response: "A report: findings (each {file, line, severity, rule, message}), files_checked, error_count, warning_count, and ok",
     },
     Operation {
-        name: "identity",
-        id: "getIdentity",
-        summary: "Returns compact user identity (L0) and current context (L1).",
-        response: "Identity block as JSON with 'identity' key",
-    },
-    Operation {
         name: "init",
         id: "init",
-        summary: "Run first-time setup or update identity. Use 'detect' to inspect, 'apply' to configure. The apply reply carries restart_required: true, because the server reads config.toml once, at start.",
+        summary: "Run first-time setup. Use 'detect' to inspect, 'apply' to write the vault profile and index. The apply reply carries restart_required: true, because the server reads config.toml once, at start.",
         response: "Setup result as JSON",
     },
     Operation {
@@ -989,8 +974,8 @@ mod tests {
     }
 
     #[test]
-    fn there_are_twenty_capabilities() {
-        assert_eq!(CAPABILITIES.len(), 20);
+    fn there_are_nineteen_capabilities() {
+        assert_eq!(CAPABILITIES.len(), 19);
     }
 
     /// The operation table is one row per capability the HTTP surface
