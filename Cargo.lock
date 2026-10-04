@@ -2677,6 +2677,7 @@ dependencies = [
  "pin-project-lite",
  "sync_wrapper",
  "tokio",
+ "tokio-util",
  "tower-layer",
  "tower-service",
  "tracing",
@@ -2691,7 +2692,9 @@ dependencies = [
  "bitflags 2.11.0",
  "bytes",
  "http",
+ "http-body",
  "pin-project-lite",
+ "tokio",
  "tower-layer",
  "tower-service",
 ]

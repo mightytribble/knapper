@@ -513,6 +513,8 @@ impl KnapperServer {
         &self,
         params: Parameters<crate::params::ReindexFile>,
     ) -> Result<CallToolResult, McpError> {
+        // It writes the store, so a read-only server refuses it like `index`.
+        self.core.writable().map_err(mcp_err)?;
         let rel_path = params.0.file;
         let vault = self.core.vault_path.clone();
         let settings = self.core.index_settings;
@@ -1192,6 +1194,20 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
         assert_eq!(err.data.as_ref().unwrap()["kind"], "not_found");
+    }
+
+    #[tokio::test]
+    async fn a_read_only_server_refuses_reindex_file() {
+        let (_tmp, mut server) = indexed_server(crate::config::GroupBy::Chunk);
+        server.core.read_only = true;
+        let err = server
+            .reindex_file(super::Parameters(crate::params::ReindexFile {
+                file: "rules/evocation-spells.md".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_REQUEST, "{err:?}");
+        assert_eq!(err.data.as_ref().unwrap()["kind"], "read_only");
     }
 
     /// A note changed outside knapper is this surface's INVALID_REQUEST: the

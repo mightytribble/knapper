@@ -89,11 +89,13 @@ curl -X POST http://localhost:3000/api/create \
   -d '{"content": "# Meeting Notes\n\nDiscussed auth timeline.", "tags": ["meeting", "auth"]}'
 ```
 
-## Rate limiting and CORS
+## Rate limiting, CORS and limits
 
 **Rate limiting:** Configurable per-key token bucket (requests per minute). Defaults to 60 req/min. Returns `429 Too Many Requests` when exceeded.
 
 **CORS:** Configurable allowed origins in `config.toml` under `[http]`. Defaults to allow all origins for local development.
+
+**Limits:** a request is answered 408 after `[http] request_timeout_secs` (60 by default; `0` disables it), except `/api/index` and `/api/init`, which run to completion. A body over 8 MiB is refused as 400 `invalid_input`. Sixteen requests run at once; the rest wait their turn.
 
 ```toml
 [http]
@@ -110,7 +112,7 @@ permissions = "write"
 
 ## Errors
 
-Every error a handler answers is a JSON body with two fields: `error`, the message, and `kind`, one word for what went wrong. The status says whose fault it is. The OpenAPI document carries the same table: every operation references `components.responses` for each status, and the body is `components.schemas.Error`.
+Every error the server answers is a JSON body with two fields: `error`, the message, and `kind`, one word for what went wrong. That includes a body the server cannot read — malformed JSON, a word that is not one of a parameter's values, a missing field, a query value of the wrong type, a body over the size limit — which is 400 `invalid_input` with the parser's own text, an unknown path, which is 404 `not_found`, and the wrong method on a known path, which is 405 `invalid_input`. The one exception is the request timeout's 408, which has no body. The status says whose fault it is. The OpenAPI document carries the same table: every operation references `components.responses` for each status, and the body is `components.schemas.Error`.
 
 | status | kind | when |
 |---|---|---|
@@ -122,6 +124,7 @@ Every error a handler answers is a JSON body with two fields: `error`, the messa
 | 403 | `forbidden` | the key has no write permission |
 | 401 | `unauthorized` | no key, or a key the server does not hold |
 | 429 | `rate_limited` | the key's bucket is empty; `retry-after` says when |
+| 408 | — | the request ran past `request_timeout_secs`; no body. `/api/index` and `/api/init` are never timed out |
 | 500 | `stale_index` | the index cannot answer until `knapper index` runs |
 | 500 | `internal` | anything else; the body carries the whole error chain |
 

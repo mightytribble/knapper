@@ -109,6 +109,10 @@ pub struct HttpConfig {
     /// The address a caller reaches this server at, when it is not the
     /// bound one: a tunnel's URL. `/openapi.json` names it as the server.
     pub public_url: Option<String>,
+    /// Seconds a request may run before it is answered 408. `0` is no limit.
+    /// `/api/index` and `/api/init` are never timed out: both index the
+    /// vault to completion.
+    pub request_timeout_secs: u64,
 }
 
 impl Default for HttpConfig {
@@ -121,6 +125,7 @@ impl Default for HttpConfig {
             cors_origins: vec![],
             api_keys: vec![],
             public_url: None,
+            request_timeout_secs: 60,
         }
     }
 }
@@ -2147,6 +2152,13 @@ name = "Someone"
         let config = Config::load_from(&path).unwrap();
         assert_eq!(config.http.port, 3000);
         assert!(config.http.public_url.is_none());
+    }
+
+    #[test]
+    fn request_timeout_secs_defaults_to_sixty() {
+        assert_eq!(HttpConfig::default().request_timeout_secs, 60);
+        let config: Config = toml::from_str("[http]\nrequest_timeout_secs = 5\n").unwrap();
+        assert_eq!(config.http.request_timeout_secs, 5);
     }
 
     #[test]

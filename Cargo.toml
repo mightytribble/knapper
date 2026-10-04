@@ -46,8 +46,8 @@ llama-cpp-2 = "0.1"
 encoding_rs = "0.8"
 shimmytok = "0.7"
 axum = "0.8"
-tower-http = { version = "0.6", features = ["cors"] }
-tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "timeout"] }
+tower = { version = "0.5", features = ["limit"] }
 uuid = { version = "1", features = ["v4"] }
 rand = "0.9"
 tokio-util = "0.7"

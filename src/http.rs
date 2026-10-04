@@ -368,15 +368,53 @@ pub fn routes() -> Vec<(&'static str, MethodRouter<ApiState>)> {
     ]
 }
 
-pub fn build_router(state: ApiState) -> Router {
-    let cors = cors_layer(&state.http_config.cors_origins);
-    let mut router = Router::new();
-    for (path, handler) in routes() {
-        router = router.route(path, handler);
-    }
-    router
+/// Bodies larger than this are refused before any handler reads them.
+pub const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+/// Requests in flight at once; the rest wait. One agent, maybe a few calls.
+pub const MAX_IN_FLIGHT: usize = 16;
+/// Routes that index the vault to completion and are not timed out.
+pub const UNTIMED_ROUTES: &[&str] = &["/api/index", "/api/init"];
+
+/// The limits every route runs under, from inner to outer: the timeout on
+/// the timed routes alone, then the body limit and the in-flight limit on
+/// all of them, then the two fallbacks. A function of its own so a test
+/// can hand it two toy routers and a timeout of milliseconds.
+pub fn with_limits(
+    timed: Router<ApiState>,
+    untimed: Router<ApiState>,
+    timeout: Option<std::time::Duration>,
+) -> Router<ApiState> {
+    let timed = match timeout {
+        Some(limit) => timed.layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            limit,
+        )),
+        None => timed,
+    };
+    timed
+        .merge(untimed)
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .layer(tower::limit::ConcurrencyLimitLayer::new(MAX_IN_FLIGHT))
         .fallback(unknown_route)
         .method_not_allowed_fallback(wrong_method)
+}
+
+pub fn build_router(state: ApiState) -> Router {
+    let cors = cors_layer(&state.http_config.cors_origins);
+    let timeout = match state.http_config.request_timeout_secs {
+        0 => None,
+        secs => Some(std::time::Duration::from_secs(secs)),
+    };
+    let mut timed = Router::new();
+    let mut untimed = Router::new();
+    for (path, handler) in routes() {
+        if UNTIMED_ROUTES.contains(&path) {
+            untimed = untimed.route(path, handler);
+        } else {
+            timed = timed.route(path, handler);
+        }
+    }
+    with_limits(timed, untimed, timeout)
         .layer(cors)
         .with_state(state)
 }
@@ -857,6 +895,8 @@ async fn handle_reindex_file(
     ApiJson(body): ApiJson<crate::params::ReindexFile>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
+    // It writes the store, so a read-only server refuses it like `index`.
+    state.core.writable()?;
     let vault = state.core.vault_path.clone();
     let settings = state.core.index_settings;
     let file = body.file.clone();
@@ -959,6 +999,7 @@ mod tests {
                 },
             ],
             public_url: None,
+            request_timeout_secs: 60,
         }
     }
 
@@ -2165,6 +2206,65 @@ mod tests {
         let (status, body) = get_json(state, "/api/delete").await;
         assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{body}");
         assert_eq!(body["kind"], "invalid_input");
+    }
+
+    /// A toy router through the same limits the real one gets. A route under
+    /// the timeout answers 408 when it runs past it; one in `UNTIMED_ROUTES`
+    /// does not.
+    #[tokio::test]
+    async fn a_request_past_the_timeout_is_a_408() {
+        async fn slow() -> &'static str {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            "done"
+        }
+        let (_tmp, state) = test_api_state();
+        let timed = Router::new().route("/api/slow", axum::routing::get(slow));
+        let untimed = Router::new().route(UNTIMED_ROUTES[0], axum::routing::get(slow));
+        let app = with_limits(timed, untimed, Some(std::time::Duration::from_millis(20)))
+            .with_state(state);
+
+        let request = |uri: &str| {
+            axum::http::Request::builder()
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap()
+        };
+        let timed_out = app.clone().oneshot(request("/api/slow")).await.unwrap();
+        assert_eq!(timed_out.status(), StatusCode::REQUEST_TIMEOUT);
+        let completed = app.oneshot(request(UNTIMED_ROUTES[0])).await.unwrap();
+        assert_eq!(completed.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn every_untimed_route_is_a_real_route() {
+        let served: Vec<&str> = routes().into_iter().map(|(path, _)| path).collect();
+        for path in UNTIMED_ROUTES {
+            assert!(served.contains(path), "{path} is not a route");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_body_over_the_limit_is_a_bad_request_with_a_kind() {
+        let (_tmp, state) = test_api_state();
+        let content = "x".repeat(MAX_BODY_BYTES + 1024);
+        let body = format!(r#"{{"filename":"big","content":"{content}"}}"#);
+        let (status, reply) = post_json(state, "/api/create", &body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{reply}");
+        assert_eq!(reply["kind"], "invalid_input");
+    }
+
+    #[tokio::test]
+    async fn a_read_only_server_refuses_reindex_file() {
+        let (_tmp, mut state) = indexed_state();
+        state.core.read_only = true;
+        let (status, body) = post_json(
+            state,
+            "/api/reindex-file",
+            r#"{"file":"rules/evocation-spells.md"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["kind"], "read_only");
     }
 
     /// Five notes that all answer one query. Five is more than the `top_n` the
