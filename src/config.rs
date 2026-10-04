@@ -1066,14 +1066,19 @@ impl Config {
             .collect()
     }
 
-    /// Name every retired table `text` carries, once.
+    /// Name every retired table `text` carries, once per process: the
+    /// config is read again on some write paths, and a user needs the
+    /// notice once.
     fn warn_retired_tables(text: &str, source: &Path) {
-        for (table, advice) in Self::retired_tables(text) {
-            tracing::warn!(
-                "{} carries [{table}], which this knapper does not read: {advice}",
-                source.display()
-            );
-        }
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            for (table, advice) in Self::retired_tables(text) {
+                tracing::warn!(
+                    "{} carries [{table}], which this knapper does not read: {advice}",
+                    source.display()
+                );
+            }
+        });
     }
 
     /// Canonical data directory: `~/.knapper/`, or an override from `--data-dir`

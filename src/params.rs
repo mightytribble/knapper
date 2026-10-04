@@ -30,8 +30,8 @@ pub struct Search {
     /// ceiling rather than the number asked for.
     #[arg(short = 'n', long)]
     pub top_n: Option<usize>,
-    /// Show the per-lane score breakdown for each result. On the servers the
-    /// breakdown rides beside the envelope as `explain` (#62).
+    /// Include the per-lane score breakdown for each result (#62).
+    // On the servers the breakdown rides beside the envelope as `explain`.
     // The CLI prints it as text.
     // The CLI refuses `--explain` with `--json`, since the breakdown is text
     // there: a usage error rather than a flag silently dropped.

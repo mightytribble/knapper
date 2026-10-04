@@ -31,7 +31,7 @@ Links resolve against https://github.com/mightytribble/knapper.
 - Every HTTP error body carries `kind`: a body the server cannot read (malformed JSON, an unknown enum word, a missing field, a query value of the wrong type, a body over the limit) is 400 `invalid_input` with the parser's text, an unknown path is 404 `not_found`, and the wrong method on a known path is 405 `invalid_input`. ([`29d03d3`](https://github.com/mightytribble/knapper/commit/29d03d3))
 - `reindex-file` on a read-only server answers 403 `read_only` on HTTP and `INVALID_REQUEST` on MCP, as `index` does. ([`e015de5`](https://github.com/mightytribble/knapper/commit/e015de5))
 - The CLI shows the library's warnings on stderr: a dimension change that re-indexes the vault, a file left unembedded, a config table this version does not read. The two startup notices about cleaned-up incomplete writes and orphan index entries are logged at info and no longer print. `knapper index` draws its bar from the CLI; `serve` draws none. ([`3d5b0fe`](https://github.com/mightytribble/knapper/commit/3d5b0fe))
-- A `config.toml` that still carries `[http.plugin]`, `[identity]` or `[memory]` loads and names the table once at load, with what to do about it. ([`5d3029f`](https://github.com/mightytribble/knapper/commit/5d3029f))
+- A `config.toml` that still carries `[http.plugin]`, `[identity]` or `[memory]` loads and names the table once, the first time the file is read in a process, with what to do about it. ([`5d3029f`](https://github.com/mightytribble/knapper/commit/5d3029f))
 
 ### Removed
 

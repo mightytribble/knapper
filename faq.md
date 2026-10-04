@@ -155,7 +155,7 @@ problems; `knapper tags` shows a vocabulary that has drifted. Hand an agent
 that output and a rule for what to do about it, and it can work through the
 list — reading, editing sections and fixing links one call at a time.
 
-Do it on a vault you can restore. Every write is atomic and audited, but a
+Do it on a vault you can restore. Every write is atomic, but a
 few hundred edits at agent speed is still a few hundred edits.
 
 ## How do I check an edit landed everywhere?
@@ -213,7 +213,7 @@ performing them and reporting success:
 
 A batch is one write: the agent sends a list of edits, and knapper applies
 them in one file write, one conflict check and one re-index. Every write is
-atomic — a temp file and a rename — and logged to an audit table.
+atomic — a temp file and a rename.
 
 The same capability is on the CLI when you want to make an edit by hand:
 

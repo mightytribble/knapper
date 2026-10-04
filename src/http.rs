@@ -376,8 +376,8 @@ pub const MAX_IN_FLIGHT: usize = 16;
 pub const UNTIMED_ROUTES: &[&str] = &["/api/index", "/api/init"];
 
 /// The limits every route runs under, from inner to outer: the timeout on
-/// the timed routes alone, then the body limit and the in-flight limit on
-/// all of them, then the two fallbacks. A function of its own so a test
+/// the timed routes alone, then the body limit and the in-flight limit (one
+/// semaphore shared by every route) on all of them, then the two fallbacks. A function of its own so a test
 /// can hand it two toy routers and a timeout of milliseconds.
 pub fn with_limits(
     timed: Router<ApiState>,
@@ -394,7 +394,9 @@ pub fn with_limits(
     timed
         .merge(untimed)
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
-        .layer(tower::limit::ConcurrencyLimitLayer::new(MAX_IN_FLIGHT))
+        .layer(tower::limit::GlobalConcurrencyLimitLayer::new(
+            MAX_IN_FLIGHT,
+        ))
         .fallback(unknown_route)
         .method_not_allowed_fallback(wrong_method)
 }
@@ -2233,6 +2235,74 @@ mod tests {
         assert_eq!(timed_out.status(), StatusCode::REQUEST_TIMEOUT);
         let completed = app.oneshot(request(UNTIMED_ROUTES[0])).await.unwrap();
         assert_eq!(completed.status(), StatusCode::OK);
+    }
+
+    /// One semaphore for the whole server, not one per route: more than
+    /// `MAX_IN_FLIGHT` requests spread over two routes never run more than
+    /// `MAX_IN_FLIGHT` at once.
+    #[tokio::test]
+    async fn the_in_flight_limit_is_server_wide() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let slow = {
+            let in_flight = in_flight.clone();
+            let peak = peak.clone();
+            move || {
+                let in_flight = in_flight.clone();
+                let peak = peak.clone();
+                async move {
+                    let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    "done"
+                }
+            }
+        };
+        let (_tmp, state) = test_api_state();
+        let timed = Router::new().route("/api/a", axum::routing::get(slow.clone()));
+        let untimed = Router::new().route(UNTIMED_ROUTES[0], axum::routing::get(slow));
+        let app = with_limits(timed, untimed, None).with_state(state);
+
+        let requests = (0..(MAX_IN_FLIGHT * 3)).map(|i| {
+            let app = app.clone();
+            let path = if i % 2 == 0 {
+                "/api/a"
+            } else {
+                UNTIMED_ROUTES[0]
+            };
+            tokio::spawn(async move {
+                let response = app
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .uri(path)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+            })
+        });
+        // Spawn them all before awaiting any: a lazy iterator would run them
+        // one at a time.
+        let requests: Vec<_> = requests.collect();
+        for handle in requests {
+            handle.await.unwrap();
+        }
+
+        let peak = peak.load(Ordering::SeqCst);
+        assert!(
+            peak > 1,
+            "the requests never overlapped; the test proves nothing"
+        );
+        assert!(
+            peak <= MAX_IN_FLIGHT,
+            "{peak} requests ran at once; the limit is {MAX_IN_FLIGHT}"
+        );
     }
 
     #[test]
