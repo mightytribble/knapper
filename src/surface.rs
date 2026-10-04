@@ -350,7 +350,7 @@ pub const OPERATIONS: &[Operation] = &[
     Operation {
         name: "create",
         id: "createNote",
-        summary: "Create a new note with automatic placement and frontmatter generation.",
+        summary: "Create a new note: tags resolved against the vault's vocabulary, links discovered, filed under folder or at the vault root.",
         response: "Created note path and metadata",
     },
     Operation {

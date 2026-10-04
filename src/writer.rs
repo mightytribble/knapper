@@ -13,7 +13,6 @@ use crate::frontmatter::KeyPlacement;
 use crate::indexer::build_edges_for_file;
 use crate::links;
 use crate::llm::{EmbedDoc, EmbedModel};
-use crate::placement::{self, PlacementHints};
 use crate::prefix::{DocContext, EmbedComposition};
 use crate::profile::VaultProfile;
 use crate::store::Store;
@@ -24,7 +23,6 @@ use crate::store::Store;
 pub struct CreateNoteInput {
     pub content: String,
     pub filename: String,
-    pub type_hint: Option<String>,
     pub tags: Vec<String>,
     pub folder: Option<String>,
     pub created_by: String,
@@ -125,13 +123,9 @@ pub struct WriteResult {
     pub links_added: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub links_suggested: Vec<String>,
+    /// The folder the note was filed under, as the caller gave it with its
+    /// leading and trailing `/` trimmed; `""` is the vault root.
     pub folder: String,
-    pub confidence: f64,
-    pub strategy: String,
-    /// Why the note landed where it did. `create` fills it from placement;
-    /// a write with no placement to explain leaves it empty.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub reason: String,
 }
 
 // ── Helper functions ────────────────────────────────────────────
@@ -438,7 +432,7 @@ pub fn cleanup_temp_files(vault_path: &Path) -> Result<usize> {
 
 // ── Pipeline functions ──────────────────────────────────────────
 
-/// Create a new note via the 5-step write pipeline.
+/// Create a new note: resolve its tags, discover its links, write it, index it.
 pub fn create_note(
     input: CreateNoteInput,
     store: &Store,
@@ -491,22 +485,14 @@ pub fn create_note(
     // Apply auto-apply links to content via apply_links (respects protected regions)
     let content_with_links = links::apply_links(&input.content, &auto_apply);
 
-    // Step 4: Determine folder placement
-    let placement_result = if let Some(ref folder) = input.folder {
-        placement::PlacementResult {
-            folder: folder.clone(),
-            confidence: 1.0,
-            strategy: placement::PlacementStrategy::TypeRule,
-            reason: "Explicit folder".to_string(),
-            suggestion: None,
-        }
-    } else {
-        let hints = PlacementHints {
-            type_hint: input.type_hint.clone(),
-            tags: resolved_tags.clone(),
-        };
-        placement::place_note(&content_with_links, &hints, profile, store, Some(embedder))?
-    };
+    // Step 4: the folder is the caller's, or the vault root. No inbox
+    // fallback and no guess from the text.
+    let folder = input
+        .folder
+        .as_deref()
+        .unwrap_or("")
+        .trim_matches('/')
+        .to_string();
 
     // Step 5: The caller's frontmatter is the note's frontmatter. The only
     // key create writes is `tags`, and only what `--tags` resolved to (#92).
@@ -520,7 +506,11 @@ pub fn create_note(
         block.render()
     };
 
-    let rel_path = format!("{}/{}", placement_result.folder, filename);
+    let rel_path = if folder.is_empty() {
+        filename.clone()
+    } else {
+        format!("{folder}/{filename}")
+    };
     let final_path = vault_path.join(&rel_path);
 
     // Check for existing file before doing expensive work
@@ -600,37 +590,13 @@ pub fn create_note(
         None,
     )?;
 
-    // Incrementally update folder centroid with new note's mean vector
-    {
-        let folder = &placement_result.folder;
-        let new_vecs: Vec<&[f32]> = chunk_data.iter().map(|c| c.vector.as_slice()).collect();
-        if !new_vecs.is_empty() {
-            let dim = new_vecs[0].len();
-            let mut mean_vec = vec![0.0f32; dim];
-            for v in &new_vecs {
-                for (i, val) in v.iter().enumerate() {
-                    mean_vec[i] += val;
-                }
-            }
-            let n = new_vecs.len() as f32;
-            for val in &mut mean_vec {
-                *val /= n;
-            }
-            let _ = store.adjust_folder_centroid(folder, &mean_vec, true);
-        }
-    }
-
-    let strategy_name = format!("{:?}", placement_result.strategy);
     Ok(WriteResult {
         path: rel_path,
         docid,
         tags: resolved_tags,
         links_added,
         links_suggested,
-        folder: placement_result.folder,
-        confidence: placement_result.confidence,
-        strategy: strategy_name,
-        reason: placement_result.reason.clone(),
+        folder,
     })
 }
 
@@ -1354,9 +1320,6 @@ pub fn move_note(
         links_added: vec![],
         links_suggested: vec![],
         folder: new_folder.to_string(),
-        confidence: 1.0,
-        strategy: "Move".to_string(),
-        reason: String::new(),
     })
 }
 
@@ -1533,9 +1496,6 @@ pub fn archive_note(
         links_added: vec![],
         links_suggested: vec![],
         folder: archive_folder.to_string(),
-        confidence: 1.0,
-        strategy: "Archive".to_string(),
-        reason: String::new(),
     })
 }
 
@@ -1665,9 +1625,6 @@ pub fn unarchive_note(
         links_added: vec![],
         links_suggested: vec![],
         folder,
-        confidence: 1.0,
-        strategy: "Unarchive".to_string(),
-        reason: String::new(),
     })
 }
 
@@ -2728,7 +2685,6 @@ mod tests {
             CreateNoteInput {
                 content: "# Swamp\n\nA #type/undead lives here.\n".to_string(),
                 filename: "swamp.md".to_string(),
-                type_hint: None,
                 tags: vec!["habitat/swamp".to_string()],
                 folder: None,
                 created_by: "test".to_string(),
@@ -2760,7 +2716,6 @@ mod tests {
             CreateNoteInput {
                 content: content.to_string(),
                 filename: filename.to_string(),
-                type_hint: None,
                 tags,
                 folder: Some("lore".to_string()),
                 created_by: "test".to_string(),
@@ -2818,6 +2773,65 @@ mod tests {
         }
     }
 
+    /// With no folder the note is filed at the vault root. There is no inbox
+    /// fallback and no guess from the note's text.
+    #[test]
+    fn a_create_with_no_folder_files_the_note_at_the_vault_root() {
+        use crate::llm::MockLlm;
+
+        let (_tmp, store, root) = setup_vault();
+        let mut embedder = MockLlm::new(256);
+        let result = create_note(
+            CreateNoteInput {
+                content: "# Loose\n\nBody.\n".to_string(),
+                filename: "loose".to_string(),
+                tags: vec![],
+                folder: None,
+                created_by: "test".to_string(),
+                auto_link: Some(false),
+            },
+            &store,
+            &mut embedder,
+            EmbedComposition::default(),
+            test_chunk_opts(),
+            &root,
+            None,
+        )
+        .unwrap();
+        assert_eq!(result.path, "loose.md");
+        assert_eq!(result.folder, "");
+        assert!(root.join("loose.md").is_file());
+        assert!(store.get_file("loose.md").unwrap().is_some());
+    }
+
+    #[test]
+    fn a_folder_with_a_trailing_slash_files_under_that_folder() {
+        use crate::llm::MockLlm;
+
+        let (_tmp, store, root) = setup_vault();
+        let mut embedder = MockLlm::new(256);
+        let result = create_note(
+            CreateNoteInput {
+                content: "# Filed\n\nBody.\n".to_string(),
+                filename: "filed".to_string(),
+                tags: vec![],
+                folder: Some("notes/".to_string()),
+                created_by: "test".to_string(),
+                auto_link: Some(false),
+            },
+            &store,
+            &mut embedder,
+            EmbedComposition::default(),
+            test_chunk_opts(),
+            &root,
+            None,
+        )
+        .unwrap();
+        assert_eq!(result.path, "notes/filed.md");
+        assert_eq!(result.folder, "notes");
+        assert!(root.join("notes/filed.md").is_file());
+    }
+
     #[test]
     fn create_refuses_a_colliding_name_and_points_at_update() {
         use crate::llm::MockLlm;
@@ -2827,7 +2841,6 @@ mod tests {
         let input = || CreateNoteInput {
             content: "# Note\n\nBody.\n".to_string(),
             filename: "dup".to_string(),
-            type_hint: None,
             tags: vec![],
             folder: Some("notes".to_string()),
             created_by: "test".to_string(),
@@ -4526,7 +4539,6 @@ mod tests {
             CreateNoteInput {
                 content: "# B\n\nBody.\n".to_string(),
                 filename: "b.md".to_string(),
-                type_hint: None,
                 tags: vec![],
                 folder: None,
                 created_by: "test".to_string(),

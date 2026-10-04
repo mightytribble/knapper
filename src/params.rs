@@ -470,14 +470,12 @@ pub struct Create {
     /// so name the file the way it should read as provenance (#47).
     #[arg(long)]
     pub filename: String,
-    /// A hint at the note's kind, used for placement.
-    #[arg(long)]
-    pub type_hint: Option<String>,
     /// Tags to resolve against the vault's vocabulary.
     #[arg(long, value_delimiter = ',')]
     #[serde(default, deserialize_with = "deserialize_tag_list")]
     pub tags: Vec<String>,
-    /// Folder to place the note in. Placement chooses one when omitted.
+    /// The folder to file the note under, relative to the vault root.
+    /// Omitted, the note is filed at the root.
     #[arg(long)]
     pub folder: Option<String>,
     /// Set to false to skip automatic wikilink resolution. Defaults to true.

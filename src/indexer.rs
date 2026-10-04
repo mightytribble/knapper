@@ -1141,38 +1141,6 @@ fn run_index_inner(
         ),
     )?;
 
-    // Step 11: Compute folder centroids for placement engine.
-    // Recompute from all chunks in the store for indexed files.
-    info!("computing folder centroids");
-    let mut folder_vecs: HashMap<String, Vec<Vec<f32>>> = HashMap::new();
-    for rel_path in &indexed_rel_paths {
-        let folder = rel_path.split('/').next().unwrap_or("(root)").to_string();
-        if let Some(file_record) = store.get_file(rel_path)? {
-            let chunk_vectors = store.get_chunk_vectors_for_file(file_record.id)?;
-            for vector in chunk_vectors {
-                folder_vecs.entry(folder.clone()).or_default().push(vector);
-            }
-        }
-    }
-
-    for (folder, vectors) in &folder_vecs {
-        if vectors.is_empty() {
-            continue;
-        }
-        let dim = embedder.dim();
-        let mut centroid = vec![0.0f32; dim];
-        for v in vectors {
-            for (i, val) in v.iter().enumerate() {
-                centroid[i] += val;
-            }
-        }
-        let n = vectors.len() as f32;
-        for val in &mut centroid {
-            *val /= n;
-        }
-        store.upsert_folder_centroid(folder, &centroid, vectors.len())?;
-    }
-
     // Last, and only on the way out (issue #31). A crash anywhere above leaves
     // the previous fingerprints standing, so the next run repeats the work — a
     // store never claims to match code that never finished running against it.
@@ -3016,7 +2984,6 @@ mod tests {
             crate::writer::CreateNoteInput {
                 content: content.to_string(),
                 filename: "archdragon".into(),
-                type_hint: None,
                 tags: vec![],
                 folder: Some("lore".into()),
                 created_by: "test".into(),

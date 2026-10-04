@@ -834,7 +834,6 @@ async fn main() -> Result<()> {
             let input = knapper::writer::CreateNoteInput {
                 content,
                 filename: args.filename,
-                type_hint: args.type_hint,
                 tags: args.tags,
                 folder: args.folder,
                 created_by: "cli".into(),
@@ -852,10 +851,7 @@ async fn main() -> Result<()> {
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
-                println!(
-                    "Created: {} (#{}) [{}]",
-                    result.path, result.docid, result.strategy
-                );
+                println!("Created: {} (#{})", result.path, result.docid);
                 if !result.links_added.is_empty() {
                     println!("Links: {}", result.links_added.join(", "));
                 }

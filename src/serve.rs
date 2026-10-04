@@ -264,7 +264,7 @@ impl KnapperServer {
 
     #[tool(
         name = "create",
-        description = "Create a new note with automatic tag resolution, link discovery, and folder placement. Returns the created file's path, docid, and what was auto-resolved."
+        description = "Create a new note with automatic tag resolution and link discovery, filed under `folder` or at the vault root. Returns the created file's path, docid, and what was auto-resolved."
     )]
     async fn create(
         &self,
@@ -280,7 +280,6 @@ impl KnapperServer {
         let input = crate::writer::CreateNoteInput {
             content,
             filename: params.0.filename,
-            type_hint: params.0.type_hint,
             tags: params.0.tags,
             folder: params.0.folder,
             created_by: "claude-code".into(),

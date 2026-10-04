@@ -803,7 +803,6 @@ mod tests {
             crate::writer::CreateNoteInput {
                 content: "Some content.\n".to_string(),
                 filename: "provenance-check".into(),
-                type_hint: None,
                 tags: vec![],
                 folder: Some("notes".into()),
                 created_by: "cli".into(),

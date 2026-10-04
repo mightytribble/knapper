@@ -637,7 +637,6 @@ async fn handle_create(
     let input = CreateNoteInput {
         content,
         filename: body.filename,
-        type_hint: body.type_hint,
         tags: body.tags,
         folder: body.folder,
         created_by: "http-api".into(),

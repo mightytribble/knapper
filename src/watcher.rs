@@ -16,7 +16,6 @@ use crate::config::{Config, WatcherBackend};
 use crate::core::{Core, CoreGuards, RecentWrites};
 use crate::exclude::ExcludeMatcher;
 use crate::indexer;
-use crate::placement;
 use crate::store::Store;
 
 /// The concrete watcher backend after config, env, and filesystem are resolved.
@@ -533,28 +532,6 @@ fn rel_of(vault_path: &Path, path: &Path) -> String {
         .to_string()
 }
 
-fn folder_of(rel: &str) -> String {
-    Path::new(rel)
-        .parent()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_default()
-}
-
-fn mean_vector(vectors: &[Vec<f32>]) -> Vec<f32> {
-    let dim = vectors[0].len();
-    let mut mean = vec![0.0f32; dim];
-    for v in vectors {
-        for (i, val) in v.iter().enumerate() {
-            mean[i] += val;
-        }
-    }
-    let n = vectors.len() as f32;
-    for val in &mut mean {
-        *val /= n;
-    }
-    mean
-}
-
 fn unix_now() -> String {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -563,8 +540,7 @@ fn unix_now() -> String {
         .to_string()
 }
 
-/// Index one changed or new file and, for a new one, move its folder's
-/// centroid toward it. Returns the file's id for the edge pass.
+/// Index one changed or new file. Returns the file's id for the edge pass.
 fn index_changed_file(
     g: CoreGuards<'_>,
     rel: &str,
@@ -573,98 +549,24 @@ fn index_changed_file(
     vault_path: &Path,
     config: &Config,
 ) -> anyhow::Result<i64> {
-    let is_new_file = g.store.get_file(rel).ok().flatten().is_none();
     let result = indexer::index_file(rel, content, hash, g.store, g.embedder, vault_path, config)?;
-    if is_new_file
-        && let Ok(vectors) = g.store.get_chunk_vectors_for_file(result.file_id)
-        && !vectors.is_empty()
-        && let Err(e) =
-            g.store
-                .adjust_folder_centroid(&folder_of(rel), &mean_vector(&vectors), true)
-    {
-        tracing::warn!(path = %rel, error = %e, "failed to adjust centroid for new file");
-    }
     Ok(result.file_id)
 }
 
-/// Remove a deleted file and move its folder's centroid away from it.
+/// Remove a deleted file from the index.
 fn remove_deleted_file(g: CoreGuards<'_>, rel: &str, vault_path: &Path) -> anyhow::Result<()> {
-    let centroid = g.store.get_file(rel).ok().flatten().and_then(|file| {
-        let vectors = g.store.get_chunk_vectors_for_file(file.id).ok()?;
-        if vectors.is_empty() {
-            return None;
-        }
-        Some((mean_vector(&vectors), folder_of(rel)))
-    });
-    indexer::remove_file(rel, g.store, vault_path)?;
-    if let Some((mean, folder)) = centroid
-        && let Err(e) = g.store.adjust_folder_centroid(&folder, &mean, false)
-    {
-        tracing::warn!(path = %rel, error = %e, "failed to adjust centroid for deleted file");
-    }
-    Ok(())
+    indexer::remove_file(rel, g.store, vault_path)
 }
 
-/// Rename a moved file in the index and learn from the move. Returns the
-/// file's id for the edge pass, and the note's text with the placement
-/// frontmatter stripped when that write is owed; the write happens outside
-/// the lock.
+/// Rename a moved file in the index. Returns the file's id for the edge pass.
 fn rename_moved_file(
     g: CoreGuards<'_>,
     old_rel: &str,
     new_rel: &str,
-    to: &Path,
     vault_path: &Path,
-) -> anyhow::Result<(Option<i64>, Option<String>)> {
+) -> anyhow::Result<Option<i64>> {
     indexer::rename_file(old_rel, new_rel, g.store, vault_path)?;
-    let file_id = g.store.get_file(new_rel)?.map(|record| record.id);
-    let Ok(content) = std::fs::read_to_string(to) else {
-        return Ok((file_id, None));
-    };
-    let actual_folder = folder_of(new_rel);
-    let stripped = match placement::detect_correction_from_frontmatter(&content, &actual_folder) {
-        Some(correction) => {
-            tracing::info!(
-                file = %new_rel,
-                suggested = %correction.suggested_folder,
-                actual = %correction.actual_folder,
-                "placement correction detected"
-            );
-            if let Some(file) = g.store.get_file(new_rel)?
-                && let Ok(vectors) = g.store.get_chunk_vectors_for_file(file.id)
-                && !vectors.is_empty()
-            {
-                let mean = mean_vector(&vectors);
-                if let Err(e) =
-                    g.store
-                        .adjust_folder_centroid(&correction.actual_folder, &mean, true)
-                {
-                    tracing::warn!(error = %e, "failed to adjust actual folder centroid");
-                }
-                if let Err(e) =
-                    g.store
-                        .adjust_folder_centroid(&correction.suggested_folder, &mean, false)
-                {
-                    tracing::warn!(error = %e, "failed to adjust suggested folder centroid");
-                }
-            }
-            if let Err(e) = g.store.insert_placement_correction(
-                new_rel,
-                &correction.suggested_folder,
-                &correction.actual_folder,
-            ) {
-                tracing::warn!(error = %e, "failed to log placement correction");
-            }
-            let stripped = placement::strip_placement_frontmatter(&content);
-            (stripped != content).then_some(stripped)
-        }
-        None if content.contains("suggested_folder:") => {
-            let stripped = placement::strip_placement_frontmatter(&content);
-            (stripped != content).then_some(stripped)
-        }
-        None => None,
-    };
-    Ok((file_id, stripped))
+    Ok(g.store.get_file(new_rel)?.map(|record| record.id))
 }
 
 /// Remove one file's row; `reason` says whether it was deleted or evicted.
@@ -719,25 +621,11 @@ async fn apply_event(core: &Core, event: WatchEvent) -> anyhow::Result<Option<i6
             let old_rel = rel_of(&core.vault_path, &from);
             let new_rel = rel_of(&core.vault_path, &to);
             let vault = core.vault_path.clone();
-            let (old_for_call, new_for_call, to_for_call) =
-                (old_rel.clone(), new_rel.clone(), to.clone());
-            let (file_id, stripped) = core
-                .with_core(move |g| {
-                    rename_moved_file(g, &old_for_call, &new_for_call, &to_for_call, &vault)
-                })
+            let (old_for_call, new_for_call) = (old_rel.clone(), new_rel.clone());
+            let file_id = core
+                .with_core(move |g| rename_moved_file(g, &old_for_call, &new_for_call, &vault))
                 .await?;
             tracing::info!(from = %old_rel, to = %new_rel, "renamed file in index");
-            // The frontmatter write happens outside the lock. It raises a
-            // `Changed` event that re-indexes the note.
-            if let Some(stripped) = stripped {
-                let tmp = to.with_extension("md.tmp");
-                if let Err(e) =
-                    std::fs::write(&tmp, &stripped).and_then(|_| std::fs::rename(&tmp, &to))
-                {
-                    tracing::warn!(error = %e, "failed to strip placement frontmatter");
-                    let _ = std::fs::remove_file(&tmp);
-                }
-            }
             Ok(file_id)
         }
         // Replaced by the vault diff before this is reached.
