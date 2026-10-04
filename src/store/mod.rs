@@ -4,19 +4,17 @@
 //! its rows and the `impl Store` block that reads and writes them. `schema.rs`
 //! holds the versioned schema and the ladder that brings a store up to it.
 //! Two declarations live outside it: `fts.rs` builds the keyword index from
-//! `[fts]` and `vectors.rs` sizes the vector table to the model, and both are
-//! reconciled on every open rather than by a step. Everything a caller names is re-exported here, so `crate::store::X`
-//! is the path to every public item whichever file holds it.
+//! `[fts]` and reconciles it on every open, and `vectors.rs` sizes the vector
+//! table to the model at index time and recreates it on open only when the
+//! store records a width and holds no table. Everything a caller names is
+//! re-exported here, so `crate::store::X` is the path to every public item
+//! whichever file holds it.
 
 mod aliases;
 mod chunks;
-mod cli_events;
 mod edges;
 mod files;
 mod fts;
-mod identity;
-mod migration_log;
-mod placement;
 mod properties;
 mod schema;
 mod scope;
@@ -25,13 +23,9 @@ mod vectors;
 
 pub(crate) use chunks::normalise_heading;
 pub use chunks::{ChunkRecord, DOC_LEVEL, NewChunk};
-pub use cli_events::CliEvent;
 pub use edges::EdgeStats;
 pub use files::FileRecord;
 pub use fts::{FtsResult, fts_objects_sql};
-pub use identity::IdentityFact;
-pub use migration_log::MigrationEntry;
-pub use placement::PlacementCorrection;
 pub use properties::{NewProperty, PropertyCount, PropertyRow, ValueCount};
 pub use schema::SCHEMA_VERSION;
 pub use scope::{LinkIds, ListOrder, ListRow};
@@ -50,7 +44,6 @@ use std::path::Path;
 pub struct StoreStats {
     pub file_count: usize,
     pub chunk_count: usize,
-    pub tombstone_count: usize,
     pub last_indexed_at: Option<String>,
     pub vault_path: Option<String>,
 }
@@ -125,12 +118,14 @@ impl Store {
         self.upgrade_to_current()?;
         self.ensure_fts_table()?;
         // The vector table's width is the embedding model's, and no model is
-        // loaded here — so this must not guess (issue #12). A database that has
-        // been indexed tells us its width; one that has not gets no vec table
-        // until [`Store::ensure_embedding_dim`] reconciles it against the model.
-        if let Some(dim) = self.recorded_embedding_dim()? {
+        // loaded here, so this must not guess (issue #12). A store that has
+        // been indexed records its width and gets its table back if it is
+        // absent; one that has not gets no table until
+        // [`Store::ensure_embedding_dim`] sizes it against the model.
+        if let Some(dim) = self.recorded_embedding_dim()?
+            && self.vec_table_dim()?.is_none()
+        {
             crate::vecstore::init_vec_table(&self.conn, dim)?;
-            self.migrate_vectors_to_vec0()?;
         }
         Ok(())
     }
@@ -170,13 +165,11 @@ impl Store {
         let chunk_count: i64 = self
             .conn
             .query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))?;
-        let tombstone_count = self.tombstone_count()?;
         let last_indexed_at = self.get_meta("last_indexed_at")?;
         let vault_path = self.get_meta("vault_path")?;
         Ok(StoreStats {
             file_count,
             chunk_count: chunk_count as usize,
-            tombstone_count,
             last_indexed_at,
             vault_path,
         })

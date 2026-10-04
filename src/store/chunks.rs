@@ -340,7 +340,7 @@ impl Store {
     }
 
     /// Return vector_ids for all chunks belonging to a file.
-    /// Useful for tombstoning before re-indexing a changed file.
+    /// Read before a changed file's chunks are replaced, so their vectors can be deleted.
     pub fn get_vector_ids_for_file(&self, file_id: i64) -> Result<Vec<u64>> {
         let mut stmt = self
             .conn
@@ -430,26 +430,6 @@ impl Store {
             // A malformed FTS expression means no match, not a failed search.
             Err(_) => Ok(None),
         }
-    }
-
-    /// Retrieve all chunk vectors for a given file, ordered by chunk id.
-    pub fn get_chunk_vectors_for_file(&self, file_id: i64) -> Result<Vec<Vec<f32>>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT vector FROM chunks WHERE file_id = ?1 AND vector IS NOT NULL ORDER BY id",
-        )?;
-        let rows = stmt.query_map(params![file_id], |row| {
-            let blob: Vec<u8> = row.get(0)?;
-            let vector: Vec<f32> = blob
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                .collect();
-            Ok(vector)
-        })?;
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row?);
-        }
-        Ok(results)
     }
 
     pub fn next_vector_id(&self) -> Result<u64> {
@@ -687,75 +667,6 @@ mod tests {
     fn test_next_vector_id_empty() {
         let store = Store::open_memory().unwrap();
         assert_eq!(store.next_vector_id().unwrap(), 0);
-    }
-
-    #[test]
-    fn test_get_chunk_vectors_for_file() {
-        let store = Store::open_memory().unwrap();
-        let file_id = store
-            .insert_file(
-                "notes/vec.md",
-                "h1",
-                100,
-                &generate_docid("notes/vec.md"),
-                None,
-                None,
-            )
-            .unwrap();
-
-        let v1: Vec<f32> = vec![1.0, 2.0, 3.0];
-        let v2: Vec<f32> = vec![4.0, 5.0, 6.0];
-        store
-            .insert_chunk_with_vector(
-                &NewChunk {
-                    file_id,
-                    seq: 0,
-                    heading: "H1",
-                    text: "text1",
-                    vector_id: 100,
-                    token_count: 10,
-                    ..Default::default()
-                },
-                &v1,
-            )
-            .unwrap();
-        store
-            .insert_chunk_with_vector(
-                &NewChunk {
-                    file_id,
-                    seq: 0,
-                    heading: "H2",
-                    text: "text2",
-                    vector_id: 101,
-                    token_count: 10,
-                    ..Default::default()
-                },
-                &v2,
-            )
-            .unwrap();
-
-        let vectors = store.get_chunk_vectors_for_file(file_id).unwrap();
-        assert_eq!(vectors.len(), 2);
-        assert_eq!(vectors[0], v1);
-        assert_eq!(vectors[1], v2);
-    }
-
-    #[test]
-    fn test_get_chunk_vectors_empty() {
-        let store = Store::open_memory().unwrap();
-        let file_id = store
-            .insert_file(
-                "notes/empty.md",
-                "h1",
-                100,
-                &generate_docid("notes/empty.md"),
-                None,
-                None,
-            )
-            .unwrap();
-
-        let vectors = store.get_chunk_vectors_for_file(file_id).unwrap();
-        assert!(vectors.is_empty());
     }
 
     #[test]

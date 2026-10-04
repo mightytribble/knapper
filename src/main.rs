@@ -64,6 +64,34 @@ fn remove_dir_if_exists(path: &std::path::Path) -> Result<bool> {
     }
 }
 
+/// The index bar `knapper index` draws, over the sink the library reports to.
+struct BarProgress(Option<indicatif::ProgressBar>);
+
+impl knapper::indexer::IndexProgress for BarProgress {
+    fn begin(&mut self, total: usize) {
+        let pb = indicatif::ProgressBar::new(total as u64);
+        pb.set_style(
+            indicatif::ProgressStyle::with_template(
+                "  [{bar:40.cyan/blue}] {pos}/{len} {msg} ({eta})",
+            )
+            .unwrap()
+            .progress_chars("=>-"),
+        );
+        self.0 = Some(pb);
+    }
+    fn file(&mut self, rel_path: &str) {
+        if let Some(pb) = &self.0 {
+            pb.set_message(rel_path.to_string());
+            pb.inc(1);
+        }
+    }
+    fn end(&mut self) {
+        if let Some(pb) = self.0.take() {
+            pb.finish_with_message("done");
+        }
+    }
+}
+
 /// The store, the vault it indexed and that vault's profile.
 ///
 /// Every capability that reads or writes the vault opens these three the same
@@ -172,12 +200,14 @@ async fn main() -> Result<()> {
         config::set_data_dir_override(dir.clone());
     }
 
-    // Set up tracing. Default: suppress all logs (ort is very noisy).
-    // --verbose enables debug for knapper, info for everything else.
+    // Set up tracing. The library reports through `tracing`, and a warning
+    // is one the user has to see: a dimension change that re-indexes the
+    // vault, a file left unembedded, a config table this version does not
+    // read. --verbose enables debug for knapper, info for everything else.
     let filter = if cli.verbose {
         "knapper=debug,info"
     } else {
-        "error"
+        "warn"
     };
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -249,6 +279,7 @@ async fn main() -> Result<()> {
                 &cfg,
                 indexer::IndexSettings::from_config(&cfg),
                 rebuild,
+                &mut BarProgress(None),
             )?;
 
             println!(
@@ -592,128 +623,29 @@ async fn main() -> Result<()> {
             }
         }
 
-        Command::Init {
-            args,
-            path,
-            identity,
-            reindex,
-            detect,
-            json,
-            quiet,
-        } => {
-            let knapper::params::Init {
-                mode,
-                name,
-                role,
-                purpose,
-            } = args;
-            // `--mode` is the name the servers call these two paths by;
-            // `--detect` and `--json` are the CLI's older spelling of the
-            // same two, and both reach the same code (#62).
-            let (detect, json) = match mode.as_deref() {
-                Some("detect") => (true, json),
-                Some("apply") => {
-                    // `--detect` is the older spelling of the other mode, so
-                    // the two together name two modes. Which one the caller
-                    // meant is not for this arm to guess.
-                    if detect {
-                        eprintln!("--mode apply and --detect name different modes. Use one.");
-                        std::process::exit(1);
-                    }
-                    (detect, true)
-                }
-                Some(other) => {
-                    eprintln!("Unknown mode: {other}. Use 'detect' or 'apply'.");
-                    std::process::exit(1);
-                }
-                None => (detect, json),
-            };
+        Command::Init { args, path } => {
             cfg.merge_vault_path(path);
             let vault_path = match &cfg.vault_path {
                 Some(p) => p.clone(),
                 None => std::env::current_dir()?,
             };
             let vault_path = vault_path.canonicalize().unwrap_or(vault_path);
-
-            if detect {
-                let result = knapper::onboarding::run_detect_json(&vault_path)?;
-                println!("{}", serde_json::to_string_pretty(&result)?);
-                return Ok(());
-            }
-
-            if json {
-                let flags = knapper::onboarding::ApplyFlags {
-                    name,
-                    role,
-                    purpose,
-                    identity_only: identity,
-                    reindex_only: reindex,
-                };
-                let settings = knapper::indexer::IndexSettings::from_config(&cfg);
-                let result = knapper::onboarding::run_apply_json(
-                    &vault_path,
-                    &mut cfg,
-                    settings,
-                    &data_dir,
-                    flags,
-                )?;
-                println!("{}", serde_json::to_string_pretty(&result)?);
-                return Ok(());
-            }
-
-            let flags = knapper::onboarding::InteractiveFlags {
-                name,
-                role,
-                purpose,
-                identity_only: identity,
-                reindex_only: reindex,
-                quiet,
+            let result = match args.mode {
+                knapper::params::InitMode::Detect => {
+                    knapper::onboarding::run_detect_json(&vault_path)?
+                }
+                knapper::params::InitMode::Apply => {
+                    let settings = knapper::indexer::IndexSettings::from_config(&cfg);
+                    knapper::onboarding::run_apply_json(
+                        &vault_path,
+                        &cfg,
+                        settings,
+                        &data_dir,
+                        &mut BarProgress(None),
+                    )?
+                }
             };
-            knapper::onboarding::run_interactive(&vault_path, &mut cfg, &data_dir, flags)?;
-        }
-
-        Command::Identity(args) => {
-            let json = cli.json;
-            let db_path = config::db_path(&data_dir);
-            if !db_path.exists() {
-                anyhow::bail!("No index found. Run `knapper init` first.");
-            }
-            let store = knapper::store::Store::open(&db_path)?;
-            if args.refresh {
-                let profile = knapper::config::Config::load_vault_profile()?;
-                match profile {
-                    Some(ref p) => {
-                        knapper::identity::extract_l1_facts(&store, p)?;
-                        eprintln!("L1 facts refreshed.");
-                    }
-                    None => {
-                        anyhow::bail!("No vault profile found. Run `knapper init` first.");
-                    }
-                }
-            }
-            if json {
-                // L0 comes from config (not the identity_facts table)
-                let id = &cfg.identity;
-                let mut l0_entries = Vec::new();
-                if let Some(name) = &id.name {
-                    l0_entries.push(serde_json::json!({"key": "name", "value": name}));
-                }
-                if let Some(role) = &id.role {
-                    l0_entries.push(serde_json::json!({"key": "role", "value": role}));
-                }
-                if let Some(purpose) = &id.vault_purpose {
-                    l0_entries.push(serde_json::json!({"key": "vault_purpose", "value": purpose}));
-                }
-                let l1 = store.get_identity_facts(1)?;
-                let result = serde_json::json!({
-                    "l0": l0_entries,
-                    "l1": l1.iter().map(|f| serde_json::json!({"key": &f.key, "value": &f.value, "source": &f.source, "updated_at": &f.updated_at})).collect::<Vec<_>>(),
-                });
-                println!("{}", serde_json::to_string_pretty(&result)?);
-            } else {
-                let block = knapper::identity::format_identity_block(&cfg, &store)?;
-                println!("{}", block);
-            }
+            println!("{}", serde_json::to_string_pretty(&result)?);
         }
 
         Command::Configure {
@@ -892,7 +824,6 @@ async fn main() -> Result<()> {
             let input = knapper::writer::CreateNoteInput {
                 content,
                 filename: args.filename,
-                type_hint: args.type_hint,
                 tags: args.tags,
                 folder: args.folder,
                 created_by: "cli".into(),
@@ -910,10 +841,7 @@ async fn main() -> Result<()> {
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
-                println!(
-                    "Created: {} (#{}) [{}]",
-                    result.path, result.docid, result.strategy
-                );
+                println!("Created: {} (#{})", result.path, result.docid);
                 if !result.links_added.is_empty() {
                     println!("Links: {}", result.links_added.join(", "));
                 }
@@ -1084,77 +1012,6 @@ async fn main() -> Result<()> {
                     "Re-indexed: {} ({} chunks, #{})",
                     args.file, result.total_chunks, result.docid
                 );
-            }
-        }
-
-        Command::Migrate(args) => {
-            // `preview` has no command-line spelling, so the CLI's `apply`
-            // reads the plan its own `preview` saved (#62).
-            let mode = args.mode;
-            let data_dir = Config::data_dir()?;
-            if !index_exists(&data_dir) {
-                eprintln!("No index found. Run 'knapper index <path>' first.");
-                std::process::exit(1);
-            }
-            let db_path = config::db_path(&data_dir);
-            let store = store::Store::open(&db_path)?;
-            let vault_path_str = store
-                .get_meta("vault_path")?
-                .expect("no vault path in index");
-            let vault_path = PathBuf::from(&vault_path_str);
-            let profile = Config::load_vault_profile().ok().flatten();
-
-            // PARA is the only strategy, so the mode names the operation and
-            // nothing spells PARA any more (#62).
-            match mode.as_str() {
-                "preview" => {
-                    println!("Scanning vault for PARA classification...");
-                    let preview =
-                        knapper::migrate::generate_preview(&store, &vault_path, profile.as_ref())?;
-                    knapper::migrate::save_preview(&preview, &data_dir)?;
-                    println!();
-                    println!("Preview generated:");
-                    println!("  Files to move: {}", preview.files.len());
-                    println!("  Uncertain:     {}", preview.uncertain.len());
-                    println!("  Skipped:       {}", preview.skipped);
-                    println!();
-                    println!("Preview saved to:");
-                    println!("  {}", data_dir.join("migration-preview.md").display());
-                    println!("  {}", data_dir.join("migration-preview.json").display());
-                    println!();
-                    println!("Review the preview, then run: knapper migrate --mode apply");
-                }
-                "apply" => {
-                    let preview = knapper::migrate::load_preview(&data_dir)?;
-                    let result = knapper::migrate::apply_preview(&preview, &store, &vault_path)?;
-                    println!(
-                        "Migration {} applied: {} files moved",
-                        result.migration_id, result.moved
-                    );
-                    if !result.errors.is_empty() {
-                        eprintln!("Errors:");
-                        for e in &result.errors {
-                            eprintln!("  {}", e);
-                        }
-                    }
-                }
-                "undo" => {
-                    let result = knapper::migrate::undo_last(&store, &vault_path)?;
-                    println!(
-                        "Migration {} undone: {} files restored",
-                        result.migration_id, result.restored
-                    );
-                    if !result.errors.is_empty() {
-                        eprintln!("Errors:");
-                        for e in &result.errors {
-                            eprintln!("  {}", e);
-                        }
-                    }
-                }
-                other => {
-                    eprintln!("Unknown mode: {other}. Use 'preview', 'apply' or 'undo'.");
-                    std::process::exit(1);
-                }
             }
         }
 

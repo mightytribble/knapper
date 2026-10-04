@@ -30,9 +30,9 @@ pub struct Search {
     /// ceiling rather than the number asked for.
     #[arg(short = 'n', long)]
     pub top_n: Option<usize>,
-    /// Show the per-lane score breakdown for each result. On the servers the
-    /// breakdown rides beside the envelope as `explain`; the CLI prints it as
-    /// text (#62).
+    /// Include the per-lane score breakdown for each result (#62).
+    // On the servers the breakdown rides beside the envelope as `explain`.
+    // The CLI prints it as text.
     // The CLI refuses `--explain` with `--json`, since the breakdown is text
     // there: a usage error rather than a flag silently dropped.
     #[arg(long, conflicts_with = "json")]
@@ -461,8 +461,8 @@ where
 /// the note's own `tags` list; no other key is written.
 #[derive(Debug, Args, Deserialize, JsonSchema)]
 pub struct Create {
-    /// Note content. Required on the servers; the CLI reads stdin when it is
-    /// omitted.
+    /// Note content.
+    // The CLI reads stdin when it is omitted; the servers require it.
     #[arg(long)]
     pub content: Option<String>,
     /// Filename for the note. A bare name gets `.md` appended; a name that
@@ -470,14 +470,12 @@ pub struct Create {
     /// so name the file the way it should read as provenance (#47).
     #[arg(long)]
     pub filename: String,
-    /// A hint at the note's kind, used for placement.
-    #[arg(long)]
-    pub type_hint: Option<String>,
     /// Tags to resolve against the vault's vocabulary.
     #[arg(long, value_delimiter = ',')]
     #[serde(default, deserialize_with = "deserialize_tag_list")]
     pub tags: Vec<String>,
-    /// Folder to place the note in. Placement chooses one when omitted.
+    /// The folder to file the note under, relative to the vault root.
+    /// Omitted, the note is filed at the root.
     #[arg(long)]
     pub folder: Option<String>,
     /// Set to false to skip automatic wikilink resolution. Defaults to true.
@@ -888,49 +886,22 @@ pub struct Status {}
 #[derive(Debug, Args, Deserialize, JsonSchema)]
 pub struct Health {}
 
-#[derive(Debug, Args, Deserialize, JsonSchema)]
-pub struct Identity {
-    /// Re-extract the L1 facts without a full re-index.
-    #[arg(long)]
-    #[serde(default)]
-    pub refresh: bool,
+/// What `init` does. `detect` inspects the vault and writes nothing; `apply`
+/// writes the vault profile and indexes. An enum, so the two legal words are
+/// published to an MCP client and the OpenAPI document (#62).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum InitMode {
+    Detect,
+    Apply,
 }
 
 #[derive(Debug, Args, Deserialize, JsonSchema)]
 pub struct Init {
-    /// `detect` inspects the vault and writes nothing; `apply` configures
-    /// identity and indexes. The CLI runs its interactive flow when this is
-    /// omitted, which is the one thing the other surfaces cannot do.
-    #[arg(long)]
-    pub mode: Option<String>,
-    /// User name, for `apply`.
-    #[arg(long)]
-    pub name: Option<String>,
-    /// User role, for `apply`.
-    #[arg(long)]
-    pub role: Option<String>,
-    /// Vault purpose, for `apply`.
-    #[arg(long)]
-    pub purpose: Option<String>,
-}
-
-/// `apply` moves files, and it moves them against the preview named here. A
-/// misspelled key would read as no key at all and send `apply` to whatever
-/// preview was saved last, so an unknown field is refused (#62).
-#[derive(Debug, Args, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct Migrate {
-    /// `preview`, `apply` or `undo`.
-    #[arg(long)]
-    pub mode: String,
-    /// The preview `apply` acts on. This is the one argument the servers
-    /// take and the CLI does not: a server caller holds the JSON that
-    /// `preview` returned it and passes it back, while the CLI's `preview`
-    /// saves the plan itself and its `apply` reads that copy.
-    // `#[arg(skip)]` keeps it off the command line, where JSON has no spelling.
-    #[arg(skip)]
-    #[serde(default)]
-    pub preview: Option<serde_json::Value>,
+    /// `detect` inspects the vault and writes nothing; `apply` writes the
+    /// vault profile and indexes.
+    #[arg(long, value_enum)]
+    pub mode: InitMode,
 }
 
 #[derive(Debug, Args, Deserialize, JsonSchema)]
@@ -960,8 +931,9 @@ pub struct Validate {
     #[arg(long, value_delimiter = ',')]
     #[serde(default, deserialize_with = "deserialize_tag_list")]
     pub none: Vec<String>,
-    /// Treat warnings as gating: the report's `ok` is false when any warning
-    /// is present, and the CLI exits non-zero.
+    /// Treat warnings as gating: the report's `ok` is false when any warning is
+    /// present.
+    // The CLI exits non-zero on a false `ok`.
     #[arg(long)]
     #[serde(default)]
     pub strict: bool,
@@ -1102,24 +1074,6 @@ mod tests {
         assert!(
             message.contains("unknown variant") && message.contains("replace"),
             "the error must name the legal values, got: {message}"
-        );
-    }
-
-    /// A misspelled `preview` key would read as no preview at all, and
-    /// `apply` would then move files against whichever plan was saved last.
-    /// The struct refuses the key instead (#62).
-    #[test]
-    fn migrate_refuses_a_key_it_does_not_know() {
-        let good =
-            serde_json::from_str::<Migrate>(r#"{"mode":"apply","preview":{"a":1}}"#).unwrap();
-        assert!(good.preview.is_some());
-
-        let err =
-            serde_json::from_str::<Migrate>(r#"{"mode":"apply","previews":{"a":1}}"#).unwrap_err();
-        let message = err.to_string();
-        assert!(
-            message.contains("unknown field") && message.contains("previews"),
-            "the error must name the key it refused, got: {message}"
         );
     }
 

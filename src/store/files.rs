@@ -557,14 +557,13 @@ mod tests {
             })
             .unwrap();
 
-        // Simulate detecting hash change: collect old vector_ids for tombstoning.
+        // Simulate detecting a hash change: collect the old vector ids.
         let old_vector_ids = store.get_vector_ids_for_file(file_id).unwrap();
         assert_eq!(old_vector_ids.len(), 2);
         assert!(old_vector_ids.contains(&50));
         assert!(old_vector_ids.contains(&51));
 
-        // Tombstone old vectors, delete file (cascades chunks), re-insert.
-        store.add_tombstones(&old_vector_ids).unwrap();
+        // Delete the file (cascades chunks), re-insert.
         store.delete_file(file_id).unwrap();
 
         let new_file_id = store
@@ -588,11 +587,6 @@ mod tests {
         let chunks = store.get_chunks_by_file(new_file_id).unwrap();
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].vector_id, 60);
-
-        // Old vectors are tombstoned.
-        let ts = store.get_tombstones().unwrap();
-        assert!(ts.contains(&50));
-        assert!(ts.contains(&51));
     }
 
     #[test]
@@ -803,7 +797,6 @@ mod tests {
             crate::writer::CreateNoteInput {
                 content: "Some content.\n".to_string(),
                 filename: "provenance-check".into(),
-                type_hint: None,
                 tags: vec![],
                 folder: Some("notes".into()),
                 created_by: "cli".into(),

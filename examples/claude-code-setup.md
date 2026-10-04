@@ -42,15 +42,17 @@ command it answers, with `-` written as `_`.
 
 **Read tools:**
 - `search` — hybrid search across the vault
+- `match` — whether a literal string still appears in the vault, and in how many notes
 - `read` — read a full note with metadata, or one section of it (`section`)
 - `list` — every note the scope admits, in path order (tag terms, directory
   terms, creator); `detailed` adds each note's heading outline, and `limit`
   with `after` reads a large listing in pages
 - `tags` — the vault's tag vocabulary, whole or under one term
+- `properties` — the vault's custom properties, or one property's values
 - `vault_map` — vault structure overview
 
 **Write tools:**
-- `create` — create a note with smart filing
+- `create` — create a note, filed under `folder` or at the vault root
 - `update` — a list of edits to one note in one write: the body, a section
   (`section`) or a frontmatter property (`property`), each with a `mode` of
   `replace`, `prepend`, `append` or `remove`
@@ -65,9 +67,7 @@ command it answers, with `-` written as `_`.
 - `health` — vault health diagnostics, read from the index
 - `validate` — check vault markdown for structural and indexing problems —
   one note, a scope, or the whole vault — read from disk, with no model loaded
-- `identity` — user identity (L0) and current context (L1)
-- `init` — first-time onboarding (`mode`: detect or apply)
-- `migrate` — PARA migration (`mode`: preview, apply or undo)
+- `init` — write the vault profile and index (`mode`: detect or apply)
 
 ## Example interactions
 

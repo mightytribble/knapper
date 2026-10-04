@@ -150,6 +150,15 @@ impl ApiError {
             headers: vec![("retry-after".to_string(), retry_after.to_string())],
         }
     }
+    /// A known route asked with the wrong method. The route exists and the
+    /// method is the caller's text, so the kind is `invalid_input`.
+    pub fn method_not_allowed() -> Self {
+        Self::new(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "invalid_input",
+            "method not allowed on this route",
+        )
+    }
 }
 
 /// The one place an error from a core call becomes a status.
@@ -176,6 +185,63 @@ impl From<anyhow::Error> for ApiError {
             None => Self::internal(&message),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Extractors whose rejection is an ApiError
+// ---------------------------------------------------------------------------
+
+/// `Json<T>` whose rejection is an `ApiError`: 400, `invalid_input`, axum's
+/// own text as the message. Every POST handler takes its body through this,
+/// so malformed JSON, an unknown enum word and a missing field answer the
+/// same body shape every other error does.
+pub struct ApiJson<T>(pub T);
+
+impl<T> axum::extract::FromRequest<ApiState> for ApiJson<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(
+        req: axum::extract::Request,
+        state: &ApiState,
+    ) -> Result<Self, Self::Rejection> {
+        match Json::<T>::from_request(req, state).await {
+            Ok(Json(value)) => Ok(ApiJson(value)),
+            Err(rejection) => Err(ApiError::bad_request(&rejection.body_text())),
+        }
+    }
+}
+
+/// `Query<T>` the same way, for every GET handler.
+pub struct ApiQuery<T>(pub T);
+
+impl<T> axum::extract::FromRequestParts<ApiState> for ApiQuery<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &ApiState,
+    ) -> Result<Self, Self::Rejection> {
+        match Query::<T>::from_request_parts(parts, state).await {
+            Ok(Query(value)) => Ok(ApiQuery(value)),
+            Err(rejection) => Err(ApiError::bad_request(&rejection.body_text())),
+        }
+    }
+}
+
+/// An unknown path. The transport's own 404, with a body like every other.
+async fn unknown_route() -> ApiError {
+    ApiError::not_found("no such route")
+}
+
+/// A known path with the wrong method.
+async fn wrong_method() -> ApiError {
+    ApiError::method_not_allowed()
 }
 
 // ---------------------------------------------------------------------------
@@ -295,23 +361,64 @@ pub fn routes() -> Vec<(&'static str, MethodRouter<ApiState>)> {
         // Index maintenance
         ("/api/index", post(handle_index)),
         ("/api/reindex-file", post(handle_reindex_file)),
-        // Identity endpoints
-        ("/api/identity", get(handle_identity)),
+        // Setup
         ("/api/init", post(handle_init)),
-        // Migration endpoints
-        ("/api/migrate", post(handle_migrate)),
         // The transport describing itself (no auth required)
         ("/openapi.json", get(handle_openapi)),
     ]
 }
 
+/// Bodies larger than this are refused before any handler reads them.
+pub const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+/// Requests in flight at once; the rest wait. One agent, maybe a few calls.
+pub const MAX_IN_FLIGHT: usize = 16;
+/// Routes that index the vault to completion and are not timed out.
+pub const UNTIMED_ROUTES: &[&str] = &["/api/index", "/api/init"];
+
+/// The limits every route runs under, from inner to outer: the timeout on
+/// the timed routes alone, then the body limit and the in-flight limit (one
+/// semaphore shared by every route) on all of them, then the two fallbacks. A function of its own so a test
+/// can hand it two toy routers and a timeout of milliseconds.
+pub fn with_limits(
+    timed: Router<ApiState>,
+    untimed: Router<ApiState>,
+    timeout: Option<std::time::Duration>,
+) -> Router<ApiState> {
+    let timed = match timeout {
+        Some(limit) => timed.layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            limit,
+        )),
+        None => timed,
+    };
+    timed
+        .merge(untimed)
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .layer(tower::limit::GlobalConcurrencyLimitLayer::new(
+            MAX_IN_FLIGHT,
+        ))
+        .fallback(unknown_route)
+        .method_not_allowed_fallback(wrong_method)
+}
+
 pub fn build_router(state: ApiState) -> Router {
     let cors = cors_layer(&state.http_config.cors_origins);
-    let mut router = Router::new();
+    let timeout = match state.http_config.request_timeout_secs {
+        0 => None,
+        secs => Some(std::time::Duration::from_secs(secs)),
+    };
+    let mut timed = Router::new();
+    let mut untimed = Router::new();
     for (path, handler) in routes() {
-        router = router.route(path, handler);
+        if UNTIMED_ROUTES.contains(&path) {
+            untimed = untimed.route(path, handler);
+        } else {
+            timed = timed.route(path, handler);
+        }
     }
-    router.layer(cors).with_state(state)
+    with_limits(timed, untimed, timeout)
+        .layer(cors)
+        .with_state(state)
 }
 
 async fn health_check() -> &'static str {
@@ -338,7 +445,7 @@ async fn handle_openapi(State(state): State<ApiState>) -> impl IntoResponse {
 async fn handle_match(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(body): Json<crate::params::Match>,
+    ApiJson(body): ApiJson<crate::params::Match>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, false)?;
     // Checked before the scan runs: a malformed scope is the caller's own text (#60).
@@ -354,7 +461,7 @@ async fn handle_match(
 async fn handle_search(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(body): Json<crate::params::Search>,
+    ApiJson(body): ApiJson<crate::params::Search>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, false)?;
     // Checked before the pipeline runs, so a typo fails fast (#35).
@@ -378,7 +485,7 @@ async fn handle_search(
 async fn handle_read(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Query(p): Query<crate::params::Read>,
+    ApiQuery(p): ApiQuery<crate::params::Read>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, false)?;
     let vault = state.core.vault_path.clone();
@@ -400,7 +507,7 @@ async fn handle_read(
 async fn handle_list(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Query(params): Query<crate::params::List>,
+    ApiQuery(params): ApiQuery<crate::params::List>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, false)?;
     let all_terms = crate::tags::merge_scope_alias(params.scope, params.all);
@@ -442,7 +549,7 @@ async fn handle_list(
 async fn handle_tags(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Query(params): Query<crate::params::Tags>,
+    ApiQuery(params): ApiQuery<crate::params::Tags>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, false)?;
     let prefix = params.under.as_deref().and_then(crate::tags::parse_term);
@@ -459,7 +566,7 @@ async fn handle_tags(
 async fn handle_properties(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Query(params): Query<crate::params::Properties>,
+    ApiQuery(params): ApiQuery<crate::params::Properties>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, false)?;
     let vault = state.core.vault_path.clone();
@@ -511,7 +618,7 @@ async fn handle_health(
 async fn handle_validate(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(body): Json<crate::params::Validate>,
+    ApiJson(body): ApiJson<crate::params::Validate>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, false)?;
     let target = body
@@ -558,7 +665,7 @@ async fn handle_status(
 async fn handle_create(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(body): Json<crate::params::Create>,
+    ApiJson(body): ApiJson<crate::params::Create>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
     state.core.writable()?;
@@ -570,7 +677,6 @@ async fn handle_create(
     let input = CreateNoteInput {
         content,
         filename: body.filename,
-        type_hint: body.type_hint,
         tags: body.tags,
         folder: body.folder,
         created_by: "http-api".into(),
@@ -606,7 +712,7 @@ async fn handle_create(
 async fn handle_update(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(body): Json<crate::params::Update>,
+    ApiJson(body): ApiJson<crate::params::Update>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
     state.core.writable()?;
@@ -653,7 +759,7 @@ async fn handle_update(
 async fn handle_move(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(body): Json<crate::params::Move>,
+    ApiJson(body): ApiJson<crate::params::Move>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
     state.core.writable()?;
@@ -675,7 +781,7 @@ async fn handle_move(
 async fn handle_archive(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(body): Json<crate::params::Archive>,
+    ApiJson(body): ApiJson<crate::params::Archive>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
     state.core.writable()?;
@@ -706,62 +812,10 @@ async fn handle_archive(
     Ok(Json(serde_json::json!(result)))
 }
 
-// ---------------------------------------------------------------------------
-// Migration endpoint handlers
-// ---------------------------------------------------------------------------
-
-async fn handle_migrate(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Json(body): Json<crate::params::Migrate>,
-) -> Result<impl IntoResponse, ApiError> {
-    authorize(&headers, &state, true)?;
-    let vault = state.core.vault_path.clone();
-    // The CLI already took a mode. MCP and HTTP split it into three names,
-    // which is the same capability spelled three ways (#62). The mode is read
-    // before the read-only guard, so that one word means the same thing on
-    // both servers: `preview` writes nothing and runs, and a word that names
-    // no operation is answered as such rather than as a refused write.
-    match body.mode.as_str() {
-        "preview" => {
-            let profile = state.core.profile.clone();
-            let preview = state
-                .core
-                .with_reader(move |store| {
-                    crate::migrate::generate_preview(store, &vault, profile.as_ref().as_ref())
-                })
-                .await?;
-            Ok(Json(serde_json::to_value(&preview).unwrap()))
-        }
-        "apply" => {
-            state.core.writable()?;
-            let preview = crate::migrate::resolve_preview(body.preview)?;
-            let result = state
-                .core
-                .with_core(move |g| crate::migrate::apply_preview(&preview, g.store, &vault))
-                .await?;
-            Ok(Json(serde_json::to_value(&result).unwrap()))
-        }
-        "undo" => {
-            state.core.writable()?;
-            let result = state
-                .core
-                .with_core(move |g| crate::migrate::undo_last(g.store, &vault))
-                .await?;
-            Ok(Json(serde_json::to_value(&result).unwrap()))
-        }
-        // The mode is the caller's own text, so a word that names no
-        // operation is a bad request and not an internal fault.
-        other => Err(ApiError::bad_request(&format!(
-            "Unknown mode: {other}. Use 'preview', 'apply' or 'undo'."
-        ))),
-    }
-}
-
 async fn handle_delete(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(body): Json<crate::params::Delete>,
+    ApiJson(body): ApiJson<crate::params::Delete>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
     state.core.writable()?;
@@ -797,7 +851,7 @@ async fn handle_delete(
 async fn handle_index(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(body): Json<crate::params::Index>,
+    ApiJson(body): ApiJson<crate::params::Index>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
     // A read-only server refuses it like any other write, the way MCP's
@@ -840,9 +894,11 @@ async fn handle_index(
 async fn handle_reindex_file(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(body): Json<crate::params::ReindexFile>,
+    ApiJson(body): ApiJson<crate::params::ReindexFile>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
+    // It writes the store, so a read-only server refuses it like `index`.
+    state.core.writable()?;
     let vault = state.core.vault_path.clone();
     let settings = state.core.index_settings;
     let file = body.file.clone();
@@ -862,97 +918,45 @@ async fn handle_reindex_file(
 }
 
 // ---------------------------------------------------------------------------
-// Identity / init endpoint handlers
+// Init endpoint handler
 // ---------------------------------------------------------------------------
-
-/// The identity block, optionally re-extracted first.
-///
-/// `refresh` is a parameter of the capability on every surface (#62). It
-/// re-reads the L1 facts from the store the server already holds, so an agent
-/// whose session started before the last write can ask for current ones
-/// without a full re-index.
-async fn handle_identity(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Query(p): Query<crate::params::Identity>,
-) -> Result<impl IntoResponse, ApiError> {
-    // Re-extraction clears the `identity_facts` rows and derives them again,
-    // so it takes the write permission and a read-only server refuses it; the
-    // block itself is a read either way.
-    authorize(&headers, &state, p.refresh)?;
-    if p.refresh {
-        state.core.writable()?;
-    }
-    let config = state.core.config.clone();
-    let block = if p.refresh {
-        if state.core.profile.is_none() {
-            return Err(ApiError::bad_request(
-                "No vault profile found. Run `knapper init` first.",
-            ));
-        }
-        let profile = state.core.profile.clone();
-        state
-            .core
-            .with_core(move |g| {
-                let profile = profile.as_ref().as_ref().expect("checked above");
-                crate::identity::extract_l1_facts(g.store, profile)?;
-                crate::identity::format_identity_block(&config, g.store)
-            })
-            .await
-    } else {
-        state
-            .core
-            .with_reader(move |store| crate::identity::format_identity_block(&config, store))
-            .await
-    }?;
-    Ok(Json(serde_json::json!({ "identity": block })))
-}
 
 async fn handle_init(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(body): Json<crate::params::Init>,
+    ApiJson(body): ApiJson<crate::params::Init>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
-    match body.mode.as_deref() {
-        Some("detect") => {
+    match body.mode {
+        crate::params::InitMode::Detect => {
             let vault = state.core.vault_path.clone();
             let result =
                 crate::core::blocking(move || crate::onboarding::run_detect_json(&vault)).await?;
             Ok(Json(result))
         }
-        Some("apply") => {
+        crate::params::InitMode::Apply => {
             // `apply` indexes the vault, which is the work `index` is guarded
             // against on a read-only server. The mode is read first, so
             // `detect` — which writes nothing — still runs (#62).
             state.core.writable()?;
             let data_dir = crate::config::Config::data_dir()?;
-            let flags = crate::onboarding::ApplyFlags {
-                name: body.name,
-                role: body.role,
-                purpose: body.purpose,
-                identity_only: false,
-                reindex_only: false,
-            };
             let vault = state.core.vault_path.clone();
+            let config = state.core.config.clone();
             let settings = state.core.index_settings;
-            // `apply` writes `config.toml`, so it is the one handler that
-            // loads the file: it edits it. The running server keeps the
-            // config it started with, which the reply says. Any index it
-            // builds takes the session's index-time settings (#55, #72).
-            // `run_apply_json` opens its own store, so the core call is taken
-            // for exclusion only.
+            // The running server keeps the profile it started with, which
+            // the reply says. Any index it builds takes the session's
+            // index-time settings (#55, #72). `run_apply_json` opens its own
+            // store, so the core call is taken for exclusion only.
             let result = state
                 .core
                 .with_core(move |g| {
                     let _ = g;
-                    let mut config = crate::config::Config::load().unwrap_or_default();
                     let mut result = crate::onboarding::run_apply_json(
                         &vault,
-                        &mut config,
+                        &config,
                         settings,
                         &data_dir,
-                        flags,
+                        &mut crate::indexer::NoProgress,
                     )?;
                     if let Some(object) = result.as_object_mut() {
                         object.insert("restart_required".into(), serde_json::json!(true));
@@ -962,15 +966,6 @@ async fn handle_init(
                 .await?;
             Ok(Json(result))
         }
-        Some(other) => Err(ApiError::bad_request(&format!(
-            "Unknown mode: {other}. Use 'detect' or 'apply'."
-        ))),
-        // A server has no interactive flow, so `init` there needs a mode.
-        // The CLI's no-mode form is its own prompt sequence and reaches no
-        // surface but the CLI (#62).
-        None => Err(ApiError::bad_request(
-            "init needs mode=detect or mode=apply",
-        )),
     }
 }
 
@@ -1006,6 +1001,7 @@ mod tests {
                 },
             ],
             public_url: None,
+            request_timeout_secs: 60,
         }
     }
 
@@ -1166,7 +1162,6 @@ mod tests {
         let (_tmp, state) = test_api_state();
         let (status, body) = post_json(state, "/api/init", r#"{}"#).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(body["error"], "init needs mode=detect or mode=apply");
         assert_eq!(body["kind"], "invalid_input");
     }
 
@@ -1828,100 +1823,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn each_migrate_mode_reaches_the_operation_it_names() {
-        // One name takes three modes (#62), so the one thing worth proving is
-        // that each mode string still arrives at the operation it names.
-        // Each answer below can come from one of the three and no other.
-
-        // `preview` classifies: an empty index proposes no move, and the
-        // response is a preview and not a result.
-        let (_tmp_a, state_a) = test_api_state();
-        let (status, body) = post_json(state_a, "/api/migrate", r#"{"mode":"preview"}"#).await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(body.get("files").is_some(), "not a preview: {body}");
-        assert_eq!(body["files"].as_array().unwrap().len(), 0);
-
-        // `apply` executes the preview it is given: this one moves nothing,
-        // and it answers with that preview's own id.
-        let (_tmp_b, state_b) = test_api_state();
-        let (status, body) = post_json(
-            state_b,
-            "/api/migrate",
-            r#"{"mode":"apply","preview":{"migration_id":"m-14","files":[],"uncertain":[],"skipped":0}}"#,
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["migration_id"], "m-14");
-        assert_eq!(body["moved"], 0);
-
-        // `undo` reads the migration log, which this store has no row in.
-        let (_tmp_c, state_c) = test_api_state();
-        let (status, body) = post_json(state_c, "/api/migrate", r#"{"mode":"undo"}"#).await;
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert!(
-            body["error"]
-                .as_str()
-                .unwrap()
-                .contains("No migration to undo"),
-            "not the undo path: {body}"
-        );
-    }
-
-    #[tokio::test]
-    async fn read_only_refuses_the_migrate_modes_that_write_and_no_others() {
-        // One name now carries all three modes, so the guard belongs to the
-        // modes that write and not to the route. `preview` writes nothing, so
-        // it runs here as it does on MCP, and an unknown mode is still
-        // answered as an unknown mode (#62).
-        let (_tmp, mut state) = test_api_state();
-        state.core.read_only = true;
-        let (status, _) = post_json(state, "/api/migrate", r#"{"mode":"preview"}"#).await;
-        assert_eq!(status, StatusCode::OK);
-
-        let (_tmp, mut state) = test_api_state();
-        state.core.read_only = true;
-        let (status, body) = post_json(
-            state,
-            "/api/migrate",
-            r#"{"mode":"apply","preview":{"migration_id":"m","files":[],"uncertain":[],"skipped":0}}"#,
-        )
-        .await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
-        assert_eq!(body["kind"], "read_only");
-        assert_eq!(
-            body["error"],
-            "write operations are disabled in read-only mode; start `serve` without --read-only to enable writes"
-        );
-
-        let (_tmp, mut state) = test_api_state();
-        state.core.read_only = true;
-        let (status, _) = post_json(state, "/api/migrate", r#"{"mode":"undo"}"#).await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
-
-        let (_tmp, mut state) = test_api_state();
-        state.core.read_only = true;
-        let (status, body) = post_json(state, "/api/migrate", r#"{"mode":"sideways"}"#).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(
-            body["error"],
-            "Unknown mode: sideways. Use 'preview', 'apply' or 'undo'."
-        );
-    }
-
-    #[tokio::test]
-    async fn a_migrate_mode_naming_nothing_is_a_bad_request() {
-        // The mode is the caller's own text, so a word that names no
-        // operation is a 400 and not a 500 (#62).
-        let (_tmp, state) = test_api_state();
-        let (status, body) = post_json(state, "/api/migrate", r#"{"mode":"sideways"}"#).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(
-            body["error"],
-            "Unknown mode: sideways. Use 'preview', 'apply' or 'undo'."
-        );
-    }
-
-    #[tokio::test]
     async fn init_detect_reaches_detection_and_writes_nothing() {
         // `detect` is the half of `init` a server can run without touching
         // the vault (#62): it reports what it found and leaves no file.
@@ -1940,22 +1841,24 @@ mod tests {
 
     #[tokio::test]
     async fn init_without_a_mode_is_a_bad_request() {
-        // A server has no interactive flow, so the CLI's no-mode form has no
-        // meaning here (#62).
+        // The mode is required on every surface; the extractor refuses the
+        // body before the handler runs, with the kind every error carries.
         let (_tmp, state) = test_api_state();
         let (status, body) = post_json(state, "/api/init", r#"{}"#).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(body["error"], "init needs mode=detect or mode=apply");
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["kind"], "invalid_input");
+        assert!(body["error"].as_str().unwrap().contains("mode"), "{body}");
     }
 
     #[tokio::test]
     async fn an_init_mode_naming_nothing_is_a_bad_request() {
         let (_tmp, state) = test_api_state();
         let (status, body) = post_json(state, "/api/init", r#"{"mode":"sideways"}"#).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(
-            body["error"],
-            "Unknown mode: sideways. Use 'detect' or 'apply'."
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["kind"], "invalid_input");
+        assert!(
+            body["error"].as_str().unwrap().contains("sideways"),
+            "{body}"
         );
     }
 
@@ -2227,79 +2130,223 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
     }
 
-    /// A server's `apply` acts on the plan its caller sends and no other. The
-    /// copy `knapper migrate --mode preview` saves belongs to the CLI's own
-    /// two-step flow, and an `apply` that fell back to it would move files
-    /// against a plan this caller never saw (#62).
-    #[tokio::test]
-    async fn a_migrate_apply_with_no_preview_is_a_bad_request() {
-        let (_tmp, state) = test_api_state();
-        let (status, body) = post_json(state, "/api/migrate", r#"{"mode":"apply"}"#).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(
-            body["error"].as_str().unwrap().contains("needs a preview"),
-            "got {body}"
-        );
-    }
-
-    /// `identity` takes `refresh` on every surface (#62). Before this the
-    /// route had no extractor at all, so the flag the CLI honoured had no
-    /// spelling here. `extract_l1_facts` clears tier 1 before it derives it
-    /// again, so a stale fact seeded first is what proves the call was made.
-    #[tokio::test]
-    async fn identity_refresh_re_extracts_the_l1_facts() {
-        let (_tmp, mut state) = indexed_state();
-        let root = state.core.vault_path.as_ref().clone();
-        state.core.profile = Arc::new(Some(crate::profile::VaultProfile {
-            vault_path: root,
-            vault_type: crate::profile::VaultType::Obsidian,
-            structure: crate::profile::StructureDetection {
-                method: crate::profile::StructureMethod::Para,
-                folders: crate::profile::FolderMap::default(),
-            },
-            stats: crate::profile::VaultStats::default(),
-        }));
-
-        let stale = |state: &ApiState| {
-            let writer = state.core.writer();
-            let store = writer.try_lock().expect("uncontended");
-            store
-                .get_identity_facts(1)
-                .unwrap()
-                .into_iter()
-                .any(|f| f.key == "stale")
-        };
-        {
-            let writer = state.core.writer();
-            let store = writer.try_lock().expect("uncontended");
-            store
-                .upsert_identity_fact(1, "stale", "from an older session", None)
-                .unwrap();
-        }
-        assert!(stale(&state));
-
-        // A read key reaches the block itself and no re-extraction happens.
-        let response = get(state.clone(), "/api/identity").await;
-        assert_eq!(response.status(), StatusCode::OK);
-        assert!(stale(&state), "a call that did not ask re-extracts nothing");
-
-        // Re-extraction writes rows, so a read key is refused.
-        let response = get(state.clone(), "/api/identity?refresh=true").await;
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        assert!(stale(&state));
-
-        let response = build_router(state.clone())
+    /// GET `path` as a writer, and return the status and the body.
+    async fn get_json(state: ApiState, path: &str) -> (StatusCode, serde_json::Value) {
+        let app = build_router(state);
+        let response = app
             .oneshot(
                 axum::http::Request::builder()
-                    .uri("/api/identity?refresh=true")
+                    .method("GET")
+                    .uri(path)
                     .header("authorization", "Bearer kn_writekey")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        assert!(!stale(&state), "refresh=true must re-derive tier 1");
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    /// The promise http-rest-api.md makes is that every error body carries
+    /// `kind`. axum's own extractor rejections are errors too.
+    #[tokio::test]
+    async fn malformed_json_is_a_bad_request_with_a_kind() {
+        let (_tmp, state) = test_api_state();
+        let (status, body) = post_json(state, "/api/delete", r#"{"file": "#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["kind"], "invalid_input");
+        assert!(body["error"].is_string(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_enum_word_is_a_bad_request_with_a_kind() {
+        let (_tmp, state) = test_api_state();
+        let (status, body) =
+            post_json(state, "/api/delete", r#"{"file":"a.md","mode":"sideways"}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["kind"], "invalid_input");
+        assert!(
+            body["error"].as_str().unwrap().contains("sideways"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_field_is_a_bad_request_with_a_kind() {
+        let (_tmp, state) = test_api_state();
+        let (status, body) = post_json(state, "/api/delete", r#"{}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["kind"], "invalid_input");
+        assert!(body["error"].as_str().unwrap().contains("file"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_query_value_of_the_wrong_type_is_a_bad_request_with_a_kind() {
+        let (_tmp, state) = test_api_state();
+        let (status, body) = get_json(state, "/api/list?limit=many").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["kind"], "invalid_input");
+        assert!(body["error"].as_str().unwrap().contains("limit"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_route_is_a_404_with_a_kind() {
+        let (_tmp, state) = test_api_state();
+        let (status, body) = get_json(state, "/api/nowhere").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["kind"], "not_found");
+    }
+
+    #[tokio::test]
+    async fn the_wrong_method_on_a_known_route_is_a_405_with_a_kind() {
+        let (_tmp, state) = test_api_state();
+        let (status, body) = get_json(state, "/api/delete").await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{body}");
+        assert_eq!(body["kind"], "invalid_input");
+    }
+
+    /// A toy router through the same limits the real one gets. A route under
+    /// the timeout answers 408 when it runs past it; one in `UNTIMED_ROUTES`
+    /// does not.
+    #[tokio::test]
+    async fn a_request_past_the_timeout_is_a_408() {
+        async fn slow() -> &'static str {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            "done"
+        }
+        let (_tmp, state) = test_api_state();
+        let timed = Router::new().route("/api/slow", axum::routing::get(slow));
+        let untimed = Router::new().route(UNTIMED_ROUTES[0], axum::routing::get(slow));
+        let app = with_limits(timed, untimed, Some(std::time::Duration::from_millis(20)))
+            .with_state(state);
+
+        let request = |uri: &str| {
+            axum::http::Request::builder()
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap()
+        };
+        let timed_out = app.clone().oneshot(request("/api/slow")).await.unwrap();
+        assert_eq!(timed_out.status(), StatusCode::REQUEST_TIMEOUT);
+        let completed = app.oneshot(request(UNTIMED_ROUTES[0])).await.unwrap();
+        assert_eq!(completed.status(), StatusCode::OK);
+    }
+
+    /// One semaphore for the whole server, not one per route: more than
+    /// `MAX_IN_FLIGHT` requests spread over two routes never run more than
+    /// `MAX_IN_FLIGHT` at once.
+    #[tokio::test]
+    async fn the_in_flight_limit_is_server_wide() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let slow = {
+            let in_flight = in_flight.clone();
+            let peak = peak.clone();
+            move || {
+                let in_flight = in_flight.clone();
+                let peak = peak.clone();
+                async move {
+                    let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    "done"
+                }
+            }
+        };
+        let (_tmp, state) = test_api_state();
+        let timed = Router::new().route("/api/a", axum::routing::get(slow.clone()));
+        let untimed = Router::new().route(UNTIMED_ROUTES[0], axum::routing::get(slow));
+        let app = with_limits(timed, untimed, None).with_state(state);
+
+        let requests = (0..(MAX_IN_FLIGHT * 3)).map(|i| {
+            let app = app.clone();
+            let path = if i % 2 == 0 {
+                "/api/a"
+            } else {
+                UNTIMED_ROUTES[0]
+            };
+            tokio::spawn(async move {
+                let response = app
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .uri(path)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+            })
+        });
+        // Spawn them all before awaiting any: a lazy iterator would run them
+        // one at a time.
+        let requests: Vec<_> = requests.collect();
+        for handle in requests {
+            handle.await.unwrap();
+        }
+
+        let peak = peak.load(Ordering::SeqCst);
+        assert!(
+            peak > 1,
+            "the requests never overlapped; the test proves nothing"
+        );
+        assert!(
+            peak <= MAX_IN_FLIGHT,
+            "{peak} requests ran at once; the limit is {MAX_IN_FLIGHT}"
+        );
+    }
+
+    #[test]
+    fn every_untimed_route_is_a_real_route() {
+        let served: Vec<&str> = routes().into_iter().map(|(path, _)| path).collect();
+        for path in UNTIMED_ROUTES {
+            assert!(served.contains(path), "{path} is not a route");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_body_over_the_limit_is_a_bad_request_with_a_kind() {
+        let (_tmp, state) = test_api_state();
+        let content = "x".repeat(MAX_BODY_BYTES + 1024);
+        let body = format!(r#"{{"filename":"big","content":"{content}"}}"#);
+        let (status, reply) = post_json(state, "/api/create", &body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{reply}");
+        assert_eq!(reply["kind"], "invalid_input");
+    }
+
+    /// Axum's own `Json` limit is 2 MiB; the layer raises it to
+    /// `MAX_BODY_BYTES`, so a body between the two reaches the handler.
+    #[tokio::test]
+    async fn a_body_between_axums_default_and_the_limit_is_not_refused() {
+        let (_tmp, state) = test_api_state();
+        let content = "x".repeat(3 * 1024 * 1024);
+        let body = format!(r#"{{"filename":"big","content":"{content}"}}"#);
+        let (status, reply) = post_json(state, "/api/create", &body).await;
+        assert_ne!(status, StatusCode::BAD_REQUEST, "{reply}");
+        assert_ne!(reply["kind"], "invalid_input", "{reply}");
+    }
+
+    #[tokio::test]
+    async fn a_read_only_server_refuses_reindex_file() {
+        let (_tmp, mut state) = indexed_state();
+        state.core.read_only = true;
+        let (status, body) = post_json(
+            state,
+            "/api/reindex-file",
+            r#"{"file":"rules/evocation-spells.md"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["kind"], "read_only");
     }
 
     /// Five notes that all answer one query. Five is more than the `top_n` the

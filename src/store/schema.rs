@@ -162,12 +162,13 @@ CREATE TABLE IF NOT EXISTS tombstones (
 
 /// The schema this binary writes. A store below it is upgraded on open; one
 /// above it was written by a newer knapper and is refused.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Step `n` upgrades a store from version `n` to `n + 1`. The array's length
 /// is the version, so a step cannot be added without bumping it and the
 /// constant cannot be bumped without a step.
-const STEPS: [fn(&Store) -> Result<()>; SCHEMA_VERSION as usize] = [Store::migrate_to_1];
+const STEPS: [fn(&Store) -> Result<()>; SCHEMA_VERSION as usize] =
+    [Store::migrate_to_1, Store::migrate_to_2];
 
 impl Store {
     /// The schema version the store records. 0 for a store that records none,
@@ -178,7 +179,7 @@ impl Store {
             .query_row("PRAGMA user_version", [], |row| row.get(0))?)
     }
 
-    fn set_user_version(&self, version: i64) -> Result<()> {
+    pub(super) fn set_user_version(&self, version: i64) -> Result<()> {
         self.conn
             .execute_batch(&format!("PRAGMA user_version = {version}"))?;
         Ok(())
@@ -500,6 +501,22 @@ impl Store {
 
         Ok(())
     }
+
+    /// Step 2: the tables knapper inherited and never read go, and a store
+    /// written before `chunks_vec` existed gets its vectors copied into it.
+    /// Open while the cleanup branch is unmerged; frozen at merge, when a
+    /// later change is step 3.
+    fn migrate_to_2(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "DROP TABLE IF EXISTS cli_events;
+             DROP TABLE IF EXISTS identity_facts;
+             DROP TABLE IF EXISTS migration_log;
+             DROP TABLE IF EXISTS folder_centroids;
+             DROP TABLE IF EXISTS placement_corrections;
+             DROP TABLE IF EXISTS tombstones;",
+        )?;
+        self.copy_blob_vectors_into_vec0()
+    }
 }
 
 #[cfg(test)]
@@ -509,7 +526,7 @@ mod tests {
     #[test]
     fn test_create_schema() {
         let store = Store::open_memory().unwrap();
-        // Verify all four tables exist by querying sqlite_master.
+        // Verify the core tables exist by querying sqlite_master.
         let tables: Vec<String> = {
             let mut stmt = store
                 .conn
@@ -521,7 +538,6 @@ mod tests {
         assert!(tables.contains(&"meta".to_string()));
         assert!(tables.contains(&"files".to_string()));
         assert!(tables.contains(&"chunks".to_string()));
-        assert!(tables.contains(&"tombstones".to_string()));
     }
 
     #[test]
@@ -832,14 +848,14 @@ mod tests {
             let store = Store::open(&db).unwrap();
             store
                 .conn
-                .execute_batch("DROP TABLE identity_facts")
+                .execute_batch("DROP TABLE unresolved_links")
                 .unwrap();
         }
         let store = Store::open(&db).unwrap();
         let present: i64 = store
             .conn
             .query_row(
-                "SELECT count(*) FROM sqlite_master WHERE name = 'identity_facts'",
+                "SELECT count(*) FROM sqlite_master WHERE name = 'unresolved_links'",
                 [],
                 |r| r.get(0),
             )
@@ -848,6 +864,47 @@ mod tests {
             present, 0,
             "a store at the current version is opened as it is; migrate_to_1 would have recreated the table"
         );
+    }
+
+    /// The tables step 2 drops.
+    const DROPPED_BY_STEP_2: &[&str] = &[
+        "cli_events",
+        "identity_facts",
+        "migration_log",
+        "folder_centroids",
+        "placement_corrections",
+        "tombstones",
+    ];
+
+    #[test]
+    fn a_version_1_store_is_upgraded_on_open() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = tmp.path().join("knapper.db");
+        {
+            let store = Store::open(&db).unwrap();
+            for table in DROPPED_BY_STEP_2 {
+                store
+                    .conn
+                    .execute_batch(&format!(
+                        "CREATE TABLE IF NOT EXISTS {table} (id INTEGER PRIMARY KEY)"
+                    ))
+                    .unwrap();
+            }
+            store.set_user_version(1).unwrap();
+        }
+        let store = Store::open(&db).unwrap();
+        assert_eq!(store.user_version().unwrap(), SCHEMA_VERSION);
+        for table in DROPPED_BY_STEP_2 {
+            let present: i64 = store
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE name = ?1",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(present, 0, "{table} survived step 2");
+        }
     }
 
     #[test]
@@ -893,7 +950,8 @@ mod tests {
             anyhow::bail!("the step failed")
         }
         let store = Store::open_memory().unwrap();
-        let steps: [fn(&Store) -> Result<()>; 2] = [Store::migrate_to_1, failing];
+        let steps: [fn(&Store) -> Result<()>; 3] =
+            [Store::migrate_to_1, Store::migrate_to_2, failing];
 
         let err = store.upgrade(SCHEMA_VERSION, &steps).unwrap_err();
 

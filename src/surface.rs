@@ -36,10 +36,9 @@ pub struct Capability {
     /// reason. The parameter parity test reads them as allowed absences.
     pub cli_only_args: &'static [(&'static str, &'static str)],
     /// Arguments this capability takes on the servers alone, each with its
-    /// reason. The asymmetry runs both ways — `migrate` takes a `preview` that
-    /// a command line has no spelling for — so the parity test needs a word
-    /// for it, or the only way to make it pass is to stop reading a whole
-    /// direction (#62).
+    /// reason. The asymmetry can run both ways, so the parity test needs a
+    /// word for it, or the only way to make it pass is to stop reading a
+    /// whole direction (#62).
     pub server_only_args: &'static [(&'static str, &'static str)],
 }
 
@@ -265,44 +264,12 @@ pub const CAPABILITIES: &[Capability] = &[
         server_only_args: &[],
     },
     Capability {
-        name: "identity",
-        cli: Presence::On,
-        mcp: Presence::On,
-        http: Http::Get,
-        cli_only_args: &[],
-        server_only_args: &[],
-    },
-    Capability {
         name: "init",
         cli: Presence::On,
         mcp: Presence::On,
         http: Http::Post,
-        cli_only_args: &[
-            ("path", "a running server is bound to its configured vault"),
-            ("identity", "the interactive flow the CLI alone can run"),
-            ("reindex", "the interactive flow the CLI alone can run"),
-            (
-                "detect",
-                "the CLI spelling of mode=detect, kept for its own flow",
-            ),
-            (
-                "json",
-                "the CLI spelling of mode=apply, kept for its own flow",
-            ),
-            ("quiet", "suppresses prompts the other surfaces never show"),
-        ],
+        cli_only_args: &[("path", "a running server is bound to its configured vault")],
         server_only_args: &[],
-    },
-    Capability {
-        name: "migrate",
-        cli: Presence::On,
-        mcp: Presence::On,
-        http: Http::Post,
-        cli_only_args: &[],
-        server_only_args: &[(
-            "preview",
-            "the plan `mode=preview` returned; the CLI saves its own copy to disk instead",
-        )],
     },
 ];
 
@@ -371,7 +338,7 @@ pub const OPERATIONS: &[Operation] = &[
     Operation {
         name: "create",
         id: "createNote",
-        summary: "Create a new note with automatic placement and frontmatter generation.",
+        summary: "Create a new note: tags resolved against the vault's vocabulary, links discovered, filed under folder or at the vault root.",
         response: "Created note path and metadata",
     },
     Operation {
@@ -429,22 +396,10 @@ pub const OPERATIONS: &[Operation] = &[
         response: "A report: findings (each {file, line, severity, rule, message}), files_checked, error_count, warning_count, and ok",
     },
     Operation {
-        name: "identity",
-        id: "getIdentity",
-        summary: "Returns compact user identity (L0) and current context (L1).",
-        response: "Identity block as JSON with 'identity' key",
-    },
-    Operation {
         name: "init",
         id: "init",
-        summary: "Run first-time setup or update identity. Use 'detect' to inspect, 'apply' to configure. The apply reply carries restart_required: true, because the server reads config.toml once, at start.",
+        summary: "Write the vault profile and index. 'detect' inspects the vault and writes nothing; 'apply' writes vault.toml and indexes. The apply reply carries restart_required: true, because the server reads the profile once, at start.",
         response: "Setup result as JSON",
-    },
-    Operation {
-        name: "migrate",
-        id: "migrate",
-        summary: "Restructure the vault into PARA. 'preview' classifies notes and suggests folder moves, 'apply' performs them, 'undo' restores the last migration.",
-        response: "Migration preview, migration result or undo result, per mode",
     },
 ];
 
@@ -989,8 +944,8 @@ mod tests {
     }
 
     #[test]
-    fn there_are_twenty_capabilities() {
-        assert_eq!(CAPABILITIES.len(), 20);
+    fn there_are_eighteen_capabilities() {
+        assert_eq!(CAPABILITIES.len(), 18);
     }
 
     /// The operation table is one row per capability the HTTP surface

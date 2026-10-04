@@ -60,7 +60,7 @@ leaves the lane idle.
 ```
 query
   ├── semantic ─┐
-  │             ├── RRF ──► shortlist (30) ──► one scorer sorts ──► floor ──► results
+  │             ├── RRF ──► shortlist (32) ──► one scorer sorts ──► floor ──► results
   ├── keyword ──┘              ▲
   ├── graph ───────────────────┤ reserved quota (8)
   └── temporal ────────────────┘ reserved quota (4)

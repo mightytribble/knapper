@@ -192,6 +192,7 @@ enabled = false
 # host = "127.0.0.1"
 # cors_origins = ["http://localhost:3000"]
 # rate_limit = 60              # requests per minute per key
+# request_timeout_secs = 60   # a request past this answers 408; 0 disables; index and init are never timed out
 # public_url = "https://..."   # a tunnel's URL; /openapi.json names it as the server
 # [[http.api_keys]]            # written by `knapper configure --add-api-key`
 # key = "kn_..."

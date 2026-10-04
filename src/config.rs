@@ -64,38 +64,6 @@ impl Default for EmbedApiConfig {
     }
 }
 
-/// User identity for AI agent context.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(default)]
-pub struct IdentityConfig {
-    pub name: Option<String>,
-    pub role: Option<String>,
-    pub vault_purpose: Option<String>,
-}
-
-/// Memory layer feature flags.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct MemoryConfig {
-    pub identity_enabled: bool,
-    pub timeline_enabled: bool,
-    pub mining_enabled: bool,
-    pub mining_strategy: String,
-    pub mining_on_index: bool,
-}
-
-impl Default for MemoryConfig {
-    fn default() -> Self {
-        Self {
-            identity_enabled: true,
-            timeline_enabled: true,
-            mining_enabled: true,
-            mining_strategy: "auto".into(),
-            mining_on_index: true,
-        }
-    }
-}
-
 /// Output packaging settings (#35).
 ///
 /// Query-time settings; neither key reaches a fingerprint.
@@ -141,6 +109,10 @@ pub struct HttpConfig {
     /// The address a caller reaches this server at, when it is not the
     /// bound one: a tunnel's URL. `/openapi.json` names it as the server.
     pub public_url: Option<String>,
+    /// Seconds a request may run before it is answered 408. `0` is no limit.
+    /// `/api/index` and `/api/init` are never timed out: both index the
+    /// vault to completion.
+    pub request_timeout_secs: u64,
 }
 
 impl Default for HttpConfig {
@@ -153,6 +125,7 @@ impl Default for HttpConfig {
             cors_origins: vec![],
             api_keys: vec![],
             public_url: None,
+            request_timeout_secs: 60,
         }
     }
 }
@@ -919,10 +892,6 @@ pub struct Config {
     #[serde(default = "default_carry_orphan_headings")]
     pub carry_orphan_headings: bool,
     #[serde(default)]
-    pub identity: IdentityConfig,
-    #[serde(default)]
-    pub memory: MemoryConfig,
-    #[serde(default)]
     pub output: OutputConfig,
     #[serde(default)]
     pub watcher: WatcherConfig,
@@ -1004,8 +973,6 @@ impl Default for Config {
             fts: FtsConfig::default(),
             calibrated: CalibratedConfig::default(),
             http: HttpConfig::default(),
-            identity: IdentityConfig::default(),
-            memory: MemoryConfig::default(),
             output: OutputConfig::default(),
             watcher: WatcherConfig::default(),
         }
@@ -1062,7 +1029,58 @@ fn resolve_data_dir(
     Ok(home.join(".knapper"))
 }
 
+/// Config tables an earlier knapper read and this one does not. A file that
+/// still carries one loads, and the table is named once at load.
+pub const RETIRED_TABLES: &[(&str, &str)] = &[
+    (
+        "http.plugin",
+        "move public_url under [http] and delete the table",
+    ),
+    ("identity", "delete the table; identity was removed"),
+    ("memory", "delete the table; its flags were never read"),
+];
+
 impl Config {
+    /// The retired tables `text` carries, each with what to do about it.
+    pub fn retired_tables(text: &str) -> Vec<(&'static str, &'static str)> {
+        let Ok(table) = text.parse::<toml::Table>() else {
+            return Vec::new();
+        };
+        RETIRED_TABLES
+            .iter()
+            .filter(|(path, _)| {
+                let mut node: Option<&toml::Value> = None;
+                for (i, key) in path.split('.').enumerate() {
+                    node = if i == 0 {
+                        table.get(key)
+                    } else {
+                        node.and_then(|v| v.get(key))
+                    };
+                    if node.is_none() {
+                        return false;
+                    }
+                }
+                node.is_some_and(|v| v.is_table())
+            })
+            .copied()
+            .collect()
+    }
+
+    /// Name every retired table `text` carries, once per process: the
+    /// config is read again on some write paths, and a user needs the
+    /// notice once.
+    fn warn_retired_tables(text: &str, source: &Path) {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            for (table, advice) in Self::retired_tables(text) {
+                tracing::warn!(
+                    "{} carries [{table}], which this knapper does not read: {advice}",
+                    source.display()
+                );
+            }
+        });
+    }
+
     /// Canonical data directory: `~/.knapper/`, or an override from `--data-dir`
     /// or `KNAPPER_HOME`.
     pub fn data_dir() -> Result<PathBuf> {
@@ -1083,6 +1101,7 @@ impl Config {
             let config: Config = toml::from_str(&contents)
                 .with_context(|| format!("failed to parse {}", config_path.display()))?;
             config.validate_exclude(&config_path)?;
+            Self::warn_retired_tables(&contents, &config_path);
             Ok(config)
         } else {
             Ok(Config::default())
@@ -1246,6 +1265,7 @@ impl Config {
         let config: Config =
             toml::from_str(&contents).with_context(|| format!("parsing {}", path.display()))?;
         config.validate_exclude(path)?;
+        Self::warn_retired_tables(&contents, path);
         Ok(config)
     }
 
@@ -2110,6 +2130,42 @@ public_url = "https://vault.example.com"
         assert!(config.http.public_url.is_none());
     }
 
+    /// A table an earlier knapper read and this one does not still loads,
+    /// and is named so the user can move or delete it.
+    #[test]
+    fn a_retired_table_is_named_at_load() {
+        let text = r#"
+[http]
+port = 3000
+
+[http.plugin]
+public_url = "https://vault.example.com"
+
+[identity]
+name = "Someone"
+"#;
+        let named: Vec<&str> = Config::retired_tables(text)
+            .into_iter()
+            .map(|(table, _)| table)
+            .collect();
+        assert_eq!(named, vec!["http.plugin", "identity"]);
+        assert!(Config::retired_tables("[http]\nport = 1\n").is_empty());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, text).unwrap();
+        let config = Config::load_from(&path).unwrap();
+        assert_eq!(config.http.port, 3000);
+        assert!(config.http.public_url.is_none());
+    }
+
+    #[test]
+    fn request_timeout_secs_defaults_to_sixty() {
+        assert_eq!(HttpConfig::default().request_timeout_secs, 60);
+        let config: Config = toml::from_str("[http]\nrequest_timeout_secs = 5\n").unwrap();
+        assert_eq!(config.http.request_timeout_secs, 5);
+    }
+
     #[test]
     fn public_url_survives_a_save_and_a_load() {
         let dir = tempfile::tempdir().unwrap();
@@ -2127,35 +2183,6 @@ public_url = "https://vault.example.com"
             text.contains("public_url = \"https://abc.trycloudflare.com\""),
             "{text}"
         );
-    }
-
-    #[test]
-    fn test_identity_config_deserializes() {
-        let toml_str = r#"
-[identity]
-name = "Test User"
-role = "Developer"
-vault_purpose = "notes"
-"#;
-        let config: Config = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.identity.name, Some("Test User".into()));
-        assert_eq!(config.identity.role, Some("Developer".into()));
-        assert_eq!(config.identity.vault_purpose, Some("notes".into()));
-    }
-
-    #[test]
-    fn test_identity_config_defaults_to_empty() {
-        let config = Config::default();
-        assert!(config.identity.name.is_none());
-        assert!(config.identity.role.is_none());
-    }
-
-    #[test]
-    fn test_memory_config_defaults() {
-        let config = Config::default();
-        assert!(config.memory.identity_enabled);
-        assert!(config.memory.timeline_enabled);
-        assert!(config.memory.mining_enabled);
     }
 
     #[test]

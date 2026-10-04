@@ -4,7 +4,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use ignore::WalkBuilder;
-use indicatif::{ProgressBar, ProgressStyle};
 use sha2::{Digest, Sha256};
 use tracing::info;
 
@@ -798,6 +797,26 @@ pub fn rename_file(old_rel: &str, new_rel: &str, store: &Store, vault_path: &Pat
     Ok(())
 }
 
+/// Where `run_index` reports its progress. The library draws nothing: the
+/// CLI draws a bar through this, and the servers report nothing.
+pub trait IndexProgress {
+    /// The run knows how many files it will embed.
+    fn begin(&mut self, total: usize);
+    /// One file is about to be embedded.
+    fn file(&mut self, rel_path: &str);
+    /// The embedding loop is over.
+    fn end(&mut self);
+}
+
+/// Reports nothing.
+pub struct NoProgress;
+
+impl IndexProgress for NoProgress {
+    fn begin(&mut self, _total: usize) {}
+    fn file(&mut self, _rel_path: &str) {}
+    fn end(&mut self) {}
+}
+
 /// Main indexing orchestrator.
 ///
 /// Walks the vault, diffs against the store, processes new/changed/deleted files,
@@ -807,6 +826,7 @@ pub fn run_index(
     config: &Config,
     settings: IndexSettings,
     rebuild: bool,
+    progress: &mut dyn IndexProgress,
 ) -> Result<IndexResult> {
     let data_dir = Config::data_dir()?;
     std::fs::create_dir_all(&data_dir)?;
@@ -826,6 +846,7 @@ pub fn run_index(
         &mut embedder,
         rebuild,
         profile.as_ref(),
+        progress,
     )
 }
 
@@ -843,11 +864,19 @@ pub fn run_index_shared(
     profile: Option<&VaultProfile>,
 ) -> Result<IndexResult> {
     run_index_inner(
-        vault_path, config, settings, store, embedder, rebuild, profile,
+        vault_path,
+        config,
+        settings,
+        store,
+        embedder,
+        rebuild,
+        profile,
+        &mut NoProgress,
     )
 }
 
 /// Shared implementation for [`run_index`] and [`run_index_shared`].
+#[allow(clippy::too_many_arguments)]
 fn run_index_inner(
     vault_path: &Path,
     config: &Config,
@@ -856,6 +885,7 @@ fn run_index_inner(
     embedder: &mut impl EmbedModel,
     rebuild: bool,
     profile: Option<&VaultProfile>,
+    progress: &mut dyn IndexProgress,
 ) -> Result<IndexResult> {
     // The single application point for the index-time settings (#72). Everything
     // below — the fingerprint that decides a rebuild, and `index_file`'s chunk
@@ -875,7 +905,7 @@ fn run_index_inner(
     // (issue #12).
     let mut rebuild = rebuild;
     if let Some(previous) = store.ensure_embedding_dim(embedder.dim())? {
-        eprintln!(
+        tracing::warn!(
             "Embedding dimension changed ({previous} -> {}). \
              Re-indexing vault (this may take a few minutes)...",
             embedder.dim()
@@ -896,14 +926,14 @@ fn run_index_inner(
     let actions = staleness.actions();
     for mismatch in &staleness.mismatches {
         match mismatch.stored {
-            Some(_) => eprintln!(
+            Some(_) => tracing::warn!(
                 "{} changed since the index was built. Will {}.",
                 mismatch.key,
                 mismatch.action.describe()
             ),
             // An index built before the key existed (#141). The store cannot
             // show what rules cut its rows, so the work is owed either way.
-            None => eprintln!(
+            None => tracing::warn!(
                 "{} was not recorded when the index was built. Will {}.",
                 mismatch.key,
                 mismatch.action.describe()
@@ -916,8 +946,8 @@ fn run_index_inner(
         // query, or on none. The fingerprint's own action cannot say this: it
         // is `Reindex`, and the re-index is not what is missing.
         if mismatch.key == crate::fingerprint::EMBEDDING.name && config.calibration_needs_refit() {
-            eprintln!(
-                "  Note: [calibrated] is fit against EmbeddingGemma, and this \
+            tracing::warn!(
+                "[calibrated] is fit against EmbeddingGemma, and this \
                  vault now embeds with something else. Its floor cuts in the \
                  wrong place until you refit the four numbers \
                  (scripts/calibrated-fusion-eval.py) or set [calibrated] \
@@ -1026,12 +1056,7 @@ fn run_index_inner(
     let mut total_chunks = 0usize;
     let mut indexed_rel_paths: Vec<String> = Vec::new();
 
-    let pb = ProgressBar::new(file_contents.len() as u64);
-    pb.set_style(
-        ProgressStyle::with_template("  [{bar:40.cyan/blue}] {pos}/{len} {msg} ({eta})")
-            .unwrap()
-            .progress_chars("=>-"),
-    );
+    progress.begin(file_contents.len());
 
     // A failing file is skipped rather than propagated: an API embedder can die
     // mid-index, and one bad file must not cost the whole run. `index_file`
@@ -1046,7 +1071,7 @@ fn run_index_inner(
     let mut skipped: Vec<String> = Vec::new();
     store.transaction(|store| {
         for (rel_str, content, hash) in &file_contents {
-            pb.set_message(rel_str.clone());
+            progress.file(rel_str);
             match index_file(rel_str, content, hash, store, embedder, vault_path, config) {
                 Ok(result) => {
                     total_chunks += result.total_chunks;
@@ -1057,11 +1082,10 @@ fn run_index_inner(
                     skipped.push(rel_str.clone());
                 }
             }
-            pb.inc(1);
         }
         Ok(())
     })?;
-    pb.finish_with_message("done");
+    progress.end();
 
     // Step 9: Build vault graph edges.
     info!("building vault graph edges");
@@ -1141,45 +1165,6 @@ fn run_index_inner(
         ),
     )?;
 
-    // Step 11: Compute folder centroids for placement engine.
-    // Recompute from all chunks in the store for indexed files.
-    info!("computing folder centroids");
-    let mut folder_vecs: HashMap<String, Vec<Vec<f32>>> = HashMap::new();
-    for rel_path in &indexed_rel_paths {
-        let folder = rel_path.split('/').next().unwrap_or("(root)").to_string();
-        if let Some(file_record) = store.get_file(rel_path)? {
-            let chunk_vectors = store.get_chunk_vectors_for_file(file_record.id)?;
-            for vector in chunk_vectors {
-                folder_vecs.entry(folder.clone()).or_default().push(vector);
-            }
-        }
-    }
-
-    for (folder, vectors) in &folder_vecs {
-        if vectors.is_empty() {
-            continue;
-        }
-        let dim = embedder.dim();
-        let mut centroid = vec![0.0f32; dim];
-        for v in vectors {
-            for (i, val) in v.iter().enumerate() {
-                centroid[i] += val;
-            }
-        }
-        let n = vectors.len() as f32;
-        for val in &mut centroid {
-            *val /= n;
-        }
-        store.upsert_folder_centroid(folder, &centroid, vectors.len())?;
-    }
-
-    // Extract L1 identity facts from the freshly indexed vault
-    if let Some(p) = profile
-        && let Err(e) = crate::identity::extract_l1_facts(store, p)
-    {
-        tracing::warn!("L1 identity extraction failed (non-fatal): {e:#}");
-    }
-
     // Last, and only on the way out (issue #31). A crash anywhere above leaves
     // the previous fingerprints standing, so the next run repeats the work — a
     // store never claims to match code that never finished running against it.
@@ -1189,12 +1174,12 @@ fn run_index_inner(
     if skipped.is_empty() {
         crate::fingerprint::record(store, &fingerprints)?;
     } else {
-        eprintln!(
+        tracing::warn!(
             "{} file(s) were not embedded and were left for a later run: {}",
             skipped.len(),
             skipped.join(", ")
         );
-        eprintln!("Index left unfingerprinted; re-run `knapper index` to complete it.");
+        tracing::warn!("Index left unfingerprinted; re-run `knapper index` to complete it.");
     }
 
     let duration = start.elapsed();
@@ -1356,6 +1341,57 @@ mod tests {
             err.to_string().contains("invalid exclude pattern"),
             "unexpected error: {err}"
         );
+    }
+
+    /// The library draws no bar: it reports through a sink, and the CLI
+    /// draws from that.
+    #[test]
+    fn the_progress_sink_sees_begin_each_file_and_end() {
+        use crate::llm::MockLlm;
+
+        #[derive(Default)]
+        struct Recording(Vec<String>);
+        impl IndexProgress for Recording {
+            fn begin(&mut self, total: usize) {
+                self.0.push(format!("begin {total}"));
+            }
+            fn file(&mut self, rel_path: &str) {
+                self.0.push(format!("file {rel_path}"));
+            }
+            fn end(&mut self) {
+                self.0.push("end".into());
+            }
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write_file(root, "a.md", "# A\n\nOne.\n");
+        write_file(root, "b.md", "# B\n\nTwo.\n");
+
+        let store = Store::open_memory().unwrap();
+        let mut embedder = MockLlm::new(256);
+        let config = Config::default();
+        let mut progress = Recording::default();
+        run_index_inner(
+            root,
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut embedder,
+            false,
+            None,
+            &mut progress,
+        )
+        .unwrap();
+
+        // The walk's order is the filesystem's, so the two file entries are
+        // compared as a set and the begin and end as positions.
+        assert_eq!(progress.0.len(), 4, "{:?}", progress.0);
+        assert_eq!(progress.0[0], "begin 2");
+        assert_eq!(progress.0[3], "end");
+        let mut files = progress.0[1..3].to_vec();
+        files.sort();
+        assert_eq!(files, vec!["file a.md", "file b.md"]);
     }
 
     /// `writer::update_note` writes the file and the new content hash and no
@@ -3023,7 +3059,6 @@ mod tests {
             crate::writer::CreateNoteInput {
                 content: content.to_string(),
                 filename: "archdragon".into(),
-                type_hint: None,
                 tags: vec![],
                 folder: Some("lore".into()),
                 created_by: "test".into(),

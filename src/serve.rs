@@ -264,7 +264,7 @@ impl KnapperServer {
 
     #[tool(
         name = "create",
-        description = "Create a new note with automatic tag resolution, link discovery, and folder placement. Returns the created file's path, docid, and what was auto-resolved."
+        description = "Create a new note with automatic tag resolution and link discovery, filed under `folder` or at the vault root. Returns the created file's path, docid, and what was auto-resolved."
     )]
     async fn create(
         &self,
@@ -280,7 +280,6 @@ impl KnapperServer {
         let input = crate::writer::CreateNoteInput {
             content,
             filename: params.0.filename,
-            type_hint: params.0.type_hint,
             tags: params.0.tags,
             folder: params.0.folder,
             created_by: "claude-code".into(),
@@ -473,54 +472,6 @@ impl KnapperServer {
     }
 
     #[tool(
-        name = "migrate",
-        description = "Restructure the vault into PARA. Mode 'preview' classifies every note into Projects/Areas/Resources/Archive and returns the proposed moves with confidence scores; 'apply' performs the moves of a preview; 'undo' reverses the last migration."
-    )]
-    async fn migrate(
-        &self,
-        params: Parameters<crate::params::Migrate>,
-    ) -> Result<CallToolResult, McpError> {
-        let vault = self.core.vault_path.clone();
-        match params.0.mode.as_str() {
-            "preview" => {
-                let profile = self.core.profile.clone();
-                let preview = self
-                    .core
-                    .with_reader(move |store| {
-                        crate::migrate::generate_preview(store, &vault, profile.as_ref().as_ref())
-                    })
-                    .await
-                    .map_err(mcp_err)?;
-                to_json_result(&preview)
-            }
-            "apply" => {
-                self.core.writable().map_err(mcp_err)?;
-                // The preview is required here: a dropped key must not
-                // silently apply an unrelated plan (#62).
-                let preview = crate::migrate::resolve_preview(params.0.preview).map_err(mcp_err)?;
-                let result = self
-                    .core
-                    .with_core(move |g| crate::migrate::apply_preview(&preview, g.store, &vault))
-                    .await
-                    .map_err(mcp_err)?;
-                to_json_result(&result)
-            }
-            "undo" => {
-                self.core.writable().map_err(mcp_err)?;
-                let result = self
-                    .core
-                    .with_core(move |g| crate::migrate::undo_last(g.store, &vault))
-                    .await
-                    .map_err(mcp_err)?;
-                to_json_result(&result)
-            }
-            other => Err(invalid_params(format!(
-                "Unknown mode: {other}. Use 'preview', 'apply' or 'undo'."
-            ))),
-        }
-    }
-
-    #[tool(
         name = "delete",
         description = "Delete a note. Soft mode (default) moves it to the archive folder. Hard mode permanently removes it from disk and index."
     )]
@@ -562,6 +513,8 @@ impl KnapperServer {
         &self,
         params: Parameters<crate::params::ReindexFile>,
     ) -> Result<CallToolResult, McpError> {
+        // It writes the store, so a read-only server refuses it like `index`.
+        self.core.writable().map_err(mcp_err)?;
         let rel_path = params.0.file;
         let vault = self.core.vault_path.clone();
         let settings = self.core.index_settings;
@@ -649,51 +602,15 @@ impl KnapperServer {
     }
 
     #[tool(
-        name = "identity",
-        description = "Returns compact user identity and current context. Call at session start for instant context. L0 = static identity (~50 tokens), L1 = dynamic state (~120 tokens). `refresh: true` re-extracts the L1 facts from the index first, without a full re-index."
-    )]
-    async fn identity(
-        &self,
-        params: Parameters<crate::params::Identity>,
-    ) -> Result<CallToolResult, McpError> {
-        let config = self.core.config.clone();
-        let block = if params.0.refresh {
-            // A write of derived state, so a read-only server refuses it.
-            self.core.writable().map_err(mcp_err)?;
-            if self.core.profile.is_none() {
-                return Err(McpError::new(
-                    rmcp::model::ErrorCode::INVALID_REQUEST,
-                    "No vault profile found. Run `knapper init` first.",
-                    Some(serde_json::json!({ "kind": "invalid_input" })),
-                ));
-            }
-            let profile = self.core.profile.clone();
-            self.core
-                .with_core(move |g| {
-                    let profile = profile.as_ref().as_ref().expect("checked above");
-                    crate::identity::extract_l1_facts(g.store, profile)?;
-                    crate::identity::format_identity_block(&config, g.store)
-                })
-                .await
-        } else {
-            self.core
-                .with_reader(move |store| crate::identity::format_identity_block(&config, store))
-                .await
-        }
-        .map_err(mcp_err)?;
-        Ok(CallToolResult::success(vec![ContentBlock::text(block)]))
-    }
-
-    #[tool(
         name = "init",
-        description = "Run first-time setup or update identity. Use 'detect' mode to inspect the vault without changes, 'apply' mode to configure identity and index. Returns JSON."
+        description = "Write the vault profile and index. Mode 'detect' inspects the vault and writes nothing; 'apply' writes vault.toml and indexes. The apply reply carries restart_required: true, because the server reads the profile once, at start."
     )]
     async fn init(
         &self,
         params: Parameters<crate::params::Init>,
     ) -> Result<CallToolResult, McpError> {
-        match params.0.mode.as_deref() {
-            Some("detect") => {
+        match params.0.mode {
+            crate::params::InitMode::Detect => {
                 let vault = self.core.vault_path.clone();
                 let result =
                     crate::core::blocking(move || crate::onboarding::run_detect_json(&vault))
@@ -701,34 +618,27 @@ impl KnapperServer {
                         .map_err(mcp_err)?;
                 to_json_result(&result)
             }
-            Some("apply") => {
+            crate::params::InitMode::Apply => {
+                // `apply` indexes the vault, which is the work `index` is
+                // guarded against on a read-only server (#62).
                 self.core.writable().map_err(mcp_err)?;
                 let data_dir = crate::config::Config::data_dir().map_err(mcp_err)?;
-                let flags = crate::onboarding::ApplyFlags {
-                    name: params.0.name,
-                    role: params.0.role,
-                    purpose: params.0.purpose,
-                    identity_only: false,
-                    reindex_only: false,
-                };
                 let vault = self.core.vault_path.clone();
+                let config = self.core.config.clone();
                 let settings = self.core.index_settings;
-                // `apply` writes `config.toml`, so it is the one handler that
-                // loads the file: it edits it. The running server keeps the
-                // config it started with, which the reply says.
                 // `run_apply_json` opens its own store, so the core call is
-                // taken for exclusion only.
+                // taken for exclusion only. The running server keeps the
+                // profile it started with, which the reply says.
                 let result = self
                     .core
                     .with_core(move |g| {
                         let _ = g;
-                        let mut config = crate::config::Config::load().unwrap_or_default();
                         let mut result = crate::onboarding::run_apply_json(
                             &vault,
-                            &mut config,
+                            &config,
                             settings,
                             &data_dir,
-                            flags,
+                            &mut crate::indexer::NoProgress,
                         )?;
                         if let Some(object) = result.as_object_mut() {
                             object.insert("restart_required".into(), serde_json::json!(true));
@@ -739,12 +649,6 @@ impl KnapperServer {
                     .map_err(mcp_err)?;
                 to_json_result(&result)
             }
-            Some(other) => Err(invalid_params(format!(
-                "Unknown mode: {other}. Use 'detect' or 'apply'."
-            ))),
-            None => Err(invalid_params(
-                "init needs mode=detect or mode=apply".into(),
-            )),
         }
     }
 }
@@ -877,19 +781,9 @@ pub const ORIENTATION: &[Orientation] = &[
         clause: "for the markdown and property problems a note carries, read from the files on disk",
     },
     Orientation {
-        capability: "identity",
-        group: "Identity",
-        clause: "for user context at session start",
-    },
-    Orientation {
         capability: "init",
-        group: "Identity",
-        clause: "to run first-time onboarding (`mode: detect` or `mode: apply`)",
-    },
-    Orientation {
-        capability: "migrate",
-        group: "Migration",
-        clause: "with `mode: preview` to classify notes into PARA folders, `mode: apply` to execute the migration, `mode: undo` to revert",
+        group: "Setup",
+        clause: "to write the vault profile and index (`mode: detect` or `mode: apply`)",
     },
 ];
 
@@ -1062,25 +956,6 @@ mod tests {
         );
     }
 
-    /// `migrate` is one tool for three operations (#62), so the mode is the
-    /// one parameter a caller must always send, and the preview it may hold
-    /// from a `preview` call stays reachable.
-    #[test]
-    fn the_migrate_schema_requires_a_mode_and_still_accepts_a_preview() {
-        let schema = schemars::schema_for!(crate::params::Migrate);
-        let json = serde_json::to_value(&schema).unwrap();
-
-        let required: Vec<&str> = json["required"]
-            .as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
-            .unwrap_or_default();
-        assert_eq!(required, vec!["mode"], "got {json}");
-        assert!(
-            json["properties"].get("preview").is_some(),
-            "the preview an apply acts on is not in the schema: {json}"
-        );
-    }
-
     /// The two abjuration-school notes the search tests index.
     const ABJURATION_NOTES: &[(&str, &str)] = &[
         (
@@ -1110,19 +985,6 @@ mod tests {
         config.group_by = group_by;
         let (tmp, core) = crate::core::testing::indexed_core(ABJURATION_NOTES, config);
         (tmp, super::KnapperServer::new(core))
-    }
-
-    /// A PARA profile over `root`, for the calls that need one.
-    fn test_profile(root: &std::path::Path) -> crate::profile::VaultProfile {
-        crate::profile::VaultProfile {
-            vault_path: root.to_path_buf(),
-            vault_type: crate::profile::VaultType::Obsidian,
-            structure: crate::profile::StructureDetection {
-                method: crate::profile::StructureMethod::Para,
-                folders: crate::profile::FolderMap::default(),
-            },
-            stats: crate::profile::VaultStats::default(),
-        }
     }
 
     /// `archive` and `archive {undo: true}` are one operation and its reverse
@@ -1158,76 +1020,6 @@ mod tests {
         assert!(!archived.exists(), "undo: true must restore");
     }
 
-    /// `identity` takes `refresh` on every surface (#62). Before this the
-    /// tool declared no parameters at all, so the flag the CLI honoured had no
-    /// spelling here. `extract_l1_facts` clears tier 1 before it derives it
-    /// again, so a stale fact seeded first is what proves the call was made.
-    #[tokio::test]
-    async fn identity_refresh_re_extracts_the_l1_facts() {
-        let (_tmp, mut server) = indexed_server(crate::config::GroupBy::Chunk);
-        let root = server.core.vault_path.as_ref().clone();
-        server.core.profile = std::sync::Arc::new(Some(test_profile(&root)));
-
-        let stale = || {
-            let writer = server.core.writer();
-            let store = writer.try_lock().expect("uncontended");
-            store
-                .get_identity_facts(1)
-                .unwrap()
-                .into_iter()
-                .any(|f| f.key == "stale")
-        };
-        {
-            let writer = server.core.writer();
-            let store = writer.try_lock().expect("uncontended");
-            store
-                .upsert_identity_fact(1, "stale", "from an older session", None)
-                .unwrap();
-        }
-        assert!(stale());
-
-        // No refresh: the facts are answered as they stand.
-        server
-            .identity(super::Parameters(crate::params::Identity {
-                refresh: false,
-            }))
-            .await
-            .unwrap();
-        assert!(stale(), "a call that did not ask must re-extract nothing");
-
-        server
-            .identity(super::Parameters(crate::params::Identity { refresh: true }))
-            .await
-            .unwrap();
-        assert!(!stale(), "refresh: true must re-derive tier 1");
-    }
-
-    /// A read-only server refuses every call that writes derived state, and
-    /// `identity {refresh: true}` is one: it clears the `identity_facts` rows
-    /// (#62).
-    #[tokio::test]
-    async fn a_read_only_server_refuses_an_identity_refresh_and_answers_a_plain_one() {
-        let (_tmp, mut server) = indexed_server(crate::config::GroupBy::Chunk);
-        let root = server.core.vault_path.as_ref().clone();
-        server.core.profile = std::sync::Arc::new(Some(test_profile(&root)));
-        server.core.read_only = true;
-
-        let err = server
-            .identity(super::Parameters(crate::params::Identity { refresh: true }))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_REQUEST, "{err:?}");
-        assert_eq!(err.data.as_ref().unwrap()["kind"], "read_only");
-        assert!(
-            server
-                .identity(super::Parameters(crate::params::Identity {
-                    refresh: false,
-                }))
-                .await
-                .is_ok()
-        );
-    }
-
     /// `init {mode: apply}` indexes the vault, which is the work `index` is
     /// guarded against. `detect` writes nothing and still runs (#62).
     #[tokio::test]
@@ -1235,32 +1027,19 @@ mod tests {
         let (_tmp, mut server) = indexed_server(crate::config::GroupBy::Chunk);
         server.core.read_only = true;
 
-        let init = |mode: &str| crate::params::Init {
-            mode: Some(mode.to_string()),
-            name: None,
-            role: None,
-            purpose: None,
-        };
-        assert!(server.init(super::Parameters(init("apply"))).await.is_err());
-        assert!(server.init(super::Parameters(init("detect"))).await.is_ok());
-    }
-
-    /// A server's `apply` acts on the plan its caller sends and no other. The
-    /// copy `knapper migrate --mode preview` saves belongs to the CLI's own
-    /// two-step flow, and an `apply` that fell back to it would move files
-    /// against a plan this caller never saw (#62).
-    #[tokio::test]
-    async fn a_migrate_apply_with_no_preview_is_a_parameter_error() {
-        let (_tmp, server) = indexed_server(crate::config::GroupBy::Chunk);
-        let err = server
-            .migrate(super::Parameters(crate::params::Migrate {
-                mode: "apply".into(),
-                preview: None,
-            }))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
-        assert!(err.message.contains("apply needs a preview"), "got {err:?}");
+        let init = |mode: crate::params::InitMode| crate::params::Init { mode };
+        assert!(
+            server
+                .init(super::Parameters(init(crate::params::InitMode::Apply)))
+                .await
+                .is_err()
+        );
+        assert!(
+            server
+                .init(super::Parameters(init(crate::params::InitMode::Detect)))
+                .await
+                .is_ok()
+        );
     }
 
     /// A search asking for one query, with everything but the two per-call
@@ -1415,6 +1194,20 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
         assert_eq!(err.data.as_ref().unwrap()["kind"], "not_found");
+    }
+
+    #[tokio::test]
+    async fn a_read_only_server_refuses_reindex_file() {
+        let (_tmp, mut server) = indexed_server(crate::config::GroupBy::Chunk);
+        server.core.read_only = true;
+        let err = server
+            .reindex_file(super::Parameters(crate::params::ReindexFile {
+                file: "rules/evocation-spells.md".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_REQUEST, "{err:?}");
+        assert_eq!(err.data.as_ref().unwrap()["kind"], "read_only");
     }
 
     /// A note changed outside knapper is this surface's INVALID_REQUEST: the

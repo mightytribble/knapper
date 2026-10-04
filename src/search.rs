@@ -363,10 +363,9 @@ pub fn search_with_intelligence(
 
     // Semantic lane
     let query_vec = embedder.embed_query(query).context("embedding query")?;
-    let tombstones = std::collections::HashSet::new();
     let raw_results = config
         .store
-        .search_vec(&query_vec, lane_width, &tombstones, scope_files)?;
+        .search_vec(&query_vec, lane_width, scope_files)?;
 
     for (vector_id, distance) in raw_results {
         if let Some(chunk) = config.store.get_chunk_by_vector_id(vector_id)? {
@@ -1907,7 +1906,6 @@ pub fn status_object(
         "vault": vault,
         "files": stats.file_count,
         "chunks": stats.chunk_count,
-        "tombstones": stats.tombstone_count,
         "last_indexed": last_indexed,
         "index_size": index_size,
         "model": model_name,
@@ -1987,14 +1985,12 @@ pub fn format_status(
         }
         out.push_str(&format!(
             "Dates:      {}/{} files\n\
-             Tombstones: {} (pending cleanup)\n\
              Last index: {}\n\
              Index size: {}\n\
              Model:      {}\n\
              Intelligence: {}\n",
             date_count,
             stats.file_count,
-            stats.tombstone_count,
             last_indexed,
             format_bytes(index_size),
             model_name,
@@ -2039,7 +2035,6 @@ mod tests {
         let stats = StoreStats {
             file_count: 42,
             chunk_count: 187,
-            tombstone_count: 3,
             last_indexed_at: Some("2026-03-19 14:30:00".to_string()),
             vault_path: Some("/path/to/vault".to_string()),
         };
@@ -2058,7 +2053,6 @@ mod tests {
         assert!(output.contains("42"), "missing file count");
         assert!(output.contains("187"), "missing chunk count");
         assert!(output.contains("30/42 files"), "missing date coverage");
-        assert!(output.contains("3"), "missing tombstone count");
         assert!(output.contains("2026-03-19 14:30:00"), "missing last index");
         assert!(output.contains("2.4 MB"), "missing index size");
         assert!(output.contains("all-MiniLM-L6-v2"), "missing model");
@@ -2072,7 +2066,6 @@ mod tests {
         let stats = StoreStats {
             file_count: 10,
             chunk_count: 20,
-            tombstone_count: 0,
             last_indexed_at: Some("2026-03-19 14:30:00".to_string()),
             vault_path: Some("/path/to/vault".to_string()),
         };
@@ -2101,7 +2094,6 @@ mod tests {
         let stats = StoreStats {
             file_count: 42,
             chunk_count: 187,
-            tombstone_count: 3,
             last_indexed_at: Some("2026-03-19 14:30:00".to_string()),
             vault_path: Some("/path/to/vault".to_string()),
         };
@@ -2120,7 +2112,6 @@ mod tests {
         assert_eq!(parsed["vault"], "/path/to/vault");
         assert_eq!(parsed["files"], 42);
         assert_eq!(parsed["chunks"], 187);
-        assert_eq!(parsed["tombstones"], 3);
         assert_eq!(parsed["last_indexed"], "2026-03-19 14:30:00");
         assert_eq!(parsed["index_size"], 2_516_582);
         assert_eq!(parsed["model"], "all-MiniLM-L6-v2");
@@ -2146,7 +2137,6 @@ mod tests {
         let stats = StoreStats {
             file_count: 1,
             chunk_count: 1,
-            tombstone_count: 0,
             last_indexed_at: None,
             vault_path: None,
         };

@@ -37,7 +37,7 @@ pub type ChunkKey = (i64, i64);
 pub enum Source {
     /// The fused semantic + keyword order.
     Rrf,
-    /// The graph lane's reach order — the reserved 16 of 64.
+    /// The graph lane's reach order, filling `graph_reserve` of `candidates`.
     Graph,
     /// A note whose date matches the query's range.
     Temporal,
@@ -104,9 +104,9 @@ impl Candidate {
 /// for it. So `budget` is the only number that binds.
 #[derive(Debug, Clone, Copy)]
 pub struct Reserves {
-    /// How many candidates the cross-encoder is shown. §8.6's 64.
+    /// How many candidates the cross-encoder is shown: `[ranking] candidates`.
     pub budget: usize,
-    /// Slots reserved for graph candidates, in reach order. §8.6's 16.
+    /// Slots reserved for graph candidates, in reach order: `[ranking] graph_reserve`.
     pub graph: usize,
     /// Slots reserved for date-matching candidates the content order cut.
     ///

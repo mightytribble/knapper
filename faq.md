@@ -155,7 +155,7 @@ problems; `knapper tags` shows a vocabulary that has drifted. Hand an agent
 that output and a rule for what to do about it, and it can work through the
 list — reading, editing sections and fixing links one call at a time.
 
-Do it on a vault you can restore. Every write is atomic and audited, but a
+Do it on a vault you can restore. Every write is atomic, but a
 few hundred edits at agent speed is still a few hundred edits.
 
 ## How do I check an edit landed everywhere?
@@ -213,7 +213,7 @@ performing them and reporting success:
 
 A batch is one write: the agent sends a list of edits, and knapper applies
 them in one file write, one conflict check and one re-index. Every write is
-atomic — a temp file and a rename — and logged to an audit table.
+atomic — a temp file and a rename.
 
 The same capability is on the CLI when you want to make an edit by hand:
 
@@ -224,28 +224,6 @@ knapper update "Meeting Notes" --section "Action Items" \
 
 Write `--content=` with an equals sign when the value starts with a `-`, or
 clap reads it as a flag.
-
-## How do I restructure my vault into PARA?
-
-`knapper migrate` classifies notes into Projects, Areas, Resources and
-Archive by heuristic, and the workflow is preview-first:
-
-```bash
-knapper migrate --mode preview   # writes a plan to ~/.knapper/
-knapper migrate --mode apply     # moves the files
-knapper migrate --mode undo      # reverses the last migration
-```
-
-Read `~/.knapper/migration_preview.md` before you apply. The signals are open
-tasks and active status for **Projects**, recurring topic keywords for
-**Areas**, people and reference material for **Resources**, and
-done/inactive/unlinked for **Archive**. A note that matches nothing with
-enough confidence stays where it is, and daily notes and templates are always
-skipped.
-
-The same three modes are available as an MCP tool and an HTTP endpoint, so an
-agent can drive it — but on both of those, `apply` takes the plan that
-`preview` returned; only the CLI reads the copy on disk.
 
 ## Why did my search return nothing?
 

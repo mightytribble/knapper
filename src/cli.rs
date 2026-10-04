@@ -173,34 +173,17 @@ pub enum Command {
         all: bool,
     },
 
-    /// Initialize vault profile, identity, and search index.
+    /// Initialize the vault profile and the search index.
     // `group(skip)` for the reason `index` gives: the flattened struct
     // declares the group this variant would declare again.
     #[group(skip)]
     Init {
         #[command(flatten)]
         args: crate::params::Init,
-        /// Path to vault directory.
+        /// Path to vault directory. A running server is bound to its
+        /// configured vault, so this argument is the CLI's alone.
         path: Option<PathBuf>,
-        /// Only run identity setup (skip indexing).
-        #[arg(long)]
-        identity: bool,
-        /// Only re-index (skip identity prompts).
-        #[arg(long)]
-        reindex: bool,
-        /// Detect vault without writing anything (agent mode).
-        #[arg(long)]
-        detect: bool,
-        /// Output as JSON (agent mode).
-        #[arg(long)]
-        json: bool,
-        /// Suppress interactive prompts.
-        #[arg(long)]
-        quiet: bool,
     },
-
-    /// Print identity block (L0 + L1 context for AI agents).
-    Identity(crate::params::Identity),
 
     /// Configure knapper settings.
     Configure {
@@ -267,9 +250,6 @@ pub enum Command {
         #[arg(long)]
         read_only: bool,
     },
-
-    /// Migrate vault structure into PARA.
-    Migrate(crate::params::Migrate),
 }
 
 #[derive(Subcommand, Debug)]
@@ -316,37 +296,31 @@ mod tests {
     }
 
     #[test]
-    fn migrate_takes_the_mode_the_servers_take() {
-        // PARA is the only strategy, so `migrate` is a leaf that takes the
-        // same three words every surface takes (#62).
-        let cli = Cli::try_parse_from(["knapper", "migrate", "--mode", "apply"]).unwrap();
-        match cli.command {
-            Command::Migrate(args) => assert_eq!(args.mode, "apply"),
-            other => panic!("got {other:?}"),
-        }
-        assert!(
-            Cli::try_parse_from(["knapper", "migrate", "para", "--apply"]).is_err(),
-            "the PARA leaf is gone"
-        );
-        assert!(
-            Cli::try_parse_from(["knapper", "migrate"]).is_err(),
-            "the mode is required"
-        );
-    }
-
-    #[test]
-    fn init_takes_a_mode_and_runs_the_prompts_without_one() {
-        // `init` is one capability: `--mode` on every surface, and the
-        // interactive flow when the CLI is given none (#62).
+    fn init_takes_a_mode_and_refuses_to_run_without_one() {
+        // `init` is one capability: `--mode` on every surface, and there is
+        // no flow a mode-less call could mean (#62).
         let cli = Cli::try_parse_from(["knapper", "init", "--mode", "detect"]).unwrap();
         match cli.command {
-            Command::Init { args, .. } => assert_eq!(args.mode.as_deref(), Some("detect")),
+            Command::Init { args, .. } => {
+                assert!(matches!(args.mode, crate::params::InitMode::Detect))
+            }
             other => panic!("got {other:?}"),
         }
-        let cli = Cli::try_parse_from(["knapper", "init"]).unwrap();
-        match cli.command {
-            Command::Init { args, .. } => assert_eq!(args.mode, None),
-            other => panic!("got {other:?}"),
+        assert!(
+            Cli::try_parse_from(["knapper", "init"]).is_err(),
+            "the mode is required"
+        );
+        assert!(
+            Cli::try_parse_from(["knapper", "init", "--mode", "sideways"]).is_err(),
+            "the mode is one of two words"
+        );
+        // `--json` is the program's own global flag, so it parses on every
+        // command and is not `init`'s to refuse.
+        for flag in ["--identity", "--reindex", "--detect", "--quiet"] {
+            assert!(
+                Cli::try_parse_from(["knapper", "init", "--mode", "apply", flag]).is_err(),
+                "{flag} still parses"
+            );
         }
     }
 

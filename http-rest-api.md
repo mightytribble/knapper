@@ -36,16 +36,14 @@ through a tunnel; the document names it as its server.
 | GET | `/api/status` | read | Index status and statistics |
 | GET | `/api/health` | read | Vault health diagnostics |
 | POST | `/api/validate` | read | Check vault markdown for structural and indexing problems — one note (`path`), a scope, or the whole vault; reads the files, not the index |
-| POST | `/api/create` | write | Create a new note |
+| POST | `/api/create` | write | Create a new note, filed under `folder` or at the vault root |
 | POST | `/api/update` | write | Apply a list of edits to one note in one write |
 | POST | `/api/move` | write | Move note to different folder |
 | POST | `/api/archive` | write | Archive a note, or restore one with `undo` |
 | POST | `/api/delete` | write | Delete note (soft or hard) |
 | POST | `/api/index` | write | Index the configured vault |
 | POST | `/api/reindex-file` | write | Re-index a single file after external edits |
-| GET | `/api/identity` | read | User identity (L0) and current context (L1). `?refresh=true` re-extracts the L1 facts and takes a write key |
-| POST | `/api/init` | write | First-time onboarding setup (`mode`: detect or apply) |
-| POST | `/api/migrate` | write | PARA migration (`mode`: preview, apply or undo). `apply` requires the `preview` that `preview` returned |
+| POST | `/api/init` | write | Write the vault profile and index (`mode`: detect or apply) |
 
 ## Authentication
 
@@ -91,11 +89,13 @@ curl -X POST http://localhost:3000/api/create \
   -d '{"content": "# Meeting Notes\n\nDiscussed auth timeline.", "tags": ["meeting", "auth"]}'
 ```
 
-## Rate limiting and CORS
+## Rate limiting, CORS and limits
 
 **Rate limiting:** Configurable per-key token bucket (requests per minute). Defaults to 60 req/min. Returns `429 Too Many Requests` when exceeded.
 
 **CORS:** Configurable allowed origins in `config.toml` under `[http]`. Defaults to allow all origins for local development.
+
+**Limits:** a request is answered 408 after `[http] request_timeout_secs` (60 by default; `0` disables it), except `/api/index` and `/api/init`, which run to completion. A body over 8 MiB is refused as 400 `invalid_input`. Sixteen requests run at once; the rest wait their turn. A 408 on a write means the outcome is unknown: a write already running when the timeout fired finishes after it.
 
 ```toml
 [http]
@@ -112,18 +112,20 @@ permissions = "write"
 
 ## Errors
 
-Every error a handler answers is a JSON body with two fields: `error`, the message, and `kind`, one word for what went wrong. The status says whose fault it is. The OpenAPI document carries the same table: every operation references `components.responses` for each status, and the body is `components.schemas.Error`.
+Every error the server answers is a JSON body with two fields: `error`, the message, and `kind`, one word for what went wrong. That includes a body the server cannot read — malformed JSON, a word that is not one of a parameter's values, a missing field, a query value of the wrong type, a body over the size limit — which is 400 `invalid_input` with the parser's own text, an unknown path, which is 404 `not_found`, and the wrong method on a known path, which is 405 `invalid_input`. The one exception is the request timeout's 408, which has no body. The status says whose fault it is. The OpenAPI document carries the same table for the statuses an error body carries a `kind` under: every operation references `components.responses` for each, and the body is `components.schemas.Error`. The 405 and 408 are the transport's own and are not declared there.
 
 | status | kind | when |
 |---|---|---|
 | 400 | `invalid_input` | the request's own text named nothing or asked two things at once: a scope term, an `after` cursor, a `links_to` or `linked_from` name, `full` with `summaries`, a `section` beside `include=metadata`, an empty `match` pattern, a `mode` word, a malformed edit list |
 | 400 | `ambiguous` | one name, several notes: an alias more than one note carries |
 | 404 | `not_found` | the `file` or `section` the call addresses is absent, on `read`, `update`, `move`, `delete`, `archive` and `reindex-file` |
+| 405 | `invalid_input` | the wrong method on a known route |
 | 409 | `conflict` | the write would clobber: the note changed on disk since it was indexed, a `create` or `move` onto an existing path, an `archive` of an archived note |
 | 403 | `read_only` | the server was started with `--read-only` |
 | 403 | `forbidden` | the key has no write permission |
 | 401 | `unauthorized` | no key, or a key the server does not hold |
 | 429 | `rate_limited` | the key's bucket is empty; `retry-after` says when |
+| 408 | — | the request ran past `request_timeout_secs`; no body. `/api/index` and `/api/init` are never timed out |
 | 500 | `stale_index` | the index cannot answer until `knapper index` runs |
 | 500 | `internal` | anything else; the body carries the whole error chain |
 
