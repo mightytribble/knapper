@@ -987,6 +987,37 @@ mod tests {
         (tmp, super::KnapperServer::new(core))
     }
 
+    #[tokio::test]
+    async fn an_unarchive_of_a_file_outside_the_vault_is_invalid_params() {
+        let (tmp, server) = indexed_server(crate::config::GroupBy::Chunk);
+        let outside = tmp.path().join("outside.md");
+        std::fs::write(&outside, "---\narchived_from: x.md\n---\n# O\n").unwrap();
+        let err = server
+            .archive(super::Parameters(crate::params::Archive {
+                file: "../outside.md".into(),
+                undo: true,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
+        assert_eq!(err.data.as_ref().unwrap()["kind"], "invalid_input");
+        assert!(outside.is_file());
+    }
+
+    #[tokio::test]
+    async fn a_reindex_file_outside_the_vault_is_invalid_params() {
+        let (tmp, server) = indexed_server(crate::config::GroupBy::Chunk);
+        std::fs::write(tmp.path().join("secret.md"), "# Secret\n").unwrap();
+        let err = server
+            .reindex_file(super::Parameters(crate::params::ReindexFile {
+                file: "../secret.md".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
+        assert_eq!(err.data.as_ref().unwrap()["kind"], "invalid_input");
+    }
+
     /// `archive` and `archive {undo: true}` are one operation and its reverse
     /// (#62). The handler's own branch chooses `archive_note` against
     /// `unarchive_note`, and nothing else covers it — an inverted branch would

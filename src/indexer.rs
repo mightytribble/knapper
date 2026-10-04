@@ -547,6 +547,7 @@ pub fn reindex_written_file(
     vault_path: &Path,
     settings: IndexSettings,
 ) -> Result<IndexFileResult> {
+    crate::writer::inside_vault(rel_path, "file")?;
     let full_path = vault_path.join(rel_path);
     // A path not on disk is an absent resource. A file that
     // is there and cannot be read is the server's, and stays an io::Error.
@@ -1463,6 +1464,36 @@ mod tests {
             text.contains("the new line"),
             "the store must hold the appended text, got: {text:?}"
         );
+    }
+
+    #[test]
+    fn a_reindex_of_a_file_outside_the_vault_is_refused_and_indexes_nothing() {
+        use crate::llm::MockLlm;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("vault");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(tmp.path().join("secret.md"), "# Secret\n\nkept out\n").unwrap();
+        let store = Store::open_memory().unwrap();
+        let config = Config::default();
+        let err = reindex_written_file(
+            "../secret.md",
+            &store,
+            &mut MockLlm::new(256),
+            &root,
+            IndexSettings::from_config(&config),
+        )
+        .err()
+        .expect("a path outside the vault is refused");
+        assert_eq!(
+            crate::fault::Fault::of(&err).map(|f| f.kind()),
+            Some("invalid_input")
+        );
+        assert_eq!(
+            err.to_string(),
+            "file must stay inside the vault: ../secret.md"
+        );
+        assert_eq!(store.file_count().unwrap(), 0);
     }
 
     #[test]

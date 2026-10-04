@@ -1539,6 +1539,7 @@ pub fn unarchive_note(
     chunk_opts: ChunkOptions,
     vault_path: &Path,
 ) -> Result<WriteResult> {
+    inside_vault(file, "file")?;
     // Resolve — the file may not be in the index (archived notes are excluded).
     // Try resolving by direct path on disk.
     let archive_path = vault_path.join(file);
@@ -1557,6 +1558,7 @@ pub fn unarchive_note(
         anyhow::anyhow!("no archived_from in frontmatter — cannot determine original location")
     })?;
 
+    inside_vault(&original_path, "archived_from")?;
     let restore_full_path = vault_path.join(&original_path);
 
     if restore_full_path.exists() {
@@ -4706,6 +4708,71 @@ mod tests {
                 format!("folder must stay inside the vault: {text}")
             );
         }
+    }
+
+    #[test]
+    fn an_unarchive_of_a_file_outside_the_vault_is_refused_and_removes_nothing() {
+        use crate::llm::MockLlm;
+
+        let (tmp, store, root) = nested_vault();
+        let outside = tmp.path().join("outside.md");
+        std::fs::write(
+            &outside,
+            "---\narchived: true\narchived_from: restored.md\n---\n# Outside\n",
+        )
+        .unwrap();
+        let err = unarchive_note(
+            "../outside.md",
+            &store,
+            &mut MockLlm::new(256),
+            EmbedComposition::default(),
+            test_chunk_opts(),
+            &root,
+        )
+        .unwrap_err();
+        assert_eq!(
+            crate::fault::Fault::of(&err).map(|f| f.kind()),
+            Some("invalid_input")
+        );
+        assert_eq!(
+            err.to_string(),
+            "file must stay inside the vault: ../outside.md"
+        );
+        assert!(outside.is_file());
+        assert!(!root.join("restored.md").exists());
+    }
+
+    #[test]
+    fn an_unarchive_whose_archived_from_climbs_out_is_refused_and_leaves_the_note() {
+        use crate::llm::MockLlm;
+
+        let (tmp, store, root) = nested_vault();
+        std::fs::create_dir_all(root.join("04-Archive")).unwrap();
+        let archived = root.join("04-Archive/n.md");
+        std::fs::write(
+            &archived,
+            "---\narchived: true\narchived_from: ../escaped.md\n---\n# N\n",
+        )
+        .unwrap();
+        let err = unarchive_note(
+            "04-Archive/n.md",
+            &store,
+            &mut MockLlm::new(256),
+            EmbedComposition::default(),
+            test_chunk_opts(),
+            &root,
+        )
+        .unwrap_err();
+        assert_eq!(
+            crate::fault::Fault::of(&err).map(|f| f.kind()),
+            Some("invalid_input")
+        );
+        assert_eq!(
+            err.to_string(),
+            "archived_from must stay inside the vault: ../escaped.md"
+        );
+        assert!(archived.is_file());
+        assert!(!tmp.path().join("escaped.md").exists());
     }
 
     #[test]

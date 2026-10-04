@@ -1840,6 +1840,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_unarchive_of_a_file_outside_the_vault_is_a_bad_request() {
+        let (tmp, state) = indexed_state();
+        let outside = tmp.path().join("outside.md");
+        std::fs::write(&outside, "---\narchived_from: x.md\n---\n# O\n").unwrap();
+        let (status, body) = post_json(
+            state,
+            "/api/archive",
+            r#"{"file":"../outside.md","undo":true}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["kind"], "invalid_input");
+        assert!(outside.is_file());
+    }
+
+    #[tokio::test]
+    async fn a_reindex_file_outside_the_vault_is_a_bad_request() {
+        let (tmp, state) = indexed_state();
+        std::fs::write(tmp.path().join("secret.md"), "# Secret\n").unwrap();
+        let (status, body) =
+            post_json(state, "/api/reindex-file", r#"{"file":"../secret.md"}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["kind"], "invalid_input");
+    }
+
+    #[tokio::test]
     async fn init_without_a_mode_is_a_bad_request() {
         // The mode is required on every surface; the extractor refuses the
         // body before the handler runs, with the kind every error carries.

@@ -39,10 +39,10 @@ through a tunnel; the document names it as its server.
 | POST | `/api/create` | write | Create a new note, filed under `folder` or at the vault root. A `folder` with a `..` segment is 400 `invalid_input`; a leading or trailing `/` is trimmed, so `/` is the vault root. |
 | POST | `/api/update` | write | Apply a list of edits to one note in one write |
 | POST | `/api/move` | write | Move note to different folder. A `new_folder` with a `..` segment is 400 `invalid_input`; a leading or trailing `/` is trimmed, so `/` is the vault root. |
-| POST | `/api/archive` | write | Archive a note, or restore one with `undo` |
+| POST | `/api/archive` | write | Archive a note, or restore one with `undo`. With `undo`, a `file` outside the vault, or a note whose `archived_from` is, is 400 `invalid_input`. |
 | POST | `/api/delete` | write | Delete note (soft or hard) |
 | POST | `/api/index` | write | Index the configured vault |
-| POST | `/api/reindex-file` | write | Re-index a single file after external edits |
+| POST | `/api/reindex-file` | write | Re-index a single file after external edits. A `file` with a `..` segment or a leading `/` is 400 `invalid_input`. |
 | POST | `/api/init` | write | Write the vault profile and index (`mode`: detect or apply) |
 
 ## Authentication
