@@ -530,23 +530,18 @@ pub fn backfill_edges_from_chunks(store: &Store) -> Result<usize> {
 /// event. Without this call the note's rows keep the text it held before the
 /// edit, and nothing later re-derives them (#62).
 ///
-/// The chunker settings and the embedding composition both come from the
-/// caller's session, not from the config this loads: a load that fails falls
-/// back to the defaults, and one file re-chunked — or re-embedded — at settings
-/// the rest of the store was not built at is a set of rows nothing downstream
-/// can tell apart. `EmbedComposition` carries `[embedding_prefix]`,
-/// `[embedding_prompt] document_title` and `breadcrumb_root` together for that
-/// reason: a caller that threads one and forgets the others writes vectors into
-/// a space the store does not share, which is what `prefix::EmbedComposition`
-/// exists to prevent. It takes both as one [`IndexSettings`], so a caller
-/// cannot thread the chunking and forget the embedding.
+/// The config is the caller's: the one a server read at start, or the one
+/// the CLI loaded. It carries the chunking, the embedding composition and the
+/// batch size together, so one file is re-indexed at the settings the rest of
+/// the store was built at (#72).
 pub fn reindex_written_file(
     rel_path: &str,
     store: &Store,
     embedder: &mut impl EmbedModel,
     vault_path: &Path,
-    settings: IndexSettings,
+    config: &Config,
 ) -> Result<IndexFileResult> {
+    crate::writer::inside_vault(rel_path, "file")?;
     let full_path = vault_path.join(rel_path);
     // A path not on disk is an absent resource. A file that
     // is there and cannot be read is the server's, and stays an io::Error.
@@ -561,10 +556,6 @@ pub fn reindex_written_file(
         format!("{:x}", hasher.finalize())
     };
 
-    let mut config = Config::load().unwrap_or_default();
-    config.set_chunk_options(settings.chunk);
-    config.set_embed_composition(settings.embed);
-
     let result = index_file(
         rel_path,
         &content,
@@ -572,7 +563,7 @@ pub fn reindex_written_file(
         store,
         embedder,
         vault_path,
-        &config,
+        config,
     )?;
 
     // Outgoing only — see issue #27.
@@ -1442,14 +1433,7 @@ mod tests {
             "update_note stores the hash of what it wrote"
         );
 
-        reindex_written_file(
-            "note.md",
-            &store,
-            &mut embedder,
-            root,
-            IndexSettings::from_config(&config),
-        )
-        .unwrap();
+        reindex_written_file("note.md", &store, &mut embedder, root, &config).unwrap();
 
         let file_id = store.get_file("note.md").unwrap().unwrap().id;
         let text: String = store
@@ -1463,6 +1447,69 @@ mod tests {
             text.contains("the new line"),
             "the store must hold the appended text, got: {text:?}"
         );
+    }
+
+    /// The config is the caller's. A reload would read whatever
+    /// `config.toml` the machine holds and drop the caller's setting.
+    #[test]
+    fn a_reindex_uses_the_breadcrumb_root_of_the_config_it_is_given() {
+        use crate::llm::MockLlm;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("lore")).unwrap();
+        std::fs::write(root.join("lore/n.md"), "# Heading\n\nBody text here.\n").unwrap();
+        let store = Store::open_memory().unwrap();
+        let mut config = Config::default();
+        config.breadcrumb_root = crate::config::BreadcrumbRoot::Stem;
+
+        reindex_written_file("lore/n.md", &store, &mut MockLlm::new(256), root, &config).unwrap();
+
+        let file_id = store.get_file("lore/n.md").unwrap().unwrap().id;
+        let chunks = store.get_chunks_by_file(file_id).unwrap();
+        assert!(!chunks.is_empty());
+        for chunk in &chunks {
+            assert!(
+                chunk.heading_path.starts_with("n"),
+                "a stem breadcrumb, got {:?}",
+                chunk.heading_path
+            );
+            assert!(
+                !chunk.heading_path.starts_with("lore/"),
+                "{:?}",
+                chunk.heading_path
+            );
+        }
+    }
+
+    #[test]
+    fn a_reindex_of_a_file_outside_the_vault_is_refused_and_indexes_nothing() {
+        use crate::llm::MockLlm;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("vault");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(tmp.path().join("secret.md"), "# Secret\n\nkept out\n").unwrap();
+        let store = Store::open_memory().unwrap();
+        let config = Config::default();
+        let err = reindex_written_file(
+            "../secret.md",
+            &store,
+            &mut MockLlm::new(256),
+            &root,
+            &config,
+        )
+        .err()
+        .expect("a path outside the vault is refused");
+        assert_eq!(
+            crate::fault::Fault::of(&err).map(|f| f.kind()),
+            Some("invalid_input")
+        );
+        assert_eq!(
+            err.to_string(),
+            "file must stay inside the vault: ../secret.md"
+        );
+        assert_eq!(store.file_count().unwrap(), 0);
     }
 
     #[test]
@@ -3953,14 +4000,7 @@ mod tests {
         assert_eq!(store.get_unresolved_links().unwrap().len(), 1);
 
         write_file(root, "b.md", "# B\n\nBody.\n");
-        reindex_written_file(
-            "b.md",
-            &store,
-            &mut embedder,
-            root,
-            IndexSettings::from_config(&config),
-        )
-        .unwrap();
+        reindex_written_file("b.md", &store, &mut embedder, root, &config).unwrap();
 
         assert!(
             store.get_unresolved_links().unwrap().is_empty(),

@@ -10,7 +10,7 @@ use std::sync::atomic::AtomicUsize;
 use std::time::SystemTime;
 
 use anyhow::Result;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::config::{Config, db_path};
 use crate::fault::Fault;
@@ -29,6 +29,46 @@ pub struct CoreGuards<'a> {
     pub store: &'a Store,
     pub embedder: &'a mut Box<dyn EmbedModel + Send>,
     pub reranker: Option<&'a mut dyn RerankModel>,
+}
+
+/// The writer, the embedder and the reranker, held. Taken by
+/// [`Core::lock_core`] and released when [`CoreLocks::run`] returns, or when
+/// it is dropped unrun.
+pub struct CoreLocks {
+    store: OwnedMutexGuard<Store>,
+    embedder: OwnedMutexGuard<Box<dyn EmbedModel + Send>>,
+    reranker: Option<OwnedMutexGuard<Box<dyn RerankModel + Send>>>,
+}
+
+impl CoreLocks {
+    /// Run `f` with the held locks, off the runtime thread. A panic inside
+    /// `f` is the `Err`, and every lock is released during unwinding.
+    pub async fn run<R, F>(self, f: F) -> Result<R>
+    where
+        R: Send + 'static,
+        F: for<'a> FnOnce(CoreGuards<'a>) -> Result<R> + Send + 'static,
+    {
+        let CoreLocks {
+            store,
+            mut embedder,
+            mut reranker,
+        } = self;
+        let joined = tokio::task::spawn_blocking(move || {
+            let guards = CoreGuards {
+                store: &store,
+                embedder: &mut embedder,
+                reranker: reranker
+                    .as_mut()
+                    .map(|g| g.as_mut() as &mut dyn RerankModel),
+            };
+            f(guards)
+        })
+        .await;
+        match joined {
+            Ok(result) => result,
+            Err(e) => Err(anyhow::anyhow!("core call panicked: {e}")),
+        }
+    }
 }
 
 /// The shared state of one `serve` process. Every field is an `Arc` or `Copy`,
@@ -166,39 +206,31 @@ impl Core {
         }
     }
 
-    /// Run `f` with the writer, the embedder and the reranker, off the runtime
-    /// thread.
-    ///
-    /// The one place two of these locks are held at once, in one order:
-    /// writer, embedder, reranker. The guards move into the blocking task and
-    /// drop when `f` returns, or during unwinding if it panics, so a panic
-    /// answers one call with an error and releases every lock.
+    /// Take the writer, the embedder and the reranker, in that order. The
+    /// one place two of these locks are held at once. Dropping the future
+    /// before it finishes releases whatever it had taken.
+    pub async fn lock_core(&self) -> CoreLocks {
+        let store = self.writer.clone().lock_owned().await;
+        let embedder = self.embedder.clone().lock_owned().await;
+        let reranker = match &self.reranker {
+            Some(r) => Some(r.clone().lock_owned().await),
+            None => None,
+        };
+        CoreLocks {
+            store,
+            embedder,
+            reranker,
+        }
+    }
+
+    /// Run `f` with the writer, the embedder and the reranker, off the
+    /// runtime thread: [`Core::lock_core`] then [`CoreLocks::run`].
     pub async fn with_core<R, F>(&self, f: F) -> Result<R>
     where
         R: Send + 'static,
         F: for<'a> FnOnce(CoreGuards<'a>) -> Result<R> + Send + 'static,
     {
-        let store = self.writer.clone().lock_owned().await;
-        let mut embedder = self.embedder.clone().lock_owned().await;
-        let mut reranker = match &self.reranker {
-            Some(r) => Some(r.clone().lock_owned().await),
-            None => None,
-        };
-        let joined = tokio::task::spawn_blocking(move || {
-            let guards = CoreGuards {
-                store: &store,
-                embedder: &mut embedder,
-                reranker: reranker
-                    .as_mut()
-                    .map(|g| g.as_mut() as &mut dyn RerankModel),
-            };
-            f(guards)
-        })
-        .await;
-        match joined {
-            Ok(result) => result,
-            Err(e) => Err(anyhow::anyhow!("core call panicked: {e}")),
-        }
+        self.lock_core().await.run(f).await
     }
 
     /// Refuse a write on a server started with `--read-only`.
@@ -434,6 +466,25 @@ mod tests {
 
         release_tx.send(()).unwrap();
         held.await.unwrap().unwrap();
+    }
+
+    /// A `lock_core` dropped before it finishes releases what it took, so a
+    /// caller that gives up waiting leaves the core free.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lock_core_given_up_on_leaves_the_core_free() {
+        let (_tmp, core) = testing::indexed_core(&[], testing::test_config());
+        let held = core.lock_core().await;
+        let gave_up = tokio::time::timeout(Duration::from_millis(50), core.lock_core()).await;
+        assert!(gave_up.is_err(), "the second lock must wait for the first");
+        drop(held);
+        let count = tokio::time::timeout(
+            Duration::from_secs(2),
+            core.with_core(|guards| guards.store.file_count()),
+        )
+        .await
+        .expect("the core is free once both are gone")
+        .unwrap();
+        assert_eq!(count, 0);
     }
 
     /// Two core calls serialize: the second runs after the first releases.

@@ -1066,8 +1066,8 @@ impl Config {
             .collect()
     }
 
-    /// Name every retired table `text` carries, once per process: the
-    /// config is read again on some write paths, and a user needs the
+    /// Name every retired table `text` carries, once per process: a CLI
+    /// command can load the config more than once, and a user needs the
     /// notice once.
     fn warn_retired_tables(text: &str, source: &Path) {
         static WARNED: std::sync::Once = std::sync::Once::new();
@@ -2150,6 +2150,15 @@ name = "Someone"
             .collect();
         assert_eq!(named, vec!["http.plugin", "identity"]);
         assert!(Config::retired_tables("[http]\nport = 1\n").is_empty());
+        let memory = Config::retired_tables("[memory]\nenabled = true\n");
+        assert_eq!(
+            memory.into_iter().map(|(t, _)| t).collect::<Vec<_>>(),
+            vec!["memory"]
+        );
+        // An unparseable text names nothing here; the typed parse reports it.
+        assert!(Config::retired_tables("[http\nport = ").is_empty());
+        // A retired name as a plain key is not the table.
+        assert!(Config::retired_tables("identity = 1\n").is_empty());
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");

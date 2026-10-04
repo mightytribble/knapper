@@ -151,6 +151,28 @@ pub fn normalize_filename(name: &str) -> String {
     }
 }
 
+/// Refuse a vault-relative path that could name something outside the vault:
+/// a `..` component, a leading `/`, or a drive prefix. The check is lexical;
+/// a symlink inside the vault is the vault owner's own arrangement.
+///
+/// `what` is the parameter's name as the caller wrote it, so the refusal
+/// names the field to fix.
+pub fn inside_vault(text: &str, what: &str) -> Result<()> {
+    use std::path::Component;
+    let escapes = Path::new(text).components().any(|c| {
+        matches!(
+            c,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    });
+    if escapes {
+        bail!(Fault::InvalidInput(format!(
+            "{what} must stay inside the vault: {text}"
+        )));
+    }
+    Ok(())
+}
+
 /// Split content into (frontmatter_string, body_string).
 /// If no frontmatter, returns ("", content).
 pub fn split_frontmatter(content: &str) -> (String, String) {
@@ -442,13 +464,24 @@ pub fn create_note(
     vault_path: &Path,
     profile: Option<&VaultProfile>,
 ) -> Result<WriteResult> {
-    // Step 1: Sanitize the caller's filename and ensure a `.md` extension.
+    // Step 1: the folder is the caller's, or the vault root. No inbox
+    // fallback and no guess from the text. It is checked before anything is
+    // read.
+    let folder = input
+        .folder
+        .as_deref()
+        .unwrap_or("")
+        .trim_matches('/')
+        .to_string();
+    inside_vault(&folder, "folder")?;
+
+    // Step 2: Sanitize the caller's filename and ensure a `.md` extension.
     let filename = normalize_filename(&input.filename);
 
-    // Step 2: Resolve tags
+    // Step 3: Resolve tags
     let resolved_tags = store.resolve_tags(&input.tags)?;
 
-    // Step 3: Discover links and apply them (unless auto_link is explicitly false)
+    // Step 4: Discover links and apply them (unless auto_link is explicitly false)
     let people_folder = profile.and_then(|p| p.structure.folders.people.as_deref());
     let discovered = links::discover_links(store, &input.content, people_folder)?;
 
@@ -484,15 +517,6 @@ pub fn create_note(
 
     // Apply auto-apply links to content via apply_links (respects protected regions)
     let content_with_links = links::apply_links(&input.content, &auto_apply);
-
-    // Step 4: the folder is the caller's, or the vault root. No inbox
-    // fallback and no guess from the text.
-    let folder = input
-        .folder
-        .as_deref()
-        .unwrap_or("")
-        .trim_matches('/')
-        .to_string();
 
     // Step 5: The caller's frontmatter is the note's frontmatter. The only
     // key create writes is `tags`, and only what `--tags` resolved to (#92).
@@ -1262,6 +1286,9 @@ pub fn move_note(
     store: &Store,
     vault_path: &Path,
 ) -> Result<WriteResult> {
+    let new_folder = new_folder.trim_matches('/');
+    inside_vault(new_folder, "new_folder")?;
+
     // Step 1: Resolve file
     let file_record = store.require_file(file)?;
 
@@ -1271,7 +1298,11 @@ pub fn move_note(
         .rsplit('/')
         .next()
         .unwrap_or(&file_record.path);
-    let new_rel_path = format!("{}/{}", new_folder, basename);
+    let new_rel_path = if new_folder.is_empty() {
+        basename.to_string()
+    } else {
+        format!("{new_folder}/{basename}")
+    };
     let new_full_path = vault_path.join(&new_rel_path);
 
     if new_full_path.exists() {
@@ -1508,6 +1539,7 @@ pub fn unarchive_note(
     chunk_opts: ChunkOptions,
     vault_path: &Path,
 ) -> Result<WriteResult> {
+    inside_vault(file, "file")?;
     // Resolve — the file may not be in the index (archived notes are excluded).
     // Try resolving by direct path on disk.
     let archive_path = vault_path.join(file);
@@ -1526,6 +1558,7 @@ pub fn unarchive_note(
         anyhow::anyhow!("no archived_from in frontmatter — cannot determine original location")
     })?;
 
+    inside_vault(&original_path, "archived_from")?;
     let restore_full_path = vault_path.join(&original_path);
 
     if restore_full_path.exists() {
@@ -3549,17 +3582,10 @@ mod tests {
             ),
         )
         .unwrap();
-        crate::indexer::reindex_written_file(
-            "note.md",
-            &store,
-            &mut embedder,
-            &vault,
-            crate::indexer::IndexSettings {
-                chunk: test_chunk_opts(),
-                embed: EmbedComposition::default(),
-            },
-        )
-        .unwrap();
+        let mut config = crate::config::Config::default();
+        config.set_chunk_options(test_chunk_opts());
+        crate::indexer::reindex_written_file("note.md", &store, &mut embedder, &vault, &config)
+            .unwrap();
 
         let file = store.get_file("note.md").unwrap().unwrap();
         assert!(
@@ -4651,5 +4677,220 @@ mod tests {
             vec![("a.md".to_string(), "inbox/n".to_string())],
             "the link names the path the note has left"
         );
+    }
+
+    /// A temp dir holding a vault at `vault/`, so `tmp` itself is outside it.
+    fn nested_vault() -> (tempfile::TempDir, Store, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("vault");
+        std::fs::create_dir_all(&root).unwrap();
+        (tmp, Store::open_memory().unwrap(), root)
+    }
+
+    #[test]
+    fn inside_vault_refuses_a_path_that_climbs_out_or_starts_at_the_root() {
+        for text in ["..", "../x", "a/../..", "a/../../x", "/etc", "/"] {
+            let err = inside_vault(text, "folder").unwrap_err();
+            assert_eq!(
+                crate::fault::Fault::of(&err).map(|f| f.kind()),
+                Some("invalid_input"),
+                "{text}"
+            );
+            assert_eq!(
+                err.to_string(),
+                format!("folder must stay inside the vault: {text}")
+            );
+        }
+    }
+
+    #[test]
+    fn an_unarchive_of_a_file_outside_the_vault_is_refused_and_removes_nothing() {
+        use crate::llm::MockLlm;
+
+        let (tmp, store, root) = nested_vault();
+        let outside = tmp.path().join("outside.md");
+        std::fs::write(
+            &outside,
+            "---\narchived: true\narchived_from: restored.md\n---\n# Outside\n",
+        )
+        .unwrap();
+        let err = unarchive_note(
+            "../outside.md",
+            &store,
+            &mut MockLlm::new(256),
+            EmbedComposition::default(),
+            test_chunk_opts(),
+            &root,
+        )
+        .unwrap_err();
+        assert_eq!(
+            crate::fault::Fault::of(&err).map(|f| f.kind()),
+            Some("invalid_input")
+        );
+        assert_eq!(
+            err.to_string(),
+            "file must stay inside the vault: ../outside.md"
+        );
+        assert!(outside.is_file());
+        assert!(!root.join("restored.md").exists());
+    }
+
+    #[test]
+    fn an_unarchive_whose_archived_from_climbs_out_is_refused_and_leaves_the_note() {
+        use crate::llm::MockLlm;
+
+        let (tmp, store, root) = nested_vault();
+        std::fs::create_dir_all(root.join("04-Archive")).unwrap();
+        let archived = root.join("04-Archive/n.md");
+        std::fs::write(
+            &archived,
+            "---\narchived: true\narchived_from: ../escaped.md\n---\n# N\n",
+        )
+        .unwrap();
+        let err = unarchive_note(
+            "04-Archive/n.md",
+            &store,
+            &mut MockLlm::new(256),
+            EmbedComposition::default(),
+            test_chunk_opts(),
+            &root,
+        )
+        .unwrap_err();
+        assert_eq!(
+            crate::fault::Fault::of(&err).map(|f| f.kind()),
+            Some("invalid_input")
+        );
+        assert_eq!(
+            err.to_string(),
+            "archived_from must stay inside the vault: ../escaped.md"
+        );
+        assert!(archived.is_file());
+        assert!(!tmp.path().join("escaped.md").exists());
+    }
+
+    #[test]
+    fn inside_vault_accepts_a_path_that_stays_in() {
+        for text in ["", ".", "notes", "notes/sub", "a..b", "notes/x.md"] {
+            inside_vault(text, "folder").unwrap();
+        }
+    }
+
+    #[test]
+    fn a_create_folder_that_climbs_out_is_refused_and_writes_nothing() {
+        use crate::llm::MockLlm;
+
+        let (tmp, store, root) = nested_vault();
+        let mut embedder = MockLlm::new(256);
+        let err = create_note(
+            CreateNoteInput {
+                content: "# Out\n\nBody.\n".to_string(),
+                filename: "out".to_string(),
+                tags: vec![],
+                folder: Some("../escape".to_string()),
+                created_by: "test".to_string(),
+                auto_link: Some(false),
+            },
+            &store,
+            &mut embedder,
+            EmbedComposition::default(),
+            test_chunk_opts(),
+            &root,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            crate::fault::Fault::of(&err).map(|f| f.kind()),
+            Some("invalid_input")
+        );
+        assert_eq!(
+            err.to_string(),
+            "folder must stay inside the vault: ../escape"
+        );
+        assert!(!tmp.path().join("escape").exists());
+        assert!(store.get_file("../escape/out.md").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_move_into_a_folder_that_climbs_out_is_refused_and_moves_nothing() {
+        use crate::llm::MockLlm;
+
+        let (tmp, store, root) = nested_vault();
+        std::fs::write(root.join("n.md"), "# N\n\nbody\n").unwrap();
+        let config = crate::config::Config::default();
+        crate::indexer::run_index_shared(
+            &root,
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut MockLlm::new(256),
+            false,
+            None,
+        )
+        .unwrap();
+
+        let err = move_note("n.md", "../escape", &store, &root).unwrap_err();
+        assert_eq!(
+            crate::fault::Fault::of(&err).map(|f| f.kind()),
+            Some("invalid_input")
+        );
+        assert_eq!(
+            err.to_string(),
+            "new_folder must stay inside the vault: ../escape"
+        );
+        assert!(root.join("n.md").is_file());
+        assert!(!tmp.path().join("escape").exists());
+        assert!(store.get_file("n.md").unwrap().is_some());
+    }
+
+    /// `new_folder` is trimmed of `/` the way `create`'s `folder` is, so a
+    /// leading `/` names a folder under the vault root, not the filesystem's.
+    #[test]
+    fn a_move_folder_with_a_leading_slash_files_inside_the_vault() {
+        use crate::llm::MockLlm;
+
+        let (_tmp, store, root) = nested_vault();
+        std::fs::write(root.join("n.md"), "# N\n\nbody\n").unwrap();
+        let config = crate::config::Config::default();
+        crate::indexer::run_index_shared(
+            &root,
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut MockLlm::new(256),
+            false,
+            None,
+        )
+        .unwrap();
+
+        let result = move_note("n.md", "/lore/", &store, &root).unwrap();
+        assert_eq!(result.path, "lore/n.md");
+        assert_eq!(result.folder, "lore");
+        assert!(root.join("lore/n.md").is_file());
+    }
+
+    /// An empty `new_folder`, or one that is only `/`, is the vault root.
+    #[test]
+    fn a_move_to_the_root_folder_files_the_note_at_the_vault_root() {
+        use crate::llm::MockLlm;
+
+        let (_tmp, store, root) = nested_vault();
+        std::fs::create_dir_all(root.join("inbox")).unwrap();
+        std::fs::write(root.join("inbox/n.md"), "# N\n\nbody\n").unwrap();
+        let config = crate::config::Config::default();
+        crate::indexer::run_index_shared(
+            &root,
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut MockLlm::new(256),
+            false,
+            None,
+        )
+        .unwrap();
+
+        let result = move_note("inbox/n.md", "/", &store, &root).unwrap();
+        assert_eq!(result.path, "n.md");
+        assert_eq!(result.folder, "");
+        assert!(root.join("n.md").is_file());
     }
 }

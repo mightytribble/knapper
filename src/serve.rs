@@ -336,7 +336,7 @@ impl KnapperServer {
             edits,
         };
         let vault = self.core.vault_path.clone();
-        let settings = self.core.index_settings;
+        let config = self.core.config.clone();
         // `update_note` stores the new content hash and writes no chunks, so
         // the re-index runs here, in the same core call (#62). A failure
         // after the write says so, and `record_write` is skipped, so the
@@ -350,7 +350,7 @@ impl KnapperServer {
                     g.store,
                     g.embedder,
                     &vault,
-                    settings,
+                    &config,
                 )
                 .with_context(|| {
                     format!(
@@ -517,14 +517,14 @@ impl KnapperServer {
         self.core.writable().map_err(mcp_err)?;
         let rel_path = params.0.file;
         let vault = self.core.vault_path.clone();
-        let settings = self.core.index_settings;
+        let config = self.core.config.clone();
         let file = rel_path.clone();
         // A path not on disk is a Fault::NotFound from the indexer, which is
         // this surface's INVALID_PARAMS (#62).
         let result = self
             .core
             .with_core(move |g| {
-                crate::indexer::reindex_written_file(&file, g.store, g.embedder, &vault, settings)
+                crate::indexer::reindex_written_file(&file, g.store, g.embedder, &vault, &config)
             })
             .await
             .map_err(mcp_err)?;
@@ -880,6 +880,7 @@ pub async fn run_serve(
     // Spawn HTTP server as a background task (before MCP blocks on stdio)
     if let Some(ref opts) = http_opts {
         let api_state = crate::http::ApiState {
+            request_timeout: crate::http::request_timeout(&core.config.http),
             http_config: Arc::new(core.config.http.clone()),
             no_auth: opts.no_auth,
             rate_limiter: Arc::new(crate::http::RateLimiter::new(core.config.http.rate_limit)),
@@ -985,6 +986,37 @@ mod tests {
         config.group_by = group_by;
         let (tmp, core) = crate::core::testing::indexed_core(ABJURATION_NOTES, config);
         (tmp, super::KnapperServer::new(core))
+    }
+
+    #[tokio::test]
+    async fn an_unarchive_of_a_file_outside_the_vault_is_invalid_params() {
+        let (tmp, server) = indexed_server(crate::config::GroupBy::Chunk);
+        let outside = tmp.path().join("outside.md");
+        std::fs::write(&outside, "---\narchived_from: x.md\n---\n# O\n").unwrap();
+        let err = server
+            .archive(super::Parameters(crate::params::Archive {
+                file: "../outside.md".into(),
+                undo: true,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
+        assert_eq!(err.data.as_ref().unwrap()["kind"], "invalid_input");
+        assert!(outside.is_file());
+    }
+
+    #[tokio::test]
+    async fn a_reindex_file_outside_the_vault_is_invalid_params() {
+        let (tmp, server) = indexed_server(crate::config::GroupBy::Chunk);
+        std::fs::write(tmp.path().join("secret.md"), "# Secret\n").unwrap();
+        let err = server
+            .reindex_file(super::Parameters(crate::params::ReindexFile {
+                file: "../secret.md".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
+        assert_eq!(err.data.as_ref().unwrap()["kind"], "invalid_input");
     }
 
     /// `archive` and `archive {undo: true}` are one operation and its reverse
@@ -1181,6 +1213,59 @@ mod tests {
         assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
         assert_eq!(err.data.as_ref().unwrap()["kind"], "not_found");
         assert_eq!(err.message, "file not found: nowhere.md");
+    }
+
+    #[tokio::test]
+    async fn a_create_folder_that_climbs_out_is_invalid_params() {
+        let (tmp, server) = indexed_server(crate::config::GroupBy::Chunk);
+        let err = server
+            .create(super::Parameters(crate::params::Create {
+                content: Some("# Out\n".into()),
+                filename: "out".into(),
+                tags: vec![],
+                folder: Some("../escape".into()),
+                auto_link: Some(false),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
+        assert_eq!(err.data.as_ref().unwrap()["kind"], "invalid_input");
+        assert!(!tmp.path().join("escape").exists());
+    }
+
+    #[tokio::test]
+    async fn a_validate_path_that_climbs_out_is_invalid_params() {
+        let (tmp, server) = indexed_server(crate::config::GroupBy::Chunk);
+        std::fs::write(tmp.path().join("secret.md"), "# Sentinel\n").unwrap();
+        let err = server
+            .validate(super::Parameters(crate::params::Validate {
+                path: Some("../secret".into()),
+                scope: vec![],
+                all: vec![],
+                any: vec![],
+                none: vec![],
+                strict: false,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
+        assert_eq!(err.data.as_ref().unwrap()["kind"], "invalid_input");
+        assert_eq!(err.message, "path must stay inside the vault: ../secret");
+    }
+
+    #[tokio::test]
+    async fn a_move_folder_that_climbs_out_is_invalid_params() {
+        let (tmp, server) = indexed_server(crate::config::GroupBy::Chunk);
+        let err = server
+            .move_note(super::Parameters(crate::params::Move {
+                file: "rules/evocation-spells.md".into(),
+                new_folder: "../escape".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
+        assert_eq!(err.data.as_ref().unwrap()["kind"], "invalid_input");
+        assert!(!tmp.path().join("escape").exists());
     }
 
     #[tokio::test]

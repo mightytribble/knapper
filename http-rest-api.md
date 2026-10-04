@@ -36,13 +36,13 @@ through a tunnel; the document names it as its server.
 | GET | `/api/status` | read | Index status and statistics |
 | GET | `/api/health` | read | Vault health diagnostics |
 | POST | `/api/validate` | read | Check vault markdown for structural and indexing problems — one note (`path`), a scope, or the whole vault; reads the files, not the index |
-| POST | `/api/create` | write | Create a new note, filed under `folder` or at the vault root |
+| POST | `/api/create` | write | Create a new note, filed under `folder` or at the vault root. A `folder` with a `..` segment is 400 `invalid_input`; a leading or trailing `/` is trimmed, so `/` is the vault root. |
 | POST | `/api/update` | write | Apply a list of edits to one note in one write |
-| POST | `/api/move` | write | Move note to different folder |
-| POST | `/api/archive` | write | Archive a note, or restore one with `undo` |
+| POST | `/api/move` | write | Move note to different folder. A `new_folder` with a `..` segment is 400 `invalid_input`; a leading or trailing `/` is trimmed, so `/` is the vault root. |
+| POST | `/api/archive` | write | Archive a note, or restore one with `undo`. With `undo`, a `file` outside the vault, or a note whose `archived_from` is, is 400 `invalid_input`. |
 | POST | `/api/delete` | write | Delete note (soft or hard) |
 | POST | `/api/index` | write | Index the configured vault |
-| POST | `/api/reindex-file` | write | Re-index a single file after external edits |
+| POST | `/api/reindex-file` | write | Re-index a single file after external edits. A `file` with a `..` segment or a leading `/` is 400 `invalid_input`. |
 | POST | `/api/init` | write | Write the vault profile and index (`mode`: detect or apply) |
 
 ## Authentication
@@ -95,7 +95,7 @@ curl -X POST http://localhost:3000/api/create \
 
 **CORS:** Configurable allowed origins in `config.toml` under `[http]`. Defaults to allow all origins for local development.
 
-**Limits:** a request is answered 408 after `[http] request_timeout_secs` (60 by default; `0` disables it), except `/api/index` and `/api/init`, which run to completion. A body over 8 MiB is refused as 400 `invalid_input`. Sixteen requests run at once; the rest wait their turn. A 408 on a write means the outcome is unknown: a write already running when the timeout fired finishes after it.
+**Limits:** a request is answered 408 after `[http] request_timeout_secs` (60 by default; `0` disables it), except `/api/index` and `/api/init`, which run to completion. A body over 8 MiB is refused as 400 `invalid_input`. Sixteen requests run at once; the rest wait their turn. The six write routes — `create`, `update`, `move`, `archive`, `delete`, `reindex-file` — are timed only while they read the request and wait for the index lock: a 408 on one means the write did not run and a retry is safe, and a write that started answers with its result however long it takes.
 
 ```toml
 [http]
@@ -125,7 +125,7 @@ Every error the server answers is a JSON body with two fields: `error`, the mess
 | 403 | `forbidden` | the key has no write permission |
 | 401 | `unauthorized` | no key, or a key the server does not hold |
 | 429 | `rate_limited` | the key's bucket is empty; `retry-after` says when |
-| 408 | — | the request ran past `request_timeout_secs`; no body. `/api/index` and `/api/init` are never timed out |
+| 408 | — | the request ran past `request_timeout_secs`; no body. `/api/index` and `/api/init` are never timed out; a write route is timed only before it starts, reading its body or waiting for the index lock, so its 408 means it did not run |
 | 500 | `stale_index` | the index cannot answer until `knapper index` runs |
 | 500 | `internal` | anything else; the body carries the whole error chain |
 

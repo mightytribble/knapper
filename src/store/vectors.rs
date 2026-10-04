@@ -269,6 +269,50 @@ mod tests {
         assert_eq!(results[0].0, 0);
     }
 
+    /// The first open copies the BLOB vector into `chunks_vec`. Once that row
+    /// is deleted, a second open, at version 2, does not copy it back: the
+    /// copy is step 2 of the ladder and runs once.
+    #[test]
+    fn step_2s_vector_copy_runs_once() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = tmp.path().join("knapper.db");
+        let vector: Vec<f32> = (0..256).map(|i| (i as f32) / 256.0).collect();
+        {
+            let store = Store::open(&db).unwrap();
+            let file_id = store
+                .insert_file("test.md", "hash123", 0, "abc123", None, None)
+                .unwrap();
+            store
+                .insert_chunk_with_vector(
+                    &NewChunk {
+                        file_id,
+                        seq: 0,
+                        heading: "heading",
+                        text: "snippet",
+                        vector_id: 0,
+                        token_count: 100,
+                        ..Default::default()
+                    },
+                    &vector,
+                )
+                .unwrap();
+            assert_eq!(store.vec_table_dim().unwrap(), None);
+            store.set_user_version(1).unwrap();
+        }
+        let count = |store: &Store| -> i64 {
+            store
+                .conn()
+                .query_row("SELECT COUNT(*) FROM chunks_vec", [], |r| r.get(0))
+                .unwrap()
+        };
+        let first = Store::open(&db).unwrap();
+        assert_eq!(count(&first), 1);
+        first.conn().execute("DELETE FROM chunks_vec", []).unwrap();
+        drop(first);
+        let second = Store::open(&db).unwrap();
+        assert_eq!(count(&second), 0);
+    }
+
     #[test]
     fn test_embedding_dim_meta() {
         let store = Store::open_memory().unwrap();

@@ -31,6 +31,10 @@ pub struct ApiState {
     pub http_config: Arc<HttpConfig>,
     pub rate_limiter: Arc<RateLimiter>,
     pub no_auth: bool,
+    /// `[http] request_timeout_secs` as a duration, `None` for `0`. The
+    /// router's timeout layer and the write routes' wait for the core both
+    /// read it.
+    pub request_timeout: Option<std::time::Duration>,
 }
 
 // ---------------------------------------------------------------------------
@@ -97,6 +101,9 @@ pub struct ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
+        if self.status == StatusCode::REQUEST_TIMEOUT {
+            return self.status.into_response();
+        }
         let body = serde_json::json!({ "error": self.message, "kind": self.kind });
         let mut response = (self.status, Json(body)).into_response();
         for (name, value) in &self.headers {
@@ -124,6 +131,11 @@ impl ApiError {
             kind,
             headers: vec![],
         }
+    }
+    /// The request ran past `request_timeout_secs` before it started. It has
+    /// no body, like the timeout layer's own 408, so its kind is never read.
+    pub fn timed_out() -> Self {
+        Self::new(StatusCode::REQUEST_TIMEOUT, "timed_out", "")
     }
     pub fn unauthorized(msg: &str) -> Self {
         Self::new(StatusCode::UNAUTHORIZED, "unauthorized", msg)
@@ -209,9 +221,23 @@ where
     ) -> Result<Self, Self::Rejection> {
         match Json::<T>::from_request(req, state).await {
             Ok(Json(value)) => Ok(ApiJson(value)),
+            Err(rejection) if body_read_timed_out(&rejection) => Err(ApiError::timed_out()),
             Err(rejection) => Err(ApiError::bad_request(&rejection.body_text())),
         }
     }
+}
+
+/// Whether a body rejection came from the write routes' body timeout, which
+/// means the write did not run and answers like the lock wait's 408.
+fn body_read_timed_out(rejection: &(dyn std::error::Error + 'static)) -> bool {
+    let mut source = Some(rejection);
+    while let Some(err) = source {
+        if err.is::<tower_http::timeout::TimeoutError>() {
+            return true;
+        }
+        source = err.source();
+    }
+    false
 }
 
 /// `Query<T>` the same way, for every GET handler.
@@ -372,13 +398,33 @@ pub fn routes() -> Vec<(&'static str, MethodRouter<ApiState>)> {
 pub const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 /// Requests in flight at once; the rest wait. One agent, maybe a few calls.
 pub const MAX_IN_FLIGHT: usize = 16;
-/// Routes that index the vault to completion and are not timed out.
+/// Routes that index the vault to completion and are never timed out.
 pub const UNTIMED_ROUTES: &[&str] = &["/api/index", "/api/init"];
+/// Routes that write. They are timed while they wait for the core and not
+/// after, so a 408 on one means it did not run. See [`core_within`].
+pub const WRITE_ROUTES: &[&str] = &[
+    "/api/create",
+    "/api/update",
+    "/api/move",
+    "/api/archive",
+    "/api/delete",
+    "/api/reindex-file",
+];
+
+/// `request_timeout_secs` as a duration; `0` is no timeout.
+pub fn request_timeout(config: &HttpConfig) -> Option<std::time::Duration> {
+    match config.request_timeout_secs {
+        0 => None,
+        secs => Some(std::time::Duration::from_secs(secs)),
+    }
+}
 
 /// The limits every route runs under, from inner to outer: the timeout on
 /// the timed routes alone, then the body limit and the in-flight limit (one
-/// semaphore shared by every route) on all of them, then the two fallbacks. A function of its own so a test
-/// can hand it two toy routers and a timeout of milliseconds.
+/// semaphore shared by every route) on all of them, then the two fallbacks.
+/// `build_router` also puts a body timeout on the write and untimed routes
+/// before it hands them in. A function of its own so a test can hand it two
+/// toy routers and a timeout of milliseconds.
 pub fn with_limits(
     timed: Router<ApiState>,
     untimed: Router<ApiState>,
@@ -403,20 +449,27 @@ pub fn with_limits(
 
 pub fn build_router(state: ApiState) -> Router {
     let cors = cors_layer(&state.http_config.cors_origins);
-    let timeout = match state.http_config.request_timeout_secs {
-        0 => None,
-        secs => Some(std::time::Duration::from_secs(secs)),
-    };
+    let timeout = state.request_timeout;
     let mut timed = Router::new();
     let mut untimed = Router::new();
+    let mut writes = Router::new();
     for (path, handler) in routes() {
-        if UNTIMED_ROUTES.contains(&path) {
+        if WRITE_ROUTES.contains(&path) {
+            writes = writes.route(path, handler);
+        } else if UNTIMED_ROUTES.contains(&path) {
             untimed = untimed.route(path, handler);
         } else {
             timed = timed.route(path, handler);
         }
     }
-    with_limits(timed, untimed, timeout)
+    // A stalled body would hold an in-flight permit for good, and a write or
+    // an untimed route is outside the timeout layer, so its body read is
+    // timed on its own.
+    let body_timed = |router: Router<ApiState>| match timeout {
+        Some(limit) => router.layer(tower_http::timeout::RequestBodyTimeoutLayer::new(limit)),
+        None => router,
+    };
+    with_limits(timed, body_timed(untimed.merge(writes)), timeout)
         .layer(cors)
         .with_state(state)
 }
@@ -662,6 +715,23 @@ async fn handle_status(
 // Write endpoint handlers
 // ---------------------------------------------------------------------------
 
+/// Run a write against the core, timed while it waits for the locks and not
+/// after. Past the deadline the write has not run, so the 408 is safe to
+/// retry; once it holds the core it runs to the end and answers.
+async fn core_within<R, F>(state: &ApiState, f: F) -> Result<R, ApiError>
+where
+    R: Send + 'static,
+    F: for<'a> FnOnce(crate::core::CoreGuards<'a>) -> anyhow::Result<R> + Send + 'static,
+{
+    let locks = match state.request_timeout {
+        Some(limit) => tokio::time::timeout(limit, state.core.lock_core())
+            .await
+            .map_err(|_| ApiError::timed_out())?,
+        None => state.core.lock_core().await,
+    };
+    Ok(locks.run(f).await?)
+}
+
 async fn handle_create(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -685,20 +755,18 @@ async fn handle_create(
     let vault = state.core.vault_path.clone();
     let profile = state.core.profile.clone();
     let settings = state.core.index_settings;
-    let result = state
-        .core
-        .with_core(move |g| {
-            writer::create_note(
-                input,
-                g.store,
-                g.embedder,
-                settings.embed,
-                settings.chunk,
-                &vault,
-                profile.as_ref().as_ref(),
-            )
-        })
-        .await?;
+    let result = core_within(&state, move |g| {
+        writer::create_note(
+            input,
+            g.store,
+            g.embedder,
+            settings.embed,
+            settings.chunk,
+            &vault,
+            profile.as_ref().as_ref(),
+        )
+    })
+    .await?;
     state
         .core
         .record_write(&state.core.vault_path.join(&result.path))
@@ -724,31 +792,23 @@ async fn handle_update(
         edits,
     };
     let vault = state.core.vault_path.clone();
-    let settings = state.core.index_settings;
+    let config = state.core.config.clone();
     // `update_note` stores the new content hash and writes no chunks, so the
     // re-index runs here, in the same core call (#62). A failure after the
     // write says so, and `record_write` is skipped, so the watcher's own
     // event on this file re-indexes it.
-    let result = state
-        .core
-        .with_core(move |g| {
-            let result = writer::update_note(g.store, &vault, &input)?;
-            crate::indexer::reindex_written_file(
-                &result.path,
-                g.store,
-                g.embedder,
-                &vault,
-                settings,
-            )
+    let result = core_within(&state, move |g| {
+        let result = writer::update_note(g.store, &vault, &input)?;
+        crate::indexer::reindex_written_file(&result.path, g.store, g.embedder, &vault, &config)
             .with_context(|| {
                 format!(
                     "the file was written; its index rows were not updated for {}",
                     result.path
                 )
             })?;
-            Ok(result)
-        })
-        .await?;
+        Ok(result)
+    })
+    .await?;
     state
         .core
         .record_write(&state.core.vault_path.join(&result.path))
@@ -764,10 +824,10 @@ async fn handle_move(
     authorize(&headers, &state, true)?;
     state.core.writable()?;
     let vault = state.core.vault_path.clone();
-    let result = state
-        .core
-        .with_core(move |g| writer::move_note(&body.file, &body.new_folder, g.store, &vault))
-        .await?;
+    let result = core_within(&state, move |g| {
+        writer::move_note(&body.file, &body.new_folder, g.store, &vault)
+    })
+    .await?;
     state
         .core
         .record_write(&state.core.vault_path.join(&result.path))
@@ -788,23 +848,21 @@ async fn handle_archive(
     let vault = state.core.vault_path.clone();
     let profile = state.core.profile.clone();
     let settings = state.core.index_settings;
-    let result = state
-        .core
-        .with_core(move |g| {
-            if body.undo {
-                writer::unarchive_note(
-                    &body.file,
-                    g.store,
-                    g.embedder,
-                    settings.embed,
-                    settings.chunk,
-                    &vault,
-                )
-            } else {
-                writer::archive_note(&body.file, g.store, &vault, profile.as_ref().as_ref())
-            }
-        })
-        .await?;
+    let result = core_within(&state, move |g| {
+        if body.undo {
+            writer::unarchive_note(
+                &body.file,
+                g.store,
+                g.embedder,
+                settings.embed,
+                settings.chunk,
+                &vault,
+            )
+        } else {
+            writer::archive_note(&body.file, g.store, &vault, profile.as_ref().as_ref())
+        }
+    })
+    .await?;
     state
         .core
         .record_write(&state.core.vault_path.join(&result.path))
@@ -830,10 +888,10 @@ async fn handle_delete(
         .to_string();
     let vault = state.core.vault_path.clone();
     let file = body.file.clone();
-    state
-        .core
-        .with_core(move |g| writer::delete_note(g.store, &vault, &file, mode, &archive_folder))
-        .await?;
+    core_within(&state, move |g| {
+        writer::delete_note(g.store, &vault, &file, mode, &archive_folder)
+    })
+    .await?;
     Ok(Json(serde_json::json!({
         "deleted": body.file,
         "mode": body.mode,
@@ -900,16 +958,14 @@ async fn handle_reindex_file(
     // It writes the store, so a read-only server refuses it like `index`.
     state.core.writable()?;
     let vault = state.core.vault_path.clone();
-    let settings = state.core.index_settings;
+    let config = state.core.config.clone();
     let file = body.file.clone();
     // A path not on disk is a Fault::NotFound from the indexer, and the
     // classifier answers 404 for it (#60).
-    let result = state
-        .core
-        .with_core(move |g| {
-            crate::indexer::reindex_written_file(&file, g.store, g.embedder, &vault, settings)
-        })
-        .await?;
+    let result = core_within(&state, move |g| {
+        crate::indexer::reindex_written_file(&file, g.store, g.embedder, &vault, &config)
+    })
+    .await?;
     Ok(Json(serde_json::json!({
         "file": body.file,
         "chunks": result.total_chunks,
@@ -977,6 +1033,7 @@ async fn handle_init(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::time::Duration;
 
     use axum::body::Body;
     use tower::ServiceExt;
@@ -1049,11 +1106,153 @@ mod tests {
         ),
     ];
 
+    /// A write still waiting for the core when the deadline passes answers
+    /// 408 with no body, and never runs: a retry is safe.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_write_waiting_for_the_core_past_the_deadline_is_a_408_and_does_not_run() {
+        let (_tmp, mut state) = indexed_state();
+        state.request_timeout = Some(Duration::from_millis(50));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let held = {
+            let core = state.core.clone();
+            tokio::spawn(async move {
+                core.with_core(move |_guards| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(())
+                })
+                .await
+            })
+        };
+        tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(5)))
+            .await
+            .unwrap()
+            .expect("the core call started");
+
+        let (status, body) = post_json(
+            state.clone(),
+            "/api/create",
+            r##"{"filename":"late","content":"# Late\n"}"##,
+        )
+        .await;
+        assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
+        assert!(body.is_null(), "a 408 has no body, got {body}");
+
+        release_tx.send(()).unwrap();
+        held.await.unwrap().unwrap();
+        // Give a write that wrongly ran after the 408 time to land.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!state.core.vault_path.join("late.md").exists());
+    }
+
+    /// A write that took the core before the deadline runs to the end and
+    /// answers with its result, however long it took.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_write_that_started_before_the_deadline_answers_after_it() {
+        let config = crate::core::testing::test_config();
+        let (_tmp, vault, db) = crate::core::testing::indexed_vault(ABJURATION_NOTES, &config);
+        let (embed, release, entered) = crate::core::testing::GatedEmbed::new(256);
+        let mut state = api_state_from(crate::core::Core::for_test(
+            &db,
+            Box::new(embed),
+            config,
+            vault.clone(),
+        ));
+        state.request_timeout = Some(Duration::from_millis(50));
+
+        let writing = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                post_json(
+                    state,
+                    "/api/create",
+                    r##"{"filename":"slow","content":"# Slow\n\nBody.\n"}"##,
+                )
+                .await
+            })
+        };
+        tokio::task::spawn_blocking(move || entered.recv_timeout(Duration::from_secs(5)))
+            .await
+            .unwrap()
+            .expect("the create reached the embedder");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        release.send(()).unwrap();
+
+        let (status, body) = writing.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(vault.join("slow.md").is_file());
+    }
+
+    /// A write or index body that stalls past the deadline answers the
+    /// bodyless 408 and never runs; a read route is not touched by the body timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_write_body_that_stalls_is_a_408_and_does_not_run() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (_tmp, mut state) = indexed_state();
+        state.request_timeout = Some(Duration::from_millis(50));
+        let vault = state.core.vault_path.clone();
+        let app = build_router(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+
+        // Headers promise 100 bytes; one chunk arrives and the rest never does.
+        for path in ["/api/create", "/api/index"] {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let head = format!(
+                "POST {path} HTTP/1.1\r\nhost: x\r\ncontent-type: application/json\r\n\
+                 content-length: 100\r\nconnection: close\r\n\r\n{{\"filename\":\"stall\","
+            );
+            stream.write_all(head.as_bytes()).await.unwrap();
+            let mut raw = Vec::new();
+            tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut raw))
+                .await
+                .expect("the stalled body is cut off")
+                .unwrap();
+            let text = String::from_utf8_lossy(&raw);
+            assert!(text.starts_with("HTTP/1.1 408"), "{path}: got {text}");
+            assert!(
+                text.ends_with("\r\n\r\n"),
+                "{path}: a 408 has no body, got {text}"
+            );
+            assert!(!vault.join("stall.md").exists());
+        }
+
+        // A read route on the same server is untouched.
+        let mut read = tokio::net::TcpStream::connect(addr).await.unwrap();
+        read.write_all(b"GET /api/health-check HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut raw = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), read.read_to_end(&mut raw))
+            .await
+            .expect("the read route answers")
+            .unwrap();
+        assert!(String::from_utf8_lossy(&raw).starts_with("HTTP/1.1 200"));
+    }
+
+    #[test]
+    fn every_write_route_is_a_real_route() {
+        let served: Vec<&str> = routes().into_iter().map(|(path, _)| path).collect();
+        for path in WRITE_ROUTES {
+            assert!(served.contains(path), "{path} is not a route");
+        }
+    }
+
+    #[test]
+    fn no_route_is_both_untimed_and_a_write_route() {
+        for path in WRITE_ROUTES {
+            assert!(!UNTIMED_ROUTES.contains(path), "{path} is in both");
+        }
+    }
+
     fn api_state_from(core: Core) -> ApiState {
         let config = test_http_config();
         let rate_limiter = Arc::new(RateLimiter::new(config.rate_limit));
         ApiState {
             core,
+            request_timeout: request_timeout(&config),
             http_config: Arc::new(config),
             rate_limiter,
             no_auth: false,
@@ -1840,6 +2039,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_unarchive_of_a_file_outside_the_vault_is_a_bad_request() {
+        let (tmp, state) = indexed_state();
+        let outside = tmp.path().join("outside.md");
+        std::fs::write(&outside, "---\narchived_from: x.md\n---\n# O\n").unwrap();
+        let (status, body) = post_json(
+            state,
+            "/api/archive",
+            r#"{"file":"../outside.md","undo":true}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["kind"], "invalid_input");
+        assert!(outside.is_file());
+    }
+
+    #[tokio::test]
+    async fn a_reindex_file_outside_the_vault_is_a_bad_request() {
+        let (tmp, state) = indexed_state();
+        std::fs::write(tmp.path().join("secret.md"), "# Secret\n").unwrap();
+        let (status, body) =
+            post_json(state, "/api/reindex-file", r#"{"file":"../secret.md"}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["kind"], "invalid_input");
+    }
+
+    #[tokio::test]
     async fn init_without_a_mode_is_a_bad_request() {
         // The mode is required on every surface; the extractor refuses the
         // body before the handler runs, with the kind every error carries.
@@ -2011,6 +2236,50 @@ mod tests {
         let (status, body) = post_json(state, "/api/match", r#"{"pattern":"x","all":[""]}"#).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert_eq!(body["kind"], "invalid_input");
+    }
+
+    /// `indexed_state`'s vault is `tmp/vault`, so `tmp` is outside it.
+    #[tokio::test]
+    async fn a_create_folder_that_climbs_out_is_a_bad_request() {
+        let (tmp, state) = indexed_state();
+        let (status, body) = post_json(
+            state,
+            "/api/create",
+            r##"{"filename":"out","content":"# Out\n","folder":"../escape"}"##,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["kind"], "invalid_input");
+        assert_eq!(
+            body["error"],
+            "folder must stay inside the vault: ../escape"
+        );
+        assert!(!tmp.path().join("escape").exists());
+    }
+
+    #[tokio::test]
+    async fn a_validate_path_that_climbs_out_is_a_bad_request() {
+        let (tmp, state) = indexed_state();
+        std::fs::write(tmp.path().join("secret.md"), "# Sentinel\n").unwrap();
+        let (status, body) = post_json(state, "/api/validate", r#"{"path":"../secret"}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["kind"], "invalid_input");
+        assert_eq!(body["error"], "path must stay inside the vault: ../secret");
+        assert!(!body.to_string().contains("Sentinel"));
+    }
+
+    #[tokio::test]
+    async fn a_move_folder_that_climbs_out_is_a_bad_request() {
+        let (tmp, state) = indexed_state();
+        let (status, body) = post_json(
+            state,
+            "/api/move",
+            r#"{"file":"rules/evocation-spells.md","new_folder":"../escape"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["kind"], "invalid_input");
+        assert!(!tmp.path().join("escape").exists());
     }
 
     /// `reindex-file` of a path not on disk is a 404; a path that exists and
@@ -2327,12 +2596,30 @@ mod tests {
     /// `MAX_BODY_BYTES`, so a body between the two reaches the handler.
     #[tokio::test]
     async fn a_body_between_axums_default_and_the_limit_is_not_refused() {
-        let (_tmp, state) = test_api_state();
+        let vault = tempfile::tempdir().unwrap();
+        let (_tmp, state) = test_api_state_at(vault.path().to_path_buf());
         let content = "x".repeat(3 * 1024 * 1024);
         let body = format!(r#"{{"filename":"big","content":"{content}"}}"#);
         let (status, reply) = post_json(state, "/api/create", &body).await;
-        assert_ne!(status, StatusCode::BAD_REQUEST, "{reply}");
-        assert_ne!(reply["kind"], "invalid_input", "{reply}");
+        assert_eq!(status, StatusCode::OK, "{reply}");
+        assert!(vault.path().join("big.md").is_file());
+    }
+
+    /// The transport's two unauthenticated routes are timed like any read.
+    /// The membership asserts pin the timing; the 200s show the routes answer
+    /// through the real router with a timeout set.
+    #[tokio::test]
+    async fn the_openapi_document_and_the_health_check_answer_under_the_timeout() {
+        for path in ["/openapi.json", "/api/health-check"] {
+            assert!(!UNTIMED_ROUTES.contains(&path), "{path}");
+            assert!(!WRITE_ROUTES.contains(&path), "{path}");
+        }
+        let (_tmp, mut state) = test_api_state();
+        state.request_timeout = Some(Duration::from_secs(5));
+        for path in ["/openapi.json", "/api/health-check"] {
+            let response = get(state.clone(), path).await;
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+        }
     }
 
     #[tokio::test]
