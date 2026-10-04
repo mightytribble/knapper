@@ -563,8 +563,7 @@ mod tests {
         assert!(old_vector_ids.contains(&50));
         assert!(old_vector_ids.contains(&51));
 
-        // Tombstone old vectors, delete file (cascades chunks), re-insert.
-        store.add_tombstones(&old_vector_ids).unwrap();
+        // Delete the file (cascades chunks), re-insert.
         store.delete_file(file_id).unwrap();
 
         let new_file_id = store
@@ -588,11 +587,6 @@ mod tests {
         let chunks = store.get_chunks_by_file(new_file_id).unwrap();
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].vector_id, 60);
-
-        // Old vectors are tombstoned.
-        let ts = store.get_tombstones().unwrap();
-        assert!(ts.contains(&50));
-        assert!(ts.contains(&51));
     }
 
     #[test]

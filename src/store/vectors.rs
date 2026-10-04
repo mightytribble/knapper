@@ -1,11 +1,9 @@
-//! The `chunks_vec` table and its width, and the tombstones beside it.
+//! The `chunks_vec` table and its width.
 
 use super::Store;
-use super::chrono_now;
 use crate::fault::Fault;
 use anyhow::{Result, bail};
-use rusqlite::{OptionalExtension, params};
-use std::collections::HashSet;
+use rusqlite::OptionalExtension;
 
 impl Store {
     /// The embedding width this database was built at, if it has been indexed.
@@ -59,78 +57,44 @@ impl Store {
         }))
     }
 
-    /// One-time migration: copy BLOB vectors from `chunks.vector` into the vec0 virtual table.
-    /// Safe to call on every startup — skips if vec0 is already populated or no BLOBs exist.
-    pub fn migrate_vectors_to_vec0(&self) -> Result<()> {
-        // Nowhere to migrate to on a database that has never been indexed.
-        if self.vec_table_dim()?.is_none() {
+    /// Copy the vectors a store written before `chunks_vec` existed holds in
+    /// `chunks.vector`, sizing the table from them when it is absent. Run by
+    /// `migrate_to_2` and frozen with it.
+    pub(super) fn copy_blob_vectors_into_vec0(&self) -> Result<()> {
+        let blob_count: i64 = self.conn.query_row(
+            "SELECT count(*) FROM chunks WHERE vector IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        if blob_count == 0 {
             return Ok(());
+        }
+        if self.vec_table_dim()?.is_none() {
+            let Some(dim) = self.recorded_embedding_dim()? else {
+                return Ok(());
+            };
+            crate::vecstore::init_vec_table(&self.conn, dim)?;
         }
         let vec_count: i64 = self
             .conn
-            .query_row("SELECT count(*) FROM chunks_vec", [], |row| row.get(0))
-            .unwrap_or(0);
-        let blob_count: i64 = self
-            .conn
-            .query_row(
-                "SELECT count(*) FROM chunks WHERE vector IS NOT NULL",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-
-        if vec_count == 0 && blob_count > 0 {
-            tracing::info!(blob_count, "migrating BLOB vectors to vec0");
-            let mut stmt = self
-                .conn
-                .prepare("SELECT vector_id, vector FROM chunks WHERE vector IS NOT NULL")?;
-            let rows: Vec<(i64, Vec<u8>)> = stmt
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-                .filter_map(|r| r.ok())
-                .collect();
-
-            for (vid, blob) in &rows {
-                self.conn.execute(
-                    "INSERT OR IGNORE INTO chunks_vec(rowid, embedding) VALUES (?1, ?2)",
-                    rusqlite::params![vid, blob],
-                )?;
-            }
-            tracing::info!(migrated = rows.len(), "BLOB vector migration complete");
+            .query_row("SELECT count(*) FROM chunks_vec", [], |row| row.get(0))?;
+        if vec_count > 0 {
+            return Ok(());
         }
-
-        Ok(())
-    }
-
-    pub fn add_tombstones(&self, vector_ids: &[u64]) -> Result<()> {
-        let now = chrono_now();
+        tracing::info!(blob_count, "copying BLOB vectors into chunks_vec");
         let mut stmt = self
             .conn
-            .prepare("INSERT OR IGNORE INTO tombstones (vector_id, created_at) VALUES (?1, ?2)")?;
-        for &vid in vector_ids {
-            stmt.execute(params![vid as i64, now])?;
+            .prepare("SELECT vector_id, vector FROM chunks WHERE vector IS NOT NULL")?;
+        let rows: Vec<(i64, Vec<u8>)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        for (vid, blob) in &rows {
+            self.conn.execute(
+                "INSERT OR IGNORE INTO chunks_vec(rowid, embedding) VALUES (?1, ?2)",
+                rusqlite::params![vid, blob],
+            )?;
         }
-        Ok(())
-    }
-
-    pub fn get_tombstones(&self) -> Result<HashSet<u64>> {
-        let mut stmt = self.conn.prepare("SELECT vector_id FROM tombstones")?;
-        let rows = stmt.query_map([], |row| Ok(row.get::<_, i64>(0)? as u64))?;
-        let mut set = HashSet::new();
-        for row in rows {
-            set.insert(row?);
-        }
-        Ok(set)
-    }
-
-    pub fn tombstone_count(&self) -> Result<usize> {
-        let count: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM tombstones", [], |row| row.get(0))?;
-        Ok(count as usize)
-    }
-
-    pub fn clear_tombstones(&self) -> Result<()> {
-        self.conn.execute("DELETE FROM tombstones", [])?;
         Ok(())
     }
 
@@ -161,7 +125,6 @@ impl Store {
         &self,
         query: &[f32],
         k: usize,
-        tombstones: &std::collections::HashSet<u64>,
         scope: Option<&[i64]>,
     ) -> Result<Vec<(u64, f32)>> {
         // A database that has never been indexed has no vec table at all, and
@@ -169,7 +132,7 @@ impl Store {
         if self.vec_table_dim()?.is_none() {
             return Ok(Vec::new());
         }
-        crate::vecstore::search_vec(&self.conn, query, k, tombstones, scope)
+        crate::vecstore::search_vec(&self.conn, query, k, scope)
     }
 
     pub fn clear_vec(&self) -> Result<()> {
@@ -239,29 +202,6 @@ mod tests {
     use crate::store::*;
 
     #[test]
-    fn test_tombstone_lifecycle() {
-        let store = Store::open_memory().unwrap();
-
-        assert_eq!(store.tombstone_count().unwrap(), 0);
-        assert!(store.get_tombstones().unwrap().is_empty());
-
-        store.add_tombstones(&[100, 200, 300]).unwrap();
-        assert_eq!(store.tombstone_count().unwrap(), 3);
-
-        let ts = store.get_tombstones().unwrap();
-        assert!(ts.contains(&100));
-        assert!(ts.contains(&200));
-        assert!(ts.contains(&300));
-
-        // Duplicate insert should be ignored.
-        store.add_tombstones(&[200, 400]).unwrap();
-        assert_eq!(store.tombstone_count().unwrap(), 4);
-
-        store.clear_tombstones().unwrap();
-        assert_eq!(store.tombstone_count().unwrap(), 0);
-    }
-
-    #[test]
     fn test_store_has_vec_table() {
         let store = Store::open_memory().unwrap();
         // The table appears once something establishes its width — not before,
@@ -285,46 +225,47 @@ mod tests {
         let vector: Vec<f32> = (0..256).map(|i| (i as f32) / 256.0).collect();
         store.insert_vec(0, &vector).unwrap();
 
-        let results = store
-            .search_vec(&vector, 1, &std::collections::HashSet::new(), None)
-            .unwrap();
+        let results = store.search_vec(&vector, 1, None).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, 0);
         assert!(results[0].1 < 0.01);
     }
 
+    /// A store written before `chunks_vec` existed holds its vectors in
+    /// `chunks.vector` alone. Step 2 sizes the table from them and copies
+    /// them in, once.
     #[test]
-    fn test_migrate_vectors_to_vec0() {
-        let store = Store::open_memory().unwrap();
-        store.ensure_embedding_dim(256).unwrap();
-        // Insert a file + chunk with a vector BLOB.
-        let file_id = store
-            .insert_file("test.md", "hash123", 0, "abc123", None, None)
-            .unwrap();
+    fn a_version_1_store_with_blob_vectors_only_gets_them_copied_into_vec0() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = tmp.path().join("knapper.db");
         let vector: Vec<f32> = (0..256).map(|i| (i as f32) / 256.0).collect();
-        store
-            .insert_chunk_with_vector(
-                &NewChunk {
-                    file_id,
-                    seq: 0,
-                    heading: "heading",
-                    text: "snippet",
-                    vector_id: 0,
-                    token_count: 100,
-                    ..Default::default()
-                },
-                &vector,
-            )
-            .unwrap();
-
-        // Clear vec0 to simulate a pre-migration state, then re-run the migration.
-        store.clear_vec().unwrap();
-        store.migrate_vectors_to_vec0().unwrap();
-
-        // Verify vec0 is now populated.
-        let results = store
-            .search_vec(&vector, 1, &std::collections::HashSet::new(), None)
-            .unwrap();
+        {
+            let store = Store::open(&db).unwrap();
+            let file_id = store
+                .insert_file("test.md", "hash123", 0, "abc123", None, None)
+                .unwrap();
+            // `insert_chunk_with_vector` writes the BLOB and nothing else, so
+            // this store has no `chunks_vec` at all.
+            store
+                .insert_chunk_with_vector(
+                    &NewChunk {
+                        file_id,
+                        seq: 0,
+                        heading: "heading",
+                        text: "snippet",
+                        vector_id: 0,
+                        token_count: 100,
+                        ..Default::default()
+                    },
+                    &vector,
+                )
+                .unwrap();
+            assert_eq!(store.vec_table_dim().unwrap(), None);
+            store.set_user_version(1).unwrap();
+        }
+        let store = Store::open(&db).unwrap();
+        assert_eq!(store.vec_table_dim().unwrap(), Some(256));
+        let results = store.search_vec(&vector, 1, None).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, 0);
     }
@@ -359,9 +300,7 @@ mod tests {
     #[test]
     fn searching_a_never_indexed_database_returns_nothing() {
         let store = Store::open_memory().unwrap();
-        let hits = store
-            .search_vec(&[0.1_f32; 768], 5, &std::collections::HashSet::new(), None)
-            .unwrap();
+        let hits = store.search_vec(&[0.1_f32; 768], 5, None).unwrap();
         assert!(hits.is_empty());
     }
 

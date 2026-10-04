@@ -179,7 +179,7 @@ impl Store {
             .query_row("PRAGMA user_version", [], |row| row.get(0))?)
     }
 
-    fn set_user_version(&self, version: i64) -> Result<()> {
+    pub(super) fn set_user_version(&self, version: i64) -> Result<()> {
         self.conn
             .execute_batch(&format!("PRAGMA user_version = {version}"))?;
         Ok(())
@@ -502,18 +502,20 @@ impl Store {
         Ok(())
     }
 
-    /// Step 2: the tables knapper inherited and never read go. Open while
-    /// the cleanup branch is unmerged; frozen at merge, when a later change
-    /// is step 3.
+    /// Step 2: the tables knapper inherited and never read go, and a store
+    /// written before `chunks_vec` existed gets its vectors copied into it.
+    /// Open while the cleanup branch is unmerged; frozen at merge, when a
+    /// later change is step 3.
     fn migrate_to_2(&self) -> Result<()> {
         self.conn.execute_batch(
             "DROP TABLE IF EXISTS cli_events;
              DROP TABLE IF EXISTS identity_facts;
              DROP TABLE IF EXISTS migration_log;
              DROP TABLE IF EXISTS folder_centroids;
-             DROP TABLE IF EXISTS placement_corrections;",
+             DROP TABLE IF EXISTS placement_corrections;
+             DROP TABLE IF EXISTS tombstones;",
         )?;
-        Ok(())
+        self.copy_blob_vectors_into_vec0()
     }
 }
 
@@ -524,7 +526,7 @@ mod tests {
     #[test]
     fn test_create_schema() {
         let store = Store::open_memory().unwrap();
-        // Verify all four tables exist by querying sqlite_master.
+        // Verify the core tables exist by querying sqlite_master.
         let tables: Vec<String> = {
             let mut stmt = store
                 .conn
@@ -536,7 +538,6 @@ mod tests {
         assert!(tables.contains(&"meta".to_string()));
         assert!(tables.contains(&"files".to_string()));
         assert!(tables.contains(&"chunks".to_string()));
-        assert!(tables.contains(&"tombstones".to_string()));
     }
 
     #[test]
@@ -865,14 +866,14 @@ mod tests {
         );
     }
 
-    /// The tables step 2 drops. A table is appended here in the task that
-    /// removes its subsystem, beside its `DROP` in `migrate_to_2`.
+    /// The tables step 2 drops.
     const DROPPED_BY_STEP_2: &[&str] = &[
         "cli_events",
         "identity_facts",
         "migration_log",
         "folder_centroids",
         "placement_corrections",
+        "tombstones",
     ];
 
     #[test]

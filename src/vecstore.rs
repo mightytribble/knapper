@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 use anyhow::Result;
 use rusqlite::Connection;
 use sqlite_vec::sqlite3_vec_init;
@@ -49,7 +47,7 @@ pub fn delete_vec(conn: &Connection, vector_id: u64) -> Result<()> {
     Ok(())
 }
 
-/// Search for the `k` nearest neighbors of `query`, excluding `tombstones`.
+/// Search for the `k` nearest neighbors of `query`.
 ///
 /// Returns `(vector_id, distance)` pairs sorted by ascending distance.
 /// Cosine distance: 0.0 = identical, 2.0 = opposite.
@@ -63,20 +61,14 @@ pub fn search_vec(
     conn: &Connection,
     query: &[f32],
     k: usize,
-    tombstones: &HashSet<u64>,
     scope: Option<&[i64]>,
 ) -> Result<Vec<(u64, f32)>> {
     use rusqlite::types::Value;
     use std::rc::Rc;
     use zerocopy::AsBytes;
 
-    // Request extra results to compensate for tombstone filtering.
-    let fetch_k = if tombstones.is_empty() { k } else { k * 2 };
-
-    let mut binds: Vec<Box<dyn rusqlite::types::ToSql>> = vec![
-        Box::new(query.as_bytes().to_vec()),
-        Box::new(fetch_k as i64),
-    ];
+    let mut binds: Vec<Box<dyn rusqlite::types::ToSql>> =
+        vec![Box::new(query.as_bytes().to_vec()), Box::new(k as i64)];
     let scope_clause = match scope {
         None => "",
         Some(ids) => {
@@ -103,13 +95,7 @@ pub fn search_vec(
     let mut results: Vec<(u64, f32)> = Vec::new();
     for row in rows {
         let (id, dist) = row?;
-        if tombstones.contains(&id) {
-            continue;
-        }
         results.push((id, dist));
-        if results.len() == k {
-            break;
-        }
     }
 
     Ok(results)
@@ -165,7 +151,7 @@ mod tests {
             insert_vec(&conn, i as u64, v).unwrap();
         }
 
-        let results = search_vec(&conn, &vectors[0], 5, &HashSet::new(), None).unwrap();
+        let results = search_vec(&conn, &vectors[0], 5, None).unwrap();
         assert!(!results.is_empty(), "search returned no results");
         assert_eq!(
             results[0].0, 0,
@@ -176,24 +162,6 @@ mod tests {
             "distance to self should be near zero, got {}",
             results[0].1
         );
-    }
-
-    #[test]
-    fn test_search_with_tombstones() {
-        let conn = setup_conn();
-        let vectors: Vec<Vec<f32>> = (0..5).map(|i| random_vector(i + 100, 384)).collect();
-
-        for (i, v) in vectors.iter().enumerate() {
-            insert_vec(&conn, i as u64, v).unwrap();
-        }
-
-        let mut tombstones = HashSet::new();
-        tombstones.insert(0u64);
-
-        let results = search_vec(&conn, &vectors[0], 5, &tombstones, None).unwrap();
-        for (id, _) in &results {
-            assert_ne!(*id, 0, "tombstoned ID should not appear in results");
-        }
     }
 
     #[test]
@@ -218,7 +186,7 @@ mod tests {
     fn test_empty_search() {
         let conn = setup_conn();
         let query = random_vector(999, 384);
-        let results = search_vec(&conn, &query, 5, &HashSet::new(), None).unwrap();
+        let results = search_vec(&conn, &query, 5, None).unwrap();
         assert!(results.is_empty(), "empty table should return no results");
     }
 
@@ -240,7 +208,7 @@ mod tests {
         // Insert and search with 256-dim vector
         let vec256: Vec<f32> = (0..256).map(|i| (i as f32) / 256.0).collect();
         insert_vec(&conn, 1, &vec256).unwrap();
-        let results = search_vec(&conn, &vec256, 1, &HashSet::new(), None).unwrap();
+        let results = search_vec(&conn, &vec256, 1, None).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, 1);
     }
@@ -279,7 +247,7 @@ mod tests {
         chunks_for(&conn, &rows);
 
         let scope = [1i64];
-        let scoped = search_vec(&conn, &vectors[0], 3, &HashSet::new(), Some(&scope)).unwrap();
+        let scoped = search_vec(&conn, &vectors[0], 3, Some(&scope)).unwrap();
 
         assert_eq!(scoped.len(), 3, "k in-scope rows, not k rows then a filter");
         for (id, _) in &scoped {
@@ -297,14 +265,7 @@ mod tests {
         chunks_for(&conn, &(0..5).map(|i| (i, 1i64)).collect::<Vec<_>>());
 
         let empty: [i64; 0] = [];
-        let out = search_vec(
-            &conn,
-            &random_vector(0, 384),
-            5,
-            &HashSet::new(),
-            Some(&empty),
-        )
-        .unwrap();
+        let out = search_vec(&conn, &random_vector(0, 384), 5, Some(&empty)).unwrap();
         assert!(out.is_empty());
     }
 }
