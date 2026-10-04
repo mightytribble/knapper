@@ -1302,11 +1302,6 @@ pub struct LlamaEmbed {
     fingerprint: String,
 }
 
-// Safety: LlamaModel is Send+Sync per llama-cpp-2 docs.
-// FlexTokenizer contains only Send types (tokenizers::Tokenizer is Send, shimmytok::Tokenizer is Send).
-// We never store a LlamaContext (which is !Send) — it lives inside a single call.
-unsafe impl Send for LlamaEmbed {}
-
 impl std::fmt::Debug for LlamaEmbed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LlamaEmbed")
@@ -1645,10 +1640,6 @@ pub struct LlamaRerank {
     /// Computed once at load. See [`RerankModel::fingerprint`].
     fingerprint: String,
 }
-
-// Safety: LlamaModel is Send+Sync per llama-cpp-2 docs.
-// LlamaContext borrows the model, so it lives inside a call and is never stored.
-unsafe impl Send for LlamaRerank {}
 
 impl std::fmt::Debug for LlamaRerank {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
