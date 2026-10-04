@@ -268,19 +268,7 @@ pub const CAPABILITIES: &[Capability] = &[
         cli: Presence::On,
         mcp: Presence::On,
         http: Http::Post,
-        cli_only_args: &[
-            ("path", "a running server is bound to its configured vault"),
-            ("reindex", "the interactive flow the CLI alone can run"),
-            (
-                "detect",
-                "the CLI spelling of mode=detect, kept for its own flow",
-            ),
-            (
-                "json",
-                "the CLI spelling of mode=apply, kept for its own flow",
-            ),
-            ("quiet", "suppresses prompts the other surfaces never show"),
-        ],
+        cli_only_args: &[("path", "a running server is bound to its configured vault")],
         server_only_args: &[],
     },
 ];
@@ -410,7 +398,7 @@ pub const OPERATIONS: &[Operation] = &[
     Operation {
         name: "init",
         id: "init",
-        summary: "Run first-time setup. Use 'detect' to inspect, 'apply' to write the vault profile and index. The apply reply carries restart_required: true, because the server reads config.toml once, at start.",
+        summary: "Write the vault profile and index. 'detect' inspects the vault and writes nothing; 'apply' writes vault.toml and indexes. The apply reply carries restart_required: true, because the server reads the profile once, at start.",
         response: "Setup result as JSON",
     },
 ];

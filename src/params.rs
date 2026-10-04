@@ -886,13 +886,22 @@ pub struct Status {}
 #[derive(Debug, Args, Deserialize, JsonSchema)]
 pub struct Health {}
 
+/// What `init` does. `detect` inspects the vault and writes nothing; `apply`
+/// writes the vault profile and indexes. An enum, so the two legal words are
+/// published to an MCP client and the OpenAPI document (#62).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum InitMode {
+    Detect,
+    Apply,
+}
+
 #[derive(Debug, Args, Deserialize, JsonSchema)]
 pub struct Init {
     /// `detect` inspects the vault and writes nothing; `apply` writes the
-    /// vault profile and indexes. The CLI runs its interactive flow when this
-    /// is omitted, which is the one thing the other surfaces cannot do.
-    #[arg(long)]
-    pub mode: Option<String>,
+    /// vault profile and indexes.
+    #[arg(long, value_enum)]
+    pub mode: InitMode,
 }
 
 #[derive(Debug, Args, Deserialize, JsonSchema)]

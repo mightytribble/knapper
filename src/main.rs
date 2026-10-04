@@ -592,70 +592,23 @@ async fn main() -> Result<()> {
             }
         }
 
-        Command::Init {
-            args,
-            path,
-            reindex,
-            detect,
-            json,
-            quiet,
-        } => {
-            let knapper::params::Init { mode } = args;
-            // `--mode` is the name the servers call these two paths by;
-            // `--detect` and `--json` are the CLI's older spelling of the
-            // same two, and both reach the same code (#62).
-            let (detect, json) = match mode.as_deref() {
-                Some("detect") => (true, json),
-                Some("apply") => {
-                    // `--detect` is the older spelling of the other mode, so
-                    // the two together name two modes. Which one the caller
-                    // meant is not for this arm to guess.
-                    if detect {
-                        eprintln!("--mode apply and --detect name different modes. Use one.");
-                        std::process::exit(1);
-                    }
-                    (detect, true)
-                }
-                Some(other) => {
-                    eprintln!("Unknown mode: {other}. Use 'detect' or 'apply'.");
-                    std::process::exit(1);
-                }
-                None => (detect, json),
-            };
+        Command::Init { args, path } => {
             cfg.merge_vault_path(path);
             let vault_path = match &cfg.vault_path {
                 Some(p) => p.clone(),
                 None => std::env::current_dir()?,
             };
             let vault_path = vault_path.canonicalize().unwrap_or(vault_path);
-
-            if detect {
-                let result = knapper::onboarding::run_detect_json(&vault_path)?;
-                println!("{}", serde_json::to_string_pretty(&result)?);
-                return Ok(());
-            }
-
-            if json {
-                let flags = knapper::onboarding::ApplyFlags {
-                    reindex_only: reindex,
-                };
-                let settings = knapper::indexer::IndexSettings::from_config(&cfg);
-                let result = knapper::onboarding::run_apply_json(
-                    &vault_path,
-                    &mut cfg,
-                    settings,
-                    &data_dir,
-                    flags,
-                )?;
-                println!("{}", serde_json::to_string_pretty(&result)?);
-                return Ok(());
-            }
-
-            let flags = knapper::onboarding::InteractiveFlags {
-                reindex_only: reindex,
-                quiet,
+            let result = match args.mode {
+                knapper::params::InitMode::Detect => {
+                    knapper::onboarding::run_detect_json(&vault_path)?
+                }
+                knapper::params::InitMode::Apply => {
+                    let settings = knapper::indexer::IndexSettings::from_config(&cfg);
+                    knapper::onboarding::run_apply_json(&vault_path, &cfg, settings, &data_dir)?
+                }
             };
-            knapper::onboarding::run_interactive(&vault_path, &mut cfg, &data_dir, flags)?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
         }
 
         Command::Configure {

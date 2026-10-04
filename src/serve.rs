@@ -601,14 +601,14 @@ impl KnapperServer {
 
     #[tool(
         name = "init",
-        description = "Run first-time setup. Use 'detect' mode to inspect the vault without changes, 'apply' mode to write the vault profile and index. Returns JSON."
+        description = "Write the vault profile and index. Mode 'detect' inspects the vault and writes nothing; 'apply' writes vault.toml and indexes. The apply reply carries restart_required: true, because the server reads the profile once, at start."
     )]
     async fn init(
         &self,
         params: Parameters<crate::params::Init>,
     ) -> Result<CallToolResult, McpError> {
-        match params.0.mode.as_deref() {
-            Some("detect") => {
+        match params.0.mode {
+            crate::params::InitMode::Detect => {
                 let vault = self.core.vault_path.clone();
                 let result =
                     crate::core::blocking(move || crate::onboarding::run_detect_json(&vault))
@@ -616,30 +616,23 @@ impl KnapperServer {
                         .map_err(mcp_err)?;
                 to_json_result(&result)
             }
-            Some("apply") => {
+            crate::params::InitMode::Apply => {
+                // `apply` indexes the vault, which is the work `index` is
+                // guarded against on a read-only server (#62).
                 self.core.writable().map_err(mcp_err)?;
                 let data_dir = crate::config::Config::data_dir().map_err(mcp_err)?;
-                let flags = crate::onboarding::ApplyFlags {
-                    reindex_only: false,
-                };
                 let vault = self.core.vault_path.clone();
+                let config = self.core.config.clone();
                 let settings = self.core.index_settings;
-                // `apply` writes `config.toml`, so it is the one handler that
-                // loads the file: it edits it. The running server keeps the
-                // config it started with, which the reply says.
                 // `run_apply_json` opens its own store, so the core call is
-                // taken for exclusion only.
+                // taken for exclusion only. The running server keeps the
+                // profile it started with, which the reply says.
                 let result = self
                     .core
                     .with_core(move |g| {
                         let _ = g;
-                        let mut config = crate::config::Config::load().unwrap_or_default();
                         let mut result = crate::onboarding::run_apply_json(
-                            &vault,
-                            &mut config,
-                            settings,
-                            &data_dir,
-                            flags,
+                            &vault, &config, settings, &data_dir,
                         )?;
                         if let Some(object) = result.as_object_mut() {
                             object.insert("restart_required".into(), serde_json::json!(true));
@@ -650,12 +643,6 @@ impl KnapperServer {
                     .map_err(mcp_err)?;
                 to_json_result(&result)
             }
-            Some(other) => Err(invalid_params(format!(
-                "Unknown mode: {other}. Use 'detect' or 'apply'."
-            ))),
-            None => Err(invalid_params(
-                "init needs mode=detect or mode=apply".into(),
-            )),
         }
     }
 }
@@ -1034,11 +1021,19 @@ mod tests {
         let (_tmp, mut server) = indexed_server(crate::config::GroupBy::Chunk);
         server.core.read_only = true;
 
-        let init = |mode: &str| crate::params::Init {
-            mode: Some(mode.to_string()),
-        };
-        assert!(server.init(super::Parameters(init("apply"))).await.is_err());
-        assert!(server.init(super::Parameters(init("detect"))).await.is_ok());
+        let init = |mode: crate::params::InitMode| crate::params::Init { mode };
+        assert!(
+            server
+                .init(super::Parameters(init(crate::params::InitMode::Apply)))
+                .await
+                .is_err()
+        );
+        assert!(
+            server
+                .init(super::Parameters(init(crate::params::InitMode::Detect)))
+                .await
+                .is_ok()
+        );
     }
 
     /// A search asking for one query, with everything but the two per-call

@@ -43,7 +43,7 @@ through a tunnel; the document names it as its server.
 | POST | `/api/delete` | write | Delete note (soft or hard) |
 | POST | `/api/index` | write | Index the configured vault |
 | POST | `/api/reindex-file` | write | Re-index a single file after external edits |
-| POST | `/api/init` | write | First-time onboarding setup (`mode`: detect or apply) |
+| POST | `/api/init` | write | Write the vault profile and index (`mode`: detect or apply) |
 
 ## Authentication
 

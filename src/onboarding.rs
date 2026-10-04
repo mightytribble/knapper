@@ -1,90 +1,17 @@
+//! The two `init` flows: `detect`, which reads the vault and writes nothing,
+//! and `apply`, which writes `vault.toml` and indexes.
+
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use console::style;
 use serde_json::json;
 
 use crate::config::{Config, db_path};
-use crate::indexer::{IndexResult, IndexSettings, run_index};
+use crate::indexer::{IndexSettings, run_index};
 use crate::profile::{
     self, FolderMap, StructureDetection, StructureMethod, VaultProfile, VaultStats, VaultType,
 };
 use crate::store::Store;
-
-// ── Public types ──────────────────────────────────────────────────
-
-/// Flags for the interactive CLI onboarding flow.
-pub struct InteractiveFlags {
-    pub reindex_only: bool,
-    pub quiet: bool,
-}
-
-/// Flags for the non-interactive (JSON) apply flow.
-pub struct ApplyFlags {
-    pub reindex_only: bool,
-}
-
-// ── Constants ─────────────────────────────────────────────────────
-
-const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-// ── Helpers ───────────────────────────────────────────────────────
-
-/// Print a section divider: `── Title ──` padded to terminal width.
-fn print_divider(title: &str) {
-    let term = console::Term::stdout();
-    let width = term.size().1 as usize;
-    let prefix = format!("── {} ", title);
-    let remaining = width.saturating_sub(prefix.len() + 2);
-    let suffix = "─".repeat(remaining);
-    println!();
-    println!("  {}{}", style(&prefix).bold(), suffix);
-    println!();
-}
-
-/// Print the knapper banner box.
-fn print_banner() {
-    let tag = format!("knapper v{}", VERSION);
-    let sub = "vault intelligence for AI agents";
-    let inner_width = tag.len().max(sub.len()) + 4;
-
-    let top = format!("  {}{}{}", "╭", "─".repeat(inner_width + 2), "╮");
-    let bot = format!("  {}{}{}", "╰", "─".repeat(inner_width + 2), "╯");
-    let empty_line = format!("  │{}│", " ".repeat(inner_width + 2));
-    let tag_line = format!(
-        "  │  {:<width$}  │",
-        style(&tag).bold(),
-        width = inner_width
-    );
-    let sub_line = format!("  │  {:<width$}  │", style(sub).dim(), width = inner_width);
-
-    println!();
-    println!("{}", top);
-    println!("{}", empty_line);
-    println!("{}", tag_line);
-    println!("{}", sub_line);
-    println!("{}", empty_line);
-    println!("{}", bot);
-    println!();
-}
-
-/// Print a green checkmark line.
-fn check(msg: &str) {
-    println!("  {} {}", style("✓").green(), msg);
-}
-
-/// Print a red cross line.
-fn cross(msg: &str) {
-    println!("  {} {}", style("✗").red(), msg);
-}
-
-/// Detect vault profile (type, structure, stats) without writing anything.
-fn detect_profile(vault_path: &Path) -> Result<(VaultType, StructureDetection, VaultStats)> {
-    let vault_type = profile::detect_vault_type(vault_path);
-    let structure = profile::detect_structure(vault_path)?;
-    let stats = profile::scan_vault_stats(vault_path)?;
-    Ok((vault_type, structure, stats))
-}
 
 /// Build a VaultProfile from detected components.
 fn build_profile(
@@ -99,156 +26,6 @@ fn build_profile(
         structure,
         stats,
     }
-}
-
-/// Print vault scan results.
-fn print_scan_results(vault_type: &VaultType, structure: &StructureDetection, stats: &VaultStats) {
-    let type_label = match vault_type {
-        VaultType::Obsidian => "Obsidian vault detected",
-        VaultType::Logseq => "Logseq vault detected",
-        VaultType::Plain => "Plain markdown folder detected",
-        VaultType::Custom => "Custom vault detected",
-    };
-    check(type_label);
-
-    check(&format!("{} markdown files", stats.total_files));
-
-    let structure_label = match structure.method {
-        StructureMethod::Para => "PARA structure",
-        StructureMethod::Folders => "Folder-based structure",
-        StructureMethod::Flat => "Flat structure",
-        StructureMethod::Custom => "Custom structure",
-    };
-    check(structure_label);
-
-    // Show detected folder roles
-    if let Some(ref daily) = structure.folders.daily {
-        check(&format!(
-            "{} daily notes in {}/",
-            count_files_in_folder_approx(stats, daily),
-            daily
-        ));
-    }
-
-    if structure.folders.templates.is_some() {
-        check("Templates folder detected");
-    } else {
-        cross("No templates folder detected");
-    }
-
-    if let Some(ref people) = structure.folders.people {
-        check(&format!("People folder: {}/", people));
-    }
-}
-
-/// Rough count for daily notes — we don't have per-folder counts, so report the folder name.
-fn count_files_in_folder_approx(_stats: &VaultStats, _folder: &str) -> String {
-    // We don't track per-folder file counts in VaultStats.
-    // The total_files stat is the best we have. Return "some" as placeholder.
-    // A more accurate count would require walking the folder again.
-    String::new()
-}
-
-/// Print index results.
-fn print_index_result(result: &IndexResult) {
-    check(&format!(
-        "Index built ({} files, {} chunks, {:.1}s)",
-        result.new_files + result.updated_files,
-        result.total_chunks,
-        result.duration.as_secs_f64()
-    ));
-}
-
-/// Print the "What's Next" section.
-fn print_next_steps() {
-    print_divider("What's Next");
-
-    println!("  Try these:");
-    println!("    {}", style("knapper search \"...\"").cyan());
-    println!("    {}", style("knapper serve").cyan());
-    println!();
-}
-
-// ── Public functions ──────────────────────────────────────────────
-
-/// Full interactive onboarding flow with banner, prompts, and progress.
-pub fn run_interactive(
-    vault_path: &Path,
-    config: &mut Config,
-    data_dir: &Path,
-    flags: InteractiveFlags,
-) -> Result<()> {
-    let quiet = flags.quiet;
-
-    // ── Banner ──
-    if !quiet {
-        print_banner();
-    }
-
-    // ── Vault Scan ──
-    let (vault_type, structure, stats) = {
-        if !quiet {
-            println!("  {}", style("Scanning vault...").dim());
-            println!();
-        }
-
-        let (vt, st, vs) = detect_profile(vault_path)?;
-
-        if !quiet {
-            print_scan_results(&vt, &st, &vs);
-        }
-
-        (vt, st, vs)
-    };
-
-    // ── Vault Profile ──
-    let vault_profile = build_profile(vault_path, vault_type, structure, stats);
-    profile::write_vault_toml(&vault_profile, data_dir).context("writing vault profile")?;
-
-    // ── Indexing ──
-    if !quiet {
-        print_divider("Indexing");
-    }
-
-    // Confirm if vault is large
-    if !quiet && !flags.reindex_only {
-        let total = profile::scan_vault_stats(vault_path)
-            .map(|s| s.total_files)
-            .unwrap_or(0);
-        if total > 500 {
-            let confirm = dialoguer::Confirm::new()
-                .with_prompt(format!("  {} files found. Ready to index?", total))
-                .default(true)
-                .interact()?;
-            if !confirm {
-                println!(
-                    "\n  {}",
-                    style("Skipped indexing. Run `knapper index` when ready.").dim()
-                );
-                print_next_steps();
-                return Ok(());
-            }
-        }
-    }
-
-    let result = run_index(
-        vault_path,
-        config,
-        IndexSettings::from_config(config),
-        false,
-    )?;
-
-    if !quiet {
-        println!();
-        print_index_result(&result);
-    }
-
-    // ── What's Next ──
-    if !quiet {
-        print_next_steps();
-    }
-
-    Ok(())
 }
 
 /// Non-destructive vault inspection returning JSON. Writes nothing.
@@ -341,14 +118,13 @@ pub fn run_detect_json(vault_path: &Path) -> Result<serde_json::Value> {
     }))
 }
 
-/// Non-interactive setup with JSON result. Detects the profile, runs the
-/// index, and returns a JSON summary.
+/// `init --mode apply`: write the vault profile, run the index, and answer
+/// what was done. The config is the caller's; nothing here writes it.
 pub fn run_apply_json(
     vault_path: &Path,
-    config: &mut Config,
+    config: &Config,
     settings: IndexSettings,
     data_dir: &Path,
-    _flags: ApplyFlags,
 ) -> Result<serde_json::Value> {
     let vault_path = vault_path
         .canonicalize()

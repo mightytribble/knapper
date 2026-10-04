@@ -885,42 +885,32 @@ async fn handle_init(
     ApiJson(body): ApiJson<crate::params::Init>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
-    match body.mode.as_deref() {
-        Some("detect") => {
+    match body.mode {
+        crate::params::InitMode::Detect => {
             let vault = state.core.vault_path.clone();
             let result =
                 crate::core::blocking(move || crate::onboarding::run_detect_json(&vault)).await?;
             Ok(Json(result))
         }
-        Some("apply") => {
+        crate::params::InitMode::Apply => {
             // `apply` indexes the vault, which is the work `index` is guarded
             // against on a read-only server. The mode is read first, so
             // `detect` — which writes nothing — still runs (#62).
             state.core.writable()?;
             let data_dir = crate::config::Config::data_dir()?;
-            let flags = crate::onboarding::ApplyFlags {
-                reindex_only: false,
-            };
             let vault = state.core.vault_path.clone();
+            let config = state.core.config.clone();
             let settings = state.core.index_settings;
-            // `apply` writes `config.toml`, so it is the one handler that
-            // loads the file: it edits it. The running server keeps the
-            // config it started with, which the reply says. Any index it
-            // builds takes the session's index-time settings (#55, #72).
-            // `run_apply_json` opens its own store, so the core call is taken
-            // for exclusion only.
+            // The running server keeps the profile it started with, which
+            // the reply says. Any index it builds takes the session's
+            // index-time settings (#55, #72). `run_apply_json` opens its own
+            // store, so the core call is taken for exclusion only.
             let result = state
                 .core
                 .with_core(move |g| {
                     let _ = g;
-                    let mut config = crate::config::Config::load().unwrap_or_default();
-                    let mut result = crate::onboarding::run_apply_json(
-                        &vault,
-                        &mut config,
-                        settings,
-                        &data_dir,
-                        flags,
-                    )?;
+                    let mut result =
+                        crate::onboarding::run_apply_json(&vault, &config, settings, &data_dir)?;
                     if let Some(object) = result.as_object_mut() {
                         object.insert("restart_required".into(), serde_json::json!(true));
                     }
@@ -929,15 +919,6 @@ async fn handle_init(
                 .await?;
             Ok(Json(result))
         }
-        Some(other) => Err(ApiError::bad_request(&format!(
-            "Unknown mode: {other}. Use 'detect' or 'apply'."
-        ))),
-        // A server has no interactive flow, so `init` there needs a mode.
-        // The CLI's no-mode form is its own prompt sequence and reaches no
-        // surface but the CLI (#62).
-        None => Err(ApiError::bad_request(
-            "init needs mode=detect or mode=apply",
-        )),
     }
 }
 
@@ -1133,7 +1114,6 @@ mod tests {
         let (_tmp, state) = test_api_state();
         let (status, body) = post_json(state, "/api/init", r#"{}"#).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(body["error"], "init needs mode=detect or mode=apply");
         assert_eq!(body["kind"], "invalid_input");
     }
 
@@ -1813,22 +1793,24 @@ mod tests {
 
     #[tokio::test]
     async fn init_without_a_mode_is_a_bad_request() {
-        // A server has no interactive flow, so the CLI's no-mode form has no
-        // meaning here (#62).
+        // The mode is required on every surface; the extractor refuses the
+        // body before the handler runs, with the kind every error carries.
         let (_tmp, state) = test_api_state();
         let (status, body) = post_json(state, "/api/init", r#"{}"#).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(body["error"], "init needs mode=detect or mode=apply");
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["kind"], "invalid_input");
+        assert!(body["error"].as_str().unwrap().contains("mode"), "{body}");
     }
 
     #[tokio::test]
     async fn an_init_mode_naming_nothing_is_a_bad_request() {
         let (_tmp, state) = test_api_state();
         let (status, body) = post_json(state, "/api/init", r#"{"mode":"sideways"}"#).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(
-            body["error"],
-            "Unknown mode: sideways. Use 'detect' or 'apply'."
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["kind"], "invalid_input");
+        assert!(
+            body["error"].as_str().unwrap().contains("sideways"),
+            "{body}"
         );
     }
 

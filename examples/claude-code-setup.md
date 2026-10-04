@@ -65,7 +65,7 @@ command it answers, with `-` written as `_`.
 - `health` — vault health diagnostics, read from the index
 - `validate` — check vault markdown for structural and indexing problems —
   one note, a scope, or the whole vault — read from disk, with no model loaded
-- `init` — first-time onboarding (`mode`: detect or apply)
+- `init` — write the vault profile and index (`mode`: detect or apply)
 
 ## Example interactions
 

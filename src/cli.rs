@@ -180,20 +180,9 @@ pub enum Command {
     Init {
         #[command(flatten)]
         args: crate::params::Init,
-        /// Path to vault directory.
+        /// Path to vault directory. A running server is bound to its
+        /// configured vault, so this argument is the CLI's alone.
         path: Option<PathBuf>,
-        /// Only re-index.
-        #[arg(long)]
-        reindex: bool,
-        /// Detect vault without writing anything (agent mode).
-        #[arg(long)]
-        detect: bool,
-        /// Output as JSON (agent mode).
-        #[arg(long)]
-        json: bool,
-        /// Suppress interactive prompts.
-        #[arg(long)]
-        quiet: bool,
     },
 
     /// Configure knapper settings.
@@ -307,18 +296,31 @@ mod tests {
     }
 
     #[test]
-    fn init_takes_a_mode_and_runs_the_prompts_without_one() {
-        // `init` is one capability: `--mode` on every surface, and the
-        // interactive flow when the CLI is given none (#62).
+    fn init_takes_a_mode_and_refuses_to_run_without_one() {
+        // `init` is one capability: `--mode` on every surface, and there is
+        // no flow a mode-less call could mean (#62).
         let cli = Cli::try_parse_from(["knapper", "init", "--mode", "detect"]).unwrap();
         match cli.command {
-            Command::Init { args, .. } => assert_eq!(args.mode.as_deref(), Some("detect")),
+            Command::Init { args, .. } => {
+                assert!(matches!(args.mode, crate::params::InitMode::Detect))
+            }
             other => panic!("got {other:?}"),
         }
-        let cli = Cli::try_parse_from(["knapper", "init"]).unwrap();
-        match cli.command {
-            Command::Init { args, .. } => assert_eq!(args.mode, None),
-            other => panic!("got {other:?}"),
+        assert!(
+            Cli::try_parse_from(["knapper", "init"]).is_err(),
+            "the mode is required"
+        );
+        assert!(
+            Cli::try_parse_from(["knapper", "init", "--mode", "sideways"]).is_err(),
+            "the mode is one of two words"
+        );
+        // `--json` is the program's own global flag, so it parses on every
+        // command and is not `init`'s to refuse.
+        for flag in ["--identity", "--reindex", "--detect", "--quiet"] {
+            assert!(
+                Cli::try_parse_from(["knapper", "init", "--mode", "apply", flag]).is_err(),
+                "{flag} still parses"
+            );
         }
     }
 

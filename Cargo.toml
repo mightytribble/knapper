@@ -29,8 +29,6 @@ tokenizers = { version = "0.22", default-features = false, features = ["fancy-re
 sha2 = "0.10"
 ureq = { version = "2.12", features = ["native-certs", "json"] }
 indicatif = "0.17"
-dialoguer = "0.12"
-console = "0.16"
 regex = "1"
 sqlite-vec = "0.1.8-alpha.1"
 zerocopy = { version = "0.7", features = ["derive"] }
