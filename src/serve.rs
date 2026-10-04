@@ -1184,6 +1184,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_create_folder_that_climbs_out_is_invalid_params() {
+        let (tmp, server) = indexed_server(crate::config::GroupBy::Chunk);
+        let err = server
+            .create(super::Parameters(crate::params::Create {
+                content: Some("# Out\n".into()),
+                filename: "out".into(),
+                tags: vec![],
+                folder: Some("../escape".into()),
+                auto_link: Some(false),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
+        assert_eq!(err.data.as_ref().unwrap()["kind"], "invalid_input");
+        assert!(!tmp.path().join("escape").exists());
+    }
+
+    #[tokio::test]
+    async fn a_move_folder_that_climbs_out_is_invalid_params() {
+        let (tmp, server) = indexed_server(crate::config::GroupBy::Chunk);
+        let err = server
+            .move_note(super::Parameters(crate::params::Move {
+                file: "rules/evocation-spells.md".into(),
+                new_folder: "../escape".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
+        assert_eq!(err.data.as_ref().unwrap()["kind"], "invalid_input");
+        assert!(!tmp.path().join("escape").exists());
+    }
+
+    #[tokio::test]
     async fn a_reindex_file_of_a_path_not_on_disk_is_invalid_params() {
         let (_tmp, server) = indexed_server(crate::config::GroupBy::Chunk);
         let err = server

@@ -36,9 +36,9 @@ through a tunnel; the document names it as its server.
 | GET | `/api/status` | read | Index status and statistics |
 | GET | `/api/health` | read | Vault health diagnostics |
 | POST | `/api/validate` | read | Check vault markdown for structural and indexing problems — one note (`path`), a scope, or the whole vault; reads the files, not the index |
-| POST | `/api/create` | write | Create a new note, filed under `folder` or at the vault root |
+| POST | `/api/create` | write | Create a new note, filed under `folder` or at the vault root. A `folder` with a `..` segment is 400 `invalid_input`; a leading or trailing `/` is trimmed, so `/` is the vault root. |
 | POST | `/api/update` | write | Apply a list of edits to one note in one write |
-| POST | `/api/move` | write | Move note to different folder |
+| POST | `/api/move` | write | Move note to different folder. A `new_folder` with a `..` segment is 400 `invalid_input`; a leading or trailing `/` is trimmed, so `/` is the vault root. |
 | POST | `/api/archive` | write | Archive a note, or restore one with `undo` |
 | POST | `/api/delete` | write | Delete note (soft or hard) |
 | POST | `/api/index` | write | Index the configured vault |

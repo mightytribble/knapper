@@ -2013,6 +2013,39 @@ mod tests {
         assert_eq!(body["kind"], "invalid_input");
     }
 
+    /// `indexed_state`'s vault is `tmp/vault`, so `tmp` is outside it.
+    #[tokio::test]
+    async fn a_create_folder_that_climbs_out_is_a_bad_request() {
+        let (tmp, state) = indexed_state();
+        let (status, body) = post_json(
+            state,
+            "/api/create",
+            r##"{"filename":"out","content":"# Out\n","folder":"../escape"}"##,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["kind"], "invalid_input");
+        assert_eq!(
+            body["error"],
+            "folder must stay inside the vault: ../escape"
+        );
+        assert!(!tmp.path().join("escape").exists());
+    }
+
+    #[tokio::test]
+    async fn a_move_folder_that_climbs_out_is_a_bad_request() {
+        let (tmp, state) = indexed_state();
+        let (status, body) = post_json(
+            state,
+            "/api/move",
+            r#"{"file":"rules/evocation-spells.md","new_folder":"../escape"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["kind"], "invalid_input");
+        assert!(!tmp.path().join("escape").exists());
+    }
+
     /// `reindex-file` of a path not on disk is a 404; a path that exists and
     /// cannot be read stays a 500, which no fixture can provoke without
     /// changing permissions, so only the first is asserted.
