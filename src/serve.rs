@@ -880,6 +880,7 @@ pub async fn run_serve(
     // Spawn HTTP server as a background task (before MCP blocks on stdio)
     if let Some(ref opts) = http_opts {
         let api_state = crate::http::ApiState {
+            request_timeout: crate::http::request_timeout(&core.config.http),
             http_config: Arc::new(core.config.http.clone()),
             no_auth: opts.no_auth,
             rate_limiter: Arc::new(crate::http::RateLimiter::new(core.config.http.rate_limit)),

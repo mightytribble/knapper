@@ -95,7 +95,7 @@ curl -X POST http://localhost:3000/api/create \
 
 **CORS:** Configurable allowed origins in `config.toml` under `[http]`. Defaults to allow all origins for local development.
 
-**Limits:** a request is answered 408 after `[http] request_timeout_secs` (60 by default; `0` disables it), except `/api/index` and `/api/init`, which run to completion. A body over 8 MiB is refused as 400 `invalid_input`. Sixteen requests run at once; the rest wait their turn. A 408 on a write means the outcome is unknown: a write already running when the timeout fired finishes after it.
+**Limits:** a request is answered 408 after `[http] request_timeout_secs` (60 by default; `0` disables it), except `/api/index` and `/api/init`, which run to completion. A body over 8 MiB is refused as 400 `invalid_input`. Sixteen requests run at once; the rest wait their turn. The six write routes — `create`, `update`, `move`, `archive`, `delete`, `reindex-file` — are timed only while they wait their turn for the index: a 408 on one means the write did not run and a retry is safe, and a write that started answers with its result however long it takes.
 
 ```toml
 [http]
@@ -125,7 +125,7 @@ Every error the server answers is a JSON body with two fields: `error`, the mess
 | 403 | `forbidden` | the key has no write permission |
 | 401 | `unauthorized` | no key, or a key the server does not hold |
 | 429 | `rate_limited` | the key's bucket is empty; `retry-after` says when |
-| 408 | — | the request ran past `request_timeout_secs`; no body. `/api/index` and `/api/init` are never timed out |
+| 408 | — | the request ran past `request_timeout_secs`; no body. `/api/index` and `/api/init` are never timed out; a write route is timed only before it starts, so its 408 means it did not run |
 | 500 | `stale_index` | the index cannot answer until `knapper index` runs |
 | 500 | `internal` | anything else; the body carries the whole error chain |
 
