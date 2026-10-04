@@ -221,9 +221,23 @@ where
     ) -> Result<Self, Self::Rejection> {
         match Json::<T>::from_request(req, state).await {
             Ok(Json(value)) => Ok(ApiJson(value)),
+            Err(rejection) if body_read_timed_out(&rejection) => Err(ApiError::timed_out()),
             Err(rejection) => Err(ApiError::bad_request(&rejection.body_text())),
         }
     }
+}
+
+/// Whether a body rejection came from the write routes' body timeout, which
+/// means the write did not run and answers like the lock wait's 408.
+fn body_read_timed_out(rejection: &(dyn std::error::Error + 'static)) -> bool {
+    let mut source = Some(rejection);
+    while let Some(err) = source {
+        if err.is::<tower_http::timeout::TimeoutError>() {
+            return true;
+        }
+        source = err.source();
+    }
+    false
 }
 
 /// `Query<T>` the same way, for every GET handler.
@@ -436,14 +450,23 @@ pub fn build_router(state: ApiState) -> Router {
     let timeout = state.request_timeout;
     let mut timed = Router::new();
     let mut untimed = Router::new();
+    let mut writes = Router::new();
     for (path, handler) in routes() {
-        if UNTIMED_ROUTES.contains(&path) || WRITE_ROUTES.contains(&path) {
+        if WRITE_ROUTES.contains(&path) {
+            writes = writes.route(path, handler);
+        } else if UNTIMED_ROUTES.contains(&path) {
             untimed = untimed.route(path, handler);
         } else {
             timed = timed.route(path, handler);
         }
     }
-    with_limits(timed, untimed, timeout)
+    // A stalled body would hold an in-flight permit for good, and a write is
+    // outside the timeout layer, so its body read is timed on its own.
+    let writes = match timeout {
+        Some(limit) => writes.layer(tower_http::timeout::RequestBodyTimeoutLayer::new(limit)),
+        None => writes,
+    };
+    with_limits(timed, untimed.merge(writes), timeout)
         .layer(cors)
         .with_state(state)
 }
@@ -1156,6 +1179,48 @@ mod tests {
         let (status, body) = writing.await.unwrap();
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(vault.join("slow.md").is_file());
+    }
+
+    /// A write whose body stalls past the deadline answers the bodyless 408
+    /// and never runs; a read route is not touched by the body timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_write_body_that_stalls_is_a_408_and_does_not_run() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (_tmp, mut state) = indexed_state();
+        state.request_timeout = Some(Duration::from_millis(50));
+        let vault = state.core.vault_path.clone();
+        let app = build_router(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+
+        // Headers promise 100 bytes; one chunk arrives and the rest never does.
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(
+                b"POST /api/create HTTP/1.1\r\nhost: x\r\ncontent-type: application/json\r\n\
+                  content-length: 100\r\nconnection: close\r\n\r\n{\"filename\":\"stall\",",
+            )
+            .await
+            .unwrap();
+        let mut raw = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut raw))
+            .await
+            .expect("the stalled body is cut off")
+            .unwrap();
+        let text = String::from_utf8_lossy(&raw);
+        assert!(text.starts_with("HTTP/1.1 408"), "got {text}");
+        assert!(text.ends_with("\r\n\r\n"), "a 408 has no body, got {text}");
+        assert!(!vault.join("stall.md").exists());
+
+        // A read route on the same server is untouched.
+        let mut read = tokio::net::TcpStream::connect(addr).await.unwrap();
+        read.write_all(b"GET /api/health-check HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut raw = Vec::new();
+        read.read_to_end(&mut raw).await.unwrap();
+        assert!(String::from_utf8_lossy(&raw).starts_with("HTTP/1.1 200"));
     }
 
     #[test]
