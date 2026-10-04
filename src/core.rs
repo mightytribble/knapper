@@ -73,11 +73,14 @@ impl Core {
 
         let cleaned = crate::writer::cleanup_temp_files(&vault_path)?;
         if cleaned > 0 {
-            eprintln!("Cleaned up {cleaned} incomplete write(s) from previous run");
+            tracing::info!(
+                cleaned,
+                "cleaned up incomplete writes from the previous run"
+            );
         }
         let orphans = crate::writer::verify_index_integrity(&store, &vault_path)?;
         if orphans > 0 {
-            eprintln!("Cleaned up {orphans} orphan DB entries for missing files");
+            tracing::info!(orphans, "cleaned up orphan DB entries for missing files");
         }
 
         let profile = Config::load_vault_profile().ok().flatten();

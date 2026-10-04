@@ -909,8 +909,13 @@ async fn handle_init(
                 .core
                 .with_core(move |g| {
                     let _ = g;
-                    let mut result =
-                        crate::onboarding::run_apply_json(&vault, &config, settings, &data_dir)?;
+                    let mut result = crate::onboarding::run_apply_json(
+                        &vault,
+                        &config,
+                        settings,
+                        &data_dir,
+                        &mut crate::indexer::NoProgress,
+                    )?;
                     if let Some(object) = result.as_object_mut() {
                         object.insert("restart_required".into(), serde_json::json!(true));
                     }

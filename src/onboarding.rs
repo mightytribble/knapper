@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use serde_json::json;
 
 use crate::config::{Config, db_path};
-use crate::indexer::{IndexSettings, run_index};
+use crate::indexer::{IndexProgress, IndexSettings, run_index};
 use crate::profile::{
     self, FolderMap, StructureDetection, StructureMethod, VaultProfile, VaultStats, VaultType,
 };
@@ -125,6 +125,7 @@ pub fn run_apply_json(
     config: &Config,
     settings: IndexSettings,
     data_dir: &Path,
+    progress: &mut dyn IndexProgress,
 ) -> Result<serde_json::Value> {
     let vault_path = vault_path
         .canonicalize()
@@ -142,7 +143,7 @@ pub fn run_apply_json(
     steps_completed.push("vault_profile_written".into());
 
     // ── Indexing ──
-    let index_result = run_index(&vault_path, config, settings, false)?;
+    let index_result = run_index(&vault_path, config, settings, false, progress)?;
     steps_completed.push("index_built".into());
 
     // ── Build response ──

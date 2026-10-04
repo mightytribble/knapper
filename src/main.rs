@@ -64,6 +64,34 @@ fn remove_dir_if_exists(path: &std::path::Path) -> Result<bool> {
     }
 }
 
+/// The index bar `knapper index` draws, over the sink the library reports to.
+struct BarProgress(Option<indicatif::ProgressBar>);
+
+impl knapper::indexer::IndexProgress for BarProgress {
+    fn begin(&mut self, total: usize) {
+        let pb = indicatif::ProgressBar::new(total as u64);
+        pb.set_style(
+            indicatif::ProgressStyle::with_template(
+                "  [{bar:40.cyan/blue}] {pos}/{len} {msg} ({eta})",
+            )
+            .unwrap()
+            .progress_chars("=>-"),
+        );
+        self.0 = Some(pb);
+    }
+    fn file(&mut self, rel_path: &str) {
+        if let Some(pb) = &self.0 {
+            pb.set_message(rel_path.to_string());
+            pb.inc(1);
+        }
+    }
+    fn end(&mut self) {
+        if let Some(pb) = self.0.take() {
+            pb.finish_with_message("done");
+        }
+    }
+}
+
 /// The store, the vault it indexed and that vault's profile.
 ///
 /// Every capability that reads or writes the vault opens these three the same
@@ -172,12 +200,14 @@ async fn main() -> Result<()> {
         config::set_data_dir_override(dir.clone());
     }
 
-    // Set up tracing. Default: suppress all logs (ort is very noisy).
-    // --verbose enables debug for knapper, info for everything else.
+    // Set up tracing. The library reports through `tracing`, and a warning
+    // is one the user has to see: a dimension change that re-indexes the
+    // vault, a file left unembedded, a config table this version does not
+    // read. --verbose enables debug for knapper, info for everything else.
     let filter = if cli.verbose {
         "knapper=debug,info"
     } else {
-        "error"
+        "warn"
     };
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -249,6 +279,7 @@ async fn main() -> Result<()> {
                 &cfg,
                 indexer::IndexSettings::from_config(&cfg),
                 rebuild,
+                &mut BarProgress(None),
             )?;
 
             println!(
@@ -605,7 +636,13 @@ async fn main() -> Result<()> {
                 }
                 knapper::params::InitMode::Apply => {
                     let settings = knapper::indexer::IndexSettings::from_config(&cfg);
-                    knapper::onboarding::run_apply_json(&vault_path, &cfg, settings, &data_dir)?
+                    knapper::onboarding::run_apply_json(
+                        &vault_path,
+                        &cfg,
+                        settings,
+                        &data_dir,
+                        &mut BarProgress(None),
+                    )?
                 }
             };
             println!("{}", serde_json::to_string_pretty(&result)?);
