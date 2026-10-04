@@ -150,6 +150,15 @@ impl ApiError {
             headers: vec![("retry-after".to_string(), retry_after.to_string())],
         }
     }
+    /// A known route asked with the wrong method. The route exists and the
+    /// method is the caller's text, so the kind is `invalid_input`.
+    pub fn method_not_allowed() -> Self {
+        Self::new(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "invalid_input",
+            "method not allowed on this route",
+        )
+    }
 }
 
 /// The one place an error from a core call becomes a status.
@@ -176,6 +185,63 @@ impl From<anyhow::Error> for ApiError {
             None => Self::internal(&message),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Extractors whose rejection is an ApiError
+// ---------------------------------------------------------------------------
+
+/// `Json<T>` whose rejection is an `ApiError`: 400, `invalid_input`, axum's
+/// own text as the message. Every POST handler takes its body through this,
+/// so malformed JSON, an unknown enum word and a missing field answer the
+/// same body shape every other error does.
+pub struct ApiJson<T>(pub T);
+
+impl<T> axum::extract::FromRequest<ApiState> for ApiJson<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(
+        req: axum::extract::Request,
+        state: &ApiState,
+    ) -> Result<Self, Self::Rejection> {
+        match Json::<T>::from_request(req, state).await {
+            Ok(Json(value)) => Ok(ApiJson(value)),
+            Err(rejection) => Err(ApiError::bad_request(&rejection.body_text())),
+        }
+    }
+}
+
+/// `Query<T>` the same way, for every GET handler.
+pub struct ApiQuery<T>(pub T);
+
+impl<T> axum::extract::FromRequestParts<ApiState> for ApiQuery<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &ApiState,
+    ) -> Result<Self, Self::Rejection> {
+        match Query::<T>::from_request_parts(parts, state).await {
+            Ok(Query(value)) => Ok(ApiQuery(value)),
+            Err(rejection) => Err(ApiError::bad_request(&rejection.body_text())),
+        }
+    }
+}
+
+/// An unknown path. The transport's own 404, with a body like every other.
+async fn unknown_route() -> ApiError {
+    ApiError::not_found("no such route")
+}
+
+/// A known path with the wrong method.
+async fn wrong_method() -> ApiError {
+    ApiError::method_not_allowed()
 }
 
 // ---------------------------------------------------------------------------
@@ -311,7 +377,11 @@ pub fn build_router(state: ApiState) -> Router {
     for (path, handler) in routes() {
         router = router.route(path, handler);
     }
-    router.layer(cors).with_state(state)
+    router
+        .fallback(unknown_route)
+        .method_not_allowed_fallback(wrong_method)
+        .layer(cors)
+        .with_state(state)
 }
 
 async fn health_check() -> &'static str {
@@ -338,7 +408,7 @@ async fn handle_openapi(State(state): State<ApiState>) -> impl IntoResponse {
 async fn handle_match(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(body): Json<crate::params::Match>,
+    ApiJson(body): ApiJson<crate::params::Match>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, false)?;
     // Checked before the scan runs: a malformed scope is the caller's own text (#60).
@@ -354,7 +424,7 @@ async fn handle_match(
 async fn handle_search(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(body): Json<crate::params::Search>,
+    ApiJson(body): ApiJson<crate::params::Search>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, false)?;
     // Checked before the pipeline runs, so a typo fails fast (#35).
@@ -378,7 +448,7 @@ async fn handle_search(
 async fn handle_read(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Query(p): Query<crate::params::Read>,
+    ApiQuery(p): ApiQuery<crate::params::Read>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, false)?;
     let vault = state.core.vault_path.clone();
@@ -400,7 +470,7 @@ async fn handle_read(
 async fn handle_list(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Query(params): Query<crate::params::List>,
+    ApiQuery(params): ApiQuery<crate::params::List>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, false)?;
     let all_terms = crate::tags::merge_scope_alias(params.scope, params.all);
@@ -442,7 +512,7 @@ async fn handle_list(
 async fn handle_tags(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Query(params): Query<crate::params::Tags>,
+    ApiQuery(params): ApiQuery<crate::params::Tags>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, false)?;
     let prefix = params.under.as_deref().and_then(crate::tags::parse_term);
@@ -459,7 +529,7 @@ async fn handle_tags(
 async fn handle_properties(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Query(params): Query<crate::params::Properties>,
+    ApiQuery(params): ApiQuery<crate::params::Properties>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, false)?;
     let vault = state.core.vault_path.clone();
@@ -511,7 +581,7 @@ async fn handle_health(
 async fn handle_validate(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(body): Json<crate::params::Validate>,
+    ApiJson(body): ApiJson<crate::params::Validate>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, false)?;
     let target = body
@@ -558,7 +628,7 @@ async fn handle_status(
 async fn handle_create(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(body): Json<crate::params::Create>,
+    ApiJson(body): ApiJson<crate::params::Create>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
     state.core.writable()?;
@@ -606,7 +676,7 @@ async fn handle_create(
 async fn handle_update(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(body): Json<crate::params::Update>,
+    ApiJson(body): ApiJson<crate::params::Update>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
     state.core.writable()?;
@@ -653,7 +723,7 @@ async fn handle_update(
 async fn handle_move(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(body): Json<crate::params::Move>,
+    ApiJson(body): ApiJson<crate::params::Move>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
     state.core.writable()?;
@@ -675,7 +745,7 @@ async fn handle_move(
 async fn handle_archive(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(body): Json<crate::params::Archive>,
+    ApiJson(body): ApiJson<crate::params::Archive>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
     state.core.writable()?;
@@ -713,7 +783,7 @@ async fn handle_archive(
 async fn handle_migrate(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(body): Json<crate::params::Migrate>,
+    ApiJson(body): ApiJson<crate::params::Migrate>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
     let vault = state.core.vault_path.clone();
@@ -761,7 +831,7 @@ async fn handle_migrate(
 async fn handle_delete(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(body): Json<crate::params::Delete>,
+    ApiJson(body): ApiJson<crate::params::Delete>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
     state.core.writable()?;
@@ -797,7 +867,7 @@ async fn handle_delete(
 async fn handle_index(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(body): Json<crate::params::Index>,
+    ApiJson(body): ApiJson<crate::params::Index>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
     // A read-only server refuses it like any other write, the way MCP's
@@ -840,7 +910,7 @@ async fn handle_index(
 async fn handle_reindex_file(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(body): Json<crate::params::ReindexFile>,
+    ApiJson(body): ApiJson<crate::params::ReindexFile>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
     let vault = state.core.vault_path.clone();
@@ -874,7 +944,7 @@ async fn handle_reindex_file(
 async fn handle_identity(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Query(p): Query<crate::params::Identity>,
+    ApiQuery(p): ApiQuery<crate::params::Identity>,
 ) -> Result<impl IntoResponse, ApiError> {
     // Re-extraction clears the `identity_facts` rows and derives them again,
     // so it takes the write permission and a read-only server refuses it; the
@@ -911,7 +981,7 @@ async fn handle_identity(
 async fn handle_init(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(body): Json<crate::params::Init>,
+    ApiJson(body): ApiJson<crate::params::Init>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
     match body.mode.as_deref() {
@@ -2240,6 +2310,86 @@ mod tests {
             body["error"].as_str().unwrap().contains("needs a preview"),
             "got {body}"
         );
+    }
+
+    /// GET `path` as a writer, and return the status and the body.
+    async fn get_json(state: ApiState, path: &str) -> (StatusCode, serde_json::Value) {
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri(path)
+                    .header("authorization", "Bearer kn_writekey")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    /// The promise http-rest-api.md makes is that every error body carries
+    /// `kind`. axum's own extractor rejections are errors too.
+    #[tokio::test]
+    async fn malformed_json_is_a_bad_request_with_a_kind() {
+        let (_tmp, state) = test_api_state();
+        let (status, body) = post_json(state, "/api/delete", r#"{"file": "#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["kind"], "invalid_input");
+        assert!(body["error"].is_string(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_enum_word_is_a_bad_request_with_a_kind() {
+        let (_tmp, state) = test_api_state();
+        let (status, body) =
+            post_json(state, "/api/delete", r#"{"file":"a.md","mode":"sideways"}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["kind"], "invalid_input");
+        assert!(
+            body["error"].as_str().unwrap().contains("sideways"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_field_is_a_bad_request_with_a_kind() {
+        let (_tmp, state) = test_api_state();
+        let (status, body) = post_json(state, "/api/delete", r#"{}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["kind"], "invalid_input");
+        assert!(body["error"].as_str().unwrap().contains("file"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_query_value_of_the_wrong_type_is_a_bad_request_with_a_kind() {
+        let (_tmp, state) = test_api_state();
+        let (status, body) = get_json(state, "/api/list?limit=many").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["kind"], "invalid_input");
+        assert!(body["error"].as_str().unwrap().contains("limit"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_route_is_a_404_with_a_kind() {
+        let (_tmp, state) = test_api_state();
+        let (status, body) = get_json(state, "/api/nowhere").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["kind"], "not_found");
+    }
+
+    #[tokio::test]
+    async fn the_wrong_method_on_a_known_route_is_a_405_with_a_kind() {
+        let (_tmp, state) = test_api_state();
+        let (status, body) = get_json(state, "/api/delete").await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{body}");
+        assert_eq!(body["kind"], "invalid_input");
     }
 
     /// `identity` takes `refresh` on every surface (#62). Before this the
