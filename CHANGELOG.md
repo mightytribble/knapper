@@ -3,7 +3,14 @@
 Every entry below the upstream-lineage line names the commit it describes.
 Links resolve against https://github.com/mightytribble/knapper.
 
-## Unreleased
+## 0.9.12 (2026-10-03)
+
+Reads under `serve` no longer wait behind a search, a write or the index, and
+every error says what kind it is, on HTTP and MCP alike. `list` reads in pages,
+a note can be named by its alias or scoped to by its path, and a path a caller
+names stays inside the vault. Identity, migration and folder placement are
+gone. Run `knapper index` once before `serve` to record an existing store's
+aliases; nothing is re-embedded.
 
 ### Added
 
