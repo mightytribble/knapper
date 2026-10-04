@@ -10,7 +10,6 @@
 
 mod aliases;
 mod chunks;
-mod cli_events;
 mod edges;
 mod files;
 mod fts;
@@ -25,7 +24,6 @@ mod vectors;
 
 pub(crate) use chunks::normalise_heading;
 pub use chunks::{ChunkRecord, DOC_LEVEL, NewChunk};
-pub use cli_events::CliEvent;
 pub use edges::EdgeStats;
 pub use files::FileRecord;
 pub use fts::{FtsResult, fts_objects_sql};
