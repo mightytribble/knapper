@@ -2150,6 +2150,15 @@ name = "Someone"
             .collect();
         assert_eq!(named, vec!["http.plugin", "identity"]);
         assert!(Config::retired_tables("[http]\nport = 1\n").is_empty());
+        let memory = Config::retired_tables("[memory]\nenabled = true\n");
+        assert_eq!(
+            memory.into_iter().map(|(t, _)| t).collect::<Vec<_>>(),
+            vec!["memory"]
+        );
+        // An unparseable text names nothing here; the typed parse reports it.
+        assert!(Config::retired_tables("[http\nport = ").is_empty());
+        // A retired name as a plain key is not the table.
+        assert!(Config::retired_tables("identity = 1\n").is_empty());
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");

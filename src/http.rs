@@ -2576,12 +2576,29 @@ mod tests {
     /// `MAX_BODY_BYTES`, so a body between the two reaches the handler.
     #[tokio::test]
     async fn a_body_between_axums_default_and_the_limit_is_not_refused() {
-        let (_tmp, state) = test_api_state();
+        let vault = tempfile::tempdir().unwrap();
+        let (_tmp, state) = test_api_state_at(vault.path().to_path_buf());
         let content = "x".repeat(3 * 1024 * 1024);
         let body = format!(r#"{{"filename":"big","content":"{content}"}}"#);
         let (status, reply) = post_json(state, "/api/create", &body).await;
-        assert_ne!(status, StatusCode::BAD_REQUEST, "{reply}");
-        assert_ne!(reply["kind"], "invalid_input", "{reply}");
+        assert_eq!(status, StatusCode::OK, "{reply}");
+        assert!(vault.path().join("big.md").is_file());
+    }
+
+    /// The transport's two unauthenticated routes are timed like any read,
+    /// and answer through the real router with a timeout set.
+    #[tokio::test]
+    async fn the_openapi_document_and_the_health_check_answer_under_the_timeout() {
+        for path in ["/openapi.json", "/api/health-check"] {
+            assert!(!UNTIMED_ROUTES.contains(&path), "{path}");
+            assert!(!WRITE_ROUTES.contains(&path), "{path}");
+        }
+        let (_tmp, mut state) = test_api_state();
+        state.request_timeout = Some(Duration::from_secs(5));
+        for path in ["/openapi.json", "/api/health-check"] {
+            let response = get(state.clone(), path).await;
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+        }
     }
 
     #[tokio::test]
