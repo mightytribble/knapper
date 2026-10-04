@@ -340,7 +340,7 @@ impl Store {
     }
 
     /// Return vector_ids for all chunks belonging to a file.
-    /// Useful for tombstoning before re-indexing a changed file.
+    /// Read before a changed file's chunks are replaced, so their vectors can be deleted.
     pub fn get_vector_ids_for_file(&self, file_id: i64) -> Result<Vec<u64>> {
         let mut stmt = self
             .conn

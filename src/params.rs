@@ -31,8 +31,8 @@ pub struct Search {
     #[arg(short = 'n', long)]
     pub top_n: Option<usize>,
     /// Show the per-lane score breakdown for each result. On the servers the
-    /// breakdown rides beside the envelope as `explain`; the CLI prints it as
-    /// text (#62).
+    /// breakdown rides beside the envelope as `explain` (#62).
+    // The CLI prints it as text.
     // The CLI refuses `--explain` with `--json`, since the breakdown is text
     // there: a usage error rather than a flag silently dropped.
     #[arg(long, conflicts_with = "json")]
@@ -461,8 +461,8 @@ where
 /// the note's own `tags` list; no other key is written.
 #[derive(Debug, Args, Deserialize, JsonSchema)]
 pub struct Create {
-    /// Note content. Required on the servers; the CLI reads stdin when it is
-    /// omitted.
+    /// Note content.
+    // The CLI reads stdin when it is omitted; the servers require it.
     #[arg(long)]
     pub content: Option<String>,
     /// Filename for the note. A bare name gets `.md` appended; a name that
@@ -931,8 +931,9 @@ pub struct Validate {
     #[arg(long, value_delimiter = ',')]
     #[serde(default, deserialize_with = "deserialize_tag_list")]
     pub none: Vec<String>,
-    /// Treat warnings as gating: the report's `ok` is false when any warning
-    /// is present, and the CLI exits non-zero.
+    /// Treat warnings as gating: the report's `ok` is false when any warning is
+    /// present.
+    // The CLI exits non-zero on a false `ok`.
     #[arg(long)]
     #[serde(default)]
     pub strict: bool,

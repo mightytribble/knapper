@@ -1342,6 +1342,7 @@ mod tests {
             "unexpected error: {err}"
         );
     }
+
     /// The library draws no bar: it reports through a sink, and the CLI
     /// draws from that.
     #[test]

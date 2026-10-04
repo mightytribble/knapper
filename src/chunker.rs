@@ -731,10 +731,6 @@ fn parse_tags_from_yaml(yaml: &str) -> Vec<String> {
 mod tests {
     use super::*;
 
-    // ── Break-point detection tests ──────────────────────────────────────
-
-    // ── Smart chunk tests ────────────────────────────────────────────────
-
     // ── Structure-first chunking tests ───────────────────────────────────
 
     /// `ChunkOptions` at a given minimum, with promotion off and the orphan

@@ -557,7 +557,7 @@ mod tests {
             })
             .unwrap();
 
-        // Simulate detecting hash change: collect old vector_ids for tombstoning.
+        // Simulate detecting a hash change: collect the old vector ids.
         let old_vector_ids = store.get_vector_ids_for_file(file_id).unwrap();
         assert_eq!(old_vector_ids.len(), 2);
         assert!(old_vector_ids.contains(&50));

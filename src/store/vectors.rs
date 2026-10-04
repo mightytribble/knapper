@@ -85,10 +85,9 @@ impl Store {
         let mut stmt = self
             .conn
             .prepare("SELECT vector_id, vector FROM chunks WHERE vector IS NOT NULL")?;
-        let rows: Vec<(i64, Vec<u8>)> = stmt
+        let rows = stmt
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<rusqlite::Result<Vec<(i64, Vec<u8>)>>>()?;
         for (vid, blob) in &rows {
             self.conn.execute(
                 "INSERT OR IGNORE INTO chunks_vec(rowid, embedding) VALUES (?1, ?2)",
