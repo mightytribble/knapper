@@ -2585,8 +2585,9 @@ mod tests {
         assert!(vault.path().join("big.md").is_file());
     }
 
-    /// The transport's two unauthenticated routes are timed like any read,
-    /// and answer through the real router with a timeout set.
+    /// The transport's two unauthenticated routes are timed like any read.
+    /// The membership asserts pin the timing; the 200s show the routes answer
+    /// through the real router with a timeout set.
     #[tokio::test]
     async fn the_openapi_document_and_the_health_check_answer_under_the_timeout() {
         for path in ["/openapi.json", "/api/health-check"] {

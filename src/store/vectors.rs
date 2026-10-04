@@ -269,8 +269,9 @@ mod tests {
         assert_eq!(results[0].0, 0);
     }
 
-    /// The copy is step 2 of the ladder, so a second open, at version 2,
-    /// copies nothing again.
+    /// The first open copies the BLOB vector into `chunks_vec`. Once that row
+    /// is deleted, a second open, at version 2, does not copy it back: the
+    /// copy is step 2 of the ladder and runs once.
     #[test]
     fn step_2s_vector_copy_runs_once() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -295,6 +296,7 @@ mod tests {
                     &vector,
                 )
                 .unwrap();
+            assert_eq!(store.vec_table_dim().unwrap(), None);
             store.set_user_version(1).unwrap();
         }
         let count = |store: &Store| -> i64 {
@@ -305,9 +307,10 @@ mod tests {
         };
         let first = Store::open(&db).unwrap();
         assert_eq!(count(&first), 1);
+        first.conn().execute("DELETE FROM chunks_vec", []).unwrap();
         drop(first);
         let second = Store::open(&db).unwrap();
-        assert_eq!(count(&second), 1);
+        assert_eq!(count(&second), 0);
     }
 
     #[test]
