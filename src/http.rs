@@ -363,8 +363,6 @@ pub fn routes() -> Vec<(&'static str, MethodRouter<ApiState>)> {
         ("/api/reindex-file", post(handle_reindex_file)),
         // Setup
         ("/api/init", post(handle_init)),
-        // Migration endpoints
-        ("/api/migrate", post(handle_migrate)),
         // The transport describing itself (no auth required)
         ("/openapi.json", get(handle_openapi)),
     ]
@@ -773,58 +771,6 @@ async fn handle_archive(
         .record_write(&state.core.vault_path.join(&result.path))
         .await;
     Ok(Json(serde_json::json!(result)))
-}
-
-// ---------------------------------------------------------------------------
-// Migration endpoint handlers
-// ---------------------------------------------------------------------------
-
-async fn handle_migrate(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    ApiJson(body): ApiJson<crate::params::Migrate>,
-) -> Result<impl IntoResponse, ApiError> {
-    authorize(&headers, &state, true)?;
-    let vault = state.core.vault_path.clone();
-    // The CLI already took a mode. MCP and HTTP split it into three names,
-    // which is the same capability spelled three ways (#62). The mode is read
-    // before the read-only guard, so that one word means the same thing on
-    // both servers: `preview` writes nothing and runs, and a word that names
-    // no operation is answered as such rather than as a refused write.
-    match body.mode.as_str() {
-        "preview" => {
-            let profile = state.core.profile.clone();
-            let preview = state
-                .core
-                .with_reader(move |store| {
-                    crate::migrate::generate_preview(store, &vault, profile.as_ref().as_ref())
-                })
-                .await?;
-            Ok(Json(serde_json::to_value(&preview).unwrap()))
-        }
-        "apply" => {
-            state.core.writable()?;
-            let preview = crate::migrate::resolve_preview(body.preview)?;
-            let result = state
-                .core
-                .with_core(move |g| crate::migrate::apply_preview(&preview, g.store, &vault))
-                .await?;
-            Ok(Json(serde_json::to_value(&result).unwrap()))
-        }
-        "undo" => {
-            state.core.writable()?;
-            let result = state
-                .core
-                .with_core(move |g| crate::migrate::undo_last(g.store, &vault))
-                .await?;
-            Ok(Json(serde_json::to_value(&result).unwrap()))
-        }
-        // The mode is the caller's own text, so a word that names no
-        // operation is a bad request and not an internal fault.
-        other => Err(ApiError::bad_request(&format!(
-            "Unknown mode: {other}. Use 'preview', 'apply' or 'undo'."
-        ))),
-    }
 }
 
 async fn handle_delete(
@@ -1850,100 +1796,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn each_migrate_mode_reaches_the_operation_it_names() {
-        // One name takes three modes (#62), so the one thing worth proving is
-        // that each mode string still arrives at the operation it names.
-        // Each answer below can come from one of the three and no other.
-
-        // `preview` classifies: an empty index proposes no move, and the
-        // response is a preview and not a result.
-        let (_tmp_a, state_a) = test_api_state();
-        let (status, body) = post_json(state_a, "/api/migrate", r#"{"mode":"preview"}"#).await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(body.get("files").is_some(), "not a preview: {body}");
-        assert_eq!(body["files"].as_array().unwrap().len(), 0);
-
-        // `apply` executes the preview it is given: this one moves nothing,
-        // and it answers with that preview's own id.
-        let (_tmp_b, state_b) = test_api_state();
-        let (status, body) = post_json(
-            state_b,
-            "/api/migrate",
-            r#"{"mode":"apply","preview":{"migration_id":"m-14","files":[],"uncertain":[],"skipped":0}}"#,
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["migration_id"], "m-14");
-        assert_eq!(body["moved"], 0);
-
-        // `undo` reads the migration log, which this store has no row in.
-        let (_tmp_c, state_c) = test_api_state();
-        let (status, body) = post_json(state_c, "/api/migrate", r#"{"mode":"undo"}"#).await;
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert!(
-            body["error"]
-                .as_str()
-                .unwrap()
-                .contains("No migration to undo"),
-            "not the undo path: {body}"
-        );
-    }
-
-    #[tokio::test]
-    async fn read_only_refuses_the_migrate_modes_that_write_and_no_others() {
-        // One name now carries all three modes, so the guard belongs to the
-        // modes that write and not to the route. `preview` writes nothing, so
-        // it runs here as it does on MCP, and an unknown mode is still
-        // answered as an unknown mode (#62).
-        let (_tmp, mut state) = test_api_state();
-        state.core.read_only = true;
-        let (status, _) = post_json(state, "/api/migrate", r#"{"mode":"preview"}"#).await;
-        assert_eq!(status, StatusCode::OK);
-
-        let (_tmp, mut state) = test_api_state();
-        state.core.read_only = true;
-        let (status, body) = post_json(
-            state,
-            "/api/migrate",
-            r#"{"mode":"apply","preview":{"migration_id":"m","files":[],"uncertain":[],"skipped":0}}"#,
-        )
-        .await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
-        assert_eq!(body["kind"], "read_only");
-        assert_eq!(
-            body["error"],
-            "write operations are disabled in read-only mode; start `serve` without --read-only to enable writes"
-        );
-
-        let (_tmp, mut state) = test_api_state();
-        state.core.read_only = true;
-        let (status, _) = post_json(state, "/api/migrate", r#"{"mode":"undo"}"#).await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
-
-        let (_tmp, mut state) = test_api_state();
-        state.core.read_only = true;
-        let (status, body) = post_json(state, "/api/migrate", r#"{"mode":"sideways"}"#).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(
-            body["error"],
-            "Unknown mode: sideways. Use 'preview', 'apply' or 'undo'."
-        );
-    }
-
-    #[tokio::test]
-    async fn a_migrate_mode_naming_nothing_is_a_bad_request() {
-        // The mode is the caller's own text, so a word that names no
-        // operation is a 400 and not a 500 (#62).
-        let (_tmp, state) = test_api_state();
-        let (status, body) = post_json(state, "/api/migrate", r#"{"mode":"sideways"}"#).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(
-            body["error"],
-            "Unknown mode: sideways. Use 'preview', 'apply' or 'undo'."
-        );
-    }
-
-    #[tokio::test]
     async fn init_detect_reaches_detection_and_writes_nothing() {
         // `detect` is the half of `init` a server can run without touching
         // the vault (#62): it reports what it found and leaves no file.
@@ -2247,21 +2099,6 @@ mod tests {
         state.core.read_only = true;
         let (status, _) = post_json(state, "/api/init", r#"{"mode":"detect"}"#).await;
         assert_eq!(status, StatusCode::OK);
-    }
-
-    /// A server's `apply` acts on the plan its caller sends and no other. The
-    /// copy `knapper migrate --mode preview` saves belongs to the CLI's own
-    /// two-step flow, and an `apply` that fell back to it would move files
-    /// against a plan this caller never saw (#62).
-    #[tokio::test]
-    async fn a_migrate_apply_with_no_preview_is_a_bad_request() {
-        let (_tmp, state) = test_api_state();
-        let (status, body) = post_json(state, "/api/migrate", r#"{"mode":"apply"}"#).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(
-            body["error"].as_str().unwrap().contains("needs a preview"),
-            "got {body}"
-        );
     }
 
     /// GET `path` as a writer, and return the status and the body.

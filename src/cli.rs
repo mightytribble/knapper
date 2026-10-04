@@ -261,9 +261,6 @@ pub enum Command {
         #[arg(long)]
         read_only: bool,
     },
-
-    /// Migrate vault structure into PARA.
-    Migrate(crate::params::Migrate),
 }
 
 #[derive(Subcommand, Debug)]
@@ -307,25 +304,6 @@ mod tests {
         // Global, so it is also accepted after the subcommand.
         let cli = Cli::try_parse_from(["knapper", "status", "--data-dir", "/tmp/kn"]).unwrap();
         assert_eq!(cli.data_dir, Some(PathBuf::from("/tmp/kn")));
-    }
-
-    #[test]
-    fn migrate_takes_the_mode_the_servers_take() {
-        // PARA is the only strategy, so `migrate` is a leaf that takes the
-        // same three words every surface takes (#62).
-        let cli = Cli::try_parse_from(["knapper", "migrate", "--mode", "apply"]).unwrap();
-        match cli.command {
-            Command::Migrate(args) => assert_eq!(args.mode, "apply"),
-            other => panic!("got {other:?}"),
-        }
-        assert!(
-            Cli::try_parse_from(["knapper", "migrate", "para", "--apply"]).is_err(),
-            "the PARA leaf is gone"
-        );
-        assert!(
-            Cli::try_parse_from(["knapper", "migrate"]).is_err(),
-            "the mode is required"
-        );
     }
 
     #[test]

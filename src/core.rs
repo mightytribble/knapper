@@ -201,9 +201,9 @@ impl Core {
     /// Refuse a write on a server started with `--read-only`.
     ///
     /// Every handler that writes the vault, the store or derived state calls
-    /// this first, so one text answers on both servers. `migrate` and `init`
-    /// read their `mode` before calling it, so `preview` and `detect` run on
-    /// a read-only server.
+    /// this first, so one text answers on both servers. `init`
+    /// reads its `mode` before calling it, so `detect` runs on a read-only
+    /// server.
     pub fn writable(&self) -> Result<()> {
         if self.read_only {
             return Err(Fault::ReadOnly.into());

@@ -36,10 +36,9 @@ pub struct Capability {
     /// reason. The parameter parity test reads them as allowed absences.
     pub cli_only_args: &'static [(&'static str, &'static str)],
     /// Arguments this capability takes on the servers alone, each with its
-    /// reason. The asymmetry runs both ways — `migrate` takes a `preview` that
-    /// a command line has no spelling for — so the parity test needs a word
-    /// for it, or the only way to make it pass is to stop reading a whole
-    /// direction (#62).
+    /// reason. The asymmetry can run both ways, so the parity test needs a
+    /// word for it, or the only way to make it pass is to stop reading a
+    /// whole direction (#62).
     pub server_only_args: &'static [(&'static str, &'static str)],
 }
 
@@ -284,17 +283,6 @@ pub const CAPABILITIES: &[Capability] = &[
         ],
         server_only_args: &[],
     },
-    Capability {
-        name: "migrate",
-        cli: Presence::On,
-        mcp: Presence::On,
-        http: Http::Post,
-        cli_only_args: &[],
-        server_only_args: &[(
-            "preview",
-            "the plan `mode=preview` returned; the CLI saves its own copy to disk instead",
-        )],
-    },
 ];
 
 /// What a capability's HTTP operation says about itself in the OpenAPI
@@ -424,12 +412,6 @@ pub const OPERATIONS: &[Operation] = &[
         id: "init",
         summary: "Run first-time setup. Use 'detect' to inspect, 'apply' to write the vault profile and index. The apply reply carries restart_required: true, because the server reads config.toml once, at start.",
         response: "Setup result as JSON",
-    },
-    Operation {
-        name: "migrate",
-        id: "migrate",
-        summary: "Restructure the vault into PARA. 'preview' classifies notes and suggests folder moves, 'apply' performs them, 'undo' restores the last migration.",
-        response: "Migration preview, migration result or undo result, per mode",
     },
 ];
 
@@ -974,8 +956,8 @@ mod tests {
     }
 
     #[test]
-    fn there_are_nineteen_capabilities() {
-        assert_eq!(CAPABILITIES.len(), 19);
+    fn there_are_eighteen_capabilities() {
+        assert_eq!(CAPABILITIES.len(), 18);
     }
 
     /// The operation table is one row per capability the HTTP surface

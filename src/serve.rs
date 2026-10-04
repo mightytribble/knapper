@@ -473,54 +473,6 @@ impl KnapperServer {
     }
 
     #[tool(
-        name = "migrate",
-        description = "Restructure the vault into PARA. Mode 'preview' classifies every note into Projects/Areas/Resources/Archive and returns the proposed moves with confidence scores; 'apply' performs the moves of a preview; 'undo' reverses the last migration."
-    )]
-    async fn migrate(
-        &self,
-        params: Parameters<crate::params::Migrate>,
-    ) -> Result<CallToolResult, McpError> {
-        let vault = self.core.vault_path.clone();
-        match params.0.mode.as_str() {
-            "preview" => {
-                let profile = self.core.profile.clone();
-                let preview = self
-                    .core
-                    .with_reader(move |store| {
-                        crate::migrate::generate_preview(store, &vault, profile.as_ref().as_ref())
-                    })
-                    .await
-                    .map_err(mcp_err)?;
-                to_json_result(&preview)
-            }
-            "apply" => {
-                self.core.writable().map_err(mcp_err)?;
-                // The preview is required here: a dropped key must not
-                // silently apply an unrelated plan (#62).
-                let preview = crate::migrate::resolve_preview(params.0.preview).map_err(mcp_err)?;
-                let result = self
-                    .core
-                    .with_core(move |g| crate::migrate::apply_preview(&preview, g.store, &vault))
-                    .await
-                    .map_err(mcp_err)?;
-                to_json_result(&result)
-            }
-            "undo" => {
-                self.core.writable().map_err(mcp_err)?;
-                let result = self
-                    .core
-                    .with_core(move |g| crate::migrate::undo_last(g.store, &vault))
-                    .await
-                    .map_err(mcp_err)?;
-                to_json_result(&result)
-            }
-            other => Err(invalid_params(format!(
-                "Unknown mode: {other}. Use 'preview', 'apply' or 'undo'."
-            ))),
-        }
-    }
-
-    #[tool(
         name = "delete",
         description = "Delete a note. Soft mode (default) moves it to the archive folder. Hard mode permanently removes it from disk and index."
     )]
@@ -841,11 +793,6 @@ pub const ORIENTATION: &[Orientation] = &[
         group: "Setup",
         clause: "to write the vault profile and index (`mode: detect` or `mode: apply`)",
     },
-    Orientation {
-        capability: "migrate",
-        group: "Migration",
-        clause: "with `mode: preview` to classify notes into PARA folders, `mode: apply` to execute the migration, `mode: undo` to revert",
-    },
 ];
 
 /// The instructions an MCP client is sent on connect, assembled from
@@ -1017,25 +964,6 @@ mod tests {
         );
     }
 
-    /// `migrate` is one tool for three operations (#62), so the mode is the
-    /// one parameter a caller must always send, and the preview it may hold
-    /// from a `preview` call stays reachable.
-    #[test]
-    fn the_migrate_schema_requires_a_mode_and_still_accepts_a_preview() {
-        let schema = schemars::schema_for!(crate::params::Migrate);
-        let json = serde_json::to_value(&schema).unwrap();
-
-        let required: Vec<&str> = json["required"]
-            .as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
-            .unwrap_or_default();
-        assert_eq!(required, vec!["mode"], "got {json}");
-        assert!(
-            json["properties"].get("preview").is_some(),
-            "the preview an apply acts on is not in the schema: {json}"
-        );
-    }
-
     /// The two abjuration-school notes the search tests index.
     const ABJURATION_NOTES: &[(&str, &str)] = &[
         (
@@ -1112,24 +1040,6 @@ mod tests {
         };
         assert!(server.init(super::Parameters(init("apply"))).await.is_err());
         assert!(server.init(super::Parameters(init("detect"))).await.is_ok());
-    }
-
-    /// A server's `apply` acts on the plan its caller sends and no other. The
-    /// copy `knapper migrate --mode preview` saves belongs to the CLI's own
-    /// two-step flow, and an `apply` that fell back to it would move files
-    /// against a plan this caller never saw (#62).
-    #[tokio::test]
-    async fn a_migrate_apply_with_no_preview_is_a_parameter_error() {
-        let (_tmp, server) = indexed_server(crate::config::GroupBy::Chunk);
-        let err = server
-            .migrate(super::Parameters(crate::params::Migrate {
-                mode: "apply".into(),
-                preview: None,
-            }))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
-        assert!(err.message.contains("apply needs a preview"), "got {err:?}");
     }
 
     /// A search asking for one query, with everything but the two per-call

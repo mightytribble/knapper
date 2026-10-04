@@ -44,7 +44,6 @@ through a tunnel; the document names it as its server.
 | POST | `/api/index` | write | Index the configured vault |
 | POST | `/api/reindex-file` | write | Re-index a single file after external edits |
 | POST | `/api/init` | write | First-time onboarding setup (`mode`: detect or apply) |
-| POST | `/api/migrate` | write | PARA migration (`mode`: preview, apply or undo). `apply` requires the `preview` that `preview` returned |
 
 ## Authentication
 

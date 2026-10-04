@@ -897,25 +897,6 @@ pub struct Init {
     pub mode: Option<String>,
 }
 
-/// `apply` moves files, and it moves them against the preview named here. A
-/// misspelled key would read as no key at all and send `apply` to whatever
-/// preview was saved last, so an unknown field is refused (#62).
-#[derive(Debug, Args, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct Migrate {
-    /// `preview`, `apply` or `undo`.
-    #[arg(long)]
-    pub mode: String,
-    /// The preview `apply` acts on. This is the one argument the servers
-    /// take and the CLI does not: a server caller holds the JSON that
-    /// `preview` returned it and passes it back, while the CLI's `preview`
-    /// saves the plan itself and its `apply` reads that copy.
-    // `#[arg(skip)]` keeps it off the command line, where JSON has no spelling.
-    #[arg(skip)]
-    #[serde(default)]
-    pub preview: Option<serde_json::Value>,
-}
-
 #[derive(Debug, Args, Deserialize, JsonSchema)]
 pub struct Validate {
     /// A vault-relative note reference (path or basename) to check one file.
@@ -1085,24 +1066,6 @@ mod tests {
         assert!(
             message.contains("unknown variant") && message.contains("replace"),
             "the error must name the legal values, got: {message}"
-        );
-    }
-
-    /// A misspelled `preview` key would read as no preview at all, and
-    /// `apply` would then move files against whichever plan was saved last.
-    /// The struct refuses the key instead (#62).
-    #[test]
-    fn migrate_refuses_a_key_it_does_not_know() {
-        let good =
-            serde_json::from_str::<Migrate>(r#"{"mode":"apply","preview":{"a":1}}"#).unwrap();
-        assert!(good.preview.is_some());
-
-        let err =
-            serde_json::from_str::<Migrate>(r#"{"mode":"apply","previews":{"a":1}}"#).unwrap_err();
-        let message = err.to_string();
-        assert!(
-            message.contains("unknown field") && message.contains("previews"),
-            "the error must name the key it refused, got: {message}"
         );
     }
 

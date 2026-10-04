@@ -225,28 +225,6 @@ knapper update "Meeting Notes" --section "Action Items" \
 Write `--content=` with an equals sign when the value starts with a `-`, or
 clap reads it as a flag.
 
-## How do I restructure my vault into PARA?
-
-`knapper migrate` classifies notes into Projects, Areas, Resources and
-Archive by heuristic, and the workflow is preview-first:
-
-```bash
-knapper migrate --mode preview   # writes a plan to ~/.knapper/
-knapper migrate --mode apply     # moves the files
-knapper migrate --mode undo      # reverses the last migration
-```
-
-Read `~/.knapper/migration_preview.md` before you apply. The signals are open
-tasks and active status for **Projects**, recurring topic keywords for
-**Areas**, people and reference material for **Resources**, and
-done/inactive/unlinked for **Archive**. A note that matches nothing with
-enough confidence stays where it is, and daily notes and templates are always
-skipped.
-
-The same three modes are available as an MCP tool and an HTTP endpoint, so an
-agent can drive it — but on both of those, `apply` takes the plan that
-`preview` returned; only the CLI reads the copy on disk.
-
 ## Why did my search return nothing?
 
 Because knapper would rather say nothing than hand your agent a plausible

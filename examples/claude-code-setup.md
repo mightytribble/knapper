@@ -66,7 +66,6 @@ command it answers, with `-` written as `_`.
 - `validate` — check vault markdown for structural and indexing problems —
   one note, a scope, or the whole vault — read from disk, with no model loaded
 - `init` — first-time onboarding (`mode`: detect or apply)
-- `migrate` — PARA migration (`mode`: preview, apply or undo)
 
 ## Example interactions
 
