@@ -421,8 +421,10 @@ pub fn request_timeout(config: &HttpConfig) -> Option<std::time::Duration> {
 
 /// The limits every route runs under, from inner to outer: the timeout on
 /// the timed routes alone, then the body limit and the in-flight limit (one
-/// semaphore shared by every route) on all of them, then the two fallbacks. A function of its own so a test
-/// can hand it two toy routers and a timeout of milliseconds.
+/// semaphore shared by every route) on all of them, then the two fallbacks.
+/// `build_router` also puts a body timeout on the write and untimed routes
+/// before it hands them in. A function of its own so a test can hand it two
+/// toy routers and a timeout of milliseconds.
 pub fn with_limits(
     timed: Router<ApiState>,
     untimed: Router<ApiState>,
@@ -460,13 +462,14 @@ pub fn build_router(state: ApiState) -> Router {
             timed = timed.route(path, handler);
         }
     }
-    // A stalled body would hold an in-flight permit for good, and a write is
-    // outside the timeout layer, so its body read is timed on its own.
-    let writes = match timeout {
-        Some(limit) => writes.layer(tower_http::timeout::RequestBodyTimeoutLayer::new(limit)),
-        None => writes,
+    // A stalled body would hold an in-flight permit for good, and a write or
+    // an untimed route is outside the timeout layer, so its body read is
+    // timed on its own.
+    let body_timed = |router: Router<ApiState>| match timeout {
+        Some(limit) => router.layer(tower_http::timeout::RequestBodyTimeoutLayer::new(limit)),
+        None => router,
     };
-    with_limits(timed, untimed.merge(writes), timeout)
+    with_limits(timed, body_timed(untimed.merge(writes)), timeout)
         .layer(cors)
         .with_state(state)
 }
@@ -1181,8 +1184,8 @@ mod tests {
         assert!(vault.join("slow.md").is_file());
     }
 
-    /// A write whose body stalls past the deadline answers the bodyless 408
-    /// and never runs; a read route is not touched by the body timeout.
+    /// A write or index body that stalls past the deadline answers the
+    /// bodyless 408 and never runs; a read route is not touched by the body timeout.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_write_body_that_stalls_is_a_408_and_does_not_run() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1195,23 +1198,26 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, app).await.ok() });
 
         // Headers promise 100 bytes; one chunk arrives and the rest never does.
-        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        stream
-            .write_all(
-                b"POST /api/create HTTP/1.1\r\nhost: x\r\ncontent-type: application/json\r\n\
-                  content-length: 100\r\nconnection: close\r\n\r\n{\"filename\":\"stall\",",
-            )
-            .await
-            .unwrap();
-        let mut raw = Vec::new();
-        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut raw))
-            .await
-            .expect("the stalled body is cut off")
-            .unwrap();
-        let text = String::from_utf8_lossy(&raw);
-        assert!(text.starts_with("HTTP/1.1 408"), "got {text}");
-        assert!(text.ends_with("\r\n\r\n"), "a 408 has no body, got {text}");
-        assert!(!vault.join("stall.md").exists());
+        for path in ["/api/create", "/api/index"] {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let head = format!(
+                "POST {path} HTTP/1.1\r\nhost: x\r\ncontent-type: application/json\r\n\
+                 content-length: 100\r\nconnection: close\r\n\r\n{{\"filename\":\"stall\","
+            );
+            stream.write_all(head.as_bytes()).await.unwrap();
+            let mut raw = Vec::new();
+            tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut raw))
+                .await
+                .expect("the stalled body is cut off")
+                .unwrap();
+            let text = String::from_utf8_lossy(&raw);
+            assert!(text.starts_with("HTTP/1.1 408"), "{path}: got {text}");
+            assert!(
+                text.ends_with("\r\n\r\n"),
+                "{path}: a 408 has no body, got {text}"
+            );
+            assert!(!vault.join("stall.md").exists());
+        }
 
         // A read route on the same server is untouched.
         let mut read = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -1219,7 +1225,10 @@ mod tests {
             .await
             .unwrap();
         let mut raw = Vec::new();
-        read.read_to_end(&mut raw).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), read.read_to_end(&mut raw))
+            .await
+            .expect("the read route answers")
+            .unwrap();
         assert!(String::from_utf8_lossy(&raw).starts_with("HTTP/1.1 200"));
     }
 
@@ -2246,6 +2255,17 @@ mod tests {
             "folder must stay inside the vault: ../escape"
         );
         assert!(!tmp.path().join("escape").exists());
+    }
+
+    #[tokio::test]
+    async fn a_validate_path_that_climbs_out_is_a_bad_request() {
+        let (tmp, state) = indexed_state();
+        std::fs::write(tmp.path().join("secret.md"), "# Sentinel\n").unwrap();
+        let (status, body) = post_json(state, "/api/validate", r#"{"path":"../secret"}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["kind"], "invalid_input");
+        assert_eq!(body["error"], "path must stay inside the vault: ../secret");
+        assert!(!body.to_string().contains("Sentinel"));
     }
 
     #[tokio::test]

@@ -744,6 +744,11 @@ pub fn validate_target(
     limits: &ChunkLimits,
     strict: bool,
 ) -> anyhow::Result<ValidateReport> {
+    // The note reference is the caller's text; it stays in the vault before
+    // anything is read.
+    if let Target::Note(rel) = target {
+        crate::writer::inside_vault(rel, "path")?;
+    }
     let declared = crate::properties::declared_types(root);
 
     // A single note walks names lazily: only if it holds a wikilink.
@@ -1325,5 +1330,33 @@ mod tests {
             "a scope may exclude the notes that carry a declared name"
         );
         assert!(rules_of(&scoped.findings).contains(&Rule::MixedPropertyKinds));
+    }
+
+    /// A `path` that climbs out is refused before any file is read. The
+    /// sentinel sits in `tmp`, beside the vault at `tmp/vault`.
+    #[test]
+    fn a_validate_path_that_climbs_out_is_refused_and_reads_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("vault");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(tmp.path().join("secret.md"), "# Sentinel\n\n[[nowhere]]\n").unwrap();
+        let limits = ChunkLimits {
+            min_chars: 120,
+            target_tokens: 512,
+        };
+        for text in ["../secret", "../secret.md"] {
+            let err =
+                validate_target(&root, &Target::Note(text.into()), &limits, false).unwrap_err();
+            assert_eq!(
+                crate::fault::Fault::of(&err).map(|f| f.kind()),
+                Some("invalid_input"),
+                "{text}"
+            );
+            assert_eq!(
+                err.to_string(),
+                format!("path must stay inside the vault: {text}")
+            );
+            assert!(!format!("{err:#}").contains("Sentinel"));
+        }
     }
 }

@@ -1234,6 +1234,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_validate_path_that_climbs_out_is_invalid_params() {
+        let (tmp, server) = indexed_server(crate::config::GroupBy::Chunk);
+        std::fs::write(tmp.path().join("secret.md"), "# Sentinel\n").unwrap();
+        let err = server
+            .validate(super::Parameters(crate::params::Validate {
+                path: Some("../secret".into()),
+                scope: vec![],
+                all: vec![],
+                any: vec![],
+                none: vec![],
+                strict: false,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
+        assert_eq!(err.data.as_ref().unwrap()["kind"], "invalid_input");
+        assert_eq!(err.message, "path must stay inside the vault: ../secret");
+    }
+
+    #[tokio::test]
     async fn a_move_folder_that_climbs_out_is_invalid_params() {
         let (tmp, server) = indexed_server(crate::config::GroupBy::Chunk);
         let err = server
