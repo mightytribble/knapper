@@ -2253,6 +2253,18 @@ mod tests {
         assert_eq!(reply["kind"], "invalid_input");
     }
 
+    /// Axum's own `Json` limit is 2 MiB; the layer raises it to
+    /// `MAX_BODY_BYTES`, so a body between the two reaches the handler.
+    #[tokio::test]
+    async fn a_body_between_axums_default_and_the_limit_is_not_refused() {
+        let (_tmp, state) = test_api_state();
+        let content = "x".repeat(3 * 1024 * 1024);
+        let body = format!(r#"{{"filename":"big","content":"{content}"}}"#);
+        let (status, reply) = post_json(state, "/api/create", &body).await;
+        assert_ne!(status, StatusCode::BAD_REQUEST, "{reply}");
+        assert_ne!(reply["kind"], "invalid_input", "{reply}");
+    }
+
     #[tokio::test]
     async fn a_read_only_server_refuses_reindex_file() {
         let (_tmp, mut state) = indexed_state();
