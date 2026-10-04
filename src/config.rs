@@ -1066,8 +1066,8 @@ impl Config {
             .collect()
     }
 
-    /// Name every retired table `text` carries, once per process: the
-    /// config is read again on some write paths, and a user needs the
+    /// Name every retired table `text` carries, once per process: a CLI
+    /// command can load the config more than once, and a user needs the
     /// notice once.
     fn warn_retired_tables(text: &str, source: &Path) {
         static WARNED: std::sync::Once = std::sync::Once::new();

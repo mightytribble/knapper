@@ -336,7 +336,7 @@ impl KnapperServer {
             edits,
         };
         let vault = self.core.vault_path.clone();
-        let settings = self.core.index_settings;
+        let config = self.core.config.clone();
         // `update_note` stores the new content hash and writes no chunks, so
         // the re-index runs here, in the same core call (#62). A failure
         // after the write says so, and `record_write` is skipped, so the
@@ -350,7 +350,7 @@ impl KnapperServer {
                     g.store,
                     g.embedder,
                     &vault,
-                    settings,
+                    &config,
                 )
                 .with_context(|| {
                     format!(
@@ -517,14 +517,14 @@ impl KnapperServer {
         self.core.writable().map_err(mcp_err)?;
         let rel_path = params.0.file;
         let vault = self.core.vault_path.clone();
-        let settings = self.core.index_settings;
+        let config = self.core.config.clone();
         let file = rel_path.clone();
         // A path not on disk is a Fault::NotFound from the indexer, which is
         // this surface's INVALID_PARAMS (#62).
         let result = self
             .core
             .with_core(move |g| {
-                crate::indexer::reindex_written_file(&file, g.store, g.embedder, &vault, settings)
+                crate::indexer::reindex_written_file(&file, g.store, g.embedder, &vault, &config)
             })
             .await
             .map_err(mcp_err)?;

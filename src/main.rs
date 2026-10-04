@@ -902,7 +902,7 @@ async fn main() -> Result<()> {
                 &store,
                 &mut embedder,
                 &vault_path,
-                knapper::indexer::IndexSettings::from_config(&cfg),
+                &cfg,
             )
             .with_context(|| {
                 format!(
@@ -998,7 +998,7 @@ async fn main() -> Result<()> {
                 &store,
                 &mut embedder,
                 &vault_path,
-                knapper::indexer::IndexSettings::from_config(&cfg),
+                &cfg,
             )?;
             let output = serde_json::json!({
                 "file": args.file,

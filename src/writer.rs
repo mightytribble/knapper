@@ -3582,17 +3582,10 @@ mod tests {
             ),
         )
         .unwrap();
-        crate::indexer::reindex_written_file(
-            "note.md",
-            &store,
-            &mut embedder,
-            &vault,
-            crate::indexer::IndexSettings {
-                chunk: test_chunk_opts(),
-                embed: EmbedComposition::default(),
-            },
-        )
-        .unwrap();
+        let mut config = crate::config::Config::default();
+        config.set_chunk_options(test_chunk_opts());
+        crate::indexer::reindex_written_file("note.md", &store, &mut embedder, &vault, &config)
+            .unwrap();
 
         let file = store.get_file("note.md").unwrap().unwrap();
         assert!(

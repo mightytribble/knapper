@@ -724,7 +724,7 @@ async fn handle_update(
         edits,
     };
     let vault = state.core.vault_path.clone();
-    let settings = state.core.index_settings;
+    let config = state.core.config.clone();
     // `update_note` stores the new content hash and writes no chunks, so the
     // re-index runs here, in the same core call (#62). A failure after the
     // write says so, and `record_write` is skipped, so the watcher's own
@@ -738,7 +738,7 @@ async fn handle_update(
                 g.store,
                 g.embedder,
                 &vault,
-                settings,
+                &config,
             )
             .with_context(|| {
                 format!(
@@ -900,14 +900,14 @@ async fn handle_reindex_file(
     // It writes the store, so a read-only server refuses it like `index`.
     state.core.writable()?;
     let vault = state.core.vault_path.clone();
-    let settings = state.core.index_settings;
+    let config = state.core.config.clone();
     let file = body.file.clone();
     // A path not on disk is a Fault::NotFound from the indexer, and the
     // classifier answers 404 for it (#60).
     let result = state
         .core
         .with_core(move |g| {
-            crate::indexer::reindex_written_file(&file, g.store, g.embedder, &vault, settings)
+            crate::indexer::reindex_written_file(&file, g.store, g.embedder, &vault, &config)
         })
         .await?;
     Ok(Json(serde_json::json!({
