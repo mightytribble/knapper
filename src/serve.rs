@@ -4,7 +4,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerConfig};
 use rmcp::{ErrorData as McpError, ServiceExt, tool, tool_handler, tool_router};
 
 use crate::config::Config;
@@ -810,8 +810,8 @@ pub fn instructions() -> String {
 
 #[tool_handler]
 impl rmcp::handler::server::ServerHandler for KnapperServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions(instructions())
             .with_server_info(rmcp::model::Implementation::new(
                 "knapper",
@@ -1709,5 +1709,84 @@ mod tests {
             .filter(|f| f["rule"] == "short-section")
             .count();
         assert_eq!(short, 0, "got {report}");
+    }
+
+    /// Writes each JSON-RPC message to a server serving over an in-memory
+    /// pipe, and returns one parsed line per response.
+    async fn exchange_over_stdio(messages: &[serde_json::Value]) -> Vec<serde_json::Value> {
+        use rmcp::ServiceExt;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let (_tmp, server) = indexed_server(crate::config::GroupBy::Chunk);
+        let (client_end, server_end) = tokio::io::duplex(1 << 16);
+        let (server_read, server_write) = tokio::io::split(server_end);
+        let serving = tokio::spawn(server.serve((server_read, server_write)));
+
+        let (client_read, mut client_write) = tokio::io::split(client_end);
+        let mut lines = BufReader::new(client_read).lines();
+        let mut responses = Vec::new();
+        for message in messages {
+            client_write
+                .write_all(format!("{message}\n").as_bytes())
+                .await
+                .unwrap();
+            if message.get("id").is_none() {
+                continue;
+            }
+            let line = tokio::time::timeout(std::time::Duration::from_secs(5), lines.next_line())
+                .await
+                .expect("no response within 5s")
+                .unwrap()
+                .expect("server closed the pipe");
+            responses.push(serde_json::from_str(&line).unwrap());
+        }
+        serving.abort();
+        responses
+    }
+
+    /// A client on the 2026-07-28 protocol may probe with `server/discover`
+    /// and then fall back to the `initialize` handshake. The session that
+    /// follows is a handshake session, so `tools/list` with no `_meta`
+    /// answers the tools rather than refusing for missing per-request
+    /// metadata, as rmcp 3.2 did once a discover had been answered.
+    #[tokio::test]
+    async fn initialize_after_discover_serves_tools_without_request_meta() {
+        let responses = exchange_over_stdio(&[
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 0, "method": "server/discover",
+                "params": {"_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                }},
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": {"name": "test", "version": "0"},
+                },
+            }),
+            serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
+        ])
+        .await;
+
+        assert!(
+            responses[0].get("result").is_some(),
+            "discover: {}",
+            responses[0]
+        );
+        assert_eq!(
+            responses[1]["result"]["protocolVersion"], "2025-11-25",
+            "{}",
+            responses[1]
+        );
+        let tools = responses[2]["result"]["tools"].as_array();
+        assert!(
+            tools.is_some_and(|t| !t.is_empty()),
+            "tools/list: {}",
+            responses[2]
+        );
     }
 }

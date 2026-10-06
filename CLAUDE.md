@@ -87,7 +87,7 @@ Single vault only. Re-indexing a different vault path triggers a confirmation pr
 - `time` (0.3) — date/time handling for frontmatter timestamps
 - `ignore` (0.4) — vault walking with `.gitignore` support
 - `rusqlite` (0.32) — bundled SQLite with FTS5 support
-- `rmcp` (3.2) — MCP server SDK for stdio transport. Carries the 2026-07-28 lifecycle as well as the handshake before it (#109)
+- `rmcp` (3.5) — MCP server SDK for stdio transport. Carries the 2026-07-28 lifecycle as well as the handshake before it (#109); 3.5 is the floor, because 3.2 bound a session that opened with `server/discover` to per-request `_meta`, so a client that fell back to `initialize` had its `tools/list` refused
 - `axum` — HTTP framework for REST API server
 - `tower-http` — CORS and request-timeout middleware for axum
 - `tower` — the in-flight limit, and the layer utilities
