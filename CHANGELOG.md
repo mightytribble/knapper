@@ -3,6 +3,12 @@
 Every entry below the upstream-lineage line names the commit it describes.
 Links resolve against https://github.com/mightytribble/knapper.
 
+## Unreleased
+
+### Fixed
+
+- An MCP client that opens with `server/discover` and falls back to `initialize` is served its tools; its `tools/list` was refused with "request _meta is missing or has malformed required fields: io.modelcontextprotocol/protocolVersion, io.modelcontextprotocol/clientCapabilities", because rmcp 3.2 held the session to the 2026-07-28 lifecycle the discover opened. rmcp is now 3.5. ([`51db594`](https://github.com/mightytribble/knapper/commit/51db594))
+
 ## 0.9.12 (2026-10-03)
 
 Reads under `serve` no longer wait behind a search, a write or the index, and
