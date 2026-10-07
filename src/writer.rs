@@ -1428,6 +1428,62 @@ pub fn delete_note(store: &Store, vault_path: &Path, file: &str, mode: DeleteMod
     Ok(())
 }
 
+/// Restore a note a soft delete moved into the trash, and index it.
+///
+/// The note goes back to its path with `.trash/` taken off, byte for byte:
+/// a soft delete wrote nothing into it. A file already at that path is
+/// refused rather than replaced (#151).
+pub fn undelete_note(
+    file: &str,
+    store: &Store,
+    embedder: &mut impl EmbedModel,
+    embed: EmbedComposition,
+    chunk_opts: ChunkOptions,
+    vault_path: &Path,
+) -> Result<WriteResult> {
+    let trashed = resolve_in_folder(file, vault_path, TRASH_FOLDER, "deleted note")?;
+    let original_path = trashed
+        .strip_prefix(&format!("{TRASH_FOLDER}/"))
+        .expect("resolve_in_folder answers a path under the folder")
+        .to_string();
+    if vault_path.join(&original_path).exists() {
+        bail!(Fault::Conflict(format!(
+            "cannot restore: a file already exists at {original_path}"
+        )));
+    }
+
+    let trashed_path = vault_path.join(&trashed);
+    let content = std::fs::read_to_string(&trashed_path)?;
+    let docid = restore_note(
+        &original_path,
+        &content,
+        "undelete",
+        store,
+        embedder,
+        embed,
+        chunk_opts,
+        vault_path,
+    )?;
+    std::fs::remove_file(&trashed_path)?;
+
+    let folder = original_path
+        .rsplit_once('/')
+        .map(|(f, _)| f.to_string())
+        .unwrap_or_default();
+    Ok(WriteResult {
+        path: original_path,
+        docid,
+        tags: crate::frontmatter::Block::parse(&content)
+            .ok()
+            .flatten()
+            .map(|b| b.list("tags"))
+            .unwrap_or_default(),
+        links_added: vec![],
+        links_suggested: vec![],
+        folder,
+    })
+}
+
 // ── Archive / Unarchive ─────────────────────────────────────────
 
 /// Archive a note: move to archive folder, add archived frontmatter, remove from index.
@@ -1524,14 +1580,17 @@ fn archive_folder(profile: Option<&VaultProfile>) -> &str {
         .trim_matches('/')
 }
 
-/// Every `.md` file under the archive folder, vault-relative, in path order.
-fn archived_notes(vault_path: &Path, archive_folder: &str) -> Result<Vec<String>> {
-    let root = vault_path.join(archive_folder);
+/// Every `.md` file under `folder`, vault-relative, in path order.
+///
+/// Ignore rules do not apply. The folder is one knapper writes notes into,
+/// and a vault that ignores `.trash/` in git still keeps its notes there.
+fn notes_under(vault_path: &Path, folder: &str) -> Result<Vec<String>> {
+    let root = vault_path.join(folder);
     if !root.is_dir() {
         return Ok(Vec::new());
     }
     let mut found = Vec::new();
-    for entry in WalkBuilder::new(&root).standard_filters(true).build() {
+    for entry in WalkBuilder::new(&root).standard_filters(false).build() {
         let entry = entry?;
         let path = entry.path();
         if path.is_file()
@@ -1553,25 +1612,29 @@ fn archived_from(vault_path: &Path, rel: &str) -> Option<String> {
     block.scalar("archived_from")
 }
 
-/// The archived note `file` names, as a vault-relative path.
+/// The note under `folder` that `file` names, as a vault-relative path.
 ///
-/// `archive` takes a note out of the store, and the watcher never watches
-/// the archive folder, so the note is looked for on disk rather than through
-/// [`Store::resolve_file`]. It takes the forms `archive` takes (#100): a path
-/// that is on disk, as before; the note's original path, which `archive`
-/// keeps under the archive folder; a basename, with or without `.md`; and a
-/// `#docid`, of the archived path or of the original one, since `archive`
-/// prints the one and the note was known by the other.
-fn resolve_archived(file: &str, vault_path: &Path, archive_folder: &str) -> Result<String> {
+/// `archive` and a soft delete both take a note out of the store, so the
+/// note is looked for on disk rather than through [`Store::resolve_file`].
+/// It takes the forms those operations take (#100): its path under
+/// `folder`; the path it came from, which is kept under `folder`; a
+/// basename, with or without `.md`; and a `#docid` of either path, or of
+/// the `archived_from` an archived note carries. `noun` names the note in
+/// the refusals: "archived note" or "deleted note".
+fn resolve_in_folder(file: &str, vault_path: &Path, folder: &str, noun: &str) -> Result<String> {
+    let prefix = format!("{folder}/");
     let found: Vec<String> = if let Some(docid) = file
         .strip_prefix('#')
         .filter(|d| d.len() == 6)
         .map(str::to_ascii_lowercase)
     {
-        archived_notes(vault_path, archive_folder)?
+        notes_under(vault_path, folder)?
             .into_iter()
             .filter(|rel| {
                 generate_docid(rel) == docid
+                    || rel
+                        .strip_prefix(&prefix)
+                        .is_some_and(|from| generate_docid(from) == docid)
                     || archived_from(vault_path, rel).is_some_and(|from| {
                         vault_relative(&from, "archived_from")
                             .is_ok_and(|from| generate_docid(&from) == docid)
@@ -1580,7 +1643,7 @@ fn resolve_archived(file: &str, vault_path: &Path, archive_folder: &str) -> Resu
             .collect()
     } else {
         let rel = vault_relative(file, "file")?;
-        if vault_path.join(&rel).is_file() {
+        if rel.starts_with(&prefix) && vault_path.join(&rel).is_file() {
             return Ok(rel);
         }
         let named = if rel.ends_with(".md") {
@@ -1588,14 +1651,14 @@ fn resolve_archived(file: &str, vault_path: &Path, archive_folder: &str) -> Resu
         } else {
             format!("{rel}.md")
         };
-        let original = format!("{archive_folder}/{named}");
+        let original = format!("{prefix}{named}");
         if vault_path.join(&original).is_file() {
             return Ok(original);
         }
         if named.contains('/') {
             Vec::new()
         } else {
-            archived_notes(vault_path, archive_folder)?
+            notes_under(vault_path, folder)?
                 .into_iter()
                 .filter(|a| {
                     a.rsplit('/')
@@ -1606,13 +1669,64 @@ fn resolve_archived(file: &str, vault_path: &Path, archive_folder: &str) -> Resu
         }
     };
     match found.as_slice() {
-        [] => bail!(Fault::NotFound(format!("archived note not found: {file}"))),
+        [] => bail!(Fault::NotFound(format!("{noun} not found: {file}"))),
         [one] => Ok(one.clone()),
         many => bail!(Fault::Ambiguous(format!(
-            "ambiguous archived note '{file}': matches [{}]",
+            "ambiguous {noun} '{file}': matches [{}]",
             many.join(", ")
         ))),
     }
+}
+
+/// Write a restored note at `rel` and index it, or leave no file there.
+///
+/// `archive --undo` and `delete --undo` both end here. The note goes back on
+/// disk, its chunks, vectors, edges and tags go back in the store, and the
+/// links other notes wrote to it resolve again (#108). A failed index
+/// removes the file it wrote, so the note is still where it was restored
+/// from. Returns the note's docid.
+#[allow(clippy::too_many_arguments)]
+fn restore_note(
+    rel: &str,
+    content: &str,
+    created_by: &str,
+    store: &Store,
+    embedder: &mut impl EmbedModel,
+    embed: EmbedComposition,
+    chunk_opts: ChunkOptions,
+    vault_path: &Path,
+) -> Result<String> {
+    let full_path = vault_path.join(rel);
+    if let Some(parent) = full_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    atomic_write(&full_path, content, false)?;
+
+    let chunk_data = precompute_chunks(rel, content, embedder, embed, chunk_opts)?;
+    let content_hash = compute_content_hash(content);
+    let docid = generate_docid(rel);
+    let mtime = file_mtime(&full_path).unwrap_or(0);
+
+    if let Err(e) = store.transaction(|store| -> Result<()> {
+        let file_id =
+            store.insert_file(rel, &content_hash, mtime, &docid, Some(created_by), None)?;
+
+        let start_vid = store.next_vector_id()?;
+        for (seq, c) in chunk_data.iter().enumerate() {
+            let vid = start_vid + seq as u64;
+            store.insert_chunk_with_vector(&c.record(file_id, seq as i64, vid), &c.vector)?;
+            store.insert_vec(vid, &c.vector)?;
+        }
+
+        build_edges_for_file(store, file_id, content, crate::indexer::ContentSource::File)?;
+        crate::indexer::reconcile_links(store, vault_path, &[])?;
+        store.reconcile_file_tags(file_id, &crate::tags::extract(content))?;
+        Ok(())
+    }) {
+        let _ = std::fs::remove_file(&full_path);
+        return Err(e);
+    }
+    Ok(docid)
 }
 
 /// Unarchive a note: move back to original location, strip archive frontmatter, re-index.
@@ -1625,16 +1739,19 @@ pub fn unarchive_note(
     vault_path: &Path,
     profile: Option<&VaultProfile>,
 ) -> Result<WriteResult> {
-    let file = resolve_archived(file, vault_path, archive_folder(profile))?;
+    let file = resolve_in_folder(file, vault_path, archive_folder(profile), "archived note")?;
     let archive_path = vault_path.join(&file);
 
     let content = std::fs::read_to_string(&archive_path)?;
-    let mut block = crate::frontmatter::Block::parse(&content)?.ok_or_else(|| {
-        anyhow::anyhow!("no archived_from in frontmatter — cannot determine original location")
-    })?;
-    let original_path = block.scalar("archived_from").ok_or_else(|| {
-        anyhow::anyhow!("no archived_from in frontmatter — cannot determine original location")
-    })?;
+    // A note under the archive folder with no `archived_from` has no record
+    // of where it came from. That is the caller's to repair (#151).
+    let no_origin = || {
+        anyhow::anyhow!(Fault::InvalidInput(format!(
+            "{file} has no archived_from: knapper cannot tell where it was archived from"
+        )))
+    };
+    let mut block = crate::frontmatter::Block::parse(&content)?.ok_or_else(no_origin)?;
+    let original_path = block.scalar("archived_from").ok_or_else(no_origin)?;
 
     let original_path = vault_relative(&original_path, "archived_from")?;
     let restore_full_path = vault_path.join(&original_path);
@@ -1666,60 +1783,16 @@ pub fn unarchive_note(
         block.render()
     };
 
-    // Ensure target directory
-    if let Some(parent) = restore_full_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    // Write restored file
-    atomic_write(&restore_full_path, &restored_content, false)?;
-
-    // Index the restored note
-    let chunk_data = precompute_chunks(
+    let docid = restore_note(
         &original_path,
         &restored_content,
+        "unarchive",
+        store,
         embedder,
         embed,
         chunk_opts,
+        vault_path,
     )?;
-    let content_hash = compute_content_hash(&restored_content);
-    let docid = generate_docid(&original_path);
-    let mtime = file_mtime(&restore_full_path).unwrap_or(0);
-
-    if let Err(e) = store.transaction(|store| -> Result<()> {
-        let file_id = store.insert_file(
-            &original_path,
-            &content_hash,
-            mtime,
-            &docid,
-            Some("unarchive"),
-            None,
-        )?;
-
-        let start_vid = store.next_vector_id()?;
-        for (seq, c) in chunk_data.iter().enumerate() {
-            let vid = start_vid + seq as u64;
-            store.insert_chunk_with_vector(&c.record(file_id, seq as i64, vid), &c.vector)?;
-            store.insert_vec(vid, &c.vector)?;
-        }
-
-        build_edges_for_file(
-            store,
-            file_id,
-            &restored_content,
-            crate::indexer::ContentSource::File,
-        )?;
-        // The note is back in the index, so the links other notes wrote to it
-        // resolve again (#108).
-        crate::indexer::reconcile_links(store, vault_path, &[])?;
-
-        store.reconcile_file_tags(file_id, &crate::tags::extract(&restored_content))?;
-
-        Ok(())
-    }) {
-        let _ = std::fs::remove_file(&restore_full_path);
-        return Err(e);
-    }
 
     // Remove archived file
     std::fs::remove_file(&archive_path)?;
@@ -4724,6 +4797,233 @@ mod tests {
             "# Old\n"
         );
         assert!(store.get_file("lore/n.md").unwrap().is_some());
+    }
+
+    /// #151's repro: a soft delete and its undo return the note to its
+    /// folder byte for byte, indexed again.
+    #[test]
+    fn a_soft_delete_and_its_undo_return_the_note_byte_for_byte() {
+        let note = "---\ntags: [type/lore]\n---\n\n# N\n\nThe coast road.\n";
+        let (_tmp, store, vault, mut embedder) = vault_with("lore/n.md", note);
+
+        delete_note(&store, &vault, "lore/n.md", DeleteMode::Soft).unwrap();
+        let result = undelete_note(
+            "n",
+            &store,
+            &mut embedder,
+            EmbedComposition::default(),
+            test_chunk_opts(),
+            &vault,
+        )
+        .unwrap();
+
+        assert_eq!(result.path, "lore/n.md");
+        assert_eq!(result.folder, "lore");
+        assert_eq!(
+            std::fs::read_to_string(vault.join("lore/n.md")).unwrap(),
+            note
+        );
+        assert!(!vault.join(".trash/lore/n.md").exists());
+        let row = store.get_file("lore/n.md").unwrap().expect("indexed again");
+        assert!(!store.get_chunks_by_file(row.id).unwrap().is_empty());
+        assert_eq!(row.docid, Some(generate_docid("lore/n.md")));
+    }
+
+    /// The links other notes wrote to a trashed note resolve again once it
+    /// is back (#108).
+    #[test]
+    fn an_undelete_resolves_the_links_waiting_for_the_note() {
+        let (_tmp, store, vault) = vault_with_files(&[
+            ("a.md", "# A\n\nSee [[b]].\n"),
+            ("lore/b.md", "# B\n\nBody.\n"),
+        ]);
+        delete_note(&store, &vault, "lore/b.md", DeleteMode::Soft).unwrap();
+        assert_eq!(store.get_unresolved_links().unwrap().len(), 1);
+
+        undelete_note(
+            "lore/b.md",
+            &store,
+            &mut crate::llm::MockLlm::new(256),
+            EmbedComposition::default(),
+            test_chunk_opts(),
+            &vault,
+        )
+        .unwrap();
+
+        assert!(store.get_unresolved_links().unwrap().is_empty());
+        assert_eq!(
+            outgoing_paths(&store, "a.md"),
+            vec!["lore/b.md".to_string()]
+        );
+    }
+
+    /// Undo finds the note by every form `delete` takes: its path in the
+    /// trash, the path it was deleted from, its basename, and a `#docid` of
+    /// either path.
+    #[test]
+    fn an_undelete_finds_the_note_by_every_form_delete_takes() {
+        let forms = [
+            ".trash/lore/n.md".to_string(),
+            "lore/n.md".to_string(),
+            "n".to_string(),
+            "n.md".to_string(),
+            format!("#{}", generate_docid("lore/n.md")),
+            format!("#{}", generate_docid(".trash/lore/n.md")),
+        ];
+        for form in forms {
+            let (_tmp, store, vault, mut embedder) = vault_with("lore/n.md", "# N\n\nBody.\n");
+            delete_note(&store, &vault, "lore/n.md", DeleteMode::Soft).unwrap();
+            let result = undelete_note(
+                &form,
+                &store,
+                &mut embedder,
+                EmbedComposition::default(),
+                test_chunk_opts(),
+                &vault,
+            )
+            .unwrap_or_else(|e| panic!("{form}: {e}"));
+            assert_eq!(result.path, "lore/n.md", "{form}");
+        }
+    }
+
+    /// The live note at the original path is not the trashed one. Naming the
+    /// path finds the copy in the trash, and restoring it would clobber the
+    /// live note, so it is refused.
+    #[test]
+    fn an_undelete_onto_an_occupied_path_is_a_conflict_and_moves_nothing() {
+        let (_tmp, store, vault, mut embedder) = vault_with("lore/n.md", "# Old\n");
+        delete_note(&store, &vault, "lore/n.md", DeleteMode::Soft).unwrap();
+        std::fs::write(vault.join("lore/n.md"), "# New\n").unwrap();
+
+        let err = undelete_note(
+            "lore/n.md",
+            &store,
+            &mut embedder,
+            EmbedComposition::default(),
+            test_chunk_opts(),
+            &vault,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            crate::fault::Fault::of(&err).map(|f| f.kind()),
+            Some("conflict")
+        );
+        assert_eq!(
+            err.to_string(),
+            "cannot restore: a file already exists at lore/n.md"
+        );
+        assert_eq!(
+            std::fs::read_to_string(vault.join("lore/n.md")).unwrap(),
+            "# New\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(vault.join(".trash/lore/n.md")).unwrap(),
+            "# Old\n"
+        );
+    }
+
+    #[test]
+    fn an_undelete_naming_no_trashed_note_is_not_found() {
+        let (_tmp, store, vault, mut embedder) = vault_with("lore/n.md", "# N\n");
+        delete_note(&store, &vault, "lore/n.md", DeleteMode::Soft).unwrap();
+        std::fs::write(vault.join("live.md"), "# Live\n").unwrap();
+
+        // `live.md` is on disk but not in the trash, so it is not a match.
+        for form in ["m", "#000000", "other/n.md", "live.md"] {
+            let err = undelete_note(
+                form,
+                &store,
+                &mut embedder,
+                EmbedComposition::default(),
+                test_chunk_opts(),
+                &vault,
+            )
+            .unwrap_err();
+            assert_eq!(
+                crate::fault::Fault::of(&err).map(|f| f.kind()),
+                Some("not_found"),
+                "{form}"
+            );
+            assert_eq!(err.to_string(), format!("deleted note not found: {form}"));
+        }
+        assert!(vault.join(".trash/lore/n.md").is_file());
+    }
+
+    #[test]
+    fn an_undelete_of_a_basename_two_trashed_notes_share_is_ambiguous() {
+        let (_tmp, store, vault) = vault_with_files(&[("a/n.md", "# A\n"), ("b/n.md", "# B\n")]);
+        delete_note(&store, &vault, "a/n.md", DeleteMode::Soft).unwrap();
+        delete_note(&store, &vault, "b/n.md", DeleteMode::Soft).unwrap();
+
+        let err = undelete_note(
+            "n",
+            &store,
+            &mut crate::llm::MockLlm::new(256),
+            EmbedComposition::default(),
+            test_chunk_opts(),
+            &vault,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            crate::fault::Fault::of(&err).map(|f| f.kind()),
+            Some("ambiguous")
+        );
+        assert_eq!(
+            err.to_string(),
+            "ambiguous deleted note 'n': matches [.trash/a/n.md, .trash/b/n.md]"
+        );
+    }
+
+    /// A vault that ignores `.trash/` in git still keeps its notes there,
+    /// so undo looks past ignore rules.
+    #[test]
+    fn an_undelete_finds_a_note_the_vault_gitignores() {
+        let (_tmp, store, vault, mut embedder) = vault_with("lore/n.md", "# N\n");
+        std::fs::write(vault.join(".gitignore"), ".trash/\n").unwrap();
+        delete_note(&store, &vault, "lore/n.md", DeleteMode::Soft).unwrap();
+
+        let result = undelete_note(
+            "n",
+            &store,
+            &mut embedder,
+            EmbedComposition::default(),
+            test_chunk_opts(),
+            &vault,
+        )
+        .unwrap();
+        assert_eq!(result.path, "lore/n.md");
+    }
+
+    /// A note in the archive folder with no `archived_from` has no record of
+    /// where it came from. That is the caller's to repair, so it is
+    /// `invalid_input` and not a server error (#151).
+    #[test]
+    fn an_unarchive_of_a_note_with_no_archived_from_is_invalid_input() {
+        let (_tmp, store, vault, mut embedder) = vault_with("lore/n.md", "# N\n");
+        std::fs::create_dir_all(vault.join("04-Archive")).unwrap();
+        std::fs::write(vault.join("04-Archive/n.md"), "# N\n").unwrap();
+
+        let err = unarchive_note(
+            "04-Archive/n.md",
+            &store,
+            &mut embedder,
+            EmbedComposition::default(),
+            test_chunk_opts(),
+            &vault,
+            None,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            crate::fault::Fault::of(&err).map(|f| f.kind()),
+            Some("invalid_input")
+        );
+        assert_eq!(
+            err.to_string(),
+            "04-Archive/n.md has no archived_from: knapper cannot tell where it was archived from"
+        );
     }
 
     /// Archiving takes the note out of the index, so the links to it break the
