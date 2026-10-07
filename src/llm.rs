@@ -835,14 +835,49 @@ impl HfModelUri {
     }
 }
 
-/// Download a file with progress bar and optional SHA256 verification. Retries once on failure.
+/// The agent every download goes through.
+///
+/// ureq's default agent has a 30 s connect timeout and no read timeout, so one
+/// stalled request could outlast an MCP client's whole connect budget (#149).
+/// The read timeout bounds each read and not the transfer, so a multi-GB model
+/// still downloads.
+fn download_agent() -> &'static ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .timeout_connect(std::time::Duration::from_secs(10))
+            .timeout_read(std::time::Duration::from_secs(30))
+            .build()
+    })
+}
+
+/// Why a download failed, as far as asking again is concerned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FetchFailure {
+    /// The server answered and the answer will not change: a 401 from a gated
+    /// repo, a 404 from a repo that holds no such file.
+    Permanent,
+    /// A 429, a 5xx, or no answer at all.
+    Transient,
+}
+
+fn classify_download_error(err: &anyhow::Error) -> FetchFailure {
+    match err.downcast_ref::<ureq::Error>() {
+        Some(e) if !crate::embed_api::retryable(e) => FetchFailure::Permanent,
+        _ => FetchFailure::Transient,
+    }
+}
+
+/// Download a file with progress bar and optional SHA256 verification.
+/// Retries once, unless the server's answer was one a retry would repeat.
 pub fn download_model(url: &str, dest: &Path, expected_sha256: Option<&str>) -> Result<()> {
     fn try_download(url: &str, dest: &Path, expected_sha256: Option<&str>) -> Result<()> {
         tracing::info!("downloading {} -> {}", url, dest.display());
 
-        let resp = ureq::get(url)
+        let resp = download_agent()
+            .get(url)
             .call()
-            .map_err(|e| anyhow::anyhow!("HTTP GET {url}: {e}"))?;
+            .map_err(|e| anyhow::Error::new(e).context(format!("HTTP GET {url}")))?;
 
         let total_size: u64 = resp
             .header("Content-Length")
@@ -897,9 +932,11 @@ pub fn download_model(url: &str, dest: &Path, expected_sha256: Option<&str>) -> 
         Ok(())
     }
 
-    // Try once, retry on failure.
     match try_download(url, dest, expected_sha256) {
         Ok(()) => Ok(()),
+        Err(first_err) if classify_download_error(&first_err) == FetchFailure::Permanent => {
+            Err(first_err)
+        }
         Err(first_err) => {
             tracing::warn!("download failed, retrying: {first_err:#}");
             let _ = std::fs::remove_file(dest);
@@ -1028,32 +1065,25 @@ fn load_tokenizer_for_model(
     )
 }
 
-/// Try downloading tokenizer.json from candidate HuggingFace repos.
-///
-/// Returns the tokenizer with the path it was read from, so the caller can
-/// digest the artifact rather than trust the repo name it was fetched under.
-fn try_external_tokenizer(
-    uri: &HfModelUri,
-    models_dir: &Path,
-) -> Option<(tokenizers::Tokenizer, PathBuf)> {
-    let mut candidates: Vec<String> = vec![uri.repo.clone()];
+/// The HuggingFace repos a GGUF repo's tokenizer.json is looked for in, in order.
+fn tokenizer_candidates(repo: &str) -> Vec<String> {
+    let mut candidates: Vec<String> = vec![repo.to_string()];
 
     // Non-GGUF variant: "org/model-GGUF" → "org/model"
-    let base_repo = uri.repo.trim_end_matches("-GGUF").to_string();
-    if base_repo != uri.repo {
+    let base_repo = repo.trim_end_matches("-GGUF").to_string();
+    if base_repo != repo {
         candidates.push(base_repo);
     }
 
     // Known upstream repos for default models (GGUF repos rarely ship tokenizers).
-    let model_lower = uri.repo.to_lowercase();
+    let model_lower = repo.to_lowercase();
     if model_lower.contains("all-minilm") {
         candidates.push("sentence-transformers/all-MiniLM-L6-v2".to_string());
     } else if model_lower.contains("embeddinggemma") {
         candidates.push("google/embeddinggemma-300m".to_string());
         candidates.push("google/gemma-2b".to_string());
     } else if model_lower.contains("qwen3") {
-        let base_name = uri
-            .repo
+        let base_name = repo
             .rsplit('/')
             .next()
             .unwrap_or("")
@@ -1063,27 +1093,99 @@ fn try_external_tokenizer(
             candidates.push(format!("Qwen/{base_name}"));
         }
     }
+    candidates
+}
 
-    for repo in &candidates {
-        let tok_uri = HfModelUri {
+/// Find a tokenizer.json for the model among its candidate repos, cached or
+/// downloaded.
+///
+/// Returns the tokenizer with the path it was read from, so the caller can
+/// digest the artifact rather than trust the repo name it was fetched under.
+fn try_external_tokenizer(
+    uri: &HfModelUri,
+    models_dir: &Path,
+) -> Option<(tokenizers::Tokenizer, PathBuf)> {
+    let marker = gguf_tokenizer_marker(&uri.cache_path(models_dir));
+    find_external_tokenizer(
+        &tokenizer_candidates(&uri.repo),
+        models_dir,
+        &marker,
+        |tok_uri| {
+            ensure_model(tok_uri, models_dir).map_err(|e| {
+                tracing::info!("no tokenizer.json from {}: {e:#}", tok_uri.repo);
+                classify_download_error(&e)
+            })
+        },
+    )
+}
+
+/// The file beside a model's GGUF that says none of its candidate repos would
+/// serve a tokenizer.json, so the GGUF's own tokenizer is the one it uses.
+///
+/// The lookup runs on every `serve` start, before the MCP handshake, and for
+/// the default embedder every candidate is gated or empty: without the record
+/// each start asked them all again (#149). Deleting the file asks again.
+fn gguf_tokenizer_marker(model_path: &Path) -> PathBuf {
+    let mut name = model_path.as_os_str().to_owned();
+    name.push(".tokenizer-from-gguf");
+    PathBuf::from(name)
+}
+
+/// The lookup [`try_external_tokenizer`] runs, with the download passed in.
+///
+/// Three passes, cheapest first:
+///
+/// 1. Every candidate's cached tokenizer.json, with no request. Asking the
+///    network for candidate 1 before reading candidate 2's cache cost a Qwen3
+///    model a 404 on every start.
+/// 2. The marker: a model every repo already refused uses its GGUF's
+///    tokenizer, and keeps using it. That is also what keeps the identity
+///    `embedding_fingerprint` folds in from changing under a built index.
+/// 3. The network, one candidate at a time. A permanent refusal moves to the
+///    next; a transient failure ends the lookup, since every candidate is on
+///    the same host and would wait out the same timeout. Only when all of them
+///    refused is the marker written — an offline start proves nothing.
+fn find_external_tokenizer(
+    candidates: &[String],
+    models_dir: &Path,
+    marker: &Path,
+    mut fetch: impl FnMut(&HfModelUri) -> std::result::Result<PathBuf, FetchFailure>,
+) -> Option<(tokenizers::Tokenizer, PathBuf)> {
+    let tok_uris: Vec<HfModelUri> = candidates
+        .iter()
+        .map(|repo| HfModelUri {
             repo: repo.clone(),
             filename: "tokenizer.json".to_string(),
-        };
-        let tok_path = tok_uri.cache_path(models_dir);
+        })
+        .collect();
 
+    for tok_uri in &tok_uris {
+        let tok_path = tok_uri.cache_path(models_dir);
         if tok_path.exists()
             && let Ok(tok) = tokenizers::Tokenizer::from_file(&tok_path)
         {
             return Some((tok, tok_path));
         }
+    }
 
-        if let Ok(p) = ensure_model(&tok_uri, models_dir)
-            && let Ok(tok) = tokenizers::Tokenizer::from_file(&p)
-        {
-            return Some((tok, p));
+    if marker.exists() {
+        return None;
+    }
+
+    for tok_uri in &tok_uris {
+        match fetch(tok_uri) {
+            Ok(p) => match tokenizers::Tokenizer::from_file(&p) {
+                Ok(tok) => return Some((tok, p)),
+                Err(e) => tracing::warn!("{} is not a usable tokenizer: {e}", p.display()),
+            },
+            Err(FetchFailure::Permanent) => {}
+            Err(FetchFailure::Transient) => return None,
         }
     }
 
+    if let Err(e) = std::fs::write(marker, "") {
+        tracing::warn!("recording {}: {e}", marker.display());
+    }
     None
 }
 
@@ -2068,6 +2170,137 @@ mod tests {
         assert!(
             defaults.embed_uri.contains("embeddinggemma"),
             "default embed model should be embeddinggemma"
+        );
+    }
+
+    // ── External tokenizer lookup (#149) ───────────────────────────────────
+
+    /// The smallest tokenizer.json `tokenizers` will load.
+    fn write_tokenizer_json(path: &Path) {
+        std::fs::write(
+            path,
+            r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],
+                "normalizer":null,"pre_tokenizer":{"type":"Whitespace"},
+                "post_processor":null,"decoder":null,
+                "model":{"type":"WordLevel","vocab":{"[UNK]":0,"a":1},"unk_token":"[UNK]"}}"#,
+        )
+        .unwrap();
+    }
+
+    fn candidates() -> Vec<String> {
+        vec![
+            "org/model-GGUF".into(),
+            "org/model".into(),
+            "up/model".into(),
+        ]
+    }
+
+    #[test]
+    fn a_cached_tokenizer_answers_before_any_candidate_is_fetched() {
+        let dir = tempfile::tempdir().unwrap();
+        let cached = HfModelUri {
+            repo: "up/model".into(),
+            filename: "tokenizer.json".into(),
+        }
+        .cache_path(dir.path());
+        write_tokenizer_json(&cached);
+        let marker = dir.path().join("model.gguf.tokenizer-from-gguf");
+
+        let mut fetched = Vec::new();
+        let found = find_external_tokenizer(&candidates(), dir.path(), &marker, |uri| {
+            fetched.push(uri.repo.clone());
+            Err(FetchFailure::Permanent)
+        });
+
+        assert_eq!(found.map(|(_, p)| p), Some(cached));
+        assert!(
+            fetched.is_empty(),
+            "a startup with a cached tokenizer makes no request: {fetched:?}"
+        );
+    }
+
+    #[test]
+    fn permanent_failures_are_remembered_so_the_next_startup_asks_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("model.gguf.tokenizer-from-gguf");
+
+        let mut fetched = 0;
+        let found = find_external_tokenizer(&candidates(), dir.path(), &marker, |_| {
+            fetched += 1;
+            Err(FetchFailure::Permanent)
+        });
+        assert!(found.is_none());
+        assert_eq!(fetched, 3, "each candidate is asked once");
+        assert!(marker.exists(), "an answer every repo refused is recorded");
+
+        let found = find_external_tokenizer(&candidates(), dir.path(), &marker, |_| {
+            panic!("the marker must stop the lookup before the network")
+        });
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn a_transport_failure_ends_the_lookup_and_is_not_remembered() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("model.gguf.tokenizer-from-gguf");
+
+        let mut fetched = 0;
+        let found = find_external_tokenizer(&candidates(), dir.path(), &marker, |_| {
+            fetched += 1;
+            Err(FetchFailure::Transient)
+        });
+        assert!(found.is_none());
+        assert_eq!(
+            fetched, 1,
+            "the other candidates are on the same host; asking them waits out \
+             the same timeout again"
+        );
+        assert!(
+            !marker.exists(),
+            "an offline startup says nothing about whether the repos have one"
+        );
+    }
+
+    #[test]
+    fn a_fetched_tokenizer_is_used_and_records_no_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("model.gguf.tokenizer-from-gguf");
+        let fetched_path = dir.path().join("fetched-tokenizer.json");
+        write_tokenizer_json(&fetched_path);
+
+        let found = find_external_tokenizer(&candidates(), dir.path(), &marker, |uri| {
+            if uri.repo == "org/model" {
+                Ok(fetched_path.clone())
+            } else {
+                Err(FetchFailure::Permanent)
+            }
+        });
+        assert_eq!(found.map(|(_, p)| p), Some(fetched_path));
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn a_client_error_is_permanent_and_a_server_error_is_not() {
+        let status = |code| {
+            let resp = ureq::Response::new(code, "status", "").unwrap();
+            anyhow::Error::new(ureq::Error::Status(code, resp)).context("HTTP GET x")
+        };
+        for code in [401, 403, 404] {
+            assert_eq!(
+                classify_download_error(&status(code)),
+                FetchFailure::Permanent
+            );
+        }
+        for code in [429, 500, 503] {
+            assert_eq!(
+                classify_download_error(&status(code)),
+                FetchFailure::Transient
+            );
+        }
+        assert_eq!(
+            classify_download_error(&anyhow::anyhow!("read: connection reset")),
+            FetchFailure::Transient,
+            "an error that is not an HTTP status is worth another try"
         );
     }
 

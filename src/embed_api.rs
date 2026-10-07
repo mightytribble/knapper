@@ -72,7 +72,7 @@ impl<P: EmbedProvider> ApiEmbedder<P> {
 // Retryable: a 429, any 5xx, or a transport-level failure (connect/timeout/
 // read). Any other 4xx is the caller's own bad request and retrying it would
 // only repeat the same rejection.
-fn retryable(err: &ureq::Error) -> bool {
+pub(crate) fn retryable(err: &ureq::Error) -> bool {
     match err {
         ureq::Error::Status(code, _) => *code == 429 || *code >= 500,
         ureq::Error::Transport(_) => true,
