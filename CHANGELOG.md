@@ -7,6 +7,7 @@ Links resolve against https://github.com/mightytribble/knapper.
 
 ### Fixed
 
+- `knapper serve` no longer asks Hugging Face for a tokenizer.json on every start. With the default embedder every candidate repo is gated or empty, so each start made up to eight requests before the MCP handshake and could outlast a client's connect timeout (#149). A model whose repos all refuse is recorded beside its GGUF (`<model>.gguf.tokenizer-from-gguf`; delete it to ask again), a cached tokenizer is found with no request, a 401, 403 or 404 is not retried, and downloads time out: 10 s to connect, 30 s per read. Nothing re-indexes. ([`c9a0956`](https://github.com/mightytribble/knapper/commit/c9a0956))
 - An MCP client that opens with `server/discover` and falls back to `initialize` is served its tools; its `tools/list` was refused with "request _meta is missing or has malformed required fields: io.modelcontextprotocol/protocolVersion, io.modelcontextprotocol/clientCapabilities", because rmcp 3.2 held the session to the 2026-07-28 lifecycle the discover opened. rmcp is now 3.5. ([`51db594`](https://github.com/mightytribble/knapper/commit/51db594))
 
 ## 0.9.12 (2026-10-03)
