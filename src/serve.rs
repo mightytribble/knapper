@@ -483,20 +483,10 @@ impl KnapperServer {
         self.core.writable().map_err(mcp_err)?;
         let p = params.0;
         let mode = crate::writer::DeleteMode::from(p.mode);
-        let archive_folder = self
-            .core
-            .profile
-            .as_ref()
-            .as_ref()
-            .and_then(|pr| pr.structure.folders.archive.as_deref())
-            .unwrap_or("04-Archive")
-            .to_string();
         let vault = self.core.vault_path.clone();
         let file = p.file.clone();
         self.core
-            .with_core(move |g| {
-                crate::writer::delete_note(g.store, &vault, &file, mode, &archive_folder)
-            })
+            .with_core(move |g| crate::writer::delete_note(g.store, &vault, &file, mode))
             .await
             .map_err(mcp_err)?;
         let result = serde_json::json!({

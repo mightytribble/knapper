@@ -879,18 +879,10 @@ async fn handle_delete(
     authorize(&headers, &state, true)?;
     state.core.writable()?;
     let mode = DeleteMode::from(body.mode);
-    let archive_folder = state
-        .core
-        .profile
-        .as_ref()
-        .as_ref()
-        .and_then(|p| p.structure.folders.archive.as_deref())
-        .unwrap_or("04-Archive")
-        .to_string();
     let vault = state.core.vault_path.clone();
     let file = body.file.clone();
     core_within(&state, move |g| {
-        writer::delete_note(g.store, &vault, &file, mode, &archive_folder)
+        writer::delete_note(g.store, &vault, &file, mode)
     })
     .await?;
     Ok(Json(serde_json::json!({

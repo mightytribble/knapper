@@ -965,19 +965,9 @@ async fn main() -> Result<()> {
         }
 
         Command::Delete(args) => {
-            let (store, vault_path, profile) = open_vault(&data_dir)?;
+            let (store, vault_path, _profile) = open_vault(&data_dir)?;
             let delete_mode = knapper::writer::DeleteMode::from(args.mode);
-            let archive_folder = profile
-                .as_ref()
-                .and_then(|p| p.structure.folders.archive.as_deref())
-                .unwrap_or("04-Archive");
-            knapper::writer::delete_note(
-                &store,
-                &vault_path,
-                &args.file,
-                delete_mode,
-                archive_folder,
-            )?;
+            knapper::writer::delete_note(&store, &vault_path, &args.file, delete_mode)?;
             if cli.json {
                 println!(
                     "{}",

@@ -1369,9 +1369,13 @@ pub fn move_note(
 
 // ── Delete ──────────────────────────────────────────────────────
 
+/// The folder a soft delete moves a note into. It is Obsidian's own trash,
+/// and it is hidden, so the vault walk and the watcher never see it.
+pub const TRASH_FOLDER: &str = ".trash";
+
 #[derive(Debug, Clone)]
 pub enum DeleteMode {
-    /// Move the file to the archive folder, update the store path.
+    /// Move the file to `.trash` under its whole path, and out of the index.
     Soft,
     /// Remove the file from disk and purge all store data.
     Hard,
@@ -1379,78 +1383,49 @@ pub enum DeleteMode {
 
 /// Delete a note from the vault.
 ///
-/// - `Soft`: move the file to `archive_folder` and update the store record (path only).
-///   The note remains on disk but is relocated. No index rebuild — it stays searchable
-///   under its new path.
-/// - `Hard`: remove the file from disk and call `store.delete_file_hard()` to purge all
-///   associated chunks, edges, FTS, and vector data.
-pub fn delete_note(
-    store: &Store,
-    vault_path: &Path,
-    file: &str,
-    mode: DeleteMode,
-    archive_folder: &str,
-) -> Result<()> {
+/// - `Soft`: move the file to `.trash/<path>` and take it out of the index.
+///   The path under `.trash` records where it came from, so the file is not
+///   edited and an undo can put it back (#151).
+/// - `Hard`: remove the file from disk and purge all its store data.
+pub fn delete_note(store: &Store, vault_path: &Path, file: &str, mode: DeleteMode) -> Result<()> {
     let file_record = store.require_file(file)?;
 
     let old_path = vault_path.join(&file_record.path);
-    // The notes that link to this one, read before the row moves or goes: the
-    // edges go with it, and only a re-derivation of those notes records what
-    // their links now name (#108).
+    // The notes that link to this one, read before the row goes: the edges go
+    // with it, and only a re-derivation of those notes records what their
+    // links now name (#108).
     let linking = crate::indexer::sources_linking_to(store, file_record.id)?;
+    let released_tags = store.file_tag_ids(file_record.id)?;
 
     match mode {
         DeleteMode::Soft => {
-            // Build destination path inside archive_folder
-            let basename = std::path::Path::new(&file_record.path)
-                .file_name()
-                .ok_or_else(|| {
-                    anyhow::anyhow!("cannot determine filename for: {}", file_record.path)
-                })?;
-            let new_rel_path = format!(
-                "{}/{}",
-                archive_folder.trim_end_matches('/'),
-                basename.to_string_lossy()
-            );
+            let new_rel_path = format!("{TRASH_FOLDER}/{}", file_record.path);
             let new_full_path = vault_path.join(&new_rel_path);
-
-            // Ensure target directory exists
+            // A second copy would replace the first, and the first is the
+            // only record of that note.
+            if new_full_path.exists() {
+                bail!(Fault::Conflict(format!(
+                    "the trash already holds {new_rel_path}: restore or remove it first, or delete with mode hard"
+                )));
+            }
             if let Some(parent) = new_full_path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-
-            // A soft delete relocates the note and leaves it indexed, so it is
-            // the same operation `move_note` performs and it moves the row the
-            // same way. It used to delete the row and insert a fresh one, which
-            // cascaded the note's chunks, vectors, keyword rows and edges away
-            // and put none of them back — the note stayed in `files` and left
-            // every search, which is issue #27's failure in this path.
-            // `update_file_path` keeps the id, and everything keyed on the id
-            // follows: the chunks, the tag rows and the unresolved links (#98).
-            //
-            // Only the docid is recomputed. It is a hash of the path, so it
-            // moves when the path does; the content does not change, so the
-            // stored hash and the tags still describe the file.
-            let new_docid = generate_docid(&new_rel_path);
-            store.update_file_path(&file_record.path, &new_rel_path, &new_docid)?;
-
-            // The store is consistent before the disk changes, so a failed
-            // rename leaves the note where the store says it is.
+            // The file moves before the store changes, so a failed rename
+            // leaves the note indexed where it is.
             std::fs::rename(&old_path, &new_full_path)?;
-
-            crate::indexer::reconcile_links(store, vault_path, &linking)?;
-            Ok(())
         }
         DeleteMode::Hard => {
-            // Delete disk file first, then purge store
-            let released_tags = store.file_tag_ids(file_record.id)?;
             std::fs::remove_file(&old_path)?;
-            store.delete_file_hard(&file_record.path)?;
-            store.prune_unused_tags(&released_tags)?;
-            crate::indexer::reconcile_links(store, vault_path, &linking)?;
-            Ok(())
         }
     }
+
+    store.transaction(|store| {
+        store.delete_file_hard(&file_record.path)?;
+        store.prune_unused_tags(&released_tags)
+    })?;
+    crate::indexer::reconcile_links(store, vault_path, &linking)?;
+    Ok(())
 }
 
 // ── Archive / Unarchive ─────────────────────────────────────────
@@ -2677,29 +2652,6 @@ mod tests {
     }
 
     #[test]
-    fn test_delete_note_soft() {
-        let (tmp, store, root) = setup_vault();
-        std::fs::create_dir_all(root.join("04-Archive")).unwrap();
-        std::fs::write(root.join("deleteme.md"), "# Delete me").unwrap();
-        store
-            .insert_file("deleteme.md", "hash", 100, "del123", None, None)
-            .unwrap();
-
-        delete_note(
-            &store,
-            &root,
-            "deleteme.md",
-            DeleteMode::Soft,
-            "04-Archive/",
-        )
-        .unwrap();
-
-        assert!(!root.join("deleteme.md").exists());
-        assert!(root.join("04-Archive/deleteme.md").exists());
-        drop(tmp);
-    }
-
-    #[test]
     fn test_delete_note_hard() {
         let (tmp, store, root) = setup_vault();
         std::fs::write(root.join("gone.md"), "# Gone forever").unwrap();
@@ -2707,7 +2659,7 @@ mod tests {
             .insert_file("gone.md", "hash", 100, "gon123", None, None)
             .unwrap();
 
-        delete_note(&store, &root, "gone.md", DeleteMode::Hard, "").unwrap();
+        delete_note(&store, &root, "gone.md", DeleteMode::Hard).unwrap();
 
         assert!(!root.join("gone.md").exists());
         assert!(store.get_file("gone.md").unwrap().is_none());
@@ -4526,7 +4478,7 @@ mod tests {
             "the note reports one broken link while it exists"
         );
 
-        delete_note(&store, &vault, "gone.md", DeleteMode::Hard, "04-Archive/").unwrap();
+        delete_note(&store, &vault, "gone.md", DeleteMode::Hard).unwrap();
 
         assert!(
             store.get_unresolved_links().unwrap().is_empty(),
@@ -4567,57 +4519,6 @@ mod tests {
             store.get_unresolved_links().unwrap(),
             vec![("lore/n.md".to_string(), "Nowhere".to_string())],
             "the link is reported against the path the note now has"
-        );
-    }
-
-    /// A soft delete moves the note and leaves it indexed, so it is still
-    /// searchable under its new path — which is what `delete_note` documents.
-    ///
-    /// It was indexed and unsearchable: the path change was a `delete_file`
-    /// plus an `insert_file`, and the cascade off the old row took the note's
-    /// chunks, its vectors, its keyword rows and its edges while nothing put
-    /// them back. That is issue #27's failure, fixed in `move_note` and left
-    /// live here. `update_file_path` is the primitive that keeps the id, and
-    /// keeping the id keeps all of it — the note's unresolved links included,
-    /// since #98 keys those on the id too.
-    #[test]
-    fn a_soft_delete_keeps_the_note_indexed_under_its_new_path() {
-        let (_tmp, store, vault, _embedder) = vault_with(
-            "Saltmere.md",
-            "# Saltmere\n\nThe coast road runs north to [[Nowhere]].\n",
-        );
-        let before = store.get_file("Saltmere.md").unwrap().unwrap();
-        let chunks_before = store.get_chunks_by_file(before.id).unwrap().len();
-        assert!(chunks_before > 0, "the note has chunks to begin with");
-
-        delete_note(
-            &store,
-            &vault,
-            "Saltmere.md",
-            DeleteMode::Soft,
-            "04-Archive/",
-        )
-        .unwrap();
-
-        let after = store
-            .get_file("04-Archive/Saltmere.md")
-            .unwrap()
-            .expect("the note is indexed at its new path");
-        assert_eq!(after.id, before.id, "the row moves; it is not replaced");
-        assert_eq!(
-            store.get_chunks_by_file(after.id).unwrap().len(),
-            chunks_before,
-            "and its chunks move with it"
-        );
-        assert_eq!(
-            after.docid.as_deref(),
-            Some(generate_docid("04-Archive/Saltmere.md").as_str()),
-            "the docid is derived from the path, so it follows the path"
-        );
-        assert_eq!(
-            store.get_unresolved_links().unwrap(),
-            vec![("04-Archive/Saltmere.md".to_string(), "Nowhere".to_string())],
-            "and so do the broken links it reports"
         );
     }
 
@@ -4708,13 +4609,121 @@ mod tests {
         assert!(store.get_unresolved_links().unwrap().is_empty());
         assert_eq!(outgoing_paths(&store, "a.md"), vec!["b.md".to_string()]);
 
-        delete_note(&store, &vault, "b.md", DeleteMode::Hard, "04-Archive/").unwrap();
+        delete_note(&store, &vault, "b.md", DeleteMode::Hard).unwrap();
 
         assert_eq!(
             store.get_unresolved_links().unwrap(),
             vec![("a.md".to_string(), "b".to_string())],
             "A still writes the link, and it now names nothing"
         );
+    }
+
+    /// A soft delete moves the note into `.trash` under its whole path and
+    /// leaves the file as it was: the path is the record of where it came
+    /// from, so undo needs nothing written into the note (#151).
+    #[test]
+    fn a_soft_delete_moves_the_note_into_the_trash_under_its_whole_path() {
+        let note =
+            "---\ntags: [type/lore]\n---\n\n# N\n\nThe coast road runs north to [[Nowhere]].\n";
+        let (_tmp, store, vault, _embedder) = vault_with("lore/n.md", note);
+
+        delete_note(&store, &vault, "lore/n.md", DeleteMode::Soft).unwrap();
+
+        assert!(!vault.join("lore/n.md").exists());
+        assert_eq!(
+            std::fs::read_to_string(vault.join(".trash/lore/n.md")).unwrap(),
+            note,
+            "the file is moved, not rewritten"
+        );
+    }
+
+    /// A trashed note is out of the index: its row, its chunks, its broken
+    /// links and the tags only it carried all go.
+    #[test]
+    fn a_soft_delete_takes_the_note_out_of_the_index() {
+        let note =
+            "---\ntags: [type/lore]\n---\n\n# N\n\nThe coast road runs north to [[Nowhere]].\n";
+        let (_tmp, store, vault, _embedder) = vault_with("lore/n.md", note);
+        assert_eq!(store.get_unresolved_links().unwrap().len(), 1);
+
+        delete_note(&store, &vault, "lore/n.md", DeleteMode::Soft).unwrap();
+
+        assert!(store.get_file("lore/n.md").unwrap().is_none());
+        assert!(store.get_file(".trash/lore/n.md").unwrap().is_none());
+        assert!(store.get_unresolved_links().unwrap().is_empty());
+        assert!(
+            store.tags_under(None).unwrap().is_empty(),
+            "a tag only the trashed note carried is pruned"
+        );
+    }
+
+    /// The notes that linked to a trashed note now link to nothing (#108).
+    #[test]
+    fn a_soft_delete_records_the_links_it_breaks() {
+        let (_tmp, store, vault) = vault_with_files(&[
+            ("a.md", "# A\n\nSee [[b]].\n"),
+            ("lore/b.md", "# B\n\nBody.\n"),
+        ]);
+        assert!(store.get_unresolved_links().unwrap().is_empty());
+
+        delete_note(&store, &vault, "lore/b.md", DeleteMode::Soft).unwrap();
+
+        assert_eq!(
+            store.get_unresolved_links().unwrap(),
+            vec![("a.md".to_string(), "b".to_string())]
+        );
+    }
+
+    /// `.trash` is hidden, so a later index walks past it and the trashed
+    /// note stays out.
+    #[test]
+    fn an_index_after_a_soft_delete_leaves_the_trashed_note_out() {
+        let (_tmp, store, vault, mut embedder) = vault_with("lore/n.md", "# N\n\nBody.\n");
+        delete_note(&store, &vault, "lore/n.md", DeleteMode::Soft).unwrap();
+
+        let config = crate::config::Config::default();
+        crate::indexer::run_index_shared(
+            &vault,
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut embedder,
+            false,
+            None,
+        )
+        .unwrap();
+
+        assert!(store.get_file(".trash/lore/n.md").unwrap().is_none());
+        assert!(store.get_all_files().unwrap().is_empty());
+    }
+
+    /// A second delete of a path the trash already holds would replace the
+    /// first copy, so it is refused and nothing moves.
+    #[test]
+    fn a_soft_delete_onto_a_path_the_trash_holds_is_a_conflict_and_moves_nothing() {
+        let (_tmp, store, vault, _embedder) = vault_with("lore/n.md", "# New\n");
+        std::fs::create_dir_all(vault.join(".trash/lore")).unwrap();
+        std::fs::write(vault.join(".trash/lore/n.md"), "# Old\n").unwrap();
+
+        let err = delete_note(&store, &vault, "lore/n.md", DeleteMode::Soft).unwrap_err();
+
+        assert_eq!(
+            crate::fault::Fault::of(&err).map(|f| f.kind()),
+            Some("conflict")
+        );
+        assert_eq!(
+            err.to_string(),
+            "the trash already holds .trash/lore/n.md: restore or remove it first, or delete with mode hard"
+        );
+        assert_eq!(
+            std::fs::read_to_string(vault.join("lore/n.md")).unwrap(),
+            "# New\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(vault.join(".trash/lore/n.md")).unwrap(),
+            "# Old\n"
+        );
+        assert!(store.get_file("lore/n.md").unwrap().is_some());
     }
 
     /// Archiving takes the note out of the index, so the links to it break the
