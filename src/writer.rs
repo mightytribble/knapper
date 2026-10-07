@@ -1643,7 +1643,7 @@ fn resolve_in_folder(file: &str, vault_path: &Path, folder: &str, noun: &str) ->
             .collect()
     } else {
         let rel = vault_relative(file, "file")?;
-        if rel.starts_with(&prefix) && vault_path.join(&rel).is_file() {
+        if rel.starts_with(&prefix) && rel.ends_with(".md") && vault_path.join(&rel).is_file() {
             return Ok(rel);
         }
         let named = if rel.ends_with(".md") {
@@ -4932,6 +4932,31 @@ mod tests {
             "# N\n\nThe coast road.\n"
         );
         assert!(store.get_file("lore/n.md").unwrap().is_none());
+    }
+
+    /// Only a note can be restored. An attachment in the trash is not one.
+    #[test]
+    fn an_undelete_of_a_file_in_the_trash_that_is_not_a_note_is_not_found() {
+        let (_tmp, store, vault, mut embedder) = vault_with("lore/n.md", "# N\n");
+        std::fs::create_dir_all(vault.join(".trash")).unwrap();
+        std::fs::write(vault.join(".trash/x.canvas"), "{}").unwrap();
+
+        let err = undelete_note(
+            ".trash/x.canvas",
+            &store,
+            &mut embedder,
+            EmbedComposition::default(),
+            test_chunk_opts(),
+            &vault,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            crate::fault::Fault::of(&err).map(|f| f.kind()),
+            Some("not_found")
+        );
+        assert_eq!(err.to_string(), "deleted note not found: .trash/x.canvas");
+        assert!(!vault.join("x.canvas").exists());
     }
 
     /// The live note at the original path is not the trashed one. Naming the
