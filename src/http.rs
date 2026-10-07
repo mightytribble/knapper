@@ -878,19 +878,33 @@ async fn handle_delete(
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
     state.core.writable()?;
-    let mode = DeleteMode::from(body.mode);
-    let archive_folder = state
-        .core
-        .profile
-        .as_ref()
-        .as_ref()
-        .and_then(|p| p.structure.folders.archive.as_deref())
-        .unwrap_or("04-Archive")
-        .to_string();
     let vault = state.core.vault_path.clone();
+    // Deleting and restoring are one operation and its reverse, as
+    // `archive` is (#151).
+    if body.restores()? {
+        let settings = state.core.index_settings;
+        let file = body.file.clone();
+        let result = core_within(&state, move |g| {
+            writer::undelete_note(
+                &file,
+                g.store,
+                g.embedder,
+                settings.embed,
+                settings.chunk,
+                &vault,
+            )
+        })
+        .await?;
+        state
+            .core
+            .record_write(&state.core.vault_path.join(&result.path))
+            .await;
+        return Ok(Json(serde_json::json!(result)));
+    }
+    let mode = DeleteMode::from(body.mode);
     let file = body.file.clone();
     core_within(&state, move |g| {
-        writer::delete_note(g.store, &vault, &file, mode, &archive_folder)
+        writer::delete_note(g.store, &vault, &file, mode)
     })
     .await?;
     Ok(Json(serde_json::json!({
@@ -2369,6 +2383,91 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(live.exists(), "undo: true must restore");
         assert!(!archived.exists(), "undo: true must restore");
+    }
+
+    /// `delete` and `delete {undo: true}` are one operation and its reverse,
+    /// as `archive` is. The handler's branch is all that covers the choice.
+    #[tokio::test]
+    async fn delete_undo_restores_what_a_soft_delete_moved() {
+        let (_tmp, state) = indexed_state();
+        let vault = state.core.vault_path.as_ref().clone();
+        let live = vault.join("rules/evocation-spells.md");
+        let trashed = vault.join(".trash/rules/evocation-spells.md");
+
+        let (status, _) = post_json(
+            state.clone(),
+            "/api/delete",
+            r#"{"file":"rules/evocation-spells.md"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!live.exists());
+        assert!(trashed.exists());
+
+        let (status, body) = post_json(
+            state,
+            "/api/delete",
+            r#"{"file":"rules/evocation-spells.md","undo":true}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["path"], "rules/evocation-spells.md");
+        assert!(live.exists());
+        assert!(!trashed.exists());
+    }
+
+    #[tokio::test]
+    async fn delete_undo_with_mode_hard_is_a_bad_request() {
+        let (_tmp, state) = indexed_state();
+        let (status, body) = post_json(
+            state,
+            "/api/delete",
+            r#"{"file":"rules/evocation-spells.md","mode":"hard","undo":true}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["kind"], "invalid_input");
+    }
+
+    #[tokio::test]
+    async fn a_soft_delete_onto_a_path_the_trash_holds_is_a_conflict() {
+        let (_tmp, state) = indexed_state();
+        let vault = state.core.vault_path.as_ref().clone();
+        std::fs::create_dir_all(vault.join(".trash/rules")).unwrap();
+        std::fs::write(vault.join(".trash/rules/evocation-spells.md"), "# Old\n").unwrap();
+        let (status, body) = post_json(
+            state,
+            "/api/delete",
+            r#"{"file":"rules/evocation-spells.md"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["kind"], "conflict");
+    }
+
+    #[tokio::test]
+    async fn delete_undo_naming_no_trashed_note_is_not_found() {
+        let (_tmp, state) = indexed_state();
+        let (status, body) =
+            post_json(state, "/api/delete", r#"{"file":"nothing","undo":true}"#).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["kind"], "not_found");
+    }
+
+    #[tokio::test]
+    async fn an_unarchive_of_a_note_with_no_archived_from_is_a_bad_request() {
+        let (_tmp, state) = indexed_state();
+        let vault = state.core.vault_path.as_ref().clone();
+        std::fs::create_dir_all(vault.join("04-Archive")).unwrap();
+        std::fs::write(vault.join("04-Archive/orphan.md"), "# Orphan\n").unwrap();
+        let (status, body) = post_json(
+            state,
+            "/api/archive",
+            r#"{"file":"04-Archive/orphan.md","undo":true}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["kind"], "invalid_input");
     }
 
     /// A read-only server refuses `index` the way MCP's `index` refuses it:

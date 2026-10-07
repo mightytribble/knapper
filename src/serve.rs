@@ -474,7 +474,7 @@ impl KnapperServer {
 
     #[tool(
         name = "delete",
-        description = "Delete a note. Soft mode (default) moves it to the archive folder. Hard mode permanently removes it from disk and index."
+        description = "Delete a note. Soft mode (default) moves it to `.trash` and out of the index; `undo: true` restores it to its original path and re-indexes it. Hard mode permanently removes it from disk and index."
     )]
     async fn delete(
         &self,
@@ -482,21 +482,32 @@ impl KnapperServer {
     ) -> Result<CallToolResult, McpError> {
         self.core.writable().map_err(mcp_err)?;
         let p = params.0;
-        let mode = crate::writer::DeleteMode::from(p.mode);
-        let archive_folder = self
-            .core
-            .profile
-            .as_ref()
-            .as_ref()
-            .and_then(|pr| pr.structure.folders.archive.as_deref())
-            .unwrap_or("04-Archive")
-            .to_string();
         let vault = self.core.vault_path.clone();
+        // Deleting and restoring are one operation and its reverse, as
+        // `archive` is (#151).
+        if p.restores().map_err(mcp_err)? {
+            let settings = self.core.index_settings;
+            let file = p.file.clone();
+            let result = self
+                .core
+                .with_core(move |g| {
+                    crate::writer::undelete_note(
+                        &file,
+                        g.store,
+                        g.embedder,
+                        settings.embed,
+                        settings.chunk,
+                        &vault,
+                    )
+                })
+                .await
+                .map_err(mcp_err)?;
+            return to_json_result(&result);
+        }
+        let mode = crate::writer::DeleteMode::from(p.mode);
         let file = p.file.clone();
         self.core
-            .with_core(move |g| {
-                crate::writer::delete_note(g.store, &vault, &file, mode, &archive_folder)
-            })
+            .with_core(move |g| crate::writer::delete_note(g.store, &vault, &file, mode))
             .await
             .map_err(mcp_err)?;
         let result = serde_json::json!({
@@ -749,12 +760,12 @@ pub const ORIENTATION: &[Orientation] = &[
     Orientation {
         capability: "archive",
         group: "Lifecycle",
-        clause: "to soft-delete (`undo: true` to restore)",
+        clause: "to set a note aside in the archive folder, out of search (`undo: true` to restore)",
     },
     Orientation {
         capability: "delete",
         group: "Lifecycle",
-        clause: "for permanent removal",
+        clause: "to remove a note: `mode: soft`, the default, moves it to `.trash` where `undo: true` restores it, and `mode: hard` is permanent",
     },
     Orientation {
         capability: "reindex-file",
@@ -1004,6 +1015,96 @@ mod tests {
         assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
         assert_eq!(err.data.as_ref().unwrap()["kind"], "invalid_input");
         assert!(outside.is_file());
+    }
+
+    #[tokio::test]
+    async fn delete_undo_restores_what_a_soft_delete_moved() {
+        let (_tmp, server) = indexed_server(crate::config::GroupBy::Chunk);
+        let vault = server.core.vault_path.as_ref().clone();
+        server
+            .delete(super::Parameters(crate::params::Delete {
+                file: "rules/evocation-spells.md".into(),
+                mode: crate::params::DeleteMode::Soft,
+                undo: false,
+            }))
+            .await
+            .unwrap();
+        assert!(vault.join(".trash/rules/evocation-spells.md").is_file());
+
+        server
+            .delete(super::Parameters(crate::params::Delete {
+                file: "evocation-spells".into(),
+                mode: crate::params::DeleteMode::Soft,
+                undo: true,
+            }))
+            .await
+            .unwrap();
+        assert!(vault.join("rules/evocation-spells.md").is_file());
+    }
+
+    #[tokio::test]
+    async fn delete_undo_with_mode_hard_is_invalid_params() {
+        let (_tmp, server) = indexed_server(crate::config::GroupBy::Chunk);
+        let err = server
+            .delete(super::Parameters(crate::params::Delete {
+                file: "rules/evocation-spells.md".into(),
+                mode: crate::params::DeleteMode::Hard,
+                undo: true,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
+        assert_eq!(err.data.as_ref().unwrap()["kind"], "invalid_input");
+    }
+
+    #[tokio::test]
+    async fn delete_undo_naming_no_trashed_note_is_invalid_params() {
+        let (_tmp, server) = indexed_server(crate::config::GroupBy::Chunk);
+        let err = server
+            .delete(super::Parameters(crate::params::Delete {
+                file: "nothing".into(),
+                mode: crate::params::DeleteMode::Soft,
+                undo: true,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
+        assert_eq!(err.data.as_ref().unwrap()["kind"], "not_found");
+    }
+
+    #[tokio::test]
+    async fn an_unarchive_of_a_note_with_no_archived_from_is_invalid_params() {
+        let (_tmp, server) = indexed_server(crate::config::GroupBy::Chunk);
+        let vault = server.core.vault_path.as_ref().clone();
+        std::fs::create_dir_all(vault.join("04-Archive")).unwrap();
+        std::fs::write(vault.join("04-Archive/orphan.md"), "# Orphan\n").unwrap();
+        let err = server
+            .archive(super::Parameters(crate::params::Archive {
+                file: "04-Archive/orphan.md".into(),
+                undo: true,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
+        assert_eq!(err.data.as_ref().unwrap()["kind"], "invalid_input");
+    }
+
+    #[tokio::test]
+    async fn a_soft_delete_onto_a_path_the_trash_holds_is_invalid_request() {
+        let (_tmp, server) = indexed_server(crate::config::GroupBy::Chunk);
+        let vault = server.core.vault_path.as_ref().clone();
+        std::fs::create_dir_all(vault.join(".trash/rules")).unwrap();
+        std::fs::write(vault.join(".trash/rules/evocation-spells.md"), "# Old\n").unwrap();
+        let err = server
+            .delete(super::Parameters(crate::params::Delete {
+                file: "rules/evocation-spells.md".into(),
+                mode: crate::params::DeleteMode::Soft,
+                undo: false,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_REQUEST, "{err:?}");
+        assert_eq!(err.data.as_ref().unwrap()["kind"], "conflict");
     }
 
     #[tokio::test]
