@@ -2454,6 +2454,22 @@ mod tests {
         assert_eq!(body["kind"], "not_found");
     }
 
+    #[tokio::test]
+    async fn an_unarchive_of_a_note_with_no_archived_from_is_a_bad_request() {
+        let (_tmp, state) = indexed_state();
+        let vault = state.core.vault_path.as_ref().clone();
+        std::fs::create_dir_all(vault.join("04-Archive")).unwrap();
+        std::fs::write(vault.join("04-Archive/orphan.md"), "# Orphan\n").unwrap();
+        let (status, body) = post_json(
+            state,
+            "/api/archive",
+            r#"{"file":"04-Archive/orphan.md","undo":true}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["kind"], "invalid_input");
+    }
+
     /// A read-only server refuses `index` the way MCP's `index` refuses it:
     /// `rebuild: true` discards derived state and stalls every other call
     /// while it runs (#62).
