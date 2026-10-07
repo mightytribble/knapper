@@ -966,18 +966,38 @@ async fn main() -> Result<()> {
 
         Command::Delete(args) => {
             let (store, vault_path, _profile) = open_vault(&data_dir)?;
-            let delete_mode = knapper::writer::DeleteMode::from(args.mode);
-            knapper::writer::delete_note(&store, &vault_path, &args.file, delete_mode)?;
-            if cli.json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "deleted": args.file,
-                        "mode": args.mode
-                    }))?
-                );
+            // Deleting and restoring are one operation and its reverse, as
+            // `archive` is (#151). Only the restore indexes anything, so only
+            // it loads a model.
+            if args.restores()? {
+                let mut embedder = open_indexing_embedder(&cfg, &data_dir, &store)?;
+                let result = knapper::writer::undelete_note(
+                    &args.file,
+                    &store,
+                    &mut embedder,
+                    knapper::prefix::EmbedComposition::from_config(&cfg),
+                    cfg.chunk_options(),
+                    &vault_path,
+                )?;
+                if cli.json {
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                } else {
+                    println!("Restored: {} → {}", args.file, result.path);
+                }
             } else {
-                println!("Deleted: {} ({})", args.file, args.mode);
+                let delete_mode = knapper::writer::DeleteMode::from(args.mode);
+                knapper::writer::delete_note(&store, &vault_path, &args.file, delete_mode)?;
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "deleted": args.file,
+                            "mode": args.mode
+                        }))?
+                    );
+                } else {
+                    println!("Deleted: {} ({})", args.file, args.mode);
+                }
             }
         }
 

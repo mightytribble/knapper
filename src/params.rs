@@ -778,13 +778,13 @@ impl Update {
 
 /// What `delete` does to the note it names. An enum and not a string, for the
 /// reason [`EditMode`] is one: a string read as `"hard" => Hard, _ => Soft`
-/// archives the note whenever the caller misspells `hard`, and the caller is
+/// soft-deletes the note whenever the caller misspells `hard`, and the caller is
 /// told nothing. The four legal spellings are published to an MCP client and
 /// to the OpenAPI spec, and a fifth is refused at the boundary (#62).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, serde::Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum DeleteMode {
-    /// Move the note to the archive folder.
+    /// Move the note to `.trash`, where `undo` restores it.
     #[default]
     Soft,
     /// Remove the note from disk and from the index.
@@ -825,12 +825,32 @@ impl From<DeleteMode> for crate::writer::DeleteMode {
 
 #[derive(Debug, Args, Deserialize, JsonSchema)]
 pub struct Delete {
-    /// File path, basename, or #docid.
+    /// File path, basename, or #docid. With `undo`, the note in `.trash`:
+    /// its path there, the path it was deleted from, its basename, or a
+    /// #docid of either.
     pub file: String,
-    /// `soft` (default) archives the note; `hard` removes it permanently.
+    /// `soft` (default) moves the note to `.trash`, where `undo` restores
+    /// it; `hard` removes it permanently.
     #[arg(long, value_enum, default_value = "soft")]
     #[serde(default, deserialize_with = "deserialize_delete_mode")]
     pub mode: DeleteMode,
+    /// Restore a note a soft delete moved to `.trash`, instead of deleting one.
+    #[arg(long)]
+    #[serde(default)]
+    pub undo: bool,
+}
+
+impl Delete {
+    /// Whether the call restores a note rather than deleting one. A hard
+    /// delete leaves nothing to restore, so `undo` beside it is refused.
+    pub fn restores(&self) -> anyhow::Result<bool> {
+        if self.undo && self.mode == DeleteMode::Hard {
+            anyhow::bail!(crate::fault::Fault::InvalidInput(
+                "`undo` restores a soft delete; a hard delete cannot be undone".into()
+            ));
+        }
+        Ok(self.undo)
+    }
 }
 
 /// The same null-must-not-fail rule the other defaulted fields take (#60):
@@ -1490,5 +1510,33 @@ mod tests {
             strict: false,
         };
         assert!(v.target().is_err());
+    }
+
+    #[test]
+    fn undo_beside_a_hard_delete_is_invalid_input() {
+        let p = Delete {
+            file: "n".into(),
+            mode: DeleteMode::Hard,
+            undo: true,
+        };
+        let err = p.restores().unwrap_err();
+        assert_eq!(
+            crate::fault::Fault::of(&err).map(|f| f.kind()),
+            Some("invalid_input")
+        );
+        assert_eq!(
+            err.to_string(),
+            "`undo` restores a soft delete; a hard delete cannot be undone"
+        );
+    }
+
+    #[test]
+    fn undo_beside_a_soft_delete_restores() {
+        let p = Delete {
+            file: "n".into(),
+            mode: DeleteMode::Soft,
+            undo: true,
+        };
+        assert!(p.restores().unwrap());
     }
 }
