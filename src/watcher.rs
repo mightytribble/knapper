@@ -365,6 +365,21 @@ fn drive_producer<T, C>(
     }
 }
 
+/// True when a component of `path` below `vault_root` starts with a dot.
+///
+/// This is the rule `walk_vault`'s `.hidden(true)` applies, so the walk and
+/// the watcher agree on which notes exist. A dotted directory above the vault
+/// root does not count (#151).
+fn is_hidden_under(path: &Path, vault_root: &Path) -> bool {
+    let Ok(rel) = path.strip_prefix(vault_root) else {
+        return false;
+    };
+    rel.components().any(|c| match c {
+        std::path::Component::Normal(name) => name.to_string_lossy().starts_with('.'),
+        _ => false,
+    })
+}
+
 /// Convert `DebouncedEvent`s to `WatchEvent`s, filtering to `.md` files.
 fn process_debounced_events(
     events: &[DebouncedEvent],
@@ -380,6 +395,7 @@ fn process_debounced_events(
             .paths
             .iter()
             .filter(|p| p.extension().map(|e| e == "md").unwrap_or(false))
+            .filter(|p| !is_hidden_under(p, vault_path))
             .filter(|p| !exclude.matches_under(p, vault_path))
             .collect();
 
@@ -391,7 +407,14 @@ fn process_debounced_events(
         match &event.kind {
             EventKind::Create(_) | EventKind::Modify(_) => {
                 for path in paths {
-                    result.push(WatchEvent::Changed(path.clone()));
+                    // A path that is gone from disk is a deletion, whatever
+                    // the event called it: a rename reports its source path
+                    // beside its target. Disk says what is there (#93, #151).
+                    if path.exists() {
+                        result.push(WatchEvent::Changed(path.clone()));
+                    } else {
+                        result.push(WatchEvent::Deleted(path.clone()));
+                    }
                 }
             }
             EventKind::Remove(_) => {
@@ -1002,6 +1025,134 @@ mod tests {
             seen.iter()
                 .any(|e| matches!(e, WatchEvent::Changed(p) if p == &note)),
             "the write itself has to reach the consumer: {seen:?}"
+        );
+    }
+
+    fn name_event(
+        kind: notify::event::RenameMode,
+        paths: Vec<std::path::PathBuf>,
+    ) -> notify_debouncer_full::DebouncedEvent {
+        notify_debouncer_full::DebouncedEvent::new(
+            notify::Event {
+                kind: notify::EventKind::Modify(notify::event::ModifyKind::Name(kind)),
+                paths,
+                attrs: Default::default(),
+            },
+            std::time::Instant::now(),
+        )
+    }
+
+    fn create_event(path: &std::path::Path) -> notify_debouncer_full::DebouncedEvent {
+        notify_debouncer_full::DebouncedEvent::new(
+            notify::Event {
+                kind: notify::EventKind::Create(notify::event::CreateKind::File),
+                paths: vec![path.to_path_buf()],
+                attrs: Default::default(),
+            },
+            std::time::Instant::now(),
+        )
+    }
+
+    /// A soft delete renames the note into `.trash`. The watcher reports the
+    /// source as gone and says nothing of the trash path (#151).
+    #[test]
+    fn a_rename_into_the_trash_is_a_deletion_and_nothing_else() {
+        use super::{WatchEvent, process_debounced_events};
+        use crate::exclude::ExcludeMatcher;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let vault = tmp.path().to_path_buf();
+        let from = vault.join("lore/n.md");
+        let to = vault.join(".trash/lore/n.md");
+        std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+        std::fs::write(&to, "# N\n").unwrap();
+
+        let events = process_debounced_events(
+            &[name_event(
+                notify::event::RenameMode::Both,
+                vec![from.clone(), to],
+            )],
+            &vault,
+            &ExcludeMatcher::new(&[]).unwrap(),
+        );
+
+        assert!(
+            matches!(events.as_slice(), [WatchEvent::Deleted(p)] if p == &from),
+            "only the source is reported, as a deletion: {events:?}"
+        );
+    }
+
+    /// An ordinary rename is a deletion and a change, which `detect_moves`
+    /// pairs into a move.
+    #[test]
+    fn a_rename_between_visible_paths_is_a_deletion_and_a_change() {
+        use super::{WatchEvent, process_debounced_events};
+        use crate::exclude::ExcludeMatcher;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let vault = tmp.path().to_path_buf();
+        let from = vault.join("a.md");
+        let to = vault.join("b.md");
+        std::fs::write(&to, "# B\n").unwrap();
+
+        let events = process_debounced_events(
+            &[name_event(
+                notify::event::RenameMode::Both,
+                vec![from.clone(), to.clone()],
+            )],
+            &vault,
+            &ExcludeMatcher::new(&[]).unwrap(),
+        );
+
+        assert!(
+            matches!(events.as_slice(), [WatchEvent::Deleted(a), WatchEvent::Changed(b)] if a == &from && b == &to),
+            "{events:?}"
+        );
+    }
+
+    /// A note under any dot-prefixed folder below the vault root is not a
+    /// note, as `walk_vault` has it (#151).
+    #[test]
+    fn a_note_under_a_hidden_folder_yields_no_event() {
+        use super::process_debounced_events;
+        use crate::exclude::ExcludeMatcher;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let vault = tmp.path().to_path_buf();
+        let mut events = Vec::new();
+        for rel in [".trash/n.md", ".obsidian/n.md", "lore/.hidden/n.md"] {
+            let p = vault.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, "# N\n").unwrap();
+            events.push(create_event(&p));
+            events.push(name_event(notify::event::RenameMode::To, vec![p]));
+        }
+
+        let out = process_debounced_events(&events, &vault, &ExcludeMatcher::new(&[]).unwrap());
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    /// Only components below the vault root count: a vault inside a dotted
+    /// directory still has notes.
+    #[test]
+    fn a_vault_under_a_dotted_directory_still_yields_its_notes() {
+        use super::{WatchEvent, process_debounced_events};
+        use crate::exclude::ExcludeMatcher;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let vault = tmp.path().join(".vaults/main");
+        std::fs::create_dir_all(&vault).unwrap();
+        let note = vault.join("n.md");
+        std::fs::write(&note, "# N\n").unwrap();
+
+        let out = process_debounced_events(
+            &[create_event(&note)],
+            &vault,
+            &ExcludeMatcher::new(&[]).unwrap(),
+        );
+        assert!(
+            matches!(out.as_slice(), [WatchEvent::Changed(p)] if p == &note),
+            "{out:?}"
         );
     }
 
