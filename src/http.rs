@@ -857,6 +857,7 @@ async fn handle_archive(
                 settings.embed,
                 settings.chunk,
                 &vault,
+                profile.as_ref().as_ref(),
             )
         } else {
             writer::archive_note(&body.file, g.store, &vault, profile.as_ref().as_ref())

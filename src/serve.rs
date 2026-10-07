@@ -414,6 +414,7 @@ impl KnapperServer {
                         settings.embed,
                         settings.chunk,
                         &vault,
+                        profile.as_ref().as_ref(),
                     )
                 } else {
                     crate::writer::archive_note(&p.file, g.store, &vault, profile.as_ref().as_ref())

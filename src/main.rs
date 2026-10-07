@@ -950,6 +950,7 @@ async fn main() -> Result<()> {
                     knapper::prefix::EmbedComposition::from_config(&cfg),
                     cfg.chunk_options(),
                     &vault_path,
+                    profile.as_ref(),
                 )?
             } else {
                 knapper::writer::archive_note(&args.file, &store, &vault_path, profile.as_ref())?
