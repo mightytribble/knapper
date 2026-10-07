@@ -541,7 +541,7 @@ pub fn reindex_written_file(
     vault_path: &Path,
     config: &Config,
 ) -> Result<IndexFileResult> {
-    crate::writer::inside_vault(rel_path, "file")?;
+    let rel_path = &crate::writer::vault_relative(rel_path, "file")?;
     let full_path = vault_path.join(rel_path);
     // A path not on disk is an absent resource. A file that
     // is there and cannot be read is the server's, and stays an io::Error.
