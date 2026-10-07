@@ -104,12 +104,15 @@ impl Core {
         let models_dir = data_dir.join("models");
 
         let store = Store::open(&db)?;
-        let embedder = crate::llm::load_embedder(&models_dir, &config)?;
-        store.verify_embedding_dim(embedder.dim())?;
 
+        // Read before any model loads: a store no `index` has run against
+        // would otherwise download the embedder only to exit here (#150).
         let vault_path = PathBuf::from(store.get_meta("vault_path")?.ok_or_else(|| {
             anyhow::anyhow!("No vault path in index. Run 'knapper index <path>' first.")
         })?);
+
+        let embedder = crate::llm::load_embedder(&models_dir, &config)?;
+        store.verify_embedding_dim(embedder.dim())?;
 
         let cleaned = crate::writer::cleanup_temp_files(&vault_path)?;
         if cleaned > 0 {
@@ -562,6 +565,26 @@ mod tests {
                 .await
                 .is_ok(),
             "the writer lock is released after a panic"
+        );
+    }
+
+    /// A store no `index` has run against names no vault, and `serve` refuses
+    /// it before loading a model, so a fresh install does not download the
+    /// embedder only to exit (#150). An embed URI no loader accepts stands in
+    /// for the download: reaching it would answer its own error instead.
+    #[test]
+    fn a_store_with_no_vault_is_refused_before_the_embedder_loads() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = testing::test_config();
+        config.models.embed = Some("unloadable:model".into());
+
+        let err = Core::open(tmp.path(), config, false)
+            .err()
+            .expect("a store with no vault path opens");
+
+        assert!(
+            format!("{err:#}").contains("No vault path in index"),
+            "refused for another reason: {err:#}"
         );
     }
 }
