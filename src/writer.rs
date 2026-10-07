@@ -1682,9 +1682,9 @@ fn resolve_in_folder(file: &str, vault_path: &Path, folder: &str, noun: &str) ->
 ///
 /// `archive --undo` and `delete --undo` both end here. The note goes back on
 /// disk, its chunks, vectors, edges and tags go back in the store, and the
-/// links other notes wrote to it resolve again (#108). A failed index
-/// removes the file it wrote, so the note is still where it was restored
-/// from. Returns the note's docid.
+/// links other notes wrote to it resolve again (#108). No file is written
+/// unless the chunks are ready, and a failed store transaction removes the
+/// file it wrote. Returns the note's docid.
 #[allow(clippy::too_many_arguments)]
 fn restore_note(
     rel: &str,
@@ -1697,14 +1697,13 @@ fn restore_note(
     vault_path: &Path,
 ) -> Result<String> {
     let full_path = vault_path.join(rel);
+    let chunk_data = precompute_chunks(rel, content, embedder, embed, chunk_opts)?;
+    let content_hash = compute_content_hash(content);
+    let docid = generate_docid(rel);
     if let Some(parent) = full_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     atomic_write(&full_path, content, false)?;
-
-    let chunk_data = precompute_chunks(rel, content, embedder, embed, chunk_opts)?;
-    let content_hash = compute_content_hash(content);
-    let docid = generate_docid(rel);
     let mtime = file_mtime(&full_path).unwrap_or(0);
 
     if let Err(e) = store.transaction(|store| -> Result<()> {
@@ -4884,6 +4883,55 @@ mod tests {
             .unwrap_or_else(|e| panic!("{form}: {e}"));
             assert_eq!(result.path, "lore/n.md", "{form}");
         }
+    }
+
+    /// An embedder whose every batch fails, as an API embedder does when it
+    /// times out.
+    struct FailingEmbed(crate::llm::MockLlm);
+
+    impl EmbedModel for FailingEmbed {
+        fn embed_batch(&mut self, _docs: &[crate::llm::EmbedDoc<'_>]) -> Result<Vec<Vec<f32>>> {
+            anyhow::bail!("embedding timed out")
+        }
+        fn token_count(&self, text: &str) -> usize {
+            self.0.token_count(text)
+        }
+        fn dim(&self) -> usize {
+            self.0.dim()
+        }
+        fn max_context(&self) -> usize {
+            self.0.max_context()
+        }
+        fn fingerprint(&self) -> String {
+            self.0.fingerprint()
+        }
+    }
+
+    /// A restore that cannot embed writes nothing: the note stays in the
+    /// trash and a retry is not met by a file it left behind (#151).
+    #[test]
+    fn an_undelete_whose_embedding_fails_writes_no_file() {
+        let (_tmp, store, vault, _embedder) = vault_with("lore/n.md", "# N\n\nThe coast road.\n");
+        delete_note(&store, &vault, "lore/n.md", DeleteMode::Soft).unwrap();
+        let mut failing = FailingEmbed(crate::llm::MockLlm::new(256));
+
+        let err = undelete_note(
+            "n",
+            &store,
+            &mut failing,
+            EmbedComposition::default(),
+            test_chunk_opts(),
+            &vault,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("embedding timed out"), "{err}");
+        assert!(!vault.join("lore/n.md").exists());
+        assert_eq!(
+            std::fs::read_to_string(vault.join(".trash/lore/n.md")).unwrap(),
+            "# N\n\nThe coast road.\n"
+        );
+        assert!(store.get_file("lore/n.md").unwrap().is_none());
     }
 
     /// The live note at the original path is not the trashed one. Naming the
