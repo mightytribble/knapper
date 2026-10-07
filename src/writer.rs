@@ -1465,9 +1465,7 @@ pub fn archive_note(
 ) -> Result<WriteResult> {
     let file_record = store.require_file(file)?;
 
-    let archive_folder = profile
-        .and_then(|p| p.structure.folders.archive.as_deref())
-        .unwrap_or("04-Archive");
+    let archive_folder = archive_folder(profile);
 
     // Don't archive something already in the archive
     if file_record.path.starts_with(archive_folder) {
@@ -1543,6 +1541,105 @@ pub fn archive_note(
     })
 }
 
+/// The folder `archive` files notes under: the profile's, or `04-Archive`.
+fn archive_folder(profile: Option<&VaultProfile>) -> &str {
+    profile
+        .and_then(|p| p.structure.folders.archive.as_deref())
+        .unwrap_or("04-Archive")
+        .trim_matches('/')
+}
+
+/// Every `.md` file under the archive folder, vault-relative, in path order.
+fn archived_notes(vault_path: &Path, archive_folder: &str) -> Result<Vec<String>> {
+    let root = vault_path.join(archive_folder);
+    if !root.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut found = Vec::new();
+    for entry in WalkBuilder::new(&root).standard_filters(true).build() {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_file()
+            && path.extension().is_some_and(|e| e == "md")
+            && let Ok(rel) = path.strip_prefix(vault_path)
+        {
+            let segments: Vec<_> = rel.iter().map(|s| s.to_string_lossy()).collect();
+            found.push(segments.join("/"));
+        }
+    }
+    found.sort();
+    Ok(found)
+}
+
+/// The `archived_from` an archived note carries, if it carries one.
+fn archived_from(vault_path: &Path, rel: &str) -> Option<String> {
+    let content = std::fs::read_to_string(vault_path.join(rel)).ok()?;
+    let block = crate::frontmatter::Block::parse(&content).ok()??;
+    block.scalar("archived_from")
+}
+
+/// The archived note `file` names, as a vault-relative path.
+///
+/// `archive` takes a note out of the store, and the watcher never watches
+/// the archive folder, so the note is looked for on disk rather than through
+/// [`Store::resolve_file`]. It takes the forms `archive` takes (#100): a path
+/// that is on disk, as before; the note's original path, which `archive`
+/// keeps under the archive folder; a basename, with or without `.md`; and a
+/// `#docid`, of the archived path or of the original one, since `archive`
+/// prints the one and the note was known by the other.
+fn resolve_archived(file: &str, vault_path: &Path, archive_folder: &str) -> Result<String> {
+    let found: Vec<String> = if let Some(docid) = file
+        .strip_prefix('#')
+        .filter(|d| d.len() == 6)
+        .map(str::to_ascii_lowercase)
+    {
+        archived_notes(vault_path, archive_folder)?
+            .into_iter()
+            .filter(|rel| {
+                generate_docid(rel) == docid
+                    || archived_from(vault_path, rel).is_some_and(|from| {
+                        vault_relative(&from, "archived_from")
+                            .is_ok_and(|from| generate_docid(&from) == docid)
+                    })
+            })
+            .collect()
+    } else {
+        let rel = vault_relative(file, "file")?;
+        if vault_path.join(&rel).is_file() {
+            return Ok(rel);
+        }
+        let named = if rel.ends_with(".md") {
+            rel.clone()
+        } else {
+            format!("{rel}.md")
+        };
+        let original = format!("{archive_folder}/{named}");
+        if vault_path.join(&original).is_file() {
+            return Ok(original);
+        }
+        if named.contains('/') {
+            Vec::new()
+        } else {
+            archived_notes(vault_path, archive_folder)?
+                .into_iter()
+                .filter(|a| {
+                    a.rsplit('/')
+                        .next()
+                        .is_some_and(|base| base.eq_ignore_ascii_case(&named))
+                })
+                .collect()
+        }
+    };
+    match found.as_slice() {
+        [] => bail!(Fault::NotFound(format!("archived note not found: {file}"))),
+        [one] => Ok(one.clone()),
+        many => bail!(Fault::Ambiguous(format!(
+            "ambiguous archived note '{file}': matches [{}]",
+            many.join(", ")
+        ))),
+    }
+}
+
 /// Unarchive a note: move back to original location, strip archive frontmatter, re-index.
 pub fn unarchive_note(
     file: &str,
@@ -1551,17 +1648,10 @@ pub fn unarchive_note(
     embed: EmbedComposition,
     chunk_opts: ChunkOptions,
     vault_path: &Path,
+    profile: Option<&VaultProfile>,
 ) -> Result<WriteResult> {
-    let file = vault_relative(file, "file")?;
-    // Resolve — the file may not be in the index (archived notes are excluded).
-    // Try resolving by direct path on disk.
+    let file = resolve_archived(file, vault_path, archive_folder(profile))?;
     let archive_path = vault_path.join(&file);
-    if !archive_path.exists() {
-        bail!(Fault::NotFound(format!(
-            "archived note not found: {}",
-            file
-        )));
-    }
 
     let content = std::fs::read_to_string(&archive_path)?;
     let mut block = crate::frontmatter::Block::parse(&content)?.ok_or_else(|| {
@@ -3039,6 +3129,7 @@ mod tests {
             EmbedComposition::default(),
             test_chunk_opts(),
             &vault,
+            None,
         )
         .unwrap();
         assert!(vault.join("Projects/n.md").exists());
@@ -3114,6 +3205,7 @@ mod tests {
             EmbedComposition::default(),
             test_chunk_opts(),
             &vault,
+            None,
         )
         .unwrap();
 
@@ -3141,6 +3233,7 @@ mod tests {
             EmbedComposition::default(),
             test_chunk_opts(),
             &vault,
+            None,
         )
         .unwrap();
 
@@ -3164,6 +3257,7 @@ mod tests {
             EmbedComposition::default(),
             test_chunk_opts(),
             &vault,
+            None,
         )
         .unwrap();
 
@@ -3191,6 +3285,7 @@ mod tests {
             EmbedComposition::default(),
             test_chunk_opts(),
             &vault,
+            None,
         )
         .unwrap();
 
@@ -3226,6 +3321,7 @@ mod tests {
             EmbedComposition::default(),
             test_chunk_opts(),
             &vault,
+            None,
         )
         .unwrap();
 
@@ -4655,6 +4751,7 @@ mod tests {
             EmbedComposition::default(),
             test_chunk_opts(),
             &vault,
+            None,
         )
         .unwrap();
 
@@ -4734,6 +4831,7 @@ mod tests {
             EmbedComposition::default(),
             test_chunk_opts(),
             &root,
+            None,
         )
         .unwrap_err();
         assert_eq!(
@@ -4767,6 +4865,7 @@ mod tests {
             EmbedComposition::default(),
             test_chunk_opts(),
             &root,
+            None,
         )
         .unwrap_err();
         assert_eq!(
@@ -5061,6 +5160,7 @@ mod tests {
             EmbedComposition::default(),
             test_chunk_opts(),
             &root,
+            None,
         )
         .unwrap();
         assert_eq!(result.path, "lore/n.md");
@@ -5068,5 +5168,140 @@ mod tests {
 
         walk_index(&root, &store);
         assert_eq!(stored_paths(&store), ["lore/n.md"]);
+    }
+
+    /// `archive --undo` takes every form `archive` does — a basename, the
+    /// note's original path, a `#docid` from before or after the archive —
+    /// and the archive path it always took (#100). The archived note is
+    /// looked for in the archive folder on disk, because `archive` takes it
+    /// out of the store.
+    #[test]
+    fn an_undo_finds_the_archived_note_by_every_form_archive_takes() {
+        let before = format!("#{}", crate::docid::generate_docid("Projects/n.md"));
+        let after = format!(
+            "#{}",
+            crate::docid::generate_docid("04-Archive/Projects/n.md")
+        );
+        for form in [
+            "n",
+            "N.md",
+            "Projects/n.md",
+            "Projects/n",
+            before.as_str(),
+            after.as_str(),
+            "04-Archive/Projects/n.md",
+        ] {
+            let (_tmp, store, vault, mut embedder) = vault_with("Projects/n.md", "# N\n\nbody\n");
+            archive_note("Projects/n.md", &store, &vault, None).unwrap();
+
+            let result = unarchive_note(
+                form,
+                &store,
+                &mut embedder,
+                EmbedComposition::default(),
+                test_chunk_opts(),
+                &vault,
+                None,
+            )
+            .unwrap_or_else(|e| panic!("{form}: {e:#}"));
+            assert_eq!(result.path, "Projects/n.md", "{form}");
+            assert!(vault.join("Projects/n.md").is_file(), "{form}");
+            assert!(!vault.join("04-Archive/Projects/n.md").exists(), "{form}");
+        }
+    }
+
+    #[test]
+    fn an_undo_naming_two_archived_notes_is_ambiguous_and_restores_neither() {
+        let (_tmp, store, vault, mut embedder) = vault_with("a/n.md", "# A\n\nbody\n");
+        std::fs::create_dir_all(vault.join("b")).unwrap();
+        std::fs::write(vault.join("b/n.md"), "# B\n\nbody\n").unwrap();
+        walk_index(&vault, &store);
+        archive_note("a/n.md", &store, &vault, None).unwrap();
+        archive_note("b/n.md", &store, &vault, None).unwrap();
+
+        let err = unarchive_note(
+            "n",
+            &store,
+            &mut embedder,
+            EmbedComposition::default(),
+            test_chunk_opts(),
+            &vault,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            crate::fault::Fault::of(&err).map(|f| f.kind()),
+            Some("ambiguous")
+        );
+        assert_eq!(
+            err.to_string(),
+            "ambiguous archived note 'n': matches [04-Archive/a/n.md, 04-Archive/b/n.md]"
+        );
+        assert!(vault.join("04-Archive/a/n.md").is_file());
+        assert!(vault.join("04-Archive/b/n.md").is_file());
+    }
+
+    #[test]
+    fn an_undo_naming_no_archived_note_is_not_found() {
+        let (_tmp, store, vault, mut embedder) = vault_with("Projects/n.md", "# N\n\nbody\n");
+        archive_note("Projects/n.md", &store, &vault, None).unwrap();
+
+        for form in ["m", "#000000", "Other/n.md"] {
+            let err = unarchive_note(
+                form,
+                &store,
+                &mut embedder,
+                EmbedComposition::default(),
+                test_chunk_opts(),
+                &vault,
+                None,
+            )
+            .unwrap_err();
+            assert_eq!(
+                crate::fault::Fault::of(&err).map(|f| f.kind()),
+                Some("not_found"),
+                "{form}"
+            );
+            assert_eq!(err.to_string(), format!("archived note not found: {form}"));
+        }
+        assert!(vault.join("04-Archive/Projects/n.md").is_file());
+    }
+
+    /// The archive folder is the profile's, on the way back as on the way
+    /// out, and a trailing `/` in it names the same folder.
+    #[test]
+    fn an_undo_looks_in_the_archive_folder_the_profile_names() {
+        use crate::profile::{
+            FolderMap, StructureDetection, StructureMethod, VaultProfile, VaultStats, VaultType,
+        };
+
+        let (_tmp, store, vault, mut embedder) = vault_with("Projects/n.md", "# N\n\nbody\n");
+        let profile = VaultProfile {
+            vault_path: vault.clone(),
+            vault_type: VaultType::Obsidian,
+            structure: StructureDetection {
+                method: StructureMethod::Para,
+                folders: FolderMap {
+                    archive: Some("Old/".to_string()),
+                    ..Default::default()
+                },
+            },
+            stats: VaultStats::default(),
+        };
+        let archived = archive_note("Projects/n.md", &store, &vault, Some(&profile)).unwrap();
+        assert_eq!(archived.path, "Old/Projects/n.md");
+
+        let result = unarchive_note(
+            "n",
+            &store,
+            &mut embedder,
+            EmbedComposition::default(),
+            test_chunk_opts(),
+            &vault,
+            Some(&profile),
+        )
+        .unwrap();
+        assert_eq!(result.path, "Projects/n.md");
+        assert!(!vault.join("Old/Projects/n.md").exists());
     }
 }
