@@ -173,6 +173,25 @@ pub fn inside_vault(text: &str, what: &str) -> Result<()> {
     Ok(())
 }
 
+/// [`inside_vault`], then the path as the vault spells it: `.` and empty
+/// segments dropped, so `a/./b` and `a//b` are `a/b` and `.` is the root.
+///
+/// A write stores the text it composes from this as the row's `path`, and a
+/// walk or the watcher finds the file at the normal spelling. Composing from
+/// the caller's text instead gave one file two rows (#146).
+pub fn vault_relative(text: &str, what: &str) -> Result<String> {
+    use std::path::Component;
+    inside_vault(text, what)?;
+    let segments: Vec<_> = Path::new(text)
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => Some(s.to_string_lossy()),
+            _ => None,
+        })
+        .collect();
+    Ok(segments.join("/"))
+}
+
 /// Split content into (frontmatter_string, body_string).
 /// If no frontmatter, returns ("", content).
 pub fn split_frontmatter(content: &str) -> (String, String) {
@@ -467,13 +486,8 @@ pub fn create_note(
     // Step 1: the folder is the caller's, or the vault root. No inbox
     // fallback and no guess from the text. It is checked before anything is
     // read.
-    let folder = input
-        .folder
-        .as_deref()
-        .unwrap_or("")
-        .trim_matches('/')
-        .to_string();
-    inside_vault(&folder, "folder")?;
+    let folder = input.folder.as_deref().unwrap_or("").trim_matches('/');
+    let folder = vault_relative(folder, "folder")?;
 
     // Step 2: Sanitize the caller's filename and ensure a `.md` extension.
     let filename = normalize_filename(&input.filename);
@@ -1286,8 +1300,7 @@ pub fn move_note(
     store: &Store,
     vault_path: &Path,
 ) -> Result<WriteResult> {
-    let new_folder = new_folder.trim_matches('/');
-    inside_vault(new_folder, "new_folder")?;
+    let new_folder = vault_relative(new_folder.trim_matches('/'), "new_folder")?;
 
     // Step 1: Resolve file
     let file_record = store.require_file(file)?;
@@ -1539,10 +1552,10 @@ pub fn unarchive_note(
     chunk_opts: ChunkOptions,
     vault_path: &Path,
 ) -> Result<WriteResult> {
-    inside_vault(file, "file")?;
+    let file = vault_relative(file, "file")?;
     // Resolve — the file may not be in the index (archived notes are excluded).
     // Try resolving by direct path on disk.
-    let archive_path = vault_path.join(file);
+    let archive_path = vault_path.join(&file);
     if !archive_path.exists() {
         bail!(Fault::NotFound(format!(
             "archived note not found: {}",
@@ -1558,7 +1571,7 @@ pub fn unarchive_note(
         anyhow::anyhow!("no archived_from in frontmatter — cannot determine original location")
     })?;
 
-    inside_vault(&original_path, "archived_from")?;
+    let original_path = vault_relative(&original_path, "archived_from")?;
     let restore_full_path = vault_path.join(&original_path);
 
     if restore_full_path.exists() {
@@ -4892,5 +4905,168 @@ mod tests {
         assert_eq!(result.path, "n.md");
         assert_eq!(result.folder, "");
         assert!(root.join("n.md").is_file());
+    }
+
+    /// Index `root` into `store` with the defaults, as a walk would.
+    fn walk_index(root: &Path, store: &Store) {
+        use crate::llm::MockLlm;
+        let config = crate::config::Config::default();
+        crate::indexer::run_index_shared(
+            root,
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            store,
+            &mut MockLlm::new(256),
+            false,
+            None,
+        )
+        .unwrap();
+    }
+
+    fn stored_paths(store: &Store) -> Vec<String> {
+        let mut paths: Vec<String> = store
+            .get_all_files()
+            .unwrap()
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    #[test]
+    fn vault_relative_drops_dot_and_empty_segments_and_still_refuses_an_escape() {
+        for (text, want) in [
+            ("", ""),
+            (".", ""),
+            ("./a", "a"),
+            ("a/./b", "a/b"),
+            ("a//b", "a/b"),
+            ("a/b/.", "a/b"),
+            ("notes/x.md", "notes/x.md"),
+        ] {
+            assert_eq!(vault_relative(text, "folder").unwrap(), want, "{text}");
+        }
+        for text in ["..", "./../x", "a/../..", "/etc"] {
+            let err = vault_relative(text, "folder").unwrap_err();
+            assert_eq!(
+                crate::fault::Fault::of(&err).map(|f| f.kind()),
+                Some("invalid_input"),
+                "{text}"
+            );
+        }
+    }
+
+    /// A `.` or empty segment in `folder` names the folder without it, so the
+    /// row the write stores is the path a later walk finds, and one file is
+    /// one row (#146).
+    #[test]
+    fn a_create_folder_with_a_dot_or_empty_segment_files_at_the_normal_path() {
+        use crate::llm::MockLlm;
+
+        for (folder, want) in [
+            (".", "n.md"),
+            ("./a", "a/n.md"),
+            ("a/./b", "a/b/n.md"),
+            ("a//b", "a/b/n.md"),
+        ] {
+            let (_tmp, store, root) = nested_vault();
+            let result = create_note(
+                CreateNoteInput {
+                    content: "# N\n\nBody.\n".to_string(),
+                    filename: "n".to_string(),
+                    tags: vec![],
+                    folder: Some(folder.to_string()),
+                    created_by: "test".to_string(),
+                    auto_link: Some(false),
+                },
+                &store,
+                &mut MockLlm::new(256),
+                EmbedComposition::default(),
+                test_chunk_opts(),
+                &root,
+                None,
+            )
+            .unwrap();
+            assert_eq!(result.path, want, "{folder}");
+            assert!(root.join(want).is_file(), "{folder}");
+
+            walk_index(&root, &store);
+            assert_eq!(stored_paths(&store), [want], "{folder}");
+        }
+    }
+
+    #[test]
+    fn a_move_folder_with_a_dot_or_empty_segment_files_at_the_normal_path() {
+        for (folder, want) in [
+            (".", "n.md"),
+            ("./a", "a/n.md"),
+            ("a/./b", "a/b/n.md"),
+            ("a//b", "a/b/n.md"),
+        ] {
+            let (_tmp, store, root) = nested_vault();
+            std::fs::create_dir_all(root.join("inbox")).unwrap();
+            std::fs::write(root.join("inbox/n.md"), "# N\n\nbody\n").unwrap();
+            walk_index(&root, &store);
+
+            let result = move_note("inbox/n.md", folder, &store, &root).unwrap();
+            assert_eq!(result.path, want, "{folder}");
+            assert!(root.join(want).is_file(), "{folder}");
+
+            walk_index(&root, &store);
+            assert_eq!(stored_paths(&store), [want], "{folder}");
+        }
+    }
+
+    /// `reindex-file` stores the path it is given, so it is normalised the
+    /// same way (#146).
+    #[test]
+    fn a_reindex_of_a_path_with_a_dot_segment_updates_the_one_row() {
+        use crate::llm::MockLlm;
+
+        let (_tmp, store, root) = nested_vault();
+        std::fs::create_dir_all(root.join("lore")).unwrap();
+        std::fs::write(root.join("lore/n.md"), "# N\n\nbody\n").unwrap();
+        walk_index(&root, &store);
+
+        let config = crate::config::Config::default();
+        crate::indexer::reindex_written_file(
+            "./lore/./n.md",
+            &store,
+            &mut MockLlm::new(256),
+            &root,
+            &config,
+        )
+        .unwrap();
+        assert_eq!(stored_paths(&store), ["lore/n.md"]);
+    }
+
+    /// `archived_from` is text in the note, so a hand-edited `./` in it must
+    /// not become the restored row's path (#146).
+    #[test]
+    fn an_unarchive_whose_archived_from_has_a_dot_segment_restores_to_the_normal_path() {
+        use crate::llm::MockLlm;
+
+        let (_tmp, store, root) = nested_vault();
+        std::fs::create_dir_all(root.join("04-Archive")).unwrap();
+        std::fs::write(
+            root.join("04-Archive/n.md"),
+            "---\narchived: true\narchived_from: ./lore/n.md\n---\n# N\n",
+        )
+        .unwrap();
+        let result = unarchive_note(
+            "04-Archive/n.md",
+            &store,
+            &mut MockLlm::new(256),
+            EmbedComposition::default(),
+            test_chunk_opts(),
+            &root,
+        )
+        .unwrap();
+        assert_eq!(result.path, "lore/n.md");
+        assert!(root.join("lore/n.md").is_file());
+
+        walk_index(&root, &store);
+        assert_eq!(stored_paths(&store), ["lore/n.md"]);
     }
 }
