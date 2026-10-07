@@ -35,6 +35,18 @@ enum QuoteStyle {
     Double,
 }
 
+/// How a fresh value under one key is quoted: in which character, and
+/// whether even a value YAML would leave bare. A key whose own value was
+/// quoted keeps quotes it did not strictly need, because dropping them
+/// changes the line for a value that is still the same string, and changes
+/// its type for a reader that is not serde_yaml — Obsidian reads a bare
+/// `2024-01-01` as a Date, a YAML 1.1 reader a bare `no` as false (#114).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Quotes {
+    style: QuoteStyle,
+    always: bool,
+}
+
 /// Where a key the block does not already hold is written. A key it does
 /// hold has a place already — the file's — so a placement says where to
 /// *put* a key and never where to move one, and re-running an edit changes
@@ -128,9 +140,16 @@ impl ListItem {
         }
     }
 
+    /// Whether the item's own source text is a quoted scalar.
+    fn is_quoted(&self) -> bool {
+        self.source
+            .as_deref()
+            .is_some_and(|s| s.starts_with(['\'', '"']))
+    }
+
     /// The item's rendered text: its own source when it has one, else fresh
     /// through `yaml_scalar` in the block's own quote style.
-    fn render(&self, quotes: QuoteStyle) -> String {
+    fn render(&self, quotes: Quotes) -> String {
         match &self.source {
             Some(source) => source.clone(),
             None => yaml_scalar(&self.value, quotes),
@@ -152,7 +171,7 @@ impl ListItem {
     /// inside `[...]`, because a fallback that renders the value the same
     /// way the failed check just read it reproduces the same corruption
     /// (#92, C2; R1 regression).
-    fn render_in_flow(&self, quotes: QuoteStyle) -> String {
+    fn render_in_flow(&self, quotes: Quotes) -> String {
         let text = self.render(quotes);
         if reparses_to_one_flow_item(&text, &self.value) {
             text
@@ -449,8 +468,22 @@ impl Block {
     /// emits, and so what a vault this tool is a guest in most often holds.
     /// It is the ladder `list_style_for` walks for inline-versus-block, for
     /// the same reason: a write matches what the file already says (#112).
-    fn quote_style_for(&self, key: &str) -> QuoteStyle {
-        quote_style_of(&self.items_of(key)).unwrap_or_else(|| self.new_quote_style())
+    ///
+    /// A value that needs no quotes is quoted only when the key's own values
+    /// show the vault quoting by choice: one of them is quoted and would read
+    /// back the same bare (#114). A quote a value needed — `"a, b"` in a flow
+    /// list, `"5"` kept a string — says only that the value needed it, and
+    /// the block's quoting says which character to reach for, not that a key
+    /// which was bare, or absent, should stop being bare.
+    fn quote_style_for(&self, key: &str) -> Quotes {
+        let items = self.items_of(key);
+        let always = items
+            .iter()
+            .any(|i| i.is_quoted() && !needs_quotes(&i.value));
+        Quotes {
+            style: quote_style_of(&items).unwrap_or_else(|| self.new_quote_style()),
+            always,
+        }
     }
 
     /// The first quote character the block uses, reading its entries in
@@ -516,7 +549,7 @@ impl Block {
         key: &str,
         items: &[ListItem],
         style: ListStyle,
-        quotes: QuoteStyle,
+        quotes: Quotes,
     ) -> String {
         if items.is_empty() {
             return format!("{key}: []{}", self.newline);
@@ -850,23 +883,43 @@ fn closing_bracket(head: &str) -> Option<usize> {
     None
 }
 
-/// One scalar as YAML, quoted when it has to be, in `style` when there is a
-/// choice. serde_yaml decides *whether* a value needs quoting, which is a
-/// correctness question and stays its; it also always reaches for `'` first,
-/// which is the part `style` overrides. Two answers are not a choice and are
-/// kept whatever `style` says: a value that needs no quotes at all, and a
-/// value serde_yaml did not single-quote, which means single quoting cannot
-/// hold it — they escape nothing, so a line break or a tab has no
-/// single-quoted spelling on one line.
-fn yaml_scalar(value: &str, style: QuoteStyle) -> String {
+/// One scalar as YAML, quoted when it has to be or when `quotes.always`
+/// asks, in `quotes.style` when there is a choice. serde_yaml decides
+/// *whether* a value needs quoting, which is a correctness question and
+/// stays its; it also always reaches for `'` first, which is the part
+/// `style` overrides. A value serde_yaml did not single-quote is not a
+/// choice, and is double-quoted whatever `style` says: single quoting
+/// cannot hold it — it escapes nothing, so a line break or a tab has no
+/// single-quoted spelling on one line. A value that needs no quotes is
+/// written bare unless `always` asks for them (#114).
+fn yaml_scalar(value: &str, quotes: Quotes) -> String {
     let yaml = serde_yaml::to_string(&serde_yaml::Value::String(value.to_string()))
         .unwrap_or_else(|_| value.to_string())
         .trim_end()
         .to_string();
-    if yaml == value || (style == QuoteStyle::Single && yaml.starts_with('\'')) {
+    let bare = yaml == value;
+    if bare && !quotes.always {
         return yaml;
     }
+    if quotes.style == QuoteStyle::Single {
+        if yaml.starts_with('\'') {
+            return yaml;
+        }
+        if bare && !value.contains(['\n', '\t']) {
+            return format!("'{}'", value.replace('\'', "''"));
+        }
+    }
     double_quoted(value)
+}
+
+/// Whether `value` needs quoting in either place a value is written: alone
+/// on a key's line, or as an item inside `[...]`.
+fn needs_quotes(value: &str) -> bool {
+    let bare = Quotes {
+        style: QuoteStyle::Double,
+        always: false,
+    };
+    yaml_scalar(value, bare) != value || !reparses_to_one_flow_item(value, value)
 }
 
 /// One scalar as a YAML double-quoted scalar. JSON's string syntax is one —
@@ -920,12 +973,12 @@ fn reparses_to_one_flow_item(text: &str, value: &str) -> bool {
 /// single quoting escapes nothing, so a value carrying a line break has no
 /// single-quoted spelling that reads back as itself, and writing one
 /// silently folded the break into a space.
-fn flow_safe_scalar(value: &str, style: QuoteStyle) -> String {
-    let plain = yaml_scalar(value, style);
+fn flow_safe_scalar(value: &str, quotes: Quotes) -> String {
+    let plain = yaml_scalar(value, quotes);
     if reparses_to_one_flow_item(&plain, value) {
         return plain;
     }
-    if style == QuoteStyle::Single {
+    if quotes.style == QuoteStyle::Single {
         let single = format!("'{}'", value.replace('\'', "''"));
         if reparses_to_one_flow_item(&single, value) {
             return single;
@@ -1995,5 +2048,88 @@ mod tests {
     #[test]
     fn parse_or_open_still_refuses_a_block_it_cannot_edit() {
         assert!(Block::parse_or_open("---\nname: X\n\nBody.\n").is_err());
+    }
+
+    /// #114: a key whose own value was quoted keeps its quotes when the new
+    /// value would need none, so the line does not churn and a reader other
+    /// than serde_yaml — Obsidian reading a bare date as a Date, a YAML 1.1
+    /// reader reading a bare `no` as false — sees the string it saw before.
+    #[test]
+    fn a_key_whose_value_was_quoted_keeps_its_quotes_when_none_are_needed() {
+        let text = "---\nname: Task\ndue: \"2024-01-01\"\nversion: \"5\"\nstatus: \"yes\"\n---\n";
+        assert_eq!(
+            edited(text, |b| {
+                b.set_scalar("due", "2024-03-01", &KeyPlacement::End)?;
+                b.set_scalar("version", "6", &KeyPlacement::End)?;
+                b.set_scalar("status", "no", &KeyPlacement::End)
+            }),
+            "---\nname: Task\ndue: \"2024-03-01\"\nversion: \"6\"\nstatus: \"no\"\n---\n"
+        );
+    }
+
+    #[test]
+    fn a_key_whose_value_was_single_quoted_keeps_single_quotes_when_none_are_needed() {
+        let text = "---\ndue: '2024-01-01'\nnote: 'plain'\n---\n";
+        assert_eq!(
+            edited(text, |b| {
+                b.set_scalar("due", "2024-03-01", &KeyPlacement::End)?;
+                b.set_scalar("note", "it's plain", &KeyPlacement::End)
+            }),
+            "---\ndue: '2024-03-01'\nnote: 'it''s plain'\n---\n"
+        );
+    }
+
+    /// Only the key's own quoting asks for quotes. A bare key stays bare
+    /// beside quoted ones, and a key the block did not hold is written bare
+    /// when YAML lets it be, which is what it was before #114.
+    #[test]
+    fn a_bare_or_new_key_stays_bare_beside_quoted_ones() {
+        let text = "---\nrealm: \"New Visland\"\ndue: 2024-01-01\n---\n";
+        assert_eq!(
+            edited(text, |b| {
+                b.set_scalar("due", "2024-03-01", &KeyPlacement::End)?;
+                b.set_scalar("status", "open", &KeyPlacement::End)
+            }),
+            "---\nrealm: \"New Visland\"\ndue: 2024-03-01\nstatus: open\n---\n"
+        );
+    }
+
+    /// A list whose items were quoted quotes the items a write adds, inline
+    /// and in block style alike.
+    #[test]
+    fn an_item_added_to_a_quoted_list_is_quoted() {
+        let inline = "---\naliases: [\"one\", \"two\"]\n---\n";
+        assert_eq!(
+            edited(inline, |b| b.add_to_list(
+                "aliases",
+                "three",
+                &KeyPlacement::End
+            )),
+            "---\naliases: [\"one\", \"two\", \"three\"]\n---\n"
+        );
+        let block = "---\naliases:\n  - 'one'\n---\n";
+        assert_eq!(
+            edited(block, |b| b.set_list(
+                "aliases",
+                &["two".into(), "three".into()],
+                &KeyPlacement::End
+            )),
+            "---\naliases:\n  - 'two'\n  - 'three'\n---\n"
+        );
+    }
+
+    /// A quote the value needed says nothing about the vault's habit: `"5"`
+    /// is quoted to stay a string and `"a, b"` to stay one flow item, so a
+    /// value that needs no quotes is written bare beside them (#114).
+    #[test]
+    fn a_quote_the_old_value_needed_does_not_quote_a_new_value_that_needs_none() {
+        let text = "---\nversion: \"5\"\ntags: [a, \"b, c\"]\n---\n";
+        assert_eq!(
+            edited(text, |b| {
+                b.set_scalar("version", "beta", &KeyPlacement::End)?;
+                b.add_to_list("tags", "d", &KeyPlacement::End)
+            }),
+            "---\nversion: beta\ntags: [a, \"b, c\", d]\n---\n"
+        );
     }
 }
