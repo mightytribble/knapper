@@ -40,7 +40,7 @@ through a tunnel; the document names it as its server.
 | POST | `/api/update` | write | Apply a list of edits to one note in one write |
 | POST | `/api/move` | write | Move note to different folder. A `new_folder` with a `..` segment is 400 `invalid_input`; a leading or trailing `/` is trimmed, so `/` is the vault root. |
 | POST | `/api/archive` | write | Archive a note, or restore one with `undo`. With `undo`, `file` takes the archive path, the note's original path, its basename or a `#docid`; one that names several archived notes is 400 `ambiguous`, and a `file` outside the vault, or a note whose `archived_from` is, is 400 `invalid_input`. |
-| POST | `/api/delete` | write | Delete note (soft or hard) |
+| POST | `/api/delete` | write | Delete a note. `mode: soft`, the default, moves it to `.trash/<its path>` and out of the index; `mode: hard` removes it for good. With `undo`, restores a soft-deleted note to its path and re-indexes it; `file` takes its path in `.trash`, the path it was deleted from, its basename or a `#docid`. `undo` with `mode: hard` is 400 `invalid_input`. |
 | POST | `/api/index` | write | Index the configured vault |
 | POST | `/api/reindex-file` | write | Re-index a single file after external edits. A `file` with a `..` segment or a leading `/` is 400 `invalid_input`. |
 | POST | `/api/init` | write | Write the vault profile and index (`mode`: detect or apply) |
@@ -116,11 +116,11 @@ Every error the server answers is a JSON body with two fields: `error`, the mess
 
 | status | kind | when |
 |---|---|---|
-| 400 | `invalid_input` | the request's own text named nothing or asked two things at once: a scope term, an `after` cursor, a `links_to` or `linked_from` name, `full` with `summaries`, a `section` beside `include=metadata`, an empty `match` pattern, a `mode` word, a malformed edit list |
-| 400 | `ambiguous` | one name, several notes: an alias more than one note carries |
+| 400 | `invalid_input` | the request's own text named nothing or asked two things at once: a scope term, an `after` cursor, a `links_to` or `linked_from` name, `full` with `summaries`, a `section` beside `include=metadata`, an empty `match` pattern, a `mode` word, `undo` with `mode: hard`, a malformed edit list |
+| 400 | `ambiguous` | one name, several notes: an alias more than one note carries, or a basename several archived or trashed notes share on an `undo` |
 | 404 | `not_found` | the `file` or `section` the call addresses is absent, on `read`, `update`, `move`, `delete`, `archive` and `reindex-file` |
 | 405 | `invalid_input` | the wrong method on a known route |
-| 409 | `conflict` | the write would clobber: the note changed on disk since it was indexed, a `create` or `move` onto an existing path, an `archive` of an archived note |
+| 409 | `conflict` | the write would clobber: the note changed on disk since it was indexed, a `create` or `move` onto an existing path, an `archive` of an archived note, a soft `delete` of a path `.trash` already holds, an `undo` onto a path a file holds |
 | 403 | `read_only` | the server was started with `--read-only` |
 | 403 | `forbidden` | the key has no write permission |
 | 401 | `unauthorized` | no key, or a key the server does not hold |

@@ -474,7 +474,7 @@ impl KnapperServer {
 
     #[tool(
         name = "delete",
-        description = "Delete a note. Soft mode (default) moves it to the archive folder. Hard mode permanently removes it from disk and index."
+        description = "Delete a note. Soft mode (default) moves it to `.trash` and out of the index; `undo: true` restores it to its original path and re-indexes it. Hard mode permanently removes it from disk and index."
     )]
     async fn delete(
         &self,
@@ -760,12 +760,12 @@ pub const ORIENTATION: &[Orientation] = &[
     Orientation {
         capability: "archive",
         group: "Lifecycle",
-        clause: "to soft-delete (`undo: true` to restore)",
+        clause: "to set a note aside in the archive folder, out of search (`undo: true` to restore)",
     },
     Orientation {
         capability: "delete",
         group: "Lifecycle",
-        clause: "for permanent removal",
+        clause: "to remove a note: `mode: soft`, the default, moves it to `.trash` where `undo: true` restores it, and `mode: hard` is permanent",
     },
     Orientation {
         capability: "reindex-file",

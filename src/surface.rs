@@ -350,7 +350,7 @@ pub const OPERATIONS: &[Operation] = &[
     Operation {
         name: "delete",
         id: "deleteNote",
-        summary: "Delete a note. Supports soft (archive) and hard (permanent) modes.",
+        summary: "Delete a note. `soft` (default) moves it to `.trash` and out of the index, and `undo: true` restores it; `hard` removes it permanently.",
         response: "Deletion confirmation",
     },
     Operation {
@@ -362,7 +362,7 @@ pub const OPERATIONS: &[Operation] = &[
     Operation {
         name: "archive",
         id: "archiveNote",
-        summary: "Archive a note (soft delete), or restore one previously archived with `undo: true`. Archiving moves the note to the archive folder and removes it from the index; `undo` reverses that and re-indexes it.",
+        summary: "Archive a note, or restore one previously archived with `undo: true`. Archiving moves the note to the archive folder and removes it from the index; `undo` reverses that and re-indexes it.",
         response: "Archived (or restored) note path",
     },
     Operation {
