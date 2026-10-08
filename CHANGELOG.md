@@ -3,11 +3,15 @@
 Every entry below the upstream-lineage line names the commit it describes.
 Links resolve against https://github.com/mightytribble/knapper.
 
-## Unreleased
+## 0.9.13 (2026-10-07)
 
-**This release rebuilds the vault graph and embeds the archive folder.** Run
-`knapper index` after upgrading, before `serve`, which refuses the index until
-then (#151).
+A soft delete goes to `.trash` and `delete --undo` brings it back. `archive`
+sets a note aside without editing it: the note stays indexed and readable, and
+reads leave it out unless a call asks for the archive. A name resolves to a
+live note before an archived one. `serve` starts without downloading a model or
+asking Hugging Face for a tokenizer. Run `knapper index` once before `serve`:
+it rebuilds the vault graph and embeds any notes already in the archive folder,
+and `serve` refuses the index until then (#151).
 
 ### Changed
 
