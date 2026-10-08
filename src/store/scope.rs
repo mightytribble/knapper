@@ -497,6 +497,54 @@ impl Store {
     }
 }
 
+/// What a scope holds, counted: notes, their chunks, and the edges they
+/// write. An edge is its source note's, so it is counted where its source
+/// is (#151).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScopeTotals {
+    pub files: usize,
+    pub chunks: usize,
+    pub edges: usize,
+}
+
+impl Store {
+    /// The clauses `scope` compiles to on this store: its terms, its
+    /// resolved link filters, and the archive rule. For a query over a whole
+    /// vault that a read can still narrow (#151).
+    pub(super) fn scope_sql(
+        &self,
+        scope: &crate::tags::Scope,
+    ) -> Result<(String, Vec<Box<dyn rusqlite::types::ToSql>>)> {
+        let links = self.resolve_scope_links(scope)?;
+        Ok(scope_clauses(scope, &links, self.archive_folder()))
+    }
+
+    /// The notes, chunks and edges a scope holds (#151).
+    pub fn totals_in_scope(&self, scope: &crate::tags::Scope) -> Result<ScopeTotals> {
+        let (files_sql, mut args) = self.scope_sql(scope)?;
+        let (chunks_sql, chunk_args) = self.scope_sql(scope)?;
+        let (edges_sql, edge_args) = self.scope_sql(scope)?;
+        args.extend(chunk_args);
+        args.extend(edge_args);
+        let sql = format!(
+            "SELECT (SELECT COUNT(*) FROM files f WHERE 1=1{files_sql}),
+                    (SELECT COUNT(*) FROM chunks c JOIN files f ON f.id = c.file_id
+                      WHERE 1=1{chunks_sql}),
+                    (SELECT COUNT(*) FROM edges e JOIN files f ON f.id = e.from_file
+                      WHERE 1=1{edges_sql})"
+        );
+        Ok(self
+            .conn
+            .query_row(&sql, rusqlite::params_from_iter(args.iter()), |row| {
+                Ok(ScopeTotals {
+                    files: row.get::<_, i64>(0)? as usize,
+                    chunks: row.get::<_, i64>(1)? as usize,
+                    edges: row.get::<_, i64>(2)? as usize,
+                })
+            })?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

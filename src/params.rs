@@ -425,6 +425,11 @@ pub struct Tags {
     /// for the whole vocabulary.
     #[arg(long)]
     pub under: Option<String>,
+    /// Count notes under the archive folder, which the vocabulary leaves out
+    /// by default.
+    #[arg(long)]
+    #[serde(default)]
+    pub include_archive: bool,
 }
 
 #[derive(Debug, Args, Deserialize, JsonSchema)]
@@ -434,10 +439,21 @@ pub struct Properties {
     /// filtering with `property=NAME=VALUE` (#66).
     #[arg(long)]
     pub name: Option<String>,
+    /// Count notes under the archive folder, which the vocabulary leaves out
+    /// by default.
+    #[arg(long)]
+    #[serde(default)]
+    pub include_archive: bool,
 }
 
 #[derive(Debug, Args, Deserialize, JsonSchema)]
-pub struct VaultMap {}
+pub struct VaultMap {
+    /// Count notes under the archive folder, which the map leaves out
+    /// by default.
+    #[arg(long)]
+    #[serde(default)]
+    pub include_archive: bool,
+}
 
 /// One field, three shapes: a JSON array of strings, one comma-separated
 /// string, or `null`.

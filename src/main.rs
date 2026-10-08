@@ -481,7 +481,8 @@ async fn main() -> Result<()> {
         Command::Tags(args) => {
             let (store, _vault_path, _profile) = open_vault(&data_dir)?;
             let prefix = args.under.as_deref().and_then(knapper::tags::parse_term);
-            let rows = store.tags_under(prefix.as_ref())?;
+            let scope = knapper::tags::Scope::default().including_archive(args.include_archive);
+            let rows = store.tags_under(prefix.as_ref(), &scope)?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&rows)?);
             } else {
@@ -501,14 +502,14 @@ async fn main() -> Result<()> {
             }
         }
 
-        Command::VaultMap(_) => {
+        Command::VaultMap(args) => {
             let (store, vault_path, profile) = open_vault(&data_dir)?;
             let params = knapper::context::ContextParams {
                 store: &store,
                 vault_path: &vault_path,
                 profile: profile.as_ref(),
             };
-            let map = knapper::context::vault_map(&params)?;
+            let map = knapper::context::vault_map(&params, args.include_archive)?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&map)?);
             } else {

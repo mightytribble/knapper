@@ -579,10 +579,12 @@ pub fn context_list(
 const TOP_NOTES: usize = 10;
 
 /// High-level vault overview: folders, the tag vocabulary and its reach, the
-/// most-linked notes, recently changed files, counts.
-pub fn vault_map(params: &ContextParams) -> Result<VaultMap> {
-    let stats = params.store.stats()?;
-    let edge_stats = params.store.get_edge_stats().ok();
+/// most-linked notes, recently changed files, counts. It describes the vault
+/// a read answers from, so the archive is left out unless `include_archive`
+/// (#151).
+pub fn vault_map(params: &ContextParams, include_archive: bool) -> Result<VaultMap> {
+    let scope = crate::tags::Scope::default().including_archive(include_archive);
+    let totals = params.store.totals_in_scope(&scope)?;
 
     let (vault_type, structure) = match params.profile {
         Some(p) => (
@@ -592,7 +594,7 @@ pub fn vault_map(params: &ContextParams) -> Result<VaultMap> {
         None => ("Unknown".into(), "Unknown".into()),
     };
 
-    let folder_counts = params.store.folder_note_counts()?;
+    let folder_counts = params.store.folder_note_counts(&scope)?;
     let folders: Vec<FolderInfo> = folder_counts
         .into_iter()
         .map(|(path, count)| FolderInfo {
@@ -601,33 +603,33 @@ pub fn vault_map(params: &ContextParams) -> Result<VaultMap> {
         })
         .collect();
 
-    let top_tags = params.store.top_tags(20)?;
-    let tagged_notes = params.store.tagged_file_count()?;
+    let top_tags = params.store.top_tags(20, &scope)?;
+    let tagged_notes = params.store.tagged_file_count(&scope)?;
     // How many facets the vocabulary spans, from the store's own axis rollup
     // (#60): one axis says the vault tags a single facet, which is what turns
     // a tag head count into something a caller can read a structure off.
-    let tag_axes = params.store.tag_axes()?.len();
+    let tag_axes = params.store.tag_axes(&scope)?.len();
 
     // The ten notes the vault points at most. `chunk_count` and `token_count`
     // are deliberately not carried beside them: a map is a fixed shape, and a
     // caller who wants sizes has `list` (#131, #138).
     let top_notes: Vec<TopNote> = params
         .store
-        .top_linked_files(TOP_NOTES)?
+        .top_linked_files(TOP_NOTES, &scope)?
         .into_iter()
         .map(|(path, links_in)| TopNote { path, links_in })
         .collect();
 
-    let recent = params.store.recent_files(10)?;
+    let recent = params.store.recent_files(10, &scope)?;
     let recent_files: Vec<String> = recent.into_iter().map(|f| f.path).collect();
 
     Ok(VaultMap {
         vault_path: params.vault_path.to_string_lossy().to_string(),
         vault_type,
         structure,
-        total_files: stats.file_count,
-        total_chunks: stats.chunk_count,
-        total_edges: edge_stats.map(|e| e.total_edges).unwrap_or(0),
+        total_files: totals.files,
+        total_chunks: totals.chunks,
+        total_edges: totals.edges,
         folders,
         top_tags,
         tagged_notes,
@@ -1502,7 +1504,7 @@ mod tests {
             vault_path: &root,
             profile: None,
         };
-        let map = vault_map(&params).unwrap();
+        let map = vault_map(&params, false).unwrap();
         assert_eq!(map.total_files, 2);
         assert!(!map.folders.is_empty());
         assert!(map.top_tags.iter().any(|(t, _)| t == "rust"));
@@ -1539,7 +1541,7 @@ mod tests {
             vault_path: &root,
             profile: None,
         };
-        let map = vault_map(&params).unwrap();
+        let map = vault_map(&params, false).unwrap();
 
         assert_eq!(
             map.top_notes,
@@ -1567,7 +1569,7 @@ mod tests {
             vault_path: &root,
             profile: None,
         };
-        let map = vault_map(&params).unwrap();
+        let map = vault_map(&params, false).unwrap();
 
         // One of the two notes carries a tag, on the single axis `rust`.
         assert_eq!(map.total_files, 2);
@@ -2069,6 +2071,86 @@ mod tests {
         )
         .unwrap();
         (tmp, store, root)
+    }
+
+    #[test]
+    fn tags_leave_the_archive_out_unless_asked() {
+        let (_tmp, store, _root) = archive_vault();
+        let paths = |include: bool| -> Vec<String> {
+            store
+                .tags_under(
+                    None,
+                    &crate::tags::Scope::default().including_archive(include),
+                )
+                .unwrap()
+                .into_iter()
+                .map(|t| t.path)
+                .collect()
+        };
+        assert_eq!(paths(false), ["type/live"]);
+        assert_eq!(paths(true), ["type/live", "type/old"]);
+    }
+
+    #[test]
+    fn properties_leave_the_archive_out_unless_asked() {
+        let (_tmp, store, root) = archive_vault();
+        let run = |json: serde_json::Value| {
+            crate::properties::run(&store, &root, &serde_json::from_value(json).unwrap()).unwrap()
+        };
+        let names = |report| match report {
+            crate::properties::PropertiesReport::Registry(rows) => {
+                rows.into_iter().map(|r| r.name).collect::<Vec<_>>()
+            }
+            other => panic!("expected the registry, got {other:?}"),
+        };
+        assert_eq!(names(run(serde_json::json!({}))), ["status"]);
+        assert_eq!(
+            names(run(serde_json::json!({"include_archive": true}))),
+            ["era", "status"]
+        );
+        match run(serde_json::json!({"name": "era"})) {
+            crate::properties::PropertiesReport::Values(rows) => assert!(rows.is_empty()),
+            other => panic!("expected values, got {other:?}"),
+        }
+    }
+
+    /// The map describes the vault a read answers from. `links_in` counts
+    /// every linking note, as `list` does, so the two cannot disagree
+    /// (#138, #151).
+    #[test]
+    fn vault_map_leaves_the_archive_out_unless_asked() {
+        let (_tmp, store, root) = archive_vault();
+        let ctx = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+
+        let map = vault_map(&ctx, false).unwrap();
+        assert_eq!(map.total_files, 1);
+        assert_eq!(map.total_edges, 0, "the one edge is the archived note's");
+        assert_eq!(
+            map.folders
+                .iter()
+                .map(|f| f.path.as_str())
+                .collect::<Vec<_>>(),
+            ["lore"]
+        );
+        assert_eq!(map.recent_files, ["lore/live.md"]);
+        assert_eq!(map.tagged_notes, 1);
+        assert_eq!(map.tag_axes, 1);
+        assert_eq!(
+            map.top_notes,
+            vec![TopNote {
+                path: "lore/live.md".into(),
+                links_in: 1
+            }]
+        );
+
+        let map = vault_map(&ctx, true).unwrap();
+        assert_eq!(map.total_files, 2);
+        assert_eq!(map.total_edges, 1);
+        assert_eq!(map.tagged_notes, 2);
     }
 
     #[test]

@@ -205,9 +205,10 @@ impl KnapperServer {
         params: Parameters<crate::params::Tags>,
     ) -> Result<CallToolResult, McpError> {
         let prefix = params.0.under.as_deref().and_then(crate::tags::parse_term);
+        let scope = crate::tags::Scope::default().including_archive(params.0.include_archive);
         let rows = self
             .core
-            .with_reader(move |store| store.tags_under(prefix.as_ref()))
+            .with_reader(move |store| store.tags_under(prefix.as_ref(), &scope))
             .await
             .map_err(mcp_err)?;
         to_json_result(&rows)
@@ -235,7 +236,11 @@ impl KnapperServer {
         name = "vault_map",
         description = "Vault structure overview: folders, file counts, the tag vocabulary with the share of notes it covers, the most-linked notes, and recently changed files. The first call on a vault you do not know: top_notes names what the vault points at most, which is where to start reading."
     )]
-    async fn vault_map(&self) -> Result<CallToolResult, McpError> {
+    async fn vault_map(
+        &self,
+        params: Parameters<crate::params::VaultMap>,
+    ) -> Result<CallToolResult, McpError> {
+        let include_archive = params.0.include_archive;
         let vault = self.core.vault_path.clone();
         let profile = self.core.profile.clone();
         let map = self
@@ -246,7 +251,7 @@ impl KnapperServer {
                     vault_path: &vault,
                     profile: profile.as_ref().as_ref(),
                 };
-                context::vault_map(&ctx)
+                context::vault_map(&ctx, include_archive)
             })
             .await
             .map_err(mcp_err)?;
@@ -1649,7 +1654,12 @@ mod tests {
     async fn a_json_result_is_framed_without_indentation() {
         let (_tmp, server) = indexed_server(crate::config::GroupBy::Chunk);
 
-        let result = server.vault_map().await.unwrap();
+        let result = server
+            .vault_map(super::Parameters(crate::params::VaultMap {
+                include_archive: false,
+            }))
+            .await
+            .unwrap();
         let text = &result
             .content
             .first()
@@ -1807,7 +1817,10 @@ mod tests {
 
         let tags = tokio::time::timeout(
             Duration::from_secs(2),
-            server.tags(super::Parameters(crate::params::Tags { under: None })),
+            server.tags(super::Parameters(crate::params::Tags {
+                under: None,
+                include_archive: false,
+            })),
         )
         .await
         .expect("tags waited on the search");
@@ -1895,6 +1908,34 @@ mod tests {
     /// follows is a handshake session, so `tools/list` with no `_meta`
     /// answers the tools rather than refusing for missing per-request
     /// metadata, as rmcp 3.2 did once a discover had been answered.
+    #[tokio::test]
+    async fn the_vault_map_tool_takes_include_archive() {
+        let (_tmp, core) = crate::core::testing::indexed_core(
+            &[
+                ("lore/live.md", "# Live\n\nThe coast road.\n"),
+                ("04-Archive/lore/old.md", "# Old\n\nThe coast road.\n"),
+            ],
+            crate::core::testing::test_config(),
+        );
+        let server = super::KnapperServer::new(core);
+        let total = |include_archive: bool| {
+            let server = &server;
+            async move {
+                let result = server
+                    .vault_map(super::Parameters(crate::params::VaultMap {
+                        include_archive,
+                    }))
+                    .await
+                    .unwrap();
+                let text = result.content[0].as_text().unwrap().text.clone();
+                let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+                json["total_files"].clone()
+            }
+        };
+        assert_eq!(total(false).await, 1);
+        assert_eq!(total(true).await, 2);
+    }
+
     #[tokio::test]
     async fn initialize_after_discover_serves_tools_without_request_meta() {
         let responses = exchange_over_stdio(&[

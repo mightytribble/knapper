@@ -28,7 +28,7 @@ pub use files::FileRecord;
 pub use fts::{FtsResult, fts_objects_sql};
 pub use properties::{NewProperty, PropertyCount, PropertyRow, ValueCount};
 pub use schema::SCHEMA_VERSION;
-pub use scope::{LinkIds, ListOrder, ListRow};
+pub use scope::{LinkIds, ListOrder, ListRow, ScopeTotals};
 pub use tags::TagCount;
 
 use anyhow::{Context, Result};

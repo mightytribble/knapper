@@ -599,9 +599,10 @@ async fn handle_tags(
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, false)?;
     let prefix = params.under.as_deref().and_then(crate::tags::parse_term);
+    let scope = crate::tags::Scope::default().including_archive(params.include_archive);
     let rows = state
         .core
-        .with_reader(move |store| store.tags_under(prefix.as_ref()))
+        .with_reader(move |store| store.tags_under(prefix.as_ref(), &scope))
         .await?;
     Ok(Json(serde_json::json!(rows)))
 }
@@ -626,6 +627,7 @@ async fn handle_properties(
 async fn handle_vault_map(
     State(state): State<ApiState>,
     headers: HeaderMap,
+    ApiQuery(params): ApiQuery<crate::params::VaultMap>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, false)?;
     let vault = state.core.vault_path.clone();
@@ -638,7 +640,7 @@ async fn handle_vault_map(
                 vault_path: &vault,
                 profile: profile.as_ref().as_ref(),
             };
-            context::vault_map(&ctx)
+            context::vault_map(&ctx, params.include_archive)
         })
         .await?;
     Ok(Json(serde_json::json!(map)))

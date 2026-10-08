@@ -180,16 +180,19 @@ impl Store {
     }
 
     /// Top-level folder grouping with note counts.
-    pub fn folder_note_counts(&self) -> Result<Vec<(String, usize)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT CASE WHEN instr(path, '/') > 0
-                    THEN substr(path, 1, instr(path, '/') - 1)
+    ///
+    /// Only the notes `scope` admits count, which by default leaves the archive out (#151).
+    pub fn folder_note_counts(&self, scope: &crate::tags::Scope) -> Result<Vec<(String, usize)>> {
+        let (scope_sql, args) = self.scope_sql(scope)?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT CASE WHEN instr(f.path, '/') > 0
+                    THEN substr(f.path, 1, instr(f.path, '/') - 1)
                     ELSE '(root)'
                     END AS folder,
                     COUNT(*) as cnt
-             FROM files GROUP BY folder ORDER BY cnt DESC",
-        )?;
-        let rows = stmt.query_map([], |row| {
+             FROM files f WHERE 1=1{scope_sql} GROUP BY folder ORDER BY cnt DESC"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
         })?;
         let mut results = Vec::new();
@@ -199,8 +202,16 @@ impl Store {
         Ok(results)
     }
 
-    /// Most recently indexed files.
-    pub fn recent_files(&self, limit: usize) -> Result<Vec<FileRecord>> {
+    /// Most recently changed files.
+    ///
+    /// Only the notes `scope` admits count, which by default leaves the archive out (#151).
+    pub fn recent_files(
+        &self,
+        limit: usize,
+        scope: &crate::tags::Scope,
+    ) -> Result<Vec<FileRecord>> {
+        let (scope_sql, mut args) = self.scope_sql(scope)?;
+        args.push(Box::new(limit as i64));
         // `mtime` and not `indexed_at` (#138): `indexed_at` is stamped when a
         // row is inserted, so `index --rebuild` reinserts every file in walk
         // order and the column collapses into that order. Presenting it as
@@ -209,9 +220,9 @@ impl Store {
         // can answer. `f.path` is the tie-break, since a bulk-written vault
         // gives whole folders one mtime.
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT {FILE_COLUMNS} FROM files f ORDER BY f.mtime DESC, f.path LIMIT ?"
+            "SELECT {FILE_COLUMNS} FROM files f WHERE 1=1{scope_sql} ORDER BY f.mtime DESC, f.path LIMIT ?"
         ))?;
-        let rows = stmt.query_map(params![limit as i64], file_from_row)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), file_from_row)?;
         let mut results = Vec::new();
         for row in rows {
             results.push(row?);
@@ -650,7 +661,9 @@ mod tests {
         store
             .insert_file("root.md", "h4", 100, "d4", None, None)
             .unwrap();
-        let counts = store.folder_note_counts().unwrap();
+        let counts = store
+            .folder_note_counts(&crate::tags::Scope::default())
+            .unwrap();
         assert!(counts.iter().any(|(f, c)| f == "01-Projects" && *c == 2));
         assert!(counts.iter().any(|(f, c)| f == "02-Areas" && *c == 1));
         assert!(counts.iter().any(|(f, c)| f == "(root)" && *c == 1));
@@ -687,7 +700,9 @@ mod tests {
             )
             .unwrap();
 
-        let recent = store.recent_files(2).unwrap();
+        let recent = store
+            .recent_files(2, &crate::tags::Scope::default())
+            .unwrap();
         assert_eq!(
             recent.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
             vec!["edited.md", "untouched.md"]

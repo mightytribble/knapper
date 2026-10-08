@@ -257,15 +257,27 @@ impl Store {
     ///
     /// A note nothing links to is absent rather than zero: `edges` holds no
     /// row for it, and it is not an answer to which notes the vault points at.
-    pub fn top_linked_files(&self, limit: usize) -> Result<Vec<(String, usize)>> {
+    ///
+    /// The scope narrows the note linked to, not the notes linking: a linking
+    /// note counts wherever it is, as `list --sort links_in` counts it. Only
+    /// the notes `scope` admits count, which by default leaves the archive out
+    /// (#151).
+    pub fn top_linked_files(
+        &self,
+        limit: usize,
+        scope: &crate::tags::Scope,
+    ) -> Result<Vec<(String, usize)>> {
+        let (scope_sql, mut args) = self.scope_sql(scope)?;
+        args.push(Box::new(limit as i64));
         // `f.path` is the tie-break, so two equally linked notes come back in
         // the same order every call.
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT f.path, COUNT(DISTINCT e.from_file) AS links_in
                FROM edges e JOIN files f ON f.id = e.to_file
-              GROUP BY e.to_file ORDER BY links_in DESC, f.path LIMIT ?",
-        )?;
-        let rows = stmt.query_map(params![limit as i64], |row| {
+              WHERE 1=1{scope_sql}
+              GROUP BY e.to_file ORDER BY links_in DESC, f.path LIMIT ?"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
         })?;
         let mut results = Vec::new();
@@ -698,7 +710,9 @@ mod tests {
         store.insert_edge(mid, 0, hub, -1, "wikilink").unwrap();
         store.insert_edge(leaf, 0, mid, -1, "wikilink").unwrap();
 
-        let top = store.top_linked_files(10).unwrap();
+        let top = store
+            .top_linked_files(10, &crate::tags::Scope::default())
+            .unwrap();
         assert_eq!(
             top,
             vec![("hub.md".to_string(), 2), ("mid.md".to_string(), 1)]
@@ -718,7 +732,9 @@ mod tests {
             .unwrap();
         store.insert_edge(leaf, 0, hub, -1, "wikilink").unwrap();
 
-        let top = store.top_linked_files(10).unwrap();
+        let top = store
+            .top_linked_files(10, &crate::tags::Scope::default())
+            .unwrap();
         assert_eq!(top, vec![("hub.md".to_string(), 1)]);
     }
 
@@ -737,7 +753,9 @@ mod tests {
         store.insert_edge(leaf, 1, hub, -1, "wikilink").unwrap();
 
         assert_eq!(
-            store.top_linked_files(10).unwrap(),
+            store
+                .top_linked_files(10, &crate::tags::Scope::default())
+                .unwrap(),
             vec![("hub.md".to_string(), 1)]
         );
     }
@@ -757,7 +775,9 @@ mod tests {
         store.insert_edge(leaf, 0, b, -1, "wikilink").unwrap();
         store.insert_edge(leaf, 0, a, -1, "wikilink").unwrap();
 
-        let top = store.top_linked_files(10).unwrap();
+        let top = store
+            .top_linked_files(10, &crate::tags::Scope::default())
+            .unwrap();
         assert_eq!(
             top.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>(),
             vec!["a.md", "b.md"]
@@ -779,7 +799,13 @@ mod tests {
         store.insert_edge(leaf, 0, a, -1, "wikilink").unwrap();
         store.insert_edge(leaf, 0, b, -1, "wikilink").unwrap();
 
-        assert_eq!(store.top_linked_files(1).unwrap().len(), 1);
+        assert_eq!(
+            store
+                .top_linked_files(1, &crate::tags::Scope::default())
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]

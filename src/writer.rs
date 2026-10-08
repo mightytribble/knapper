@@ -2688,7 +2688,10 @@ mod tests {
             store.resolve_tag("shared").unwrap(),
             crate::tags::TagResolution::Exact(_)
         ));
-        assert_eq!(store.top_tags(10).unwrap(), vec![("shared".to_string(), 1)]);
+        assert_eq!(
+            store.top_tags(10, &crate::tags::Scope::default()).unwrap(),
+            vec![("shared".to_string(), 1)]
+        );
     }
 
     #[test]
@@ -4682,7 +4685,10 @@ mod tests {
         assert!(store.get_file(".trash/lore/n.md").unwrap().is_none());
         assert!(store.get_unresolved_links().unwrap().is_empty());
         assert!(
-            store.tags_under(None).unwrap().is_empty(),
+            store
+                .tags_under(None, &crate::tags::Scope::default())
+                .unwrap()
+                .is_empty(),
             "a tag only the trashed note carried is pruned"
         );
     }

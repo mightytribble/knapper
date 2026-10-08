@@ -370,9 +370,10 @@ pub fn declared_types(vault_path: &Path) -> BTreeMap<String, String> {
 pub fn registry(
     store: &crate::store::Store,
     vault_path: &Path,
+    scope: &crate::tags::Scope,
 ) -> anyhow::Result<Vec<crate::store::PropertyCount>> {
     let declared = declared_types(vault_path);
-    let mut rows = store.property_registry()?;
+    let mut rows = store.property_registry(scope)?;
     for row in &mut rows {
         row.declared_type = declared.get(&row.name).cloned();
     }
@@ -409,9 +410,10 @@ pub fn run(
     vault_path: &Path,
     params: &crate::params::Properties,
 ) -> anyhow::Result<PropertiesReport> {
+    let scope = crate::tags::Scope::default().including_archive(params.include_archive);
     Ok(match &params.name {
-        Some(name) => PropertiesReport::Values(store.property_values(name)?),
-        None => PropertiesReport::Registry(registry(store, vault_path)?),
+        Some(name) => PropertiesReport::Values(store.property_values(name, &scope)?),
+        None => PropertiesReport::Registry(registry(store, vault_path, &scope)?),
     })
 }
 
@@ -741,7 +743,7 @@ mod tests {
                 }],
             )
             .unwrap();
-        let rows = registry(&store, root).unwrap();
+        let rows = registry(&store, root, &crate::tags::Scope::default()).unwrap();
         let got: Vec<(&str, usize, Option<&str>)> = rows
             .iter()
             .map(|r| (r.name.as_str(), r.note_count, r.declared_type.as_deref()))
@@ -784,7 +786,10 @@ mod tests {
         let whole = run(
             &store,
             tmp.path(),
-            &crate::params::Properties { name: None },
+            &crate::params::Properties {
+                name: None,
+                include_archive: false,
+            },
         )
         .unwrap();
         assert_eq!(render_text(&whole), "status (1) text\n");
@@ -793,6 +798,7 @@ mod tests {
             tmp.path(),
             &crate::params::Properties {
                 name: Some("status".into()),
+                include_archive: false,
             },
         )
         .unwrap();
