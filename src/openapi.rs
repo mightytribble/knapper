@@ -131,7 +131,7 @@ const ERROR_RESPONSES: &[(&str, &str)] = &[
     ),
     (
         "409",
-        "The write would clobber: the note changed on disk since it was indexed, a create or move onto an existing path, an archive of an archived note (kind conflict).",
+        "The write would clobber: the note changed on disk since it was indexed, a create or move onto an existing path, an archive of an archived note or onto a path the archive holds, a soft delete onto a path .trash holds, a restore onto an occupied path (kind conflict).",
     ),
     (
         "429",

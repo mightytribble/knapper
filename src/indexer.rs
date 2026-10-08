@@ -14,7 +14,6 @@ use crate::exclude::ExcludeMatcher;
 use crate::fault::Fault;
 use crate::graph::{Wikilink, extract_wikilinks, resolve_link_target};
 use crate::llm::EmbedModel;
-use crate::profile::VaultProfile;
 use crate::store::{DOC_LEVEL, FileRecord, Store};
 
 /// Summary of an indexing run.
@@ -822,13 +821,14 @@ pub fn run_index(
     let data_dir = Config::data_dir()?;
     std::fs::create_dir_all(&data_dir)?;
 
+    let profile = crate::config::Config::load_vault_profile().ok().flatten();
     let db_path = db_path(&data_dir);
-    let store = Store::open(&db_path)?;
+    let store = Store::open(&db_path)?
+        .with_archive_folder(crate::profile::archive_folder(profile.as_ref()));
 
     let models_dir = data_dir.join("models");
     let mut embedder = crate::llm::load_embedder(&models_dir, config)?;
 
-    let profile = crate::config::Config::load_vault_profile().ok().flatten();
     run_index_inner(
         vault_path,
         config,
@@ -836,7 +836,6 @@ pub fn run_index(
         &store,
         &mut embedder,
         rebuild,
-        profile.as_ref(),
         progress,
     )
 }
@@ -852,7 +851,6 @@ pub fn run_index_shared(
     store: &Store,
     embedder: &mut impl EmbedModel,
     rebuild: bool,
-    profile: Option<&VaultProfile>,
 ) -> Result<IndexResult> {
     run_index_inner(
         vault_path,
@@ -861,7 +859,6 @@ pub fn run_index_shared(
         store,
         embedder,
         rebuild,
-        profile,
         &mut NoProgress,
     )
 }
@@ -875,7 +872,6 @@ fn run_index_inner(
     store: &Store,
     embedder: &mut impl EmbedModel,
     rebuild: bool,
-    profile: Option<&VaultProfile>,
     progress: &mut dyn IndexProgress,
 ) -> Result<IndexResult> {
     // The single application point for the index-time settings (#72). Everything
@@ -974,19 +970,8 @@ fn run_index_inner(
         info!(orphans, "cleaned up orphan DB entries for missing files");
     }
 
-    // Build exclude list: config excludes + archive folder (if detected)
-    let mut exclude = config.exclude.clone();
-    if let Some(p) = profile
-        && let Some(archive) = &p.structure.folders.archive
-    {
-        let archive_pattern = format!("{}/", archive);
-        if !exclude.contains(&archive_pattern) {
-            exclude.push(archive_pattern);
-        }
-    }
-
     // If rebuild, treat everything as new.
-    let files = walk_vault(vault_path, &exclude, config.respect_gitignore)?;
+    let files = walk_vault(vault_path, &config.exclude, config.respect_gitignore)?;
 
     let (new_files, changed_files, deleted_files) = if rebuild {
         // On rebuild we skip diffing — all files are "new".
@@ -1370,7 +1355,6 @@ mod tests {
             &store,
             &mut embedder,
             false,
-            None,
             &mut progress,
         )
         .unwrap();
@@ -1408,7 +1392,6 @@ mod tests {
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
 
@@ -1543,7 +1526,6 @@ mod tests {
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
         assert_eq!(result.new_files, 2);
@@ -1586,7 +1568,6 @@ mod tests {
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
 
@@ -1629,7 +1610,6 @@ mod tests {
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
         let sources: Vec<String> = store
@@ -1648,7 +1628,6 @@ mod tests {
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
 
@@ -1691,7 +1670,6 @@ mod tests {
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
         let hub_id = store.get_file("hub.md").unwrap().unwrap().id;
@@ -1715,7 +1693,6 @@ mod tests {
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
 
@@ -1743,9 +1720,90 @@ mod tests {
             &fresh,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
+        assert_eq!(edge_snapshot(&store), edge_snapshot(&fresh));
+    }
+
+    /// The archive is indexed (#151): a read leaves it out, and the index
+    /// does not.
+    #[test]
+    fn an_index_walks_the_archive_folder() {
+        use crate::llm::MockLlm;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write_file(root, "lore/live.md", "# Live\nBody.");
+        write_file(root, "04-Archive/lore/old.md", "# Old\nBody.");
+        let store = Store::open_memory()
+            .unwrap()
+            .with_archive_folder("04-Archive");
+        let config = Config::default();
+        run_index_shared(
+            root,
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut MockLlm::new(256),
+            false,
+        )
+        .unwrap();
+        let old = store
+            .get_file("04-Archive/lore/old.md")
+            .unwrap()
+            .expect("the archive is indexed");
+        assert!(!store.get_chunks_by_file(old.id).unwrap().is_empty());
+    }
+
+    /// The #27 invariant with an archived note of the same name present: an
+    /// incremental index and a fresh one resolve `[[hub]]` to the same live
+    /// note (#151).
+    #[test]
+    fn an_incremental_edit_and_a_full_index_agree_on_the_edges_table_with_an_archive_present() {
+        use crate::llm::MockLlm;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write_file(root, "a.md", "# A\nSee [[hub]].");
+        write_file(root, "lore/deep/hub.md", "# Hub\nLive.");
+        write_file(root, "04-Archive/hub.md", "# Hub\nArchived.");
+        let config = Config::default();
+        let index = |store: &Store| {
+            run_index_shared(
+                root,
+                &config,
+                crate::indexer::IndexSettings::from_config(&config),
+                store,
+                &mut MockLlm::new(256),
+                false,
+            )
+            .unwrap();
+        };
+
+        let store = Store::open_memory()
+            .unwrap()
+            .with_archive_folder("04-Archive");
+        index(&store);
+        let a = store.get_file("a.md").unwrap().unwrap().id;
+        let live = store.get_file("lore/deep/hub.md").unwrap().unwrap().id;
+        assert_eq!(
+            store
+                .get_outgoing(a, Some("wikilink"))
+                .unwrap()
+                .into_iter()
+                .map(|(to, _)| to)
+                .collect::<Vec<_>>(),
+            vec![live],
+            "the live hub, though the archived one has the shorter path"
+        );
+
+        write_file(root, "lore/deep/hub.md", "# Hub\nLive, one word changed.");
+        index(&store);
+
+        let fresh = Store::open_memory()
+            .unwrap()
+            .with_archive_folder("04-Archive");
+        index(&fresh);
         assert_eq!(edge_snapshot(&store), edge_snapshot(&fresh));
     }
 
@@ -1773,7 +1831,6 @@ mod tests {
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
         let a_id = store.get_file("a.md").unwrap().unwrap().id;
@@ -1787,7 +1844,6 @@ mod tests {
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
 
@@ -1802,7 +1858,6 @@ mod tests {
             &fresh,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
         assert_eq!(edge_snapshot(&store), edge_snapshot(&fresh));
@@ -1839,7 +1894,6 @@ mod tests {
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
         embedder.seen.clear();
@@ -1894,7 +1948,6 @@ mod tests {
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
 
@@ -1952,7 +2005,6 @@ mod tests {
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
 
@@ -1991,7 +2043,6 @@ mod tests {
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
 
@@ -2030,7 +2081,6 @@ mod tests {
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
 
@@ -2060,7 +2110,6 @@ mod tests {
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
 
@@ -2105,7 +2154,6 @@ mod tests {
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
 
@@ -2149,7 +2197,6 @@ mod tests {
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
         assert_eq!(result.new_files, 1);
@@ -2171,7 +2218,6 @@ mod tests {
             &store,
             &mut wider,
             false,
-            None,
         )
         .unwrap();
 
@@ -2710,7 +2756,6 @@ mod tests {
             &store,
             &mut flaky,
             false,
-            None,
         );
         if let Err(e) = &result {
             panic!("a failing file must be skipped, not propagated as an error: {e:#}");
@@ -2741,7 +2786,6 @@ mod tests {
             &store,
             &mut fixed,
             false,
-            None,
         )
         .unwrap();
 
@@ -2806,7 +2850,6 @@ mod tests {
             &store,
             &mut embedder,
             false,
-            None,
         );
         if let Err(e) = &result {
             panic!("a failed store write must be skipped, not propagated as an error: {e:#}");
@@ -2840,7 +2883,6 @@ mod tests {
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
 
@@ -2896,7 +2938,6 @@ mod tests {
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
         (store, embedder)
@@ -2978,7 +3019,6 @@ mod tests {
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
 
@@ -3217,7 +3257,6 @@ mod tests {
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
 
@@ -3248,7 +3287,6 @@ mod tests {
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
 
@@ -3322,7 +3360,6 @@ mod tests {
                 &store,
                 &mut embedder,
                 false,
-                None,
             )
             .unwrap();
             store
@@ -3374,7 +3411,6 @@ mod tests {
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
 
@@ -3413,7 +3449,6 @@ mod tests {
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
         store
@@ -3699,7 +3734,6 @@ mod tests {
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
 
@@ -3735,7 +3769,6 @@ mod tests {
             store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
     }
@@ -3902,7 +3935,6 @@ mod tests {
                 store,
                 embedder,
                 rebuild,
-                None,
             )
             .unwrap()
         };
@@ -3950,7 +3982,6 @@ mod tests {
                 store,
                 embedder,
                 false,
-                None,
             )
             .unwrap()
         };
@@ -3994,7 +4025,6 @@ mod tests {
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
         assert_eq!(store.get_unresolved_links().unwrap().len(), 1);
@@ -4037,7 +4067,6 @@ mod tests {
                 store,
                 embedder,
                 false,
-                None,
             )
             .unwrap()
         };
@@ -4312,7 +4341,6 @@ mod tests {
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
 
@@ -4326,6 +4354,7 @@ mod tests {
             none: Vec::new(),
             scan: crate::params::Scan::All,
             limit: None,
+            include_archive: false,
         };
         let report = crate::matching::run(&store, &params).unwrap();
 
@@ -4353,7 +4382,6 @@ mod tests {
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
         assert!(store.find_file_by_alias("Sam").unwrap().is_some());
@@ -4385,7 +4413,6 @@ mod tests {
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
         let a = store.get_file("a.md").unwrap().unwrap().id;
@@ -4428,7 +4455,6 @@ mod tests {
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
 

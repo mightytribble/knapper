@@ -1486,8 +1486,14 @@ pub fn undelete_note(
 
 // ── Archive / Unarchive ─────────────────────────────────────────
 
-/// Archive a note: move to archive folder, add archived frontmatter, remove from index.
-/// The note becomes invisible to search/context but is physically preserved.
+/// Archive a note: move it under the archive folder at its whole path.
+///
+/// The path under the archive folder is the record of where the note came
+/// from, so the file is not edited, and its row moves with it as `move`'s
+/// does: chunks, vectors and edges stay and nothing is re-embedded. The
+/// note stays indexed, and reads leave it out unless they ask for the
+/// archive. A path the archive already holds is refused rather than
+/// replaced (#151).
 pub fn archive_note(
     file: &str,
     store: &Store,
@@ -1496,10 +1502,9 @@ pub fn archive_note(
 ) -> Result<WriteResult> {
     let file_record = store.require_file(file)?;
 
-    let archive_folder = archive_folder(profile);
-
-    // Don't archive something already in the archive
-    if file_record.path.starts_with(archive_folder) {
+    let folder = crate::profile::archive_folder(profile);
+    let prefix = format!("{folder}/");
+    if file_record.path.starts_with(&prefix) {
         bail!(Fault::Conflict(format!(
             "note is already archived: {}",
             file_record.path
@@ -1507,77 +1512,44 @@ pub fn archive_note(
     }
 
     let old_path = vault_path.join(&file_record.path);
-    let new_rel_path = format!("{}/{}", archive_folder, file_record.path);
+    let new_rel_path = format!("{prefix}{}", file_record.path);
     let new_full_path = vault_path.join(&new_rel_path);
-
-    // Archive's three keys go into the block the note already has, so every
-    // key the note carried is still there when it comes back (#92).
-    let content = std::fs::read_to_string(&old_path)?;
-    let mut block = crate::frontmatter::Block::parse_or_open(&content)?;
-    // A note that already holds one of these three keys cannot be archived
-    // without losing something: overwriting the note's own value, or —
-    // since `unarchive` removes exactly these three — leaving no way to
-    // tell the note's own key from the one this write adds. Refusing is
-    // the honest answer; the file is not touched (#92, I7).
-    for key in ["archived", "archived_at", "archived_from"] {
-        if block.value(key).is_some() {
-            bail!(
-                "note already holds `{key}`; knapper cannot archive it without losing that note's own value"
-            );
-        }
+    // A second copy would replace the first, and the first is the only
+    // record of that note.
+    if new_full_path.exists() {
+        bail!(Fault::Conflict(format!(
+            "the archive already holds {new_rel_path}: unarchive or remove it first"
+        )));
     }
-    let tags = block.list("tags");
-    block.set_bool("archived", true)?;
-    block.set_scalar("archived_at", &today_date(), &KeyPlacement::End)?;
-    block.set_scalar("archived_from", &file_record.path, &KeyPlacement::End)?;
-    let new_content = block.render();
 
-    // Ensure target directory
+    // The notes that link to this one, read before the move: a link written
+    // as a path stops resolving, and a live note of the same name now takes
+    // a plain one (#108).
+    let linking = crate::indexer::sources_linking_to(store, file_record.id)?;
     if let Some(parent) = new_full_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-
-    // Write archived file to new location
-    atomic_write(&new_full_path, &new_content, false)?;
-
-    // Remove from index (note disappears from search)
-    //
-    // The notes that link to this one are read before the cascade takes their
-    // edges: an archived note is out of the index, so those links now name
-    // nothing and only a re-derivation of those notes records that (#108).
-    let linking = crate::indexer::sources_linking_to(store, file_record.id)?;
-    let old_vids = store.get_vector_ids_for_file(file_record.id)?;
-    for vid in &old_vids {
-        store.delete_vec(*vid)?;
+    // The file moves before the store changes. A failed rename leaves the
+    // note where it is. A failed store change renames the file back.
+    std::fs::rename(&old_path, &new_full_path)?;
+    let docid = generate_docid(&new_rel_path);
+    if let Err(e) = store.transaction(|store| {
+        store.update_file_path(&file_record.path, &new_rel_path, &docid)?;
+        store.update_file_mtime(&new_rel_path, file_mtime(&new_full_path)?)
+    }) {
+        let _ = std::fs::rename(&new_full_path, &old_path);
+        return Err(e);
     }
-    let released_tags = store.file_tag_ids(file_record.id)?;
-    store.delete_edges_for_file(file_record.id)?;
-    store.delete_file(file_record.id)?;
-    store.prune_unused_tags(&released_tags)?;
-
-    // Remove original file
-    std::fs::remove_file(&old_path)?;
-
     crate::indexer::reconcile_links(store, vault_path, &linking)?;
-
-    let docid = file_record.docid.unwrap_or_default();
 
     Ok(WriteResult {
         path: new_rel_path,
         docid,
-        tags,
+        tags: file_record.tags,
         links_added: vec![],
         links_suggested: vec![],
-        folder: archive_folder.to_string(),
+        folder: folder.to_string(),
     })
-}
-
-/// The folder `archive` files notes under: the profile's, or `04-Archive`.
-fn archive_folder(profile: Option<&VaultProfile>) -> &str {
-    profile
-        .and_then(|p| p.structure.folders.archive.as_deref())
-        .unwrap_or("04-Archive")
-        .trim_matches('/')
 }
 
 /// Every `.md` file under `folder`, vault-relative, in path order.
@@ -1614,8 +1586,10 @@ fn archived_from(vault_path: &Path, rel: &str) -> Option<String> {
 
 /// The note under `folder` that `file` names, as a vault-relative path.
 ///
-/// `archive` and a soft delete both take a note out of the store, so the
-/// note is looked for on disk rather than through [`Store::resolve_file`].
+/// `archive` and a soft delete both move a note under a folder, and the note
+/// is looked for on disk rather than through [`Store::resolve_file`]: the disk
+/// holds an archived note whether or not the index does, and the store
+/// resolver puts a live note of the same name first.
 /// It takes the forms those operations take (#100): its path under
 /// `folder`; the path it came from, which is kept under `folder`; a
 /// basename, with or without `.md`; and a `#docid` of either path, or of
@@ -1728,7 +1702,38 @@ fn restore_note(
     Ok(docid)
 }
 
-/// Unarchive a note: move back to original location, strip archive frontmatter, re-index.
+/// A note an earlier archive wrote, with what that archive wrote taken off:
+/// `archived`, `archived_at` and `archived_from`, and the `archived` tag a
+/// version before #92 put in `tags`. A note that had no block before it was
+/// archived gets none back: `is_empty` counts keys only, so a block holding
+/// just a comment is kept by testing `is_blank` (#92, I2). Returns the text
+/// and the tags left.
+fn strip_archive_keys(content: &str) -> Result<(String, Vec<String>)> {
+    let Some(mut block) = crate::frontmatter::Block::parse(content)? else {
+        return Ok((content.to_string(), Vec::new()));
+    };
+    block.remove("archived")?;
+    block.remove("archived_at")?;
+    block.remove("archived_from")?;
+    block.remove_from_list("tags", "archived")?;
+    let tags = block.list("tags");
+    let text = if block.is_blank() {
+        block.body().to_string()
+    } else {
+        block.render()
+    };
+    Ok((text, tags))
+}
+
+/// Restore an archived note to the path it was archived from.
+///
+/// A note `archive` filed comes back byte for byte to its path with the
+/// archive folder taken off, and its row moves with it: same id, chunks and
+/// vectors, nothing re-embedded. A note an earlier archive wrote carries
+/// `archived_from`. It goes back there, with that archive's keys and its
+/// `archived` tag stripped, and is indexed again. So is a note the index
+/// holds no row for. A file already at the original path is refused rather
+/// than replaced (#151).
 pub fn unarchive_note(
     file: &str,
     store: &Store,
@@ -1738,50 +1743,89 @@ pub fn unarchive_note(
     vault_path: &Path,
     profile: Option<&VaultProfile>,
 ) -> Result<WriteResult> {
-    let file = resolve_in_folder(file, vault_path, archive_folder(profile), "archived note")?;
-    let archive_path = vault_path.join(&file);
-
+    let folder = crate::profile::archive_folder(profile);
+    let archived = resolve_in_folder(file, vault_path, folder, "archived note")?;
+    let archive_path = vault_path.join(&archived);
     let content = std::fs::read_to_string(&archive_path)?;
-    // A note under the archive folder with no `archived_from` has no record
-    // of where it came from. That is the caller's to repair (#151).
-    let no_origin = || {
-        anyhow::anyhow!(Fault::InvalidInput(format!(
-            "{file} has no archived_from: knapper cannot tell where it was archived from"
-        )))
+
+    // Only an earlier archive wrote `archived_from`. Testing that key alone
+    // keeps a note's own `archived_at` or `archived` tag: this archive writes
+    // neither, so one present is the note's.
+    let legacy_origin = crate::frontmatter::Block::parse(&content)
+        .ok()
+        .flatten()
+        .and_then(|block| block.scalar("archived_from"));
+    let original_path = match &legacy_origin {
+        Some(from) => vault_relative(from, "archived_from")?,
+        None => archived
+            .strip_prefix(&format!("{folder}/"))
+            .expect("resolve_in_folder answers a path under the folder")
+            .to_string(),
     };
-    let mut block = crate::frontmatter::Block::parse(&content)?.ok_or_else(no_origin)?;
-    let original_path = block.scalar("archived_from").ok_or_else(no_origin)?;
-
-    let original_path = vault_relative(&original_path, "archived_from")?;
     let restore_full_path = vault_path.join(&original_path);
-
     if restore_full_path.exists() {
         bail!(Fault::Conflict(format!(
-            "cannot unarchive: a file already exists at {}",
-            original_path
+            "cannot unarchive: a file already exists at {original_path}"
         )));
     }
+    let restored_folder = original_path
+        .rsplit_once('/')
+        .map(|(f, _)| f.to_string())
+        .unwrap_or_default();
+    let row = store.get_file(&archived)?;
 
-    block.remove("archived")?;
-    block.remove("archived_at")?;
-    block.remove("archived_from")?;
-    // A note archived by a version of knapper before #92 got `archived`
-    // written into its own `tags` list, alongside the three keys above.
-    // This build's `archive` no longer does that, but an old note still
-    // carries the tag, and it must not come back into the vocabulary just
-    // because the note is unarchived.
-    block.remove_from_list("tags", "archived")?;
-    let tags = block.list("tags");
-    // A note that had no block before it was archived gets none back.
-    // `is_empty` counts keys only, so a block holding just a comment or a
-    // blank line still reports empty; checking `is_blank` instead keeps
-    // those bytes rather than discarding the fences around them (#92, I2).
-    let restored_content = if block.is_blank() {
-        block.body().to_string()
-    } else {
-        block.render()
+    // An unchanged note the index holds moves with its row, as `move` moves
+    // one.
+    if legacy_origin.is_none()
+        && let Some(row) = &row
+    {
+        let linking = crate::indexer::sources_linking_to(store, row.id)?;
+        if let Some(parent) = restore_full_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        // A failed rename leaves the note where it is. A failed store change
+        // renames the file back.
+        std::fs::rename(&archive_path, &restore_full_path)?;
+        let docid = generate_docid(&original_path);
+        if let Err(e) = store.transaction(|store| {
+            store.update_file_path(&archived, &original_path, &docid)?;
+            store.update_file_mtime(&original_path, file_mtime(&restore_full_path)?)
+        }) {
+            let _ = std::fs::rename(&restore_full_path, &archive_path);
+            return Err(e);
+        }
+        crate::indexer::reconcile_links(store, vault_path, &linking)?;
+        return Ok(WriteResult {
+            path: original_path,
+            docid,
+            tags: row.tags.clone(),
+            links_added: vec![],
+            links_suggested: vec![],
+            folder: restored_folder,
+        });
+    }
+
+    // Otherwise the note is written back and indexed: its content changes,
+    // or the index holds no row for it.
+    let (restored_content, tags) = match legacy_origin {
+        Some(_) => strip_archive_keys(&content)?,
+        None => {
+            let tags = crate::frontmatter::Block::parse(&content)
+                .ok()
+                .flatten()
+                .map(|b| b.list("tags"))
+                .unwrap_or_default();
+            (content.clone(), tags)
+        }
     };
-
+    // The archived row's links and tags, read before it goes (#108).
+    let (linking, released_tags) = match &row {
+        Some(row) => (
+            crate::indexer::sources_linking_to(store, row.id)?,
+            store.file_tag_ids(row.id)?,
+        ),
+        None => (Vec::new(), Vec::new()),
+    };
     let docid = restore_note(
         &original_path,
         &restored_content,
@@ -1792,14 +1836,14 @@ pub fn unarchive_note(
         chunk_opts,
         vault_path,
     )?;
-
-    // Remove archived file
+    if row.is_some() {
+        store.transaction(|store| {
+            store.delete_file_hard(&archived)?;
+            store.prune_unused_tags(&released_tags)
+        })?;
+        crate::indexer::reconcile_links(store, vault_path, &linking)?;
+    }
     std::fs::remove_file(&archive_path)?;
-
-    let folder = original_path
-        .rsplit_once('/')
-        .map(|(f, _)| f.to_string())
-        .unwrap_or_default();
 
     Ok(WriteResult {
         path: original_path,
@@ -1807,7 +1851,7 @@ pub fn unarchive_note(
         tags,
         links_added: vec![],
         links_suggested: vec![],
-        folder,
+        folder: restored_folder,
     })
 }
 
@@ -2652,7 +2696,10 @@ mod tests {
             store.resolve_tag("shared").unwrap(),
             crate::tags::TagResolution::Exact(_)
         ));
-        assert_eq!(store.top_tags(10).unwrap(), vec![("shared".to_string(), 1)]);
+        assert_eq!(
+            store.top_tags(10, &crate::tags::Scope::default()).unwrap(),
+            vec![("shared".to_string(), 1)]
+        );
     }
 
     #[test]
@@ -2696,7 +2743,6 @@ mod tests {
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
 
@@ -3035,30 +3081,32 @@ mod tests {
         );
     }
 
-    /// `archive` overwrites the note's own value and `unarchive` then
-    /// removes the key, so a note that already holds `archived_at` loses
-    /// it in the round trip. Refusing is the only choice that neither
-    /// loses the note's own value nor leaves a key behind (#92, I7).
+    /// This archive writes no key, so a note's own `archived_at` or
+    /// `archived` tag is the note's and survives the round trip (#151).
     #[test]
-    fn archiving_a_note_that_already_holds_archived_at_is_refused() {
-        let (_tmp, store, root) = setup_vault();
-        let content = "---\nname: X\narchived_at: 1999-01-01\n---\n\nBody\n";
-        std::fs::write(root.join("n.md"), content).unwrap();
-        store
-            .insert_file("n.md", "hash", 100, "refuse1", None, None)
-            .unwrap();
+    fn a_note_carrying_its_own_archived_keys_keeps_them_through_an_archive_round_trip() {
+        let note = "---\ntags: [archived]\narchived_at: 1999-01-01\n---\n\nBody\n";
+        let (_tmp, store, vault, mut embedder) = vault_with("n.md", note);
 
-        let err = archive_note("n.md", &store, &root, None).unwrap_err();
-        assert!(err.to_string().contains("archived_at"), "{err}");
-        assert_eq!(
-            std::fs::read_to_string(root.join("n.md")).unwrap(),
-            content,
-            "a refused archive must not touch the file"
-        );
+        archive_note("n.md", &store, &vault, None).unwrap();
+        unarchive_note(
+            "n",
+            &store,
+            &mut embedder,
+            EmbedComposition::default(),
+            test_chunk_opts(),
+            &vault,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read_to_string(vault.join("n.md")).unwrap(), note);
     }
 
+    /// An archived note is still indexed, so the tags it carries stay
+    /// (#151).
     #[test]
-    fn archiving_a_note_takes_the_tags_that_go_unused_with_it() {
+    fn archiving_keeps_the_notes_tags_in_the_index() {
         let (_tmp, store, root) = setup_vault();
         let content = "---\ntags:\n  - solo\n---\n\nBody.\n";
         let file_path = root.join("n.md");
@@ -3073,49 +3121,7 @@ mod tests {
 
         archive_note("n.md", &store, &root, None).unwrap();
 
-        let remaining: i64 = store
-            .conn()
-            .query_row("SELECT COUNT(*) FROM tags", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(remaining, 0, "the note was the tag's only carrier");
-    }
-
-    /// A note whose property holds one tag and whose body holds another.
-    ///
-    /// The junction holds both, because the property and the body are peers
-    /// (#60). A write to the user's frontmatter must carry the property alone.
-    fn note_with_a_body_hashtag(store: &Store, root: &std::path::Path) {
-        let content = "---\ntags:\n  - work\n---\n\nBlocked on #todo today.\n";
-        let file_path = root.join("n.md");
-        std::fs::write(&file_path, content).unwrap();
-        let mtime = file_mtime(&file_path).unwrap();
-        let id = store
-            .insert_file("n.md", "hash", mtime, "bodytg", None, None)
-            .unwrap();
-        store
-            .reconcile_file_tags(id, &crate::tags::extract(content))
-            .unwrap();
-        assert_eq!(
-            stored_tags(store, "n.md"),
-            vec!["todo", "work"],
-            "the junction holds the property tag and the body tag"
-        );
-    }
-
-    #[test]
-    fn archiving_keeps_a_body_hashtag_out_of_the_property() {
-        let (_tmp, store, root) = setup_vault();
-        note_with_a_body_hashtag(&store, &root);
-
-        archive_note("n.md", &store, &root, None).unwrap();
-
-        let written = std::fs::read_to_string(root.join("04-Archive/n.md")).unwrap();
-        let (fm, _) = split_frontmatter(&written);
-        let (_, property_tags, _) = parse_frontmatter_fields(&fm);
-        // archive no longer writes an `archived` tag (#92): `archived: true`
-        // and the note's place under the archive folder already say it.
-        assert_eq!(property_tags, vec!["work"]);
-        assert!(written.contains("#todo"), "the body tag stays in the body");
+        assert_eq!(stored_tags(&store, "04-Archive/n.md"), vec!["solo"]);
     }
 
     /// `archive` and `undo: true` are one capability and its reverse (#62):
@@ -3137,7 +3143,6 @@ mod tests {
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
 
@@ -3190,30 +3195,9 @@ mod tests {
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
         (tmp, store, vault, embedder)
-    }
-
-    #[test]
-    fn archiving_keeps_every_key_the_note_already_carried() {
-        let note = "---\nname: Probe\naliases: []\ntags: [type/lore]\n---\n\nBody.\n";
-        let (_tmp, store, vault, _embedder) = vault_with("lore/Probe.md", note);
-
-        archive_note("lore/Probe.md", &store, &vault, None).unwrap();
-
-        let archived = std::fs::read_to_string(vault.join("04-Archive/lore/Probe.md")).unwrap();
-        assert!(
-            archived.starts_with("---\nname: Probe\naliases: []\ntags: [type/lore]\n"),
-            "{archived}"
-        );
-        assert!(archived.contains("archived: true"), "{archived}");
-        assert!(
-            archived.contains("archived_from: lore/Probe.md"),
-            "{archived}"
-        );
-        assert!(archived.ends_with("---\n\nBody.\n"), "{archived}");
     }
 
     #[test]
@@ -3288,16 +3272,10 @@ mod tests {
         assert_eq!(std::fs::read_to_string(vault.join("n.md")).unwrap(), note);
     }
 
-    /// A block that is present but holds no key at all — `---\n---\n` — and
-    /// a note with no block are indistinguishable once archived: both
-    /// leave the archived block holding exactly the three archive keys and
-    /// nothing else, so `unarchive_note`'s only honest choice between them
-    /// is the one that does not regress the no-block round trip above.
-    /// This does not restore the original `---\n---\n` fences — a known
-    /// limit of a fix confined to `unarchive_note` (#92, I2 — see the final
-    /// fix report for why `archive_note` would have to change too).
+    /// Neither direction edits the note, so an empty block comes back as it
+    /// went (#151).
     #[test]
-    fn a_truly_empty_block_and_no_block_restore_the_same_way() {
+    fn an_archive_round_trip_keeps_an_empty_block() {
         let note = "---\n---\n\nBody\n";
         let (_tmp, store, vault, mut embedder) = vault_with("n.md", note);
 
@@ -3313,11 +3291,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            std::fs::read_to_string(vault.join("n.md")).unwrap(),
-            "Body\n",
-            "an empty block cannot be told apart from no block at unarchive time"
-        );
+        assert_eq!(std::fs::read_to_string(vault.join("n.md")).unwrap(), note);
     }
 
     /// A note archived by a version of knapper before #92 wrote `archived`
@@ -3377,7 +3351,6 @@ mod tests {
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
         (tmp, store, vault)
@@ -3745,7 +3718,6 @@ mod tests {
             store,
             &mut crate::llm::MockLlm::new(256),
             false,
-            None,
         )
         .unwrap();
     }
@@ -3972,7 +3944,6 @@ mod tests {
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
 
@@ -4026,7 +3997,6 @@ mod tests {
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
 
@@ -4218,7 +4188,6 @@ mod tests {
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
 
@@ -4559,20 +4528,21 @@ mod tests {
         );
     }
 
-    /// Archiving removes the note from the index, so it stops reporting
-    /// broken links for the same reason a hard delete does (#98).
+    /// The row moves, so the note's broken links follow it to the archive
+    /// path, as a move's do (#98). `health` leaves them out (#151).
     #[test]
-    fn archiving_a_note_takes_its_unresolved_links_with_it() {
+    fn archiving_carries_the_notes_unresolved_links_to_its_archive_path() {
         let (_tmp, store, vault, _embedder) =
             vault_with("lore/Probe.md", "# Probe\n\n[[Nowhere]]\n");
-        assert_eq!(store.get_unresolved_links().unwrap().len(), 1);
 
         archive_note("lore/Probe.md", &store, &vault, None).unwrap();
 
-        assert!(
-            store.get_unresolved_links().unwrap().is_empty(),
-            "an archived note reports nothing: {:?}",
-            store.get_unresolved_links().unwrap()
+        assert_eq!(
+            store.get_unresolved_links().unwrap(),
+            vec![(
+                "04-Archive/lore/Probe.md".to_string(),
+                "Nowhere".to_string()
+            )]
         );
     }
 
@@ -4614,7 +4584,6 @@ mod tests {
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
         (tmp, store, vault)
@@ -4724,7 +4693,10 @@ mod tests {
         assert!(store.get_file(".trash/lore/n.md").unwrap().is_none());
         assert!(store.get_unresolved_links().unwrap().is_empty());
         assert!(
-            store.tags_under(None).unwrap().is_empty(),
+            store
+                .tags_under(None, &crate::tags::Scope::default())
+                .unwrap()
+                .is_empty(),
             "a tag only the trashed note carried is pruned"
         );
     }
@@ -4761,7 +4733,6 @@ mod tests {
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
 
@@ -5069,17 +5040,16 @@ mod tests {
         assert_eq!(result.path, "lore/n.md");
     }
 
-    /// A note in the archive folder with no `archived_from` has no record of
-    /// where it came from. That is the caller's to repair, so it is
-    /// `invalid_input` and not a server error (#151).
+    /// A note filed in the archive by hand, which the index has not seen, is
+    /// restored to its path with the folder taken off, and indexed (#151).
     #[test]
-    fn an_unarchive_of_a_note_with_no_archived_from_is_invalid_input() {
+    fn an_unarchive_of_a_note_the_index_has_not_seen_restores_and_indexes_it() {
         let (_tmp, store, vault, mut embedder) = vault_with("lore/n.md", "# N\n");
-        std::fs::create_dir_all(vault.join("04-Archive")).unwrap();
-        std::fs::write(vault.join("04-Archive/n.md"), "# N\n").unwrap();
+        std::fs::create_dir_all(vault.join("04-Archive/notes")).unwrap();
+        std::fs::write(vault.join("04-Archive/notes/m.md"), "# M\n\nBody.\n").unwrap();
 
-        let err = unarchive_note(
-            "04-Archive/n.md",
+        let result = unarchive_note(
+            "04-Archive/notes/m.md",
             &store,
             &mut embedder,
             EmbedComposition::default(),
@@ -5087,43 +5057,46 @@ mod tests {
             &vault,
             None,
         )
-        .unwrap_err();
+        .unwrap();
 
+        assert_eq!(result.path, "notes/m.md");
         assert_eq!(
-            crate::fault::Fault::of(&err).map(|f| f.kind()),
-            Some("invalid_input")
+            std::fs::read_to_string(vault.join("notes/m.md")).unwrap(),
+            "# M\n\nBody.\n"
         );
-        assert_eq!(
-            err.to_string(),
-            "04-Archive/n.md has no archived_from: knapper cannot tell where it was archived from"
-        );
+        assert!(!vault.join("04-Archive/notes/m.md").exists());
+        let row = store.get_file("notes/m.md").unwrap().expect("indexed");
+        assert!(!store.get_chunks_by_file(row.id).unwrap().is_empty());
     }
 
-    /// Archiving takes the note out of the index, so the links to it break the
-    /// same way a hard delete breaks them (#108).
+    /// An archived note is still a note, so the links to it still resolve
+    /// (#151).
     #[test]
-    fn archiving_a_note_records_the_links_it_breaks() {
+    fn archiving_a_note_keeps_the_links_to_it_resolved() {
         let (_tmp, store, vault) =
             vault_with_files(&[("a.md", "# A\n\nSee [[b]].\n"), ("b.md", "# B\n\nBody.\n")]);
 
         archive_note("b.md", &store, &vault, None).unwrap();
 
+        assert!(store.get_unresolved_links().unwrap().is_empty());
         assert_eq!(
-            store.get_unresolved_links().unwrap(),
-            vec![("a.md".to_string(), "b".to_string())],
-            "an archived note is out of the index, so links to it name nothing"
+            outgoing_paths(&store, "a.md"),
+            vec!["04-Archive/b.md".to_string()]
         );
     }
 
-    /// Unarchiving puts the note back, and the links to it resolve again (#108).
+    /// Unarchiving moves the note back, and the links to it follow (#108).
     #[test]
-    fn unarchiving_a_note_resolves_the_links_that_named_it() {
+    fn unarchiving_a_note_points_the_links_that_named_it_at_its_path_again() {
         use crate::llm::MockLlm;
 
         let (_tmp, store, vault) =
             vault_with_files(&[("a.md", "# A\n\nSee [[b]].\n"), ("b.md", "# B\n\nBody.\n")]);
         archive_note("b.md", &store, &vault, None).unwrap();
-        assert_eq!(store.get_unresolved_links().unwrap().len(), 1);
+        assert_eq!(
+            outgoing_paths(&store, "a.md"),
+            vec!["04-Archive/b.md".to_string()]
+        );
 
         let mut embedder = MockLlm::new(256);
         unarchive_note(
@@ -5318,7 +5291,6 @@ mod tests {
             &store,
             &mut MockLlm::new(256),
             false,
-            None,
         )
         .unwrap();
 
@@ -5352,7 +5324,6 @@ mod tests {
             &store,
             &mut MockLlm::new(256),
             false,
-            None,
         )
         .unwrap();
 
@@ -5378,7 +5349,6 @@ mod tests {
             &store,
             &mut MockLlm::new(256),
             false,
-            None,
         )
         .unwrap();
 
@@ -5399,7 +5369,6 @@ mod tests {
             store,
             &mut MockLlm::new(256),
             false,
-            None,
         )
         .unwrap();
     }
@@ -5685,5 +5654,284 @@ mod tests {
         .unwrap();
         assert_eq!(result.path, "Projects/n.md");
         assert!(!vault.join("Old/Projects/n.md").exists());
+    }
+
+    /// A profile whose archive folder is `folder`.
+    fn profile_archiving_to(vault: &std::path::Path, folder: &str) -> VaultProfile {
+        use crate::profile::{
+            FolderMap, StructureDetection, StructureMethod, VaultStats, VaultType,
+        };
+        VaultProfile {
+            vault_path: vault.to_path_buf(),
+            vault_type: VaultType::Obsidian,
+            structure: StructureDetection {
+                method: StructureMethod::Para,
+                folders: FolderMap {
+                    archive: Some(folder.to_string()),
+                    ..Default::default()
+                },
+            },
+            stats: VaultStats::default(),
+        }
+    }
+
+    /// Neither direction edits the note, so the row moves with the file:
+    /// same id, same vectors, nothing re-embedded (#151).
+    #[test]
+    fn archiving_and_unarchiving_move_the_row_and_embed_nothing() {
+        let note = "---\ntags: [type/lore]\n---\n\n# N\n\nThe coast road.\n";
+        let (_tmp, store, vault, mut embedder) = vault_with("lore/n.md", note);
+        let before = store.get_file("lore/n.md").unwrap().unwrap();
+        let vectors = store.get_vector_ids_for_file(before.id).unwrap();
+        assert!(!vectors.is_empty());
+
+        let archived = archive_note("lore/n.md", &store, &vault, None).unwrap();
+        assert_eq!(archived.path, "04-Archive/lore/n.md");
+        assert_eq!(archived.docid, generate_docid("04-Archive/lore/n.md"));
+        assert!(!vault.join("lore/n.md").exists());
+        assert_eq!(
+            std::fs::read_to_string(vault.join("04-Archive/lore/n.md")).unwrap(),
+            note
+        );
+        let row = store
+            .get_file("04-Archive/lore/n.md")
+            .unwrap()
+            .expect("the row moved with the file");
+        assert_eq!(row.id, before.id);
+        assert_eq!(store.get_vector_ids_for_file(row.id).unwrap(), vectors);
+
+        let restored = unarchive_note(
+            "n",
+            &store,
+            &mut embedder,
+            EmbedComposition::default(),
+            test_chunk_opts(),
+            &vault,
+            None,
+        )
+        .unwrap();
+        assert_eq!(restored.path, "lore/n.md");
+        assert_eq!(
+            std::fs::read_to_string(vault.join("lore/n.md")).unwrap(),
+            note
+        );
+        let row = store.get_file("lore/n.md").unwrap().unwrap();
+        assert_eq!(row.id, before.id);
+        assert_eq!(store.get_vector_ids_for_file(row.id).unwrap(), vectors);
+        assert!(store.get_file("04-Archive/lore/n.md").unwrap().is_none());
+    }
+
+    /// Replacing the archived copy would lose it, so it is refused and
+    /// nothing moves (#151).
+    #[test]
+    fn an_archive_onto_a_path_the_archive_holds_is_a_conflict_and_moves_nothing() {
+        let (_tmp, store, vault, _embedder) = vault_with("lore/n.md", "# New\n");
+        std::fs::create_dir_all(vault.join("04-Archive/lore")).unwrap();
+        std::fs::write(vault.join("04-Archive/lore/n.md"), "# Old\n").unwrap();
+
+        let err = archive_note("lore/n.md", &store, &vault, None).unwrap_err();
+
+        assert_eq!(
+            crate::fault::Fault::of(&err).map(|f| f.kind()),
+            Some("conflict")
+        );
+        assert_eq!(
+            err.to_string(),
+            "the archive already holds 04-Archive/lore/n.md: unarchive or remove it first"
+        );
+        assert_eq!(
+            std::fs::read_to_string(vault.join("lore/n.md")).unwrap(),
+            "# New\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(vault.join("04-Archive/lore/n.md")).unwrap(),
+            "# Old\n"
+        );
+        assert!(store.get_file("lore/n.md").unwrap().is_some());
+    }
+
+    /// A stale row at the destination makes the store refuse the move after
+    /// the file has gone. The file goes back (#151).
+    #[test]
+    fn an_archive_the_store_refuses_puts_the_file_back() {
+        let (_tmp, store, vault, _embedder) = vault_with("lore/n.md", "# N\n");
+        store
+            .insert_file("04-Archive/lore/n.md", "h", 0, "abcdef", None, None)
+            .unwrap();
+
+        let err = archive_note("lore/n.md", &store, &vault, None).unwrap_err();
+
+        assert_eq!(
+            crate::fault::Fault::of(&err).map(|f| f.kind()),
+            Some("conflict")
+        );
+        assert!(vault.join("lore/n.md").exists());
+        assert!(!vault.join("04-Archive/lore/n.md").exists());
+        assert!(store.get_file("lore/n.md").unwrap().is_some());
+    }
+
+    /// The same failure on the way back: the file returns to the archive
+    /// (#151).
+    #[test]
+    fn an_unarchive_the_store_refuses_puts_the_file_back() {
+        let (_tmp, store, vault, mut embedder) = vault_with("04-Archive/lore/n.md", "# N\n");
+        store
+            .insert_file("lore/n.md", "h", 0, "abcdef", None, None)
+            .unwrap();
+
+        let err = unarchive_note(
+            "04-Archive/lore/n.md",
+            &store,
+            &mut embedder,
+            EmbedComposition::default(),
+            test_chunk_opts(),
+            &vault,
+            None,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            crate::fault::Fault::of(&err).map(|f| f.kind()),
+            Some("conflict")
+        );
+        assert!(vault.join("04-Archive/lore/n.md").exists());
+        assert!(!vault.join("lore/n.md").exists());
+        assert!(store.get_file("04-Archive/lore/n.md").unwrap().is_some());
+    }
+
+    #[test]
+    fn an_archive_of_an_archived_note_is_a_conflict() {
+        let (_tmp, store, vault, _embedder) = vault_with("lore/n.md", "# N\n");
+        archive_note("lore/n.md", &store, &vault, None).unwrap();
+
+        let err = archive_note("04-Archive/lore/n.md", &store, &vault, None).unwrap_err();
+
+        assert_eq!(
+            crate::fault::Fault::of(&err).map(|f| f.kind()),
+            Some("conflict")
+        );
+        assert_eq!(
+            err.to_string(),
+            "note is already archived: 04-Archive/lore/n.md"
+        );
+    }
+
+    #[test]
+    fn a_note_in_a_folder_whose_name_starts_with_the_archives_is_not_archived() {
+        let (_tmp, store, vault, _embedder) = vault_with("04-Archive-old/n.md", "# N\n");
+        let result = archive_note("04-Archive-old/n.md", &store, &vault, None).unwrap();
+        assert_eq!(result.path, "04-Archive/04-Archive-old/n.md");
+    }
+
+    /// The first index after the upgrade indexes a note an earlier archive
+    /// wrote. Undoing it restores it to `archived_from`, strips what that
+    /// archive wrote, and drops the archived row (#151).
+    #[test]
+    fn unarchiving_a_legacy_note_the_index_holds_restores_it_and_drops_the_archived_row() {
+        let legacy = "---\ntags: [work, archived]\narchived: true\narchived_at: 2020-01-01\narchived_from: lore/n.md\n---\n\nBody.\n";
+        let (_tmp, store, vault, mut embedder) = vault_with("04-Archive/lore/n.md", legacy);
+        assert!(store.get_file("04-Archive/lore/n.md").unwrap().is_some());
+
+        let result = unarchive_note(
+            "n",
+            &store,
+            &mut embedder,
+            EmbedComposition::default(),
+            test_chunk_opts(),
+            &vault,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(result.path, "lore/n.md");
+        assert_eq!(result.tags, vec!["work"]);
+        assert_eq!(
+            std::fs::read_to_string(vault.join("lore/n.md")).unwrap(),
+            "---\ntags: [work]\n---\n\nBody.\n"
+        );
+        assert!(!vault.join("04-Archive/lore/n.md").exists());
+        assert_eq!(stored_paths(&store), ["lore/n.md"]);
+        assert_eq!(stored_tags(&store, "lore/n.md"), vec!["work"]);
+        let row = store.get_file("lore/n.md").unwrap().unwrap();
+        assert!(!store.get_chunks_by_file(row.id).unwrap().is_empty());
+    }
+
+    /// Archiving re-derives the links to the note, and a live note of the
+    /// same name now takes them (#151).
+    #[test]
+    fn archiving_a_note_hands_its_name_to_a_live_note_that_shares_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        for (rel, text) in [
+            ("a.md", "# A\n\nSee [[n]].\n"),
+            ("n.md", "# N\n\nRoot.\n"),
+            ("lore/deep/n.md", "# N\n\nDeep.\n"),
+        ] {
+            std::fs::create_dir_all(root.join(rel).parent().unwrap()).unwrap();
+            std::fs::write(root.join(rel), text).unwrap();
+        }
+        let store = Store::open_memory()
+            .unwrap()
+            .with_archive_folder("04-Archive");
+        walk_index(&root, &store);
+        assert_eq!(outgoing_paths(&store, "a.md"), vec!["n.md".to_string()]);
+
+        archive_note("n.md", &store, &root, None).unwrap();
+
+        assert_eq!(
+            outgoing_paths(&store, "a.md"),
+            vec!["lore/deep/n.md".to_string()]
+        );
+    }
+
+    /// An archive folder the walk skips: `.archive` is hidden. The row
+    /// moves, the next index drops it because the walk never sees the file,
+    /// and `undo` still restores and indexes the note (#151).
+    #[test]
+    fn an_archive_folder_the_walk_skips_drops_out_of_the_index_and_still_unarchives() {
+        let (_tmp, store, vault, mut embedder) = vault_with("lore/n.md", "# N\n\nBody.\n");
+        let profile = profile_archiving_to(&vault, ".archive");
+
+        let archived = archive_note("lore/n.md", &store, &vault, Some(&profile)).unwrap();
+        assert_eq!(archived.path, ".archive/lore/n.md");
+        walk_index(&vault, &store);
+        assert!(store.get_file(".archive/lore/n.md").unwrap().is_none());
+
+        let result = unarchive_note(
+            "n",
+            &store,
+            &mut embedder,
+            EmbedComposition::default(),
+            test_chunk_opts(),
+            &vault,
+            Some(&profile),
+        )
+        .unwrap();
+        assert_eq!(result.path, "lore/n.md");
+        let row = store.get_file("lore/n.md").unwrap().expect("indexed again");
+        assert!(!store.get_chunks_by_file(row.id).unwrap().is_empty());
+    }
+
+    /// A soft delete of an archived note keeps its whole path under
+    /// `.trash`, so undo puts it back in the archive, indexed (#151).
+    #[test]
+    fn a_soft_delete_of_an_archived_note_and_its_undo_return_it_to_the_archive() {
+        let (_tmp, store, vault, mut embedder) = vault_with("lore/n.md", "# N\n\nBody.\n");
+        archive_note("lore/n.md", &store, &vault, None).unwrap();
+
+        delete_note(&store, &vault, "04-Archive/lore/n.md", DeleteMode::Soft).unwrap();
+        assert!(vault.join(".trash/04-Archive/lore/n.md").is_file());
+
+        let result = undelete_note(
+            "04-Archive/lore/n.md",
+            &store,
+            &mut embedder,
+            EmbedComposition::default(),
+            test_chunk_opts(),
+            &vault,
+        )
+        .unwrap();
+        assert_eq!(result.path, "04-Archive/lore/n.md");
+        assert!(store.get_file("04-Archive/lore/n.md").unwrap().is_some());
     }
 }

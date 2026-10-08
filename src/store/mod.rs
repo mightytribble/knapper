@@ -28,7 +28,7 @@ pub use files::FileRecord;
 pub use fts::{FtsResult, fts_objects_sql};
 pub use properties::{NewProperty, PropertyCount, PropertyRow, ValueCount};
 pub use schema::SCHEMA_VERSION;
-pub use scope::{LinkIds, ListOrder, ListRow};
+pub use scope::{LinkIds, ListOrder, ListRow, ScopeTotals};
 pub use tags::TagCount;
 
 use anyhow::{Context, Result};
@@ -50,6 +50,11 @@ pub struct StoreStats {
 
 pub struct Store {
     conn: Connection,
+    /// The folder `archive` files notes under. A read leaves it out unless
+    /// its scope asks for it, and a name resolves to a note outside it
+    /// first. `None` leaves nothing out and prefers nothing, which is a
+    /// store opened with no profile in hand (#151).
+    archive: Option<String>,
 }
 
 impl Store {
@@ -63,7 +68,10 @@ impl Store {
         // parameter per file id (#60). It is per-connection, so it is
         // registered where connections are made.
         rusqlite::vtab::array::load_module(&conn).context("registering rarray")?;
-        let store = Self { conn };
+        let store = Self {
+            conn,
+            archive: None,
+        };
         store.init()?;
         Ok(store)
     }
@@ -73,7 +81,10 @@ impl Store {
         crate::vecstore::init_sqlite_vec();
         let conn = Connection::open_in_memory().context("failed to open in-memory database")?;
         rusqlite::vtab::array::load_module(&conn).context("registering rarray")?;
-        let store = Self { conn };
+        let store = Self {
+            conn,
+            archive: None,
+        };
         store.init()?;
         Ok(store)
     }
@@ -99,7 +110,10 @@ impl Store {
         rusqlite::vtab::array::load_module(&conn).context("registering rarray")?;
         conn.execute_batch("PRAGMA busy_timeout = 5000;")
             .context("failed to set the reader's busy_timeout")?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            archive: None,
+        })
     }
 
     fn init(&self) -> Result<()> {
@@ -137,6 +151,66 @@ impl Store {
             params![key, value],
         )?;
         Ok(())
+    }
+
+    /// The store, knowing the folder `archive` files notes under. Set where
+    /// a store opens beside the vault profile, from
+    /// [`crate::profile::archive_folder`]. A name with nothing left after
+    /// its slashes are trimmed sets nothing (#151).
+    pub fn with_archive_folder(mut self, folder: &str) -> Self {
+        let folder = folder.trim_matches('/');
+        self.archive = (!folder.is_empty()).then(|| folder.to_string());
+        self
+    }
+
+    /// The folder `archive` files notes under, if this store knows it.
+    pub fn archive_folder(&self) -> Option<&str> {
+        self.archive.as_deref()
+    }
+
+    /// Whether `path` is under the archive folder.
+    pub fn is_archived(&self, path: &str) -> bool {
+        self.archive.as_deref().is_some_and(|folder| {
+            path.strip_prefix(folder)
+                .is_some_and(|rest| rest.starts_with('/'))
+        })
+    }
+
+    /// An `ORDER BY` term over a `files` row aliased `f` that sorts a note
+    /// outside the archive folder before one under it, and its arguments.
+    /// It is `NULL`, with no arguments, when the store knows no folder, so
+    /// every row sorts equal (#151).
+    pub(crate) fn archived_sql(&self) -> (String, Vec<String>) {
+        match self.archive_folder() {
+            Some(folder) => {
+                let (pred, args) =
+                    crate::tags::folder_sql(&crate::tags::FolderTerm::Subtree(folder.to_string()));
+                (format!("({pred})"), args)
+            }
+            None => ("NULL".to_string(), Vec::new()),
+        }
+    }
+
+    /// Whether any indexed note is under `folder`.
+    pub fn has_files_under(&self, folder: &str) -> Result<bool> {
+        let (pred, args) =
+            crate::tags::folder_sql(&crate::tags::FolderTerm::Subtree(folder.to_string()));
+        Ok(self.conn.query_row(
+            &format!("SELECT EXISTS (SELECT 1 FROM files f WHERE {pred})"),
+            rusqlite::params_from_iter(args.iter()),
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Whether `scope` leaves out notes this store holds: the store knows an
+    /// archive folder, the scope does not ask for it, and a note is there.
+    /// A search with no other filter takes the unscoped path when this is
+    /// false (#151).
+    pub fn excludes_archive(&self, scope: &crate::tags::Scope) -> Result<bool> {
+        match self.archive_folder() {
+            Some(folder) if !scope.admits_archive(folder) => self.has_files_under(folder),
+            _ => Ok(false),
+        }
     }
 
     pub fn get_meta(&self, key: &str) -> Result<Option<String>> {

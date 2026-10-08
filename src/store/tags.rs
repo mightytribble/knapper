@@ -29,13 +29,21 @@ impl TagCount {
 
 impl Store {
     /// Tag frequency: how many notes carry each tag (#60).
-    pub fn top_tags(&self, limit: usize) -> Result<Vec<(String, usize)>> {
-        let mut stmt = self.conn.prepare(
+    /// Only the notes `scope` admits count, which by default leaves the archive out (#151).
+    pub fn top_tags(
+        &self,
+        limit: usize,
+        scope: &crate::tags::Scope,
+    ) -> Result<Vec<(String, usize)>> {
+        let (scope_sql, mut args) = self.scope_sql(scope)?;
+        args.push(Box::new(limit as i64));
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT t.display, COUNT(*) AS cnt
-               FROM tags t JOIN file_tags ft ON ft.tag_id = t.id
-              GROUP BY t.id ORDER BY cnt DESC, t.path LIMIT ?",
-        )?;
-        let rows = stmt.query_map(params![limit as i64], |row| {
+               FROM tags t JOIN file_tags ft ON ft.tag_id = t.id JOIN files f ON f.id = ft.file_id
+              WHERE 1=1{scope_sql}
+              GROUP BY t.id ORDER BY cnt DESC, t.path LIMIT ?"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
         })?;
         let mut results = Vec::new();
@@ -51,12 +59,17 @@ impl Store {
     /// Without it a head count reads against `total_files` and overstates the
     /// vocabulary's reach, which is the difference between a tag filter being
     /// worth reaching for and not.
-    pub fn tagged_file_count(&self) -> Result<usize> {
-        let count: i64 =
-            self.conn
-                .query_row("SELECT COUNT(DISTINCT file_id) FROM file_tags", [], |row| {
-                    row.get(0)
-                })?;
+    /// Only the notes `scope` admits count, which by default leaves the archive out (#151).
+    pub fn tagged_file_count(&self, scope: &crate::tags::Scope) -> Result<usize> {
+        let (scope_sql, args) = self.scope_sql(scope)?;
+        let count: i64 = self.conn.query_row(
+            &format!(
+                "SELECT COUNT(DISTINCT ft.file_id) FROM file_tags ft JOIN files f ON f.id = ft.file_id
+                  WHERE 1=1{scope_sql}"
+            ),
+            rusqlite::params_from_iter(args.iter()),
+            |row| row.get(0),
+        )?;
         Ok(count as usize)
     }
 
@@ -67,19 +80,28 @@ impl Store {
     ///
     /// A tag with no notes does not exist: `prune_unused_tags` deletes the row
     /// the last note released.
-    pub fn tags_under(&self, prefix: Option<&crate::tags::TagTerm>) -> Result<Vec<TagCount>> {
-        let (clause, args) = match prefix {
-            Some(term) => {
-                let subtree = crate::tags::TagTerm::Subtree(term.path().to_string());
-                let (pred, args) = crate::tags::predicate(&subtree);
-                (format!("WHERE {pred}"), args)
+    ///
+    /// Only the notes `scope` admits count, which by default leaves the archive out (#151).
+    pub fn tags_under(
+        &self,
+        prefix: Option<&crate::tags::TagTerm>,
+        scope: &crate::tags::Scope,
+    ) -> Result<Vec<TagCount>> {
+        let (scope_sql, mut args) = self.scope_sql(scope)?;
+        let mut clause = String::new();
+        if let Some(term) = prefix {
+            let subtree = crate::tags::TagTerm::Subtree(term.path().to_string());
+            let (pred, values) = crate::tags::predicate(&subtree);
+            clause = format!(" AND {pred}");
+            for value in values {
+                args.push(Box::new(value));
             }
-            None => (String::new(), Vec::new()),
-        };
+        }
         let mut stmt = self.conn.prepare(&format!(
             "SELECT t.path, t.display, COUNT(ft.file_id) AS notes
                FROM tags t JOIN file_tags ft ON ft.tag_id = t.id
-               {clause}
+                           JOIN files f ON f.id = ft.file_id
+              WHERE 1=1{scope_sql}{clause}
               GROUP BY t.id ORDER BY t.path"
         ))?;
         let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |row| {
@@ -198,14 +220,18 @@ impl Store {
     /// knapper names no axis. This reports what the vault wrote: the first
     /// segment of every path, counting each note once however many tags of that
     /// axis it carries.
-    pub fn tag_axes(&self) -> Result<Vec<(String, usize)>> {
-        let mut stmt = self.conn.prepare(
+    /// Only the notes `scope` admits count, which by default leaves the archive out (#151).
+    pub fn tag_axes(&self, scope: &crate::tags::Scope) -> Result<Vec<(String, usize)>> {
+        let (scope_sql, args) = self.scope_sql(scope)?;
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT substr(t.path, 1, COALESCE(NULLIF(instr(t.path, '/'), 0) - 1, length(t.path))) AS axis,
                     COUNT(DISTINCT ft.file_id) AS notes
                FROM tags t JOIN file_tags ft ON ft.tag_id = t.id
-              GROUP BY axis ORDER BY notes DESC, axis",
-        )?;
-        let rows = stmt.query_map([], |row| {
+                           JOIN files f ON f.id = ft.file_id
+              WHERE 1=1{scope_sql}
+              GROUP BY axis ORDER BY notes DESC, axis"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
         })?;
         let mut out = Vec::new();
@@ -245,7 +271,7 @@ mod tests {
             .reconcile_file_tags(b, &[tag("rust"), tag("web")])
             .unwrap();
         store.reconcile_file_tags(c, &[tag("rust")]).unwrap();
-        let tags = store.top_tags(10).unwrap();
+        let tags = store.top_tags(10, &crate::tags::Scope::default()).unwrap();
         assert_eq!(tags[0].0, "rust");
         assert_eq!(tags[0].1, 3);
     }
@@ -273,7 +299,12 @@ mod tests {
             .reconcile_file_tags(b, &[tag("status/active")])
             .unwrap();
 
-        assert_eq!(store.tagged_file_count().unwrap(), 2);
+        assert_eq!(
+            store
+                .tagged_file_count(&crate::tags::Scope::default())
+                .unwrap(),
+            2
+        );
     }
 
     #[test]
@@ -302,7 +333,7 @@ mod tests {
             )
             .unwrap();
 
-        let rows = store.tag_axes().unwrap();
+        let rows = store.tag_axes(&crate::tags::Scope::default()).unwrap();
         let axes: Vec<&str> = rows.iter().map(|(a, _)| a.as_str()).collect();
         assert_eq!(axes, vec!["dimension", "draft", "status"]);
     }
@@ -326,7 +357,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            store.tag_axes().unwrap(),
+            store.tag_axes(&crate::tags::Scope::default()).unwrap(),
             vec![("dimension".to_string(), 1)]
         );
     }
@@ -478,7 +509,10 @@ mod tests {
 
         // One row, so the two spellings are one tag and one axis value.
         assert_eq!(tag_row_count(&store), 1);
-        assert_eq!(store.tag_axes().unwrap(), vec![("type".to_string(), 2)]);
+        assert_eq!(
+            store.tag_axes(&crate::tags::Scope::default()).unwrap(),
+            vec![("type".to_string(), 2)]
+        );
         // And the folded query side meets a folded column: the subtree arm,
         assert_eq!(
             store
@@ -625,7 +659,7 @@ mod tests {
             .reconcile_file_tags(b, &[tag("shared", "shared")])
             .unwrap();
 
-        let top = store.top_tags(10).unwrap();
+        let top = store.top_tags(10, &crate::tags::Scope::default()).unwrap();
         assert_eq!(top[0], ("Shared".to_string(), 2));
     }
 
@@ -633,7 +667,7 @@ mod tests {
     fn the_whole_vocabulary_comes_back_in_path_order() {
         let store = operator_fixture();
         let paths: Vec<String> = store
-            .tags_under(None)
+            .tags_under(None, &crate::tags::Scope::default())
             .unwrap()
             .into_iter()
             .map(|t| t.path)
@@ -648,7 +682,10 @@ mod tests {
     fn a_subtree_prefix_returns_the_subtree_and_counts_each_exact_tag() {
         let store = operator_fixture();
         let rows = store
-            .tags_under(Some(&crate::tags::parse_term("type/").unwrap()))
+            .tags_under(
+                Some(&crate::tags::parse_term("type/").unwrap()),
+                &crate::tags::Scope::default(),
+            )
             .unwrap();
         let counted: Vec<(String, usize)> =
             rows.into_iter().map(|t| (t.path, t.note_count)).collect();
@@ -667,10 +704,16 @@ mod tests {
     fn a_bare_exact_prefix_answers_the_same_subtree() {
         let store = operator_fixture();
         let bare = store
-            .tags_under(Some(&crate::tags::parse_term("type").unwrap()))
+            .tags_under(
+                Some(&crate::tags::parse_term("type").unwrap()),
+                &crate::tags::Scope::default(),
+            )
             .unwrap();
         let slash = store
-            .tags_under(Some(&crate::tags::parse_term("type/").unwrap()))
+            .tags_under(
+                Some(&crate::tags::parse_term("type/").unwrap()),
+                &crate::tags::Scope::default(),
+            )
             .unwrap();
         let paths = |rows: Vec<TagCount>| -> Vec<(String, usize)> {
             rows.into_iter().map(|t| (t.path, t.note_count)).collect()
@@ -700,7 +743,10 @@ mod tests {
             )
             .unwrap();
         let rows = store
-            .tags_under(Some(&crate::tags::parse_term("type/").unwrap()))
+            .tags_under(
+                Some(&crate::tags::parse_term("type/").unwrap()),
+                &crate::tags::Scope::default(),
+            )
             .unwrap();
         let displays: Vec<String> = rows.iter().map(|t| t.as_written().to_string()).collect();
         // The vault's own spelling comes back, not the folded path.
@@ -734,7 +780,9 @@ mod tests {
     #[test]
     fn a_tag_the_vault_spells_as_its_path_holds_no_separate_display_form() {
         let store = mixed_case_fixture();
-        let rows = store.tags_under(None).unwrap();
+        let rows = store
+            .tags_under(None, &crate::tags::Scope::default())
+            .unwrap();
         let forms: Vec<(&str, Option<&str>)> = rows
             .iter()
             .map(|t| (t.path.as_str(), t.display.as_deref()))
@@ -754,7 +802,9 @@ mod tests {
     #[test]
     fn a_serialised_row_carries_display_only_where_it_differs_from_the_path() {
         let store = mixed_case_fixture();
-        let rows = store.tags_under(None).unwrap();
+        let rows = store
+            .tags_under(None, &crate::tags::Scope::default())
+            .unwrap();
         let json = serde_json::to_value(&rows).unwrap();
         assert!(
             json[0].get("display").is_none(),
@@ -768,7 +818,10 @@ mod tests {
     fn a_prefix_matching_nothing_returns_no_rows() {
         let store = operator_fixture();
         let rows = store
-            .tags_under(Some(&crate::tags::parse_term("nowhere/").unwrap()))
+            .tags_under(
+                Some(&crate::tags::parse_term("nowhere/").unwrap()),
+                &crate::tags::Scope::default(),
+            )
             .unwrap();
         assert!(rows.is_empty());
     }
@@ -856,7 +909,7 @@ mod tests {
     #[test]
     fn an_axis_counts_each_note_once() {
         let store = axis_fixture();
-        let axes = store.tag_axes().unwrap();
+        let axes = store.tag_axes(&crate::tags::Scope::default()).unwrap();
         assert_eq!(
             axes[0],
             ("type".to_string(), 3),

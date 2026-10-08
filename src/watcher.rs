@@ -794,7 +794,6 @@ mod tests {
                 &store,
                 &mut MockLlm::new(256),
                 false,
-                None,
             )
             .unwrap();
             assert_eq!(store.get_unresolved_links().unwrap().len(), 1);
@@ -860,7 +859,6 @@ mod tests {
                 &store,
                 &mut MockLlm::new(256),
                 false,
-                None,
             )
             .unwrap();
             assert!(store.get_unresolved_links().unwrap().is_empty());
@@ -1293,7 +1291,6 @@ mod tests {
             &fresh,
             &mut MockLlm::new(256),
             false,
-            None,
         )
         .unwrap();
 

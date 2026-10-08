@@ -66,7 +66,11 @@ pub fn find_orphans(store: &Store, config: &HealthConfig) -> Result<Vec<String>>
         exclude.push(inbox.as_str());
     }
     let isolated = store.find_isolated_files(&exclude)?;
-    Ok(isolated.into_iter().map(|f| f.path).collect())
+    Ok(isolated
+        .into_iter()
+        .filter(|f| !store.is_archived(&f.path))
+        .map(|f| f.path)
+        .collect())
 }
 
 /// Find wikilink references that could not be resolved to any indexed file.
@@ -76,6 +80,7 @@ pub fn find_broken_links(store: &Store) -> Result<Vec<BrokenLink>> {
     let unresolved = store.get_unresolved_links()?;
     Ok(unresolved
         .into_iter()
+        .filter(|(source, _)| !store.is_archived(source))
         .map(|(source, target)| BrokenLink { source, target })
         .collect())
 }
@@ -93,7 +98,12 @@ pub fn find_broken_links(store: &Store) -> Result<Vec<BrokenLink>> {
 /// — so a note that documents the wikilink syntax reports one finding that is
 /// not real.
 pub fn find_stale_headings(store: &Store) -> Result<Vec<StaleHeading>> {
-    let sources: Vec<i64> = store.get_all_files()?.into_iter().map(|f| f.id).collect();
+    let sources: Vec<i64> = store
+        .get_all_files()?
+        .into_iter()
+        .filter(|f| !store.is_archived(&f.path))
+        .map(|f| f.id)
+        .collect();
     let mut out = Vec::new();
     for link in crate::graph::deep_links_from(store, &sources)? {
         if !store
@@ -123,6 +133,10 @@ pub fn find_stale_notes(_store: &Store, _days: u32) -> Result<Vec<String>> {
 }
 
 /// Generate a combined health report for the vault.
+///
+/// An archived note is set aside and nothing maintains its links, so it is no
+/// finding: not an orphan, not the source of a broken link or a stale
+/// heading, not a tag issue (#151).
 pub fn generate_health_report(store: &Store, config: &HealthConfig) -> Result<HealthReport> {
     let orphans = find_orphans(store, config)?;
     let broken_links = find_broken_links(store)?;
@@ -146,6 +160,7 @@ pub fn generate_health_report(store: &Store, config: &HealthConfig) -> Result<He
     // Tag issues: find work notes missing required tags.
     let tag_issues = all_files
         .iter()
+        .filter(|f| !store.is_archived(&f.path))
         .filter(|f| f.path.contains("Work/") || f.path.contains("01-Projects/Work/"))
         .filter(|f| !f.tags.iter().any(|t| t.eq_ignore_ascii_case("work")))
         .map(|f| TagIssue {
@@ -404,5 +419,76 @@ mod tests {
         // One file in inbox.
         assert_eq!(report.inbox_pending.len(), 1);
         assert_eq!(report.inbox_pending[0], "00-Inbox/unsorted.md");
+    }
+
+    /// A store that knows the archive folder.
+    fn archive_store() -> Store {
+        Store::open_memory()
+            .unwrap()
+            .with_archive_folder("04-Archive")
+    }
+
+    /// An archived note is set aside, and nothing maintains its links, so
+    /// health reports none of it (#151).
+    #[test]
+    fn an_archived_note_is_not_an_orphan() {
+        let store = archive_store();
+        store
+            .insert_file("04-Archive/island.md", "h", 100, "h00001", None, None)
+            .unwrap();
+        store
+            .insert_file("island.md", "h", 100, "h00002", None, None)
+            .unwrap();
+        let config = HealthConfig {
+            daily_folder: None,
+            inbox_folder: None,
+        };
+        assert_eq!(find_orphans(&store, &config).unwrap(), ["island.md"]);
+    }
+
+    #[test]
+    fn a_broken_link_an_archived_note_wrote_is_not_reported() {
+        let store = archive_store();
+        let old = store
+            .insert_file("04-Archive/old.md", "h", 100, "h00003", None, None)
+            .unwrap();
+        let live = store
+            .insert_file("live.md", "h", 100, "h00004", None, None)
+            .unwrap();
+        store.insert_unresolved_link(old, "gone.md").unwrap();
+        store.insert_unresolved_link(live, "missing.md").unwrap();
+        let broken = find_broken_links(&store).unwrap();
+        assert_eq!(broken.len(), 1);
+        assert_eq!(broken[0].source, "live.md");
+    }
+
+    #[test]
+    fn a_stale_heading_an_archived_note_wrote_is_not_reported() {
+        let store = archive_store();
+        note(&store, "Roads.md", &[("## Norlund to Westport", "body")]);
+        note(
+            &store,
+            "04-Archive/Trade.md",
+            &[("## Legs", "See [[Roads#Norlund to Westport via Bend]].")],
+        );
+        assert!(find_stale_headings(&store).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_archived_work_note_is_not_a_tag_issue() {
+        let store = archive_store();
+        store
+            .insert_file("04-Archive/Work/old.md", "h", 100, "h00005", None, None)
+            .unwrap();
+        let config = HealthConfig {
+            daily_folder: None,
+            inbox_folder: None,
+        };
+        assert!(
+            generate_health_report(&store, &config)
+                .unwrap()
+                .tag_issues
+                .is_empty()
+        );
     }
 }

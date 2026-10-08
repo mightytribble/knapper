@@ -94,6 +94,12 @@ pub struct Search {
     #[arg(long)]
     #[serde(default)]
     pub linked_from: Option<String>,
+    /// Include notes under the archive folder, which a search leaves out by
+    /// default. Naming the archive folder, a folder inside it or a note
+    /// inside it in `scope`, `all` or `any` includes them too.
+    #[arg(long)]
+    #[serde(default)]
+    pub include_archive: bool,
     /// Token budget for the returned text. Fill is greedy in rank order; the
     /// first result is always included. Omit for the configured default (#35).
     #[arg(long = "tokens")]
@@ -268,6 +274,12 @@ pub struct List {
     #[arg(long)]
     #[serde(default)]
     pub detailed: bool,
+    /// Include notes under the archive folder, which a listing leaves out by
+    /// default. Naming the archive folder, a folder inside it or a note
+    /// inside it in `scope`, `all` or `any` includes them too.
+    #[arg(long)]
+    #[serde(default)]
+    pub include_archive: bool,
 }
 
 /// The order a listing comes back in (#121). An enum and not a string, so a
@@ -283,6 +295,22 @@ pub enum Sort {
     Path,
     LinksIn,
     LinksInAsc,
+}
+
+impl List {
+    /// The notes to list: `scope` folded into `all`, the property and link
+    /// filters, and whether the archive is admitted. One builder, so the
+    /// three surfaces cannot read a listing two ways.
+    pub fn scope(&self) -> anyhow::Result<crate::tags::Scope> {
+        let all = crate::tags::merge_scope_alias(self.scope.clone(), self.all.clone());
+        Ok(crate::tags::Scope::parse(&all, &self.any, &self.none)?
+            .with_filters(
+                self.property.as_deref(),
+                self.links_to.as_deref(),
+                self.linked_from.as_deref(),
+            )?
+            .including_archive(self.include_archive))
+    }
 }
 
 impl From<Sort> for crate::store::ListOrder {
@@ -355,6 +383,13 @@ pub struct Match {
     #[arg(long)]
     #[serde(default)]
     pub limit: Option<usize>,
+    /// Include notes under the archive folder, which `match` leaves out by
+    /// default, so `notes: 0` speaks for the working vault. Naming the
+    /// archive folder, a folder inside it or a note inside it in `scope`,
+    /// `all` or `any` includes them too.
+    #[arg(long)]
+    #[serde(default)]
+    pub include_archive: bool,
 }
 
 /// Which half of a note `match` reads (#137). An enum and not a pair of
@@ -379,7 +414,8 @@ impl Match {
     /// The notes to look in, with `scope` folded into `all`.
     pub fn scope(&self) -> anyhow::Result<crate::tags::Scope> {
         let all = crate::tags::merge_scope_alias(self.scope.clone(), self.all.clone());
-        crate::tags::Scope::parse(&all, &self.any, &self.none)
+        Ok(crate::tags::Scope::parse(&all, &self.any, &self.none)?
+            .including_archive(self.include_archive))
     }
 }
 
@@ -389,6 +425,11 @@ pub struct Tags {
     /// for the whole vocabulary.
     #[arg(long)]
     pub under: Option<String>,
+    /// Count notes under the archive folder, which the vocabulary leaves out
+    /// by default.
+    #[arg(long)]
+    #[serde(default)]
+    pub include_archive: bool,
 }
 
 #[derive(Debug, Args, Deserialize, JsonSchema)]
@@ -398,10 +439,21 @@ pub struct Properties {
     /// filtering with `property=NAME=VALUE` (#66).
     #[arg(long)]
     pub name: Option<String>,
+    /// Count notes under the archive folder, which the vocabulary leaves out
+    /// by default.
+    #[arg(long)]
+    #[serde(default)]
+    pub include_archive: bool,
 }
 
 #[derive(Debug, Args, Deserialize, JsonSchema)]
-pub struct VaultMap {}
+pub struct VaultMap {
+    /// Count notes under the archive folder, which the map leaves out
+    /// by default.
+    #[arg(long)]
+    #[serde(default)]
+    pub include_archive: bool,
+}
 
 /// One field, three shapes: a JSON array of strings, one comma-separated
 /// string, or `null`.
@@ -874,7 +926,9 @@ pub struct Move {
 
 #[derive(Debug, Args, Deserialize, JsonSchema)]
 pub struct Archive {
-    /// File path, basename, or #docid.
+    /// File path, basename, or #docid. With `undo`, the archived note: its
+    /// path under the archive folder, the path it was archived from, its
+    /// basename, or a #docid of either.
     pub file: String,
     /// Restore a note the archive holds, instead of archiving one.
     #[arg(long)]

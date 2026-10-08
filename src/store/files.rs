@@ -157,7 +157,7 @@ impl Store {
         crate::tags::check_terms(&self.conn, &checked)?;
         let links = self.resolve_scope_links(scope)?;
 
-        let (scope_sql, args) = scope_clauses(scope, &links);
+        let (scope_sql, args) = scope_clauses(scope, &links, self.archive_folder());
         let mut stmt = self.conn.prepare(&format!(
             "SELECT EXISTS(SELECT 1 FROM files f WHERE f.frontmatter IS NULL{scope_sql})"
         ))?;
@@ -180,16 +180,19 @@ impl Store {
     }
 
     /// Top-level folder grouping with note counts.
-    pub fn folder_note_counts(&self) -> Result<Vec<(String, usize)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT CASE WHEN instr(path, '/') > 0
-                    THEN substr(path, 1, instr(path, '/') - 1)
+    ///
+    /// Only the notes `scope` admits count, which by default leaves the archive out (#151).
+    pub fn folder_note_counts(&self, scope: &crate::tags::Scope) -> Result<Vec<(String, usize)>> {
+        let (scope_sql, args) = self.scope_sql(scope)?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT CASE WHEN instr(f.path, '/') > 0
+                    THEN substr(f.path, 1, instr(f.path, '/') - 1)
                     ELSE '(root)'
                     END AS folder,
                     COUNT(*) as cnt
-             FROM files GROUP BY folder ORDER BY cnt DESC",
-        )?;
-        let rows = stmt.query_map([], |row| {
+             FROM files f WHERE 1=1{scope_sql} GROUP BY folder ORDER BY cnt DESC"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
         })?;
         let mut results = Vec::new();
@@ -199,8 +202,16 @@ impl Store {
         Ok(results)
     }
 
-    /// Most recently indexed files.
-    pub fn recent_files(&self, limit: usize) -> Result<Vec<FileRecord>> {
+    /// Most recently changed files.
+    ///
+    /// Only the notes `scope` admits count, which by default leaves the archive out (#151).
+    pub fn recent_files(
+        &self,
+        limit: usize,
+        scope: &crate::tags::Scope,
+    ) -> Result<Vec<FileRecord>> {
+        let (scope_sql, mut args) = self.scope_sql(scope)?;
+        args.push(Box::new(limit as i64));
         // `mtime` and not `indexed_at` (#138): `indexed_at` is stamped when a
         // row is inserted, so `index --rebuild` reinserts every file in walk
         // order and the column collapses into that order. Presenting it as
@@ -209,9 +220,9 @@ impl Store {
         // can answer. `f.path` is the tie-break, since a bulk-written vault
         // gives whole folders one mtime.
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT {FILE_COLUMNS} FROM files f ORDER BY f.mtime DESC, f.path LIMIT ?"
+            "SELECT {FILE_COLUMNS} FROM files f WHERE 1=1{scope_sql} ORDER BY f.mtime DESC, f.path LIMIT ?"
         ))?;
-        let rows = stmt.query_map(params![limit as i64], file_from_row)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), file_from_row)?;
         let mut results = Vec::new();
         for row in rows {
             results.push(row?);
@@ -229,7 +240,7 @@ impl Store {
             .map_err(|e| anyhow::anyhow!("find_files_by_prefix: {e}"))
     }
 
-    /// Find a file by case-insensitive basename match. Returns first match (shortest path).
+    /// Find a file by case-insensitive basename match. Returns the first match: a live note before an archived one, then the shortest path.
     pub fn find_file_by_basename(&self, basename: &str) -> Result<Option<FileRecord>> {
         let base = if basename.ends_with(".md") {
             basename.to_string()
@@ -258,16 +269,20 @@ impl Store {
             }
         }
 
-        // Try each candidate as a case-insensitive basename match.
+        // A live note before an archived one, then the shortest path. Path
+        // length alone would hand `n` to an archived `04-Archive/n.md` over a
+        // live `a/b/c/n.md` (#151).
+        let (archived, archived_args) = self.archived_sql();
         for candidate in &candidates {
             let mut stmt = self.conn.prepare(&format!(
                 "SELECT {FILE_COLUMNS}
                  FROM files f
                  WHERE lower(f.path) LIKE '%/' || lower(?1) OR lower(f.path) = lower(?1)
-                 ORDER BY length(f.path) ASC LIMIT 1"
+                 ORDER BY {archived}, length(f.path) ASC LIMIT 1"
             ))?;
+            let args = std::iter::once(candidate).chain(archived_args.iter());
             let record = stmt
-                .query_row(params![candidate], file_from_row)
+                .query_row(rusqlite::params_from_iter(args), file_from_row)
                 .optional()?;
             if let Some(record) = record {
                 return Ok(Some(record));
@@ -334,32 +349,53 @@ impl Store {
     /// Resolution order:
     /// 1. `#docid` — 6-char hex prefixed with `#`
     /// 2. Exact path match
-    /// 3. Basename match (case-insensitive, with separator normalization)
+    /// 3. Basename match (case-insensitive, with separator normalization), a
+    ///    live note before an archived one
     /// 4. Fuzzy match — Levenshtein distance ≤ 2 on basenames (stripped of `.md`)
     ///    - If exactly one candidate: return it
-    ///    - If multiple equidistant candidates: error with candidate list
+    ///    - If several are equidistant: the live ones, and an error listing
+    ///      them when more than one is left
     ///    - If none within threshold: return None
     pub fn resolve_file(&self, file_or_docid: &str) -> Result<Option<FileRecord>> {
+        if let Some(f) = self.resolve_by_name(file_or_docid)? {
+            return Ok(Some(f));
+        }
+        self.find_file_by_fuzzy(file_or_docid)
+    }
+
+    /// The first three steps of [`resolve_file`](Self::resolve_file): a name
+    /// the caller wrote, with no guessing.
+    fn resolve_by_name(&self, file_or_docid: &str) -> Result<Option<FileRecord>> {
         if file_or_docid.starts_with('#') && file_or_docid.len() == 7 {
             return self.get_file_by_docid(&file_or_docid[1..]);
         }
         if let Some(f) = self.get_file(file_or_docid)? {
             return Ok(Some(f));
         }
-        if let Some(f) = self.find_file_by_basename(file_or_docid)? {
-            return Ok(Some(f));
-        }
-        self.find_file_by_fuzzy(file_or_docid)
+        self.find_file_by_basename(file_or_docid)
     }
 
     /// `resolve_file`, with a miss as the caller's fault.
     ///
     /// The write tools address one note and refuse when it is absent; this
-    /// is the one text and the one kind they answer with.
+    /// is the one text and the one kind they answer with. A fuzzy match
+    /// under the archive is a miss too. The caller named something else, and
+    /// a typo should not edit set-aside material, so the refusal names the
+    /// path that reaches it on purpose (#151).
     pub fn require_file(&self, file_or_docid: &str) -> Result<FileRecord> {
-        self.resolve_file(file_or_docid)?.ok_or_else(|| {
-            anyhow::anyhow!(Fault::NotFound(format!("file not found: {file_or_docid}")))
-        })
+        if let Some(f) = self.resolve_by_name(file_or_docid)? {
+            return Ok(f);
+        }
+        match self.find_file_by_fuzzy(file_or_docid)? {
+            Some(f) if self.is_archived(&f.path) => Err(anyhow::anyhow!(Fault::NotFound(format!(
+                "file not found: {file_or_docid}; the nearest match is archived: {}",
+                f.path
+            )))),
+            Some(f) => Ok(f),
+            None => Err(anyhow::anyhow!(Fault::NotFound(format!(
+                "file not found: {file_or_docid}"
+            )))),
+        }
     }
 
     /// Fuzzy-match a query against all stored file basenames using Levenshtein distance.
@@ -402,6 +438,11 @@ impl Store {
             } else if dist == best_distance {
                 best_paths.push(path.clone());
             }
+        }
+
+        // A live note at the best distance beats an archived one at it (#151).
+        if best_paths.iter().any(|p| !self.is_archived(p)) {
+            best_paths.retain(|p| !self.is_archived(p));
         }
 
         match best_paths.len() {
@@ -620,7 +661,9 @@ mod tests {
         store
             .insert_file("root.md", "h4", 100, "d4", None, None)
             .unwrap();
-        let counts = store.folder_note_counts().unwrap();
+        let counts = store
+            .folder_note_counts(&crate::tags::Scope::default())
+            .unwrap();
         assert!(counts.iter().any(|(f, c)| f == "01-Projects" && *c == 2));
         assert!(counts.iter().any(|(f, c)| f == "02-Areas" && *c == 1));
         assert!(counts.iter().any(|(f, c)| f == "(root)" && *c == 1));
@@ -657,7 +700,9 @@ mod tests {
             )
             .unwrap();
 
-        let recent = store.recent_files(2).unwrap();
+        let recent = store
+            .recent_files(2, &crate::tags::Scope::default())
+            .unwrap();
         assert_eq!(
             recent.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
             vec!["edited.md", "untouched.md"]
@@ -1078,5 +1123,89 @@ mod tests {
             .insert_file("c.md", "h3", 100, "ccc333", None, Some(day1 + 86400))
             .unwrap();
         assert_eq!(store.count_files_with_dates().unwrap(), 2);
+    }
+
+    /// A store that knows the archive, holding `paths`.
+    fn archive_store(paths: &[&str]) -> Store {
+        let store = Store::open_memory()
+            .unwrap()
+            .with_archive_folder("04-Archive");
+        for path in paths {
+            store
+                .insert_file(path, "h", 1, &generate_docid(path), None, None)
+                .unwrap();
+        }
+        store
+    }
+
+    /// Shortest path alone would hand `n` to the archived note (#151).
+    #[test]
+    fn a_live_note_beats_an_archived_one_of_its_basename_whatever_the_path_lengths() {
+        let store = archive_store(&["lore/deeper/still/n.md", "04-Archive/n.md"]);
+        assert_eq!(
+            store.find_file_by_basename("n").unwrap().unwrap().path,
+            "lore/deeper/still/n.md"
+        );
+        assert_eq!(
+            store.require_file("n").unwrap().path,
+            "lore/deeper/still/n.md"
+        );
+    }
+
+    #[test]
+    fn an_archived_only_basename_still_resolves() {
+        let store = archive_store(&["lore/live.md", "04-Archive/only.md"]);
+        assert_eq!(
+            store.require_file("only").unwrap().path,
+            "04-Archive/only.md"
+        );
+    }
+
+    #[test]
+    fn a_fuzzy_match_prefers_a_live_note_at_the_same_distance() {
+        let store = archive_store(&["lore/notes.md", "04-Archive/notes.md"]);
+        assert_eq!(
+            store.resolve_file("notex").unwrap().unwrap().path,
+            "lore/notes.md",
+            "one live candidate is not ambiguous"
+        );
+    }
+
+    /// A near match the caller did not name, under the archive, is refused
+    /// for a write and named, so the caller can write to it on purpose (#151).
+    #[test]
+    fn require_file_refuses_a_fuzzy_match_that_is_archived_and_names_it() {
+        let store = archive_store(&["lore/live.md", "04-Archive/notes.md"]);
+        let err = store.require_file("notex").unwrap_err();
+        assert_eq!(
+            crate::fault::Fault::of(&err).map(|f| f.kind()),
+            Some("not_found")
+        );
+        assert_eq!(
+            err.to_string(),
+            "file not found: notex; the nearest match is archived: 04-Archive/notes.md"
+        );
+    }
+
+    #[test]
+    fn resolve_file_answers_a_fuzzy_match_that_is_archived() {
+        let store = archive_store(&["lore/live.md", "04-Archive/notes.md"]);
+        assert_eq!(
+            store.resolve_file("notex").unwrap().unwrap().path,
+            "04-Archive/notes.md"
+        );
+    }
+
+    #[test]
+    fn an_exact_path_or_docid_reaches_an_archived_note_for_a_write() {
+        let store = archive_store(&["lore/notes.md", "04-Archive/notes.md"]);
+        let docid = format!("#{}", generate_docid("04-Archive/notes.md"));
+        for form in ["04-Archive/notes.md", docid.as_str()] {
+            assert_eq!(
+                store.require_file(form).unwrap().path,
+                "04-Archive/notes.md",
+                "{form}"
+            );
+        }
     }
 }

@@ -563,15 +563,8 @@ async fn handle_list(
     ApiQuery(params): ApiQuery<crate::params::List>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, false)?;
-    let all_terms = crate::tags::merge_scope_alias(params.scope, params.all);
-    let filter = crate::tags::Scope::parse(&all_terms, &params.any, &params.none)
-        .and_then(|s| {
-            s.with_filters(
-                params.property.as_deref(),
-                params.links_to.as_deref(),
-                params.linked_from.as_deref(),
-            )
-        })
+    let filter = params
+        .scope()
         .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
     let vault = state.core.vault_path.clone();
     let profile = state.core.profile.clone();
@@ -606,9 +599,10 @@ async fn handle_tags(
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, false)?;
     let prefix = params.under.as_deref().and_then(crate::tags::parse_term);
+    let scope = crate::tags::Scope::default().including_archive(params.include_archive);
     let rows = state
         .core
-        .with_reader(move |store| store.tags_under(prefix.as_ref()))
+        .with_reader(move |store| store.tags_under(prefix.as_ref(), &scope))
         .await?;
     Ok(Json(serde_json::json!(rows)))
 }
@@ -633,6 +627,7 @@ async fn handle_properties(
 async fn handle_vault_map(
     State(state): State<ApiState>,
     headers: HeaderMap,
+    ApiQuery(params): ApiQuery<crate::params::VaultMap>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, false)?;
     let vault = state.core.vault_path.clone();
@@ -645,7 +640,7 @@ async fn handle_vault_map(
                 vault_path: &vault,
                 profile: profile.as_ref().as_ref(),
             };
-            context::vault_map(&ctx)
+            context::vault_map(&ctx, params.include_archive)
         })
         .await?;
     Ok(Json(serde_json::json!(map)))
@@ -939,7 +934,6 @@ async fn handle_index(
         config.respect_gitignore = false;
     }
     let vault = state.core.vault_path.clone();
-    let profile = state.core.profile.clone();
     let settings = state.core.index_settings;
     let result = state
         .core
@@ -951,7 +945,6 @@ async fn handle_index(
                 g.store,
                 g.embedder,
                 body.rebuild,
-                profile.as_ref().as_ref(),
             )
         })
         .await?;
@@ -2113,6 +2106,27 @@ mod tests {
         (tmp, api_state_from(core))
     }
 
+    /// A server over a live note and an archived one.
+    fn archive_state() -> (tempfile::TempDir, ApiState) {
+        let (tmp, core) = crate::core::testing::indexed_core(
+            &[
+                ("lore/live.md", "# Live\n\nThe coast road.\n"),
+                ("04-Archive/lore/old.md", "# Old\n\nThe coast road.\n"),
+            ],
+            crate::core::testing::test_config(),
+        );
+        (tmp, api_state_from(core))
+    }
+
+    #[tokio::test]
+    async fn the_list_route_takes_include_archive() {
+        let (_tmp, state) = archive_state();
+        let listed = paths(&json_body(get(state.clone(), "/api/list").await).await);
+        assert_eq!(listed, vec!["lore/live.md"]);
+        let listed = paths(&json_body(get(state, "/api/list?include_archive=true").await).await);
+        assert_eq!(listed, vec!["04-Archive/lore/old.md", "lore/live.md"]);
+    }
+
     /// How many sections of the one file that holds three matching ones came
     /// back, across the included blocks and the budget's overflow alike —
     /// this counts answers, not what fit under the default budget.
@@ -2455,19 +2469,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unarchive_of_a_note_with_no_archived_from_is_a_bad_request() {
+    async fn an_archive_onto_a_path_the_archive_holds_is_a_conflict() {
         let (_tmp, state) = indexed_state();
         let vault = state.core.vault_path.as_ref().clone();
-        std::fs::create_dir_all(vault.join("04-Archive")).unwrap();
-        std::fs::write(vault.join("04-Archive/orphan.md"), "# Orphan\n").unwrap();
+        std::fs::create_dir_all(vault.join("04-Archive/rules")).unwrap();
+        std::fs::write(
+            vault.join("04-Archive/rules/evocation-spells.md"),
+            "# Old\n",
+        )
+        .unwrap();
         let (status, body) = post_json(
             state,
             "/api/archive",
-            r#"{"file":"04-Archive/orphan.md","undo":true}"#,
+            r#"{"file":"rules/evocation-spells.md"}"#,
         )
         .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-        assert_eq!(body["kind"], "invalid_input");
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["kind"], "conflict");
     }
 
     /// A read-only server refuses `index` the way MCP's `index` refuses it:

@@ -151,16 +151,7 @@ impl KnapperServer {
         params: Parameters<crate::params::List>,
     ) -> Result<CallToolResult, McpError> {
         let p = params.0;
-        let all_terms = crate::tags::merge_scope_alias(p.scope, p.all);
-        let tags = crate::tags::Scope::parse(&all_terms, &p.any, &p.none)
-            .and_then(|s| {
-                s.with_filters(
-                    p.property.as_deref(),
-                    p.links_to.as_deref(),
-                    p.linked_from.as_deref(),
-                )
-            })
-            .map_err(|e| invalid_params(format!("{e:#}")))?;
+        let tags = p.scope().map_err(|e| invalid_params(format!("{e:#}")))?;
         let vault = self.core.vault_path.clone();
         let profile = self.core.profile.clone();
         let items = self
@@ -214,9 +205,10 @@ impl KnapperServer {
         params: Parameters<crate::params::Tags>,
     ) -> Result<CallToolResult, McpError> {
         let prefix = params.0.under.as_deref().and_then(crate::tags::parse_term);
+        let scope = crate::tags::Scope::default().including_archive(params.0.include_archive);
         let rows = self
             .core
-            .with_reader(move |store| store.tags_under(prefix.as_ref()))
+            .with_reader(move |store| store.tags_under(prefix.as_ref(), &scope))
             .await
             .map_err(mcp_err)?;
         to_json_result(&rows)
@@ -244,7 +236,11 @@ impl KnapperServer {
         name = "vault_map",
         description = "Vault structure overview: folders, file counts, the tag vocabulary with the share of notes it covers, the most-linked notes, and recently changed files. The first call on a vault you do not know: top_notes names what the vault points at most, which is where to start reading."
     )]
-    async fn vault_map(&self) -> Result<CallToolResult, McpError> {
+    async fn vault_map(
+        &self,
+        params: Parameters<crate::params::VaultMap>,
+    ) -> Result<CallToolResult, McpError> {
+        let include_archive = params.0.include_archive;
         let vault = self.core.vault_path.clone();
         let profile = self.core.profile.clone();
         let map = self
@@ -255,7 +251,7 @@ impl KnapperServer {
                     vault_path: &vault,
                     profile: profile.as_ref().as_ref(),
                 };
-                context::vault_map(&ctx)
+                context::vault_map(&ctx, include_archive)
             })
             .await
             .map_err(mcp_err)?;
@@ -391,7 +387,7 @@ impl KnapperServer {
 
     #[tool(
         name = "archive",
-        description = "Archive a note: moves it to the archive folder, removes from search index. The note is preserved on disk but invisible to search/context. `undo: true` reverses this: restores the note to its original location and re-indexes it."
+        description = "Archive a note: move it under the archive folder at its whole path, unedited. It stays indexed and readable by path, and search, match, list, tags, properties and vault_map leave it out unless a call passes `include_archive` or names the archive folder in a scope. `undo: true` moves it back to the path it was archived from."
     )]
     async fn archive(
         &self,
@@ -571,19 +567,12 @@ impl KnapperServer {
         }
         let rebuild = params.0.rebuild;
         let vault = self.core.vault_path.clone();
-        let profile = self.core.profile.clone();
         let settings = self.core.index_settings;
         let result = self
             .core
             .with_core(move |g| {
                 crate::indexer::run_index_shared(
-                    &vault,
-                    &config,
-                    settings,
-                    g.store,
-                    g.embedder,
-                    rebuild,
-                    profile.as_ref().as_ref(),
+                    &vault, &config, settings, g.store, g.embedder, rebuild,
                 )
             })
             .await
@@ -766,7 +755,7 @@ pub const ORIENTATION: &[Orientation] = &[
     Orientation {
         capability: "archive",
         group: "Lifecycle",
-        clause: "to set a note aside in the archive folder, out of search (`undo: true` to restore)",
+        clause: "to set a note aside as reference: kept, indexed, and left out of reads unless `include_archive` (`undo: true` to restore)",
     },
     Orientation {
         capability: "delete",
@@ -874,16 +863,9 @@ pub async fn run_serve(
 
     let core = Core::open(data_dir, config, read_only)?;
 
-    // The watcher's exclude list: config excludes plus the archive folder.
-    let mut exclude = core.config.exclude.clone();
-    if let Some(ref prof) = *core.profile
-        && let Some(ref archive) = prof.structure.folders.archive
-    {
-        let pattern = format!("{}/", archive);
-        if !exclude.contains(&pattern) {
-            exclude.push(pattern);
-        }
-    }
+    // The watcher's exclude list is the config's. The archive folder is
+    // indexed, and reads leave it out (#151).
+    let exclude = core.config.exclude.clone();
     let (watcher_handle, watcher_shutdown) = crate::watcher::start_watcher(core.clone(), exclude)?;
 
     if read_only {
@@ -1133,20 +1115,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unarchive_of_a_note_with_no_archived_from_is_invalid_params() {
+    async fn an_archive_onto_a_path_the_archive_holds_is_invalid_request() {
         let (_tmp, server) = indexed_server(crate::config::GroupBy::Chunk);
         let vault = server.core.vault_path.as_ref().clone();
-        std::fs::create_dir_all(vault.join("04-Archive")).unwrap();
-        std::fs::write(vault.join("04-Archive/orphan.md"), "# Orphan\n").unwrap();
+        std::fs::create_dir_all(vault.join("04-Archive/rules")).unwrap();
+        std::fs::write(
+            vault.join("04-Archive/rules/evocation-spells.md"),
+            "# Old\n",
+        )
+        .unwrap();
         let err = server
             .archive(super::Parameters(crate::params::Archive {
-                file: "04-Archive/orphan.md".into(),
-                undo: true,
+                file: "rules/evocation-spells.md".into(),
+                undo: false,
             }))
             .await
             .unwrap_err();
-        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
-        assert_eq!(err.data.as_ref().unwrap()["kind"], "invalid_input");
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_REQUEST, "{err:?}");
+        assert_eq!(err.data.as_ref().unwrap()["kind"], "conflict");
     }
 
     #[tokio::test]
@@ -1254,6 +1240,7 @@ mod tests {
             property: None,
             links_to: None,
             linked_from: None,
+            include_archive: false,
             budget_tokens: None,
             full: false,
             summaries: false,
@@ -1353,6 +1340,7 @@ mod tests {
             none: vec![],
             scan: crate::params::Scan::default(),
             limit: None,
+            include_archive: false,
         };
         let err = server.r#match(super::Parameters(params)).await.unwrap_err();
         assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
@@ -1511,6 +1499,7 @@ mod tests {
             none: vec![],
             scan: crate::params::Scan::default(),
             limit: None,
+            include_archive: false,
         };
         let err = server.r#match(super::Parameters(params)).await.unwrap_err();
         assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
@@ -1665,7 +1654,12 @@ mod tests {
     async fn a_json_result_is_framed_without_indentation() {
         let (_tmp, server) = indexed_server(crate::config::GroupBy::Chunk);
 
-        let result = server.vault_map().await.unwrap();
+        let result = server
+            .vault_map(super::Parameters(crate::params::VaultMap {
+                include_archive: false,
+            }))
+            .await
+            .unwrap();
         let text = &result
             .content
             .first()
@@ -1823,7 +1817,10 @@ mod tests {
 
         let tags = tokio::time::timeout(
             Duration::from_secs(2),
-            server.tags(super::Parameters(crate::params::Tags { under: None })),
+            server.tags(super::Parameters(crate::params::Tags {
+                under: None,
+                include_archive: false,
+            })),
         )
         .await
         .expect("tags waited on the search");
@@ -1904,6 +1901,34 @@ mod tests {
         }
         serving.abort();
         responses
+    }
+
+    #[tokio::test]
+    async fn the_vault_map_tool_takes_include_archive() {
+        let (_tmp, core) = crate::core::testing::indexed_core(
+            &[
+                ("lore/live.md", "# Live\n\nThe coast road.\n"),
+                ("04-Archive/lore/old.md", "# Old\n\nThe coast road.\n"),
+            ],
+            crate::core::testing::test_config(),
+        );
+        let server = super::KnapperServer::new(core);
+        let total = |include_archive: bool| {
+            let server = &server;
+            async move {
+                let result = server
+                    .vault_map(super::Parameters(crate::params::VaultMap {
+                        include_archive,
+                    }))
+                    .await
+                    .unwrap();
+                let text = result.content[0].as_text().unwrap().text.clone();
+                let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+                json["total_files"].clone()
+            }
+        };
+        assert_eq!(total(false).await, 1);
+        assert_eq!(total(true).await, 2);
     }
 
     /// A client on the 2026-07-28 protocol may probe with `server/discover`

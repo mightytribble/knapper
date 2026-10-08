@@ -155,7 +155,8 @@ pub(crate) fn resolve_link_target(store: &Store, target: &str) -> Result<Option<
         })
         .collect();
 
-    matches.sort_by_key(|f| f.path.len());
+    // A live note before an archived one, then the shortest path (#151).
+    matches.sort_by_key(|f| (store.is_archived(&f.path), f.path.len()));
     Ok(matches.first().map(|f| f.id))
 }
 
@@ -1288,5 +1289,36 @@ mod tests {
         let empty = std::collections::HashSet::new();
         let out = graph_expand(&store, &[seed(&store, a, 0, 1.0)], &ppr(), Some(&empty)).unwrap();
         assert!(out.is_empty());
+    }
+
+    /// `[[n]]` names the live note when there is one, and the archived one
+    /// when there is not (#151).
+    #[test]
+    fn a_wikilink_resolves_to_a_live_note_before_an_archived_one_of_its_name() {
+        let store = Store::open_memory()
+            .unwrap()
+            .with_archive_folder("04-Archive");
+        let live = store
+            .insert_file("lore/deeper/still/n.md", "h", 1, "g00001", None, None)
+            .unwrap();
+        let old = store
+            .insert_file("04-Archive/n.md", "h", 1, "g00002", None, None)
+            .unwrap();
+        let only = store
+            .insert_file("04-Archive/only.md", "h", 1, "g00003", None, None)
+            .unwrap();
+        assert_eq!(resolve_link_target(&store, "n").unwrap(), Some(live));
+        assert_eq!(resolve_link_target(&store, "only").unwrap(), Some(only));
+
+        // A store with no folder prefers the shorter path.
+        let plain = Store::open_memory().unwrap();
+        plain
+            .insert_file("lore/deeper/still/n.md", "h", 1, "g00001", None, None)
+            .unwrap();
+        let shorter = plain
+            .insert_file("04-Archive/n.md", "h", 1, "g00002", None, None)
+            .unwrap();
+        assert_eq!(resolve_link_target(&plain, "n").unwrap(), Some(shorter));
+        let _ = old;
     }
 }

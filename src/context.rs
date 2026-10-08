@@ -579,10 +579,12 @@ pub fn context_list(
 const TOP_NOTES: usize = 10;
 
 /// High-level vault overview: folders, the tag vocabulary and its reach, the
-/// most-linked notes, recently changed files, counts.
-pub fn vault_map(params: &ContextParams) -> Result<VaultMap> {
-    let stats = params.store.stats()?;
-    let edge_stats = params.store.get_edge_stats().ok();
+/// most-linked notes, recently changed files, counts. It describes the vault
+/// a read answers from, so the archive is left out unless `include_archive`
+/// (#151).
+pub fn vault_map(params: &ContextParams, include_archive: bool) -> Result<VaultMap> {
+    let scope = crate::tags::Scope::default().including_archive(include_archive);
+    let totals = params.store.totals_in_scope(&scope)?;
 
     let (vault_type, structure) = match params.profile {
         Some(p) => (
@@ -592,7 +594,7 @@ pub fn vault_map(params: &ContextParams) -> Result<VaultMap> {
         None => ("Unknown".into(), "Unknown".into()),
     };
 
-    let folder_counts = params.store.folder_note_counts()?;
+    let folder_counts = params.store.folder_note_counts(&scope)?;
     let folders: Vec<FolderInfo> = folder_counts
         .into_iter()
         .map(|(path, count)| FolderInfo {
@@ -601,33 +603,33 @@ pub fn vault_map(params: &ContextParams) -> Result<VaultMap> {
         })
         .collect();
 
-    let top_tags = params.store.top_tags(20)?;
-    let tagged_notes = params.store.tagged_file_count()?;
+    let top_tags = params.store.top_tags(20, &scope)?;
+    let tagged_notes = params.store.tagged_file_count(&scope)?;
     // How many facets the vocabulary spans, from the store's own axis rollup
     // (#60): one axis says the vault tags a single facet, which is what turns
     // a tag head count into something a caller can read a structure off.
-    let tag_axes = params.store.tag_axes()?.len();
+    let tag_axes = params.store.tag_axes(&scope)?.len();
 
     // The ten notes the vault points at most. `chunk_count` and `token_count`
     // are deliberately not carried beside them: a map is a fixed shape, and a
     // caller who wants sizes has `list` (#131, #138).
     let top_notes: Vec<TopNote> = params
         .store
-        .top_linked_files(TOP_NOTES)?
+        .top_linked_files(TOP_NOTES, &scope)?
         .into_iter()
         .map(|(path, links_in)| TopNote { path, links_in })
         .collect();
 
-    let recent = params.store.recent_files(10)?;
+    let recent = params.store.recent_files(10, &scope)?;
     let recent_files: Vec<String> = recent.into_iter().map(|f| f.path).collect();
 
     Ok(VaultMap {
         vault_path: params.vault_path.to_string_lossy().to_string(),
         vault_type,
         structure,
-        total_files: stats.file_count,
-        total_chunks: stats.chunk_count,
-        total_edges: edge_stats.map(|e| e.total_edges).unwrap_or(0),
+        total_files: totals.files,
+        total_chunks: totals.chunks,
+        total_edges: totals.edges,
         folders,
         top_tags,
         tagged_notes,
@@ -1502,7 +1504,7 @@ mod tests {
             vault_path: &root,
             profile: None,
         };
-        let map = vault_map(&params).unwrap();
+        let map = vault_map(&params, false).unwrap();
         assert_eq!(map.total_files, 2);
         assert!(!map.folders.is_empty());
         assert!(map.top_tags.iter().any(|(t, _)| t == "rust"));
@@ -1539,7 +1541,7 @@ mod tests {
             vault_path: &root,
             profile: None,
         };
-        let map = vault_map(&params).unwrap();
+        let map = vault_map(&params, false).unwrap();
 
         assert_eq!(
             map.top_notes,
@@ -1567,7 +1569,7 @@ mod tests {
             vault_path: &root,
             profile: None,
         };
-        let map = vault_map(&params).unwrap();
+        let map = vault_map(&params, false).unwrap();
 
         // One of the two notes carries a tag, on the single axis `rust`.
         assert_eq!(map.total_files, 2);
@@ -2000,5 +2002,213 @@ mod tests {
             "only the matched row, not every row: {rows:?}"
         );
         assert_eq!(rows[0].value, "draft");
+    }
+
+    /// `read` resolves through the store's order: a basename names the live
+    /// note first and still reaches an archived note when it is the only one
+    /// (#151).
+    #[test]
+    fn a_read_by_basename_prefers_the_live_note_and_still_reaches_an_archived_only_one() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let store = Store::open_memory()
+            .unwrap()
+            .with_archive_folder("04-Archive");
+        for (path, text) in [
+            ("lore/deeper/still/n.md", "# Live\n"),
+            ("04-Archive/n.md", "# Old\n"),
+            ("04-Archive/only.md", "# Only\n"),
+        ] {
+            std::fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
+            std::fs::write(root.join(path), text).unwrap();
+            store
+                .insert_file(path, "h", 1, &generate_docid(path), None, None)
+                .unwrap();
+        }
+        let ctx = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+        let read = |name: &str| {
+            content_of(context_read(&ctx, name, None, crate::params::Include::Content).unwrap())
+                .path
+        };
+        assert_eq!(read("n"), "lore/deeper/still/n.md");
+        assert_eq!(read("only"), "04-Archive/only.md");
+    }
+
+    /// A live note and an archived one, each with a tag and a property only
+    /// it carries, indexed into a store that knows the archive. The archived
+    /// note links to the live one.
+    fn archive_vault() -> (TempDir, Store, std::path::PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        for (rel, text) in [
+            (
+                "lore/live.md",
+                "---\ntags: [type/live]\nstatus: current\n---\n# Live\n\nThe coast road runs north.\n",
+            ),
+            (
+                "04-Archive/lore/old.md",
+                "---\ntags: [type/old]\nera: past\n---\n# Old\n\nThe coast road ran south. See [[live]].\n",
+            ),
+        ] {
+            std::fs::create_dir_all(root.join(rel).parent().unwrap()).unwrap();
+            std::fs::write(root.join(rel), text).unwrap();
+        }
+        let store = Store::open_memory()
+            .unwrap()
+            .with_archive_folder("04-Archive");
+        let config = crate::config::Config::default();
+        crate::indexer::run_index_shared(
+            &root,
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut crate::llm::MockLlm::new(256),
+            false,
+        )
+        .unwrap();
+        (tmp, store, root)
+    }
+
+    #[test]
+    fn tags_leave_the_archive_out_unless_asked() {
+        let (_tmp, store, _root) = archive_vault();
+        let paths = |include: bool| -> Vec<String> {
+            store
+                .tags_under(
+                    None,
+                    &crate::tags::Scope::default().including_archive(include),
+                )
+                .unwrap()
+                .into_iter()
+                .map(|t| t.path)
+                .collect()
+        };
+        assert_eq!(paths(false), ["type/live"]);
+        assert_eq!(paths(true), ["type/live", "type/old"]);
+    }
+
+    #[test]
+    fn properties_leave_the_archive_out_unless_asked() {
+        let (_tmp, store, root) = archive_vault();
+        let run = |json: serde_json::Value| {
+            crate::properties::run(&store, &root, &serde_json::from_value(json).unwrap()).unwrap()
+        };
+        let names = |report| match report {
+            crate::properties::PropertiesReport::Registry(rows) => {
+                rows.into_iter().map(|r| r.name).collect::<Vec<_>>()
+            }
+            other => panic!("expected the registry, got {other:?}"),
+        };
+        assert_eq!(names(run(serde_json::json!({}))), ["status"]);
+        assert_eq!(
+            names(run(serde_json::json!({"include_archive": true}))),
+            ["era", "status"]
+        );
+        match run(serde_json::json!({"name": "era"})) {
+            crate::properties::PropertiesReport::Values(rows) => assert!(rows.is_empty()),
+            other => panic!("expected values, got {other:?}"),
+        }
+    }
+
+    /// The map describes the vault a read answers from. `links_in` counts
+    /// every linking note, as `list` does, so the two cannot disagree
+    /// (#138, #151).
+    #[test]
+    fn vault_map_leaves_the_archive_out_unless_asked() {
+        let (_tmp, store, root) = archive_vault();
+        let ctx = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+
+        let map = vault_map(&ctx, false).unwrap();
+        assert_eq!(map.total_files, 1);
+        assert_eq!(map.total_edges, 0, "the one edge is the archived note's");
+        assert_eq!(
+            map.folders
+                .iter()
+                .map(|f| f.path.as_str())
+                .collect::<Vec<_>>(),
+            ["lore"]
+        );
+        assert_eq!(map.recent_files, ["lore/live.md"]);
+        assert_eq!(map.tagged_notes, 1);
+        assert_eq!(map.tag_axes, 1);
+        assert_eq!(
+            map.top_notes,
+            vec![TopNote {
+                path: "lore/live.md".into(),
+                links_in: 1
+            }]
+        );
+
+        let map = vault_map(&ctx, true).unwrap();
+        assert_eq!(map.total_files, 2);
+        assert_eq!(map.total_edges, 1);
+        assert_eq!(map.tagged_notes, 2);
+    }
+
+    #[test]
+    fn list_leaves_the_archive_out_unless_asked() {
+        let (_tmp, store, root) = archive_vault();
+        let ctx = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+        let list = |json: serde_json::Value| -> Vec<String> {
+            let params: crate::params::List = serde_json::from_value(json).unwrap();
+            context_list(
+                &ctx,
+                &params.scope().unwrap(),
+                None,
+                None,
+                None,
+                crate::store::ListOrder::Path,
+                false,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|item| item.path)
+            .collect()
+        };
+        assert_eq!(list(serde_json::json!({})), ["lore/live.md"]);
+        assert_eq!(
+            list(serde_json::json!({"include_archive": true})),
+            ["04-Archive/lore/old.md", "lore/live.md"]
+        );
+        assert_eq!(
+            list(serde_json::json!({"all": ["/04-Archive/"]})),
+            ["04-Archive/lore/old.md"]
+        );
+    }
+
+    #[test]
+    fn match_leaves_the_archive_out_unless_asked() {
+        let (_tmp, store, _root) = archive_vault();
+        let notes = |json: serde_json::Value| {
+            crate::matching::run(&store, &serde_json::from_value(json).unwrap())
+                .unwrap()
+                .notes
+        };
+        assert_eq!(notes(serde_json::json!({"pattern": "coast road"})), 1);
+        assert_eq!(
+            notes(serde_json::json!({"pattern": "coast road", "include_archive": true})),
+            2
+        );
+        assert_eq!(
+            notes(serde_json::json!({"pattern": "coast road", "all": ["/04-Archive/"]})),
+            1
+        );
+        assert_eq!(
+            notes(serde_json::json!({"pattern": "ran south"})),
+            0,
+            "absent from what a default read sees"
+        );
     }
 }

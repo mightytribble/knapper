@@ -62,9 +62,13 @@ pub struct LinkIds {
 /// `list_files` and `files_in_scope` ask the same question and a second copy is
 /// a second thing to keep right. A tag term is an `EXISTS` over the junction; a
 /// directory term is a range predicate on `files.path`, which needs no join.
+///
+/// `archive` is the store's archive folder, which the clauses leave out unless
+/// the scope asks for it (#151).
 pub(super) fn scope_clauses(
     scope: &crate::tags::Scope,
     links: &LinkIds,
+    archive: Option<&str>,
 ) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
     use crate::tags::ScopeTerm;
 
@@ -180,6 +184,17 @@ pub(super) fn scope_clauses(
         push_value(&mut sql, &mut args);
         sql.push(')');
     }
+    // The archive (#151): the store's folder, left out unless the scope asks
+    // for it.
+    if let Some(folder) = archive
+        && !scope.admits_archive(folder)
+    {
+        let (pred, values) = crate::tags::outside_folder_sql(folder);
+        sql.push_str(&format!(" AND {pred}"));
+        for value in values {
+            args.push(Box::new(value));
+        }
+    }
     (sql, args)
 }
 
@@ -284,7 +299,7 @@ impl Store {
              FROM files f WHERE 1=1"
         );
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        let (tag_sql, tag_args) = scope_clauses(tags, &links);
+        let (tag_sql, tag_args) = scope_clauses(tags, &links, self.archive_folder());
         sql.push_str(&tag_sql);
         param_values.extend(tag_args);
         if let Some(cb) = created_by {
@@ -376,7 +391,7 @@ impl Store {
         // The scope clauses are built twice because each arm binds its own
         // copy of the arguments; `scope_clauses` is the one builder, so the
         // two arms cannot select different notes.
-        let (scope_sql, mut args) = scope_clauses(scope, &links);
+        let (scope_sql, mut args) = scope_clauses(scope, &links, self.archive_folder());
         let frontmatter_arm = format!(
             "SELECT f.path AS path, {DOC_LEVEL} AS seq, '' AS heading_path, f.frontmatter AS text
                FROM files f
@@ -391,7 +406,7 @@ impl Store {
             Scan::All => {
                 // Each arm binds its own copy: a bound value is a boxed
                 // `dyn ToSql` and cannot be cloned, so the builder runs again.
-                let (_, second) = scope_clauses(scope, &links);
+                let (_, second) = scope_clauses(scope, &links, self.archive_folder());
                 args.extend(second);
                 (
                     format!("{frontmatter_arm} UNION ALL {body_arm} ORDER BY path, seq"),
@@ -436,7 +451,7 @@ impl Store {
         crate::tags::check_terms(&self.conn, &checked)?;
         let links = self.resolve_scope_links(filter)?;
 
-        let (tag_sql, args) = scope_clauses(filter, &links);
+        let (tag_sql, args) = scope_clauses(filter, &links, self.archive_folder());
         let mut stmt = self
             .conn
             .prepare(&format!("SELECT f.id FROM files f WHERE 1=1{tag_sql}"))?;
@@ -479,6 +494,54 @@ impl Store {
             links_to: resolve("links_to", &scope.links_to)?,
             linked_from: resolve("linked_from", &scope.linked_from)?,
         })
+    }
+}
+
+/// What a scope holds, counted: notes, their chunks, and the edges they
+/// write. An edge is its source note's, so it is counted where its source
+/// is (#151).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScopeTotals {
+    pub files: usize,
+    pub chunks: usize,
+    pub edges: usize,
+}
+
+impl Store {
+    /// The clauses `scope` compiles to on this store: its terms, its
+    /// resolved link filters, and the archive rule. For a query over a whole
+    /// vault that a read can still narrow (#151).
+    pub(super) fn scope_sql(
+        &self,
+        scope: &crate::tags::Scope,
+    ) -> Result<(String, Vec<Box<dyn rusqlite::types::ToSql>>)> {
+        let links = self.resolve_scope_links(scope)?;
+        Ok(scope_clauses(scope, &links, self.archive_folder()))
+    }
+
+    /// The notes, chunks and edges a scope holds (#151).
+    pub fn totals_in_scope(&self, scope: &crate::tags::Scope) -> Result<ScopeTotals> {
+        let (files_sql, mut args) = self.scope_sql(scope)?;
+        let (chunks_sql, chunk_args) = self.scope_sql(scope)?;
+        let (edges_sql, edge_args) = self.scope_sql(scope)?;
+        args.extend(chunk_args);
+        args.extend(edge_args);
+        let sql = format!(
+            "SELECT (SELECT COUNT(*) FROM files f WHERE 1=1{files_sql}),
+                    (SELECT COUNT(*) FROM chunks c JOIN files f ON f.id = c.file_id
+                      WHERE 1=1{chunks_sql}),
+                    (SELECT COUNT(*) FROM edges e JOIN files f ON f.id = e.from_file
+                      WHERE 1=1{edges_sql})"
+        );
+        Ok(self
+            .conn
+            .query_row(&sql, rusqlite::params_from_iter(args.iter()), |row| {
+                Ok(ScopeTotals {
+                    files: row.get::<_, i64>(0)? as usize,
+                    chunks: row.get::<_, i64>(1)? as usize,
+                    edges: row.get::<_, i64>(2)? as usize,
+                })
+            })?)
     }
 }
 
@@ -1118,6 +1181,195 @@ mod tests {
             &none.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
         )
         .unwrap()
+    }
+
+    /// Two archived notes, two live ones, in a store that knows the folder.
+    fn archive_fixture() -> Store {
+        let store = Store::open_memory()
+            .unwrap()
+            .with_archive_folder("04-Archive");
+        for (i, path) in [
+            "04-Archive/lore/old.md",
+            "04-Archive/top.md",
+            "lore/live.md",
+            "notes.md",
+        ]
+        .iter()
+        .enumerate()
+        {
+            store
+                .insert_file(path, "h", i as i64, &format!("a00000{i}"), None, None)
+                .unwrap();
+        }
+        store
+    }
+
+    /// The archive is set aside: a read leaves it out unless it asks (#151).
+    #[test]
+    fn a_scope_leaves_the_archive_out_by_default() {
+        let store = archive_fixture();
+        let empty = crate::tags::Scope::default();
+        assert_eq!(scoped_paths(&store, &empty), ["lore/live.md", "notes.md"]);
+        let listed: Vec<String> = store
+            .list_files(&empty, None, None)
+            .unwrap()
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+        assert_eq!(
+            listed,
+            ["lore/live.md", "notes.md"],
+            "a listing inherits it"
+        );
+    }
+
+    #[test]
+    fn include_archive_brings_the_archive_back() {
+        let store = archive_fixture();
+        let scope = crate::tags::Scope::default().including_archive(true);
+        assert_eq!(
+            scoped_paths(&store, &scope),
+            [
+                "04-Archive/lore/old.md",
+                "04-Archive/top.md",
+                "lore/live.md",
+                "notes.md"
+            ]
+        );
+    }
+
+    /// Naming the archive is asking for it, so the exclusion would answer an
+    /// empty scope (#151).
+    #[test]
+    fn naming_the_archive_in_all_or_any_brings_it_back() {
+        let store = archive_fixture();
+        assert_eq!(
+            scoped_paths(&store, &folder_scope(&["/04-Archive/"], &[], &[])),
+            ["04-Archive/lore/old.md", "04-Archive/top.md"]
+        );
+        assert_eq!(
+            scoped_paths(&store, &folder_scope(&["/04-Archive/lore/"], &[], &[])),
+            ["04-Archive/lore/old.md"]
+        );
+        assert_eq!(
+            scoped_paths(&store, &folder_scope(&["/04-Archive"], &[], &[])),
+            ["04-Archive/top.md"],
+            "the folder's own notes"
+        );
+        assert_eq!(
+            scoped_paths(&store, &folder_scope(&["/04-Archive/top.md"], &[], &[])),
+            ["04-Archive/top.md"],
+            "one note inside it"
+        );
+        assert_eq!(
+            scoped_paths(
+                &store,
+                &folder_scope(&[], &["/04-Archive/lore/", "/lore/"], &[])
+            ),
+            ["04-Archive/lore/old.md", "lore/live.md"]
+        );
+    }
+
+    #[test]
+    fn a_none_term_or_a_tag_term_leaves_the_archive_out() {
+        let store = archive_fixture();
+        let old = store
+            .get_file("04-Archive/lore/old.md")
+            .unwrap()
+            .unwrap()
+            .id;
+        store
+            .reconcile_file_tags(
+                old,
+                &[crate::tags::Tag {
+                    path: "type/old".into(),
+                    display: "type/old".into(),
+                }],
+            )
+            .unwrap();
+        assert!(
+            scoped_paths(&store, &folder_scope(&["type/old"], &[], &[])).is_empty(),
+            "a tag names no folder, so the archive stays out"
+        );
+        assert_eq!(
+            scoped_paths(&store, &folder_scope(&[], &[], &["/lore/"])),
+            ["notes.md"]
+        );
+    }
+
+    /// A range and not a `LIKE`: `_` is literal and the case is kept, as a
+    /// directory term's is (#65).
+    #[test]
+    fn the_archive_folder_is_matched_literally_and_in_its_case() {
+        let store = Store::open_memory()
+            .unwrap()
+            .with_archive_folder("_archive");
+        for (i, path) in [
+            "_archive/n.md",
+            "xarchive/n.md",
+            "_ARCHIVE/n.md",
+            "_archive.md",
+        ]
+        .iter()
+        .enumerate()
+        {
+            store
+                .insert_file(path, "h", i as i64, &format!("b00000{i}"), None, None)
+                .unwrap();
+        }
+        assert_eq!(
+            scoped_paths(&store, &crate::tags::Scope::default()),
+            ["_ARCHIVE/n.md", "_archive.md", "xarchive/n.md"]
+        );
+    }
+
+    #[test]
+    fn a_store_with_no_archive_folder_leaves_nothing_out() {
+        let store = Store::open_memory().unwrap();
+        store
+            .insert_file("04-Archive/n.md", "h", 1, "c00000", None, None)
+            .unwrap();
+        assert_eq!(
+            scoped_paths(&store, &crate::tags::Scope::default()),
+            ["04-Archive/n.md"]
+        );
+        assert!(
+            !store
+                .excludes_archive(&crate::tags::Scope::default())
+                .unwrap()
+        );
+    }
+
+    /// Search keeps its unscoped path when nothing is archived, so the
+    /// exclusion counts only when the archive holds a note (#151).
+    #[test]
+    fn the_archive_counts_as_excluded_only_when_it_holds_a_note() {
+        let store = Store::open_memory()
+            .unwrap()
+            .with_archive_folder("04-Archive");
+        store
+            .insert_file("lore/live.md", "h", 1, "e00000", None, None)
+            .unwrap();
+        let empty = crate::tags::Scope::default();
+        assert!(
+            !store.excludes_archive(&empty).unwrap(),
+            "nothing is archived"
+        );
+
+        store
+            .insert_file("04-Archive/old.md", "h", 2, "e00001", None, None)
+            .unwrap();
+        assert!(store.excludes_archive(&empty).unwrap());
+        assert!(
+            !store
+                .excludes_archive(&empty.clone().including_archive(true))
+                .unwrap()
+        );
+        assert!(
+            !store
+                .excludes_archive(&folder_scope(&["/04-Archive/"], &[], &[]))
+                .unwrap()
+        );
     }
 
     /// A file with two chunks, so a scan has an order to answer in.

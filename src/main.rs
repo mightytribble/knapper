@@ -103,11 +103,12 @@ fn open_vault(data_dir: &Path) -> Result<(store::Store, PathBuf, Option<VaultPro
         eprintln!("No index found. Run 'knapper index <path>' first.");
         std::process::exit(1);
     }
-    let store = store::Store::open(&config::db_path(data_dir))?;
+    let profile = config::Config::load_vault_profile().ok().flatten();
+    let store = store::Store::open(&config::db_path(data_dir))?
+        .with_archive_folder(knapper::profile::archive_folder(profile.as_ref()));
     let vault_path = store.get_meta("vault_path")?.ok_or_else(|| {
         anyhow::anyhow!("No vault path in index. Run 'knapper index <path>' first.")
     })?;
-    let profile = config::Config::load_vault_profile().ok().flatten();
     Ok((store, PathBuf::from(&vault_path), profile))
 }
 
@@ -308,7 +309,9 @@ async fn main() -> Result<()> {
                 eprintln!("No index found. Run 'knapper index <path>' first.");
                 std::process::exit(1);
             }
-            let store = store::Store::open(&config::db_path(&data_dir))?;
+            let profile = config::Config::load_vault_profile().ok().flatten();
+            let store = store::Store::open(&config::db_path(&data_dir))?
+                .with_archive_folder(knapper::profile::archive_folder(profile.as_ref()));
             let report = knapper::matching::run(&store, &args)?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
@@ -434,13 +437,7 @@ async fn main() -> Result<()> {
                 vault_path: &vault_path,
                 profile: profile.as_ref(),
             };
-            let all_terms = knapper::tags::merge_scope_alias(args.scope, args.all);
-            let filter = knapper::tags::Scope::parse(&all_terms, &args.any, &args.none)?
-                .with_filters(
-                    args.property.as_deref(),
-                    args.links_to.as_deref(),
-                    args.linked_from.as_deref(),
-                )?;
+            let filter = args.scope()?;
             let items = knapper::context::context_list(
                 &params,
                 &filter,
@@ -484,7 +481,8 @@ async fn main() -> Result<()> {
         Command::Tags(args) => {
             let (store, _vault_path, _profile) = open_vault(&data_dir)?;
             let prefix = args.under.as_deref().and_then(knapper::tags::parse_term);
-            let rows = store.tags_under(prefix.as_ref())?;
+            let scope = knapper::tags::Scope::default().including_archive(args.include_archive);
+            let rows = store.tags_under(prefix.as_ref(), &scope)?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&rows)?);
             } else {
@@ -504,14 +502,14 @@ async fn main() -> Result<()> {
             }
         }
 
-        Command::VaultMap(_) => {
+        Command::VaultMap(args) => {
             let (store, vault_path, profile) = open_vault(&data_dir)?;
             let params = knapper::context::ContextParams {
                 store: &store,
                 vault_path: &vault_path,
                 profile: profile.as_ref(),
             };
-            let map = knapper::context::vault_map(&params)?;
+            let map = knapper::context::vault_map(&params, args.include_archive)?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&map)?);
             } else {

@@ -253,6 +253,16 @@ pub fn detect_daily_folder(root: &Path) -> Result<Option<String>> {
     Ok(None)
 }
 
+/// The folder `archive` files notes under: the profile's, or `04-Archive`,
+/// with no leading or trailing `/`. The writer, the store and the servers
+/// all read it here, so they cannot name two folders (#151).
+pub fn archive_folder(profile: Option<&VaultProfile>) -> &str {
+    profile
+        .and_then(|p| p.structure.folders.archive.as_deref())
+        .unwrap_or("04-Archive")
+        .trim_matches('/')
+}
+
 /// Find the archive folder by looking for well-known names (case-insensitive):
 /// "archive", "_archive", ".archive", or folders matching PARA-style patterns
 /// like "04-Archive".
@@ -665,6 +675,23 @@ pub fn load_vault_toml(config_dir: &Path) -> Result<Option<VaultProfile>> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn the_archive_folder_is_the_profiles_trimmed_or_04_archive() {
+        assert_eq!(archive_folder(None), "04-Archive");
+        let mut profile = VaultProfile {
+            vault_path: std::path::PathBuf::from("/v"),
+            vault_type: VaultType::Obsidian,
+            structure: StructureDetection {
+                method: StructureMethod::Para,
+                folders: FolderMap::default(),
+            },
+            stats: VaultStats::default(),
+        };
+        assert_eq!(archive_folder(Some(&profile)), "04-Archive");
+        profile.structure.folders.archive = Some("/Old/".to_string());
+        assert_eq!(archive_folder(Some(&profile)), "Old");
+    }
 
     #[test]
     fn test_detect_para_structure() {

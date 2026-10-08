@@ -191,12 +191,17 @@ impl Store {
     /// One row per property name (#66): how many notes carry it and the
     /// kinds seen, by note count and then name. `declared_type` is left
     /// empty; `properties::registry` fills it from the vault.
-    pub fn property_registry(&self) -> Result<Vec<PropertyCount>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT name, COUNT(DISTINCT file_id) AS notes, GROUP_CONCAT(DISTINCT kind)
-               FROM properties GROUP BY name ORDER BY notes DESC, name",
-        )?;
-        let rows = stmt.query_map([], |row| {
+    ///
+    /// Only the notes `scope` admits count, which by default leaves the archive out (#151).
+    pub fn property_registry(&self, scope: &crate::tags::Scope) -> Result<Vec<PropertyCount>> {
+        let (scope_sql, args) = self.scope_sql(scope)?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT p.name, COUNT(DISTINCT p.file_id) AS notes, GROUP_CONCAT(DISTINCT p.kind)
+               FROM properties p JOIN files f ON f.id = p.file_id
+              WHERE 1=1{scope_sql}
+              GROUP BY p.name ORDER BY notes DESC, p.name"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |row| {
             let kinds: String = row.get(2)?;
             let mut kinds: Vec<crate::properties::Kind> = kinds
                 .split(',')
@@ -219,13 +224,23 @@ impl Store {
 
     /// One property's distinct values, each with its kind and the notes
     /// carrying it, by note count and then value (#66).
-    pub fn property_values(&self, name: &str) -> Result<Vec<ValueCount>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT value, kind, COUNT(DISTINCT file_id) AS notes
-               FROM properties WHERE name = ?1
-              GROUP BY value, kind ORDER BY notes DESC, value",
-        )?;
-        let rows = stmt.query_map(params![name], |row| {
+    ///
+    /// Only the notes `scope` admits count, which by default leaves the archive out (#151).
+    pub fn property_values(
+        &self,
+        name: &str,
+        scope: &crate::tags::Scope,
+    ) -> Result<Vec<ValueCount>> {
+        let (scope_sql, scope_args) = self.scope_sql(scope)?;
+        let mut args: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(name.to_string())];
+        args.extend(scope_args);
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT p.value, p.kind, COUNT(DISTINCT p.file_id) AS notes
+               FROM properties p JOIN files f ON f.id = p.file_id
+              WHERE p.name = ?{scope_sql}
+              GROUP BY p.value, p.kind ORDER BY notes DESC, p.value"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |row| {
             let kind: String = row.get(1)?;
             Ok(ValueCount {
                 value: row.get(0)?,
@@ -357,7 +372,9 @@ mod tests {
         store
             .replace_file_properties(b, &[prop(DOC_LEVEL, "rating", "high", Kind::Text, None)])
             .unwrap();
-        let reg = store.property_registry().unwrap();
+        let reg = store
+            .property_registry(&crate::tags::Scope::default())
+            .unwrap();
         assert_eq!(reg.len(), 2, "{reg:?}");
         // Ordered by note count, then name.
         assert_eq!(reg[0].name, "rating");
@@ -367,7 +384,9 @@ mod tests {
         assert_eq!(reg[1].name, "status");
         assert_eq!(reg[1].note_count, 1, "two values in one note count once");
 
-        let vals = store.property_values("status").unwrap();
+        let vals = store
+            .property_values("status", &crate::tags::Scope::default())
+            .unwrap();
         assert_eq!(vals.len(), 2);
         assert_eq!(vals[0].value, "draft");
         assert_eq!(vals[0].note_count, 1);

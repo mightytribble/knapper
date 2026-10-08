@@ -129,7 +129,12 @@ pub const CHUNK_RECORD_VERSION: u32 = 2;
 /// The table is empty on a store an earlier binary built, and the rebuild this
 /// bump declares is what fills it. A change to the alias grammar in
 /// `aliases::extract` is a bump here too.
-pub const LINK_RESOLVER_VERSION: u32 = 5;
+///
+/// Version 6 is issue #151: a link resolves to a note outside the archive
+/// folder before one under it, then to the shortest path. The rebuild this
+/// bump declares re-derives every edge from the vault with no model. `serve`
+/// refuses the index until `knapper index` has run it.
+pub const LINK_RESOLVER_VERSION: u32 = 6;
 
 /// Bump when the *text* of a [`crate::llm::PromptFormat`] template changes
 /// while the template keeps its name.

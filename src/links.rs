@@ -51,10 +51,16 @@ pub(crate) struct NameEntry {
 /// For each file: extract basename (without .md) as ExactName (if len >= 3),
 /// then each alias the store records for it (each len >= 2) as an Alias entry.
 /// The aliases are the rows the edge pass wrote (#142), so a suggestion and
-/// `read` agree on what a note's aliases are.
+/// `read` agree on what a note's aliases are. A note under the archive folder
+/// is not a target.
 /// Results are sorted by name length descending so longer names match first.
 pub(crate) fn build_name_index(store: &Store) -> Result<Vec<NameEntry>> {
-    let all_files = store.get_all_files()?;
+    // A new note is not linked to set-aside material (#151).
+    let all_files: Vec<_> = store
+        .get_all_files()?
+        .into_iter()
+        .filter(|f| !store.is_archived(&f.path))
+        .collect();
     let file_ids: Vec<i64> = all_files.iter().map(|f| f.id).collect();
     let mut aliases = store.aliases_for_files(&file_ids)?;
     let mut entries = Vec::new();
@@ -1120,5 +1126,19 @@ mod tests {
         assert!(!followed_by_file_extension(b"word rest", 4));
         // Not a file extension: dot at end
         assert!(!followed_by_file_extension(b"word.", 4));
+    }
+
+    /// A new note is not linked to set-aside material. A link a caller
+    /// writes by hand still resolves to it (#151).
+    #[test]
+    fn link_discovery_proposes_no_archived_note() {
+        let store = Store::open_memory()
+            .unwrap()
+            .with_archive_folder("04-Archive");
+        store
+            .insert_file("04-Archive/Steve Barbera.md", "h", 1, "i00001", None, None)
+            .unwrap();
+        let links = discover_links(&store, "Talked to Steve Barbera", None).unwrap();
+        assert!(links.is_empty(), "{links:?}");
     }
 }

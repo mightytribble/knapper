@@ -26,20 +26,20 @@ through a tunnel; the document names it as its server.
 | Method | Endpoint | Permission | Description |
 |--------|----------|------------|-------------|
 | GET | `/api/health-check` | none | Server health check |
-| POST | `/api/search` | read | Hybrid search (semantic + FTS5 + graph + reranker + temporal), scoped by tag or directory terms — a leading `/` reads a term as a directory path (`scope`/`all`, `any`, `none`), and `property`, `links_to`, `linked_from` (one value each) |
-| POST | `/api/match` | read | Find every note whose text holds a literal string, and count them — scoped the same way. For verification, not discovery: `notes: 0` means nothing in scope says it |
+| POST | `/api/search` | read | Hybrid search (semantic + FTS5 + graph + reranker + temporal), scoped by tag or directory terms — a leading `/` reads a term as a directory path (`scope`/`all`, `any`, `none`), and `property`, `links_to`, `linked_from` (one value each). Notes under the archive folder are left out unless `include_archive` is set or a `scope`/`all`/`any` term names the archive folder, a folder inside it or a note inside it. |
+| POST | `/api/match` | read | Find every note whose text holds a literal string, and count them — scoped the same way. For verification, not discovery: `notes: 0` means nothing in scope says it. Notes under the archive folder are left out unless `include_archive` is set or a `scope`/`all`/`any` term names the archive folder, a folder inside it or a note inside it. |
 | GET | `/api/read` | read | Read a note (`file`), or one of its sections (`section`) |
-| GET | `/api/list` | read | List notes by tag or directory terms — a leading `/` reads a term as a directory path (`scope`/`all`, `any`, `none`), creator, limit, `after` (the last path a page answered, which starts the next page), and `detailed=true` for each note's heading outline, and `property`, `links_to`, `linked_from` (one value each) |
-| GET | `/api/tags` | read | The tag vocabulary, whole or under one term (`under`) |
-| GET | `/api/properties` | read | The custom-property registry, or one property's values (`name`) |
-| GET | `/api/vault-map` | read | Vault structure overview (folders, counts, the tag vocabulary and its reach, the most-linked notes, recently changed files) |
+| GET | `/api/list` | read | List notes by tag or directory terms — a leading `/` reads a term as a directory path (`scope`/`all`, `any`, `none`), creator, limit, `after` (the last path a page answered, which starts the next page), and `detailed=true` for each note's heading outline, and `property`, `links_to`, `linked_from` (one value each). Notes under the archive folder are left out unless the query string `include_archive=true` is set or a `scope`/`all`/`any` term names the archive folder, a folder inside it or a note inside it. |
+| GET | `/api/tags` | read | The tag vocabulary, whole or under one term (`under`). Notes under the archive folder are not counted unless `include_archive=true`. |
+| GET | `/api/properties` | read | The custom-property registry, or one property's values (`name`). Notes under the archive folder are not counted unless `include_archive=true`. |
+| GET | `/api/vault-map` | read | Vault structure overview (folders, counts, the tag vocabulary and its reach, the most-linked notes, recently changed files). Notes under the archive folder are not counted unless `include_archive=true`. |
 | GET | `/api/status` | read | Index status and statistics |
 | GET | `/api/health` | read | Vault health diagnostics |
 | POST | `/api/validate` | read | Check vault markdown for structural and indexing problems — one note (`path`), a scope, or the whole vault; reads the files, not the index |
 | POST | `/api/create` | write | Create a new note, filed under `folder` or at the vault root. A `folder` with a `..` segment is 400 `invalid_input`; a leading or trailing `/` is trimmed, so `/` is the vault root. |
 | POST | `/api/update` | write | Apply a list of edits to one note in one write |
 | POST | `/api/move` | write | Move note to different folder. A `new_folder` with a `..` segment is 400 `invalid_input`; a leading or trailing `/` is trimmed, so `/` is the vault root. |
-| POST | `/api/archive` | write | Archive a note, or restore one with `undo`. With `undo`, `file` takes the archive path, the note's original path, its basename or a `#docid`; one that names several archived notes is 400 `ambiguous`, and a `file` outside the vault, or a note whose `archived_from` is, is 400 `invalid_input`. |
+| POST | `/api/archive` | write | Archive a note: move it under the archive folder at its whole path, unedited and still indexed, where reads leave it out unless they pass `include_archive`. A path the archive already holds is 409 `conflict`. With `undo`, move it back; `file` takes its path under the archive, the path it was archived from, its basename or a `#docid`, and one that names several archived notes is 400 `ambiguous`. A `file` outside the vault, or a note whose `archived_from` is, is 400 `invalid_input`. |
 | POST | `/api/delete` | write | Delete a note. `mode: soft`, the default, moves it to `.trash/<its path>` and out of the index; `mode: hard` removes it for good. With `undo`, restores a soft-deleted note to its path and re-indexes it; `file` takes its path in `.trash`, the path it was deleted from, its basename or a `#docid`. `undo` with `mode: hard` is 400 `invalid_input`. |
 | POST | `/api/index` | write | Index the configured vault |
 | POST | `/api/reindex-file` | write | Re-index a single file after external edits. A `file` with a `..` segment or a leading `/` is 400 `invalid_input`. |
@@ -118,9 +118,9 @@ Every error the server answers is a JSON body with two fields: `error`, the mess
 |---|---|---|
 | 400 | `invalid_input` | the request's own text named nothing or asked two things at once: a scope term, an `after` cursor, a `links_to` or `linked_from` name, `full` with `summaries`, a `section` beside `include=metadata`, an empty `match` pattern, a `mode` word, `undo` with `mode: hard`, a malformed edit list |
 | 400 | `ambiguous` | one name, several notes: an alias more than one note carries, or a basename several archived or trashed notes share on an `undo` |
-| 404 | `not_found` | the `file` or `section` the call addresses is absent, on `read`, `update`, `move`, `delete`, `archive` and `reindex-file` |
+| 404 | `not_found` | the `file` or `section` the call addresses is absent, on `read`, `update`, `move`, `delete`, `archive` and `reindex-file`, and a write naming a note only by a near miss of an archived note's name (the error names the archived path) |
 | 405 | `invalid_input` | the wrong method on a known route |
-| 409 | `conflict` | the write would clobber: the note changed on disk since it was indexed, a `create` or `move` onto an existing path, an `archive` of an archived note, a soft `delete` of a path `.trash` already holds, an `undo` onto a path a file holds |
+| 409 | `conflict` | the write would clobber: the note changed on disk since it was indexed, a `create` or `move` onto an existing path, an `archive` of an archived note, a soft `delete` of a path `.trash` already holds, an `undo` onto a path a file holds, an `archive` onto a path the archive already holds |
 | 403 | `read_only` | the server was started with `--read-only` |
 | 403 | `forbidden` | the key has no write permission |
 | 401 | `unauthorized` | no key, or a key the server does not hold |

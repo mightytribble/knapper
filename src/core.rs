@@ -105,6 +105,13 @@ impl Core {
 
         let store = Store::open(&db)?;
 
+        // The archive folder rides on both connections, so every read and
+        // every resolution the server makes knows it, the startup
+        // reconciliation included (#151).
+        let profile = Config::load_vault_profile().ok().flatten();
+        let archive = crate::profile::archive_folder(profile.as_ref()).to_string();
+        let store = store.with_archive_folder(&archive);
+
         // Read before any model loads: a store no `index` has run against
         // would otherwise download the embedder only to exit here (#150).
         let vault_path = PathBuf::from(store.get_meta("vault_path")?.ok_or_else(|| {
@@ -125,8 +132,6 @@ impl Core {
         if orphans > 0 {
             tracing::info!(orphans, "cleaned up orphan DB entries for missing files");
         }
-
-        let profile = Config::load_vault_profile().ok().flatten();
 
         let reranker: Option<Box<dyn RerankModel + Send>> = if config.intelligence_enabled() {
             match crate::llm::LlamaRerank::new(&models_dir, &config) {
@@ -149,7 +154,7 @@ impl Core {
         );
         crate::fingerprint::verify(&store, &fingerprints)?;
 
-        let reader = Store::open_reader(&db)?;
+        let reader = Store::open_reader(&db)?.with_archive_folder(&archive);
 
         Ok(Self::from_parts(
             Arc::new(Mutex::new(store)),
@@ -273,8 +278,15 @@ impl Core {
         config: Config,
         vault_path: PathBuf,
     ) -> Core {
-        let writer = Store::open(db).expect("writer");
-        let reader = Store::open_reader(db).expect("reader");
+        // The folder `archive` uses with no profile, so the server tests run
+        // with the archive left out of reads, as a server does (#151).
+        let archive = crate::profile::archive_folder(None);
+        let writer = Store::open(db)
+            .expect("writer")
+            .with_archive_folder(archive);
+        let reader = Store::open_reader(db)
+            .expect("reader")
+            .with_archive_folder(archive);
         Self::from_parts(
             Arc::new(Mutex::new(writer)),
             reader,
@@ -355,7 +367,6 @@ pub mod testing {
             &store,
             &mut MockLlm::new(256),
             false,
-            None,
         )
         .unwrap();
         (tmp, vault, db)
