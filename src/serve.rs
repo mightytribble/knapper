@@ -422,6 +422,9 @@ impl KnapperServer {
             })
             .await
             .map_err(mcp_err)?;
+        self.core
+            .record_write(&self.core.vault_path.join(&result.path))
+            .await;
         to_json_result(&result)
     }
 
@@ -502,6 +505,9 @@ impl KnapperServer {
                 })
                 .await
                 .map_err(mcp_err)?;
+            self.core
+                .record_write(&self.core.vault_path.join(&result.path))
+                .await;
             return to_json_result(&result);
         }
         let mode = crate::writer::DeleteMode::from(p.mode);
@@ -1040,6 +1046,60 @@ mod tests {
             .await
             .unwrap();
         assert!(vault.join("rules/evocation-spells.md").is_file());
+    }
+
+    /// A restore over MCP records the note it wrote, so the watcher does not
+    /// embed it a second time, as HTTP's restore already does.
+    #[tokio::test]
+    async fn a_delete_undo_records_the_note_it_restored() {
+        let (_tmp, server) = indexed_server(crate::config::GroupBy::Chunk);
+        let vault = server.core.vault_path.as_ref().clone();
+        for undo in [false, true] {
+            server
+                .delete(super::Parameters(crate::params::Delete {
+                    file: "rules/evocation-spells.md".into(),
+                    mode: crate::params::DeleteMode::Soft,
+                    undo,
+                }))
+                .await
+                .unwrap();
+        }
+
+        let restored = vault.join("rules/evocation-spells.md");
+        assert!(
+            server
+                .core
+                .recent_writes
+                .lock()
+                .await
+                .contains_key(&restored)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_archive_undo_records_the_note_it_restored() {
+        let (_tmp, server) = indexed_server(crate::config::GroupBy::Chunk);
+        let vault = server.core.vault_path.as_ref().clone();
+        for undo in [false, true] {
+            server
+                .archive(super::Parameters(crate::params::Archive {
+                    file: "rules/evocation-spells.md".into(),
+                    undo,
+                }))
+                .await
+                .unwrap();
+        }
+
+        let restored = vault.join("rules/evocation-spells.md");
+        assert!(restored.is_file());
+        assert!(
+            server
+                .core
+                .recent_writes
+                .lock()
+                .await
+                .contains_key(&restored)
+        );
     }
 
     #[tokio::test]
