@@ -362,7 +362,7 @@ pub const OPERATIONS: &[Operation] = &[
     Operation {
         name: "archive",
         id: "archiveNote",
-        summary: "Archive a note, or restore one previously archived with `undo: true`. Archiving moves the note to the archive folder and removes it from the index; `undo` reverses that and re-indexes it.",
+        summary: "Archive a note, or restore one with `undo: true`. Archiving moves the note under the archive folder, unedited and still indexed; reads leave it out unless they pass `include_archive`. `undo` moves it back.",
         response: "Archived (or restored) note path",
     },
     Operation {

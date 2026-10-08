@@ -926,7 +926,9 @@ pub struct Move {
 
 #[derive(Debug, Args, Deserialize, JsonSchema)]
 pub struct Archive {
-    /// File path, basename, or #docid.
+    /// File path, basename, or #docid. With `undo`, the archived note: its
+    /// path under the archive folder, the path it was archived from, its
+    /// basename, or a #docid of either.
     pub file: String,
     /// Restore a note the archive holds, instead of archiving one.
     #[arg(long)]

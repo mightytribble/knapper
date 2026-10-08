@@ -387,7 +387,7 @@ impl KnapperServer {
 
     #[tool(
         name = "archive",
-        description = "Archive a note: moves it to the archive folder, removes from search index. The note is preserved on disk but invisible to search/context. `undo: true` reverses this: restores the note to its original location and re-indexes it."
+        description = "Archive a note: move it under the archive folder at its whole path, unedited. It stays indexed and readable by path, and search, match, list, tags, properties and vault_map leave it out unless a call passes `include_archive` or names the archive folder in a scope. `undo: true` moves it back to the path it was archived from."
     )]
     async fn archive(
         &self,
@@ -755,7 +755,7 @@ pub const ORIENTATION: &[Orientation] = &[
     Orientation {
         capability: "archive",
         group: "Lifecycle",
-        clause: "to set a note aside in the archive folder, out of search (`undo: true` to restore)",
+        clause: "to set a note aside as reference: kept, indexed, and left out of reads unless `include_archive` (`undo: true` to restore)",
     },
     Orientation {
         capability: "delete",
