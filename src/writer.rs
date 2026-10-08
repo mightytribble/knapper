@@ -1496,7 +1496,7 @@ pub fn archive_note(
 ) -> Result<WriteResult> {
     let file_record = store.require_file(file)?;
 
-    let archive_folder = archive_folder(profile);
+    let archive_folder = crate::profile::archive_folder(profile);
 
     // Don't archive something already in the archive
     if file_record.path.starts_with(archive_folder) {
@@ -1570,14 +1570,6 @@ pub fn archive_note(
         links_suggested: vec![],
         folder: archive_folder.to_string(),
     })
-}
-
-/// The folder `archive` files notes under: the profile's, or `04-Archive`.
-fn archive_folder(profile: Option<&VaultProfile>) -> &str {
-    profile
-        .and_then(|p| p.structure.folders.archive.as_deref())
-        .unwrap_or("04-Archive")
-        .trim_matches('/')
 }
 
 /// Every `.md` file under `folder`, vault-relative, in path order.
@@ -1738,7 +1730,12 @@ pub fn unarchive_note(
     vault_path: &Path,
     profile: Option<&VaultProfile>,
 ) -> Result<WriteResult> {
-    let file = resolve_in_folder(file, vault_path, archive_folder(profile), "archived note")?;
+    let file = resolve_in_folder(
+        file,
+        vault_path,
+        crate::profile::archive_folder(profile),
+        "archived note",
+    )?;
     let archive_path = vault_path.join(&file);
 
     let content = std::fs::read_to_string(&archive_path)?;

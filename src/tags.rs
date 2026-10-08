@@ -575,6 +575,15 @@ pub fn folder_sql(term: &FolderTerm) -> (String, Vec<String>) {
     }
 }
 
+/// The SQL predicate over a `files` row aliased `f` that leaves out every
+/// note under `folder`, and its arguments in order. It is the negation of the
+/// folder's subtree range, so `_` and `%` in the name are literal and its
+/// case is kept, as a directory term's are (#65, #151).
+pub fn outside_folder_sql(folder: &str) -> (String, Vec<String>) {
+    let (pred, args) = folder_sql(&FolderTerm::Subtree(folder.to_string()));
+    (format!("NOT ({pred})"), args)
+}
+
 /// Whether any file lives where a directory term names.
 fn folder_exists(conn: &Connection, term: &FolderTerm) -> Result<bool> {
     let (pred, args) = folder_sql(term);
@@ -698,6 +707,10 @@ pub struct Scope {
     pub links_to: Option<LinkTerm>,
     /// The notes this note links to; under `property`, filed there (#66).
     pub linked_from: Option<LinkTerm>,
+    /// Admit the notes under the archive folder, which a read leaves out by
+    /// default (#151). It is not a filter: admitting everything constrains
+    /// nothing, so `is_empty` does not count it.
+    pub include_archive: bool,
 }
 
 impl Scope {
@@ -721,6 +734,31 @@ impl Scope {
             none: read("none", none)?,
             ..Default::default()
         })
+    }
+
+    /// The scope, with or without the notes under the archive folder.
+    pub fn including_archive(mut self, include: bool) -> Self {
+        self.include_archive = include;
+        self
+    }
+
+    /// Whether the scope asks for the notes under `folder`: by
+    /// `include_archive`, or by an `all` or `any` term that names the
+    /// folder, a folder inside it, or a note inside it. Naming the archive is
+    /// asking for it, and leaving it out would answer an empty scope (#151).
+    pub fn admits_archive(&self, folder: &str) -> bool {
+        let inside = |path: &str| {
+            path == folder
+                || path
+                    .strip_prefix(folder)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        };
+        self.include_archive
+            || self.all.iter().chain(&self.any).any(|term| match term {
+                ScopeTerm::Folder(f) => inside(f.path()),
+                ScopeTerm::File(path) => inside(path),
+                ScopeTerm::Tag(_) => false,
+            })
     }
 
     /// Add the three property and link filters (#66). Each takes one value

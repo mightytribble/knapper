@@ -157,7 +157,7 @@ impl Store {
         crate::tags::check_terms(&self.conn, &checked)?;
         let links = self.resolve_scope_links(scope)?;
 
-        let (scope_sql, args) = scope_clauses(scope, &links);
+        let (scope_sql, args) = scope_clauses(scope, &links, self.archive_folder());
         let mut stmt = self.conn.prepare(&format!(
             "SELECT EXISTS(SELECT 1 FROM files f WHERE f.frontmatter IS NULL{scope_sql})"
         ))?;
