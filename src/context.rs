@@ -2001,4 +2001,38 @@ mod tests {
         );
         assert_eq!(rows[0].value, "draft");
     }
+
+    /// `read` resolves through the store's order: a basename names the live
+    /// note first and still reaches an archived note when it is the only one
+    /// (#151).
+    #[test]
+    fn a_read_by_basename_prefers_the_live_note_and_still_reaches_an_archived_only_one() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let store = Store::open_memory()
+            .unwrap()
+            .with_archive_folder("04-Archive");
+        for (path, text) in [
+            ("lore/deeper/still/n.md", "# Live\n"),
+            ("04-Archive/n.md", "# Old\n"),
+            ("04-Archive/only.md", "# Only\n"),
+        ] {
+            std::fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
+            std::fs::write(root.join(path), text).unwrap();
+            store
+                .insert_file(path, "h", 1, &generate_docid(path), None, None)
+                .unwrap();
+        }
+        let ctx = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+        let read = |name: &str| {
+            content_of(context_read(&ctx, name, None, crate::params::Include::Content).unwrap())
+                .path
+        };
+        assert_eq!(read("n"), "lore/deeper/still/n.md");
+        assert_eq!(read("only"), "04-Archive/only.md");
+    }
 }

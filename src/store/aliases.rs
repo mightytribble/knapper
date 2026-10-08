@@ -44,6 +44,10 @@ impl Store {
         let mut found = stmt
             .query_map(params![crate::aliases::fold(alias)], file_from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        // A live note's alias beats an archived note's (#151).
+        if found.len() > 1 && found.iter().any(|f| !self.is_archived(&f.path)) {
+            found.retain(|f| !self.is_archived(&f.path));
+        }
         match found.len() {
             0 | 1 => Ok(found.pop()),
             _ => Err(anyhow::anyhow!(Fault::Ambiguous(format!(
@@ -205,5 +209,30 @@ mod tests {
         assert_eq!(by_file[&a], aliases(&["Sam", "Dragon"]));
         assert_eq!(by_file[&b], aliases(&["El Ja'nadine", "Empress"]));
         assert!(!by_file.contains_key(&c));
+    }
+
+    /// An alias a live note and an archived note both carry names the live
+    /// one, not two notes (#151).
+    #[test]
+    fn an_alias_a_live_and_an_archived_note_share_resolves_to_the_live_one() {
+        let store = Store::open_memory()
+            .unwrap()
+            .with_archive_folder("04-Archive");
+        let live = store
+            .insert_file("people/sam.md", "h", 1, "f00001", None, None)
+            .unwrap();
+        let old = store
+            .insert_file("04-Archive/sam-old.md", "h", 1, "f00002", None, None)
+            .unwrap();
+        store
+            .replace_file_aliases(live, &["Sam".to_string()])
+            .unwrap();
+        store
+            .replace_file_aliases(old, &["Sam".to_string()])
+            .unwrap();
+        assert_eq!(
+            store.find_file_by_alias("sam").unwrap().unwrap().path,
+            "people/sam.md"
+        );
     }
 }

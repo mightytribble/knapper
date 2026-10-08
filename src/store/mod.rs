@@ -176,6 +176,21 @@ impl Store {
         })
     }
 
+    /// An `ORDER BY` term over a `files` row aliased `f` that sorts a note
+    /// outside the archive folder before one under it, and its arguments.
+    /// It is `NULL`, with no arguments, when the store knows no folder, so
+    /// every row sorts equal (#151).
+    pub(crate) fn archived_sql(&self) -> (String, Vec<String>) {
+        match self.archive_folder() {
+            Some(folder) => {
+                let (pred, args) =
+                    crate::tags::folder_sql(&crate::tags::FolderTerm::Subtree(folder.to_string()));
+                (format!("({pred})"), args)
+            }
+            None => ("NULL".to_string(), Vec::new()),
+        }
+    }
+
     /// Whether any indexed note is under `folder`.
     pub fn has_files_under(&self, folder: &str) -> Result<bool> {
         let (pred, args) =
