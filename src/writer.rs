@@ -2693,7 +2693,6 @@ mod tests {
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
 
@@ -3134,7 +3133,6 @@ mod tests {
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
 
@@ -3187,7 +3185,6 @@ mod tests {
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
         (tmp, store, vault, embedder)
@@ -3374,7 +3371,6 @@ mod tests {
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
         (tmp, store, vault)
@@ -3742,7 +3738,6 @@ mod tests {
             store,
             &mut crate::llm::MockLlm::new(256),
             false,
-            None,
         )
         .unwrap();
     }
@@ -3969,7 +3964,6 @@ mod tests {
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
 
@@ -4023,7 +4017,6 @@ mod tests {
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
 
@@ -4215,7 +4208,6 @@ mod tests {
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
 
@@ -4611,7 +4603,6 @@ mod tests {
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
         (tmp, store, vault)
@@ -4758,7 +4749,6 @@ mod tests {
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
 
@@ -5315,7 +5305,6 @@ mod tests {
             &store,
             &mut MockLlm::new(256),
             false,
-            None,
         )
         .unwrap();
 
@@ -5349,7 +5338,6 @@ mod tests {
             &store,
             &mut MockLlm::new(256),
             false,
-            None,
         )
         .unwrap();
 
@@ -5375,7 +5363,6 @@ mod tests {
             &store,
             &mut MockLlm::new(256),
             false,
-            None,
         )
         .unwrap();
 
@@ -5396,7 +5383,6 @@ mod tests {
             store,
             &mut MockLlm::new(256),
             false,
-            None,
         )
         .unwrap();
     }

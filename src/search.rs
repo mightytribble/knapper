@@ -1719,7 +1719,10 @@ pub fn run_search(
         crate::llm::load_embedder(&models_dir, config).context("loading embedder")?;
 
     let db_path = db_path(data_dir);
-    let store = Store::open(&db_path).context("opening store")?;
+    let profile = crate::config::Config::load_vault_profile().ok().flatten();
+    let store = Store::open(&db_path)
+        .context("opening store")?
+        .with_archive_folder(crate::profile::archive_folder(profile.as_ref()));
     store.verify_embedding_dim(embedder.dim())?;
 
     // Load the cross-encoder if enabled.
@@ -2293,7 +2296,6 @@ mod tests {
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
         (tmp, store, embedder)
@@ -2396,7 +2398,6 @@ A warding effect that ends an ongoing spell.              It reaches an effect a
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
         (tmp, store, embedder)
@@ -2451,7 +2452,6 @@ A warding effect that ends an ongoing spell.              It reaches an effect a
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
         (tmp, store, embedder)
@@ -2596,7 +2596,6 @@ A warding effect that ends an ongoing spell.              It reaches an effect a
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
         (tmp, store, embedder)
@@ -2913,7 +2912,6 @@ A warding effect that ends an ongoing spell.              It reaches an effect a
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
         (tmp, store, embedder)
@@ -2980,7 +2978,6 @@ A warding effect that ends an ongoing spell.              It reaches an effect a
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
         (tmp, store, embedder)
@@ -3186,7 +3183,6 @@ A warding effect that ends an ongoing spell.              It reaches an effect a
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
         (tmp, store, embedder)
@@ -3268,7 +3264,6 @@ A warding effect that ends an ongoing spell.              It reaches an effect a
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
         (tmp, store, embedder)
@@ -3430,7 +3425,6 @@ A warding effect that ends an ongoing spell.              It reaches an effect a
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
         (tmp, store, embedder)
@@ -3826,7 +3820,6 @@ A warding effect that ends an ongoing spell.              It reaches an effect a
             &store,
             &mut embedder,
             false,
-            None,
         )
         .unwrap();
         (tmp, store, embedder)

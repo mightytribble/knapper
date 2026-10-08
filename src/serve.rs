@@ -571,19 +571,12 @@ impl KnapperServer {
         }
         let rebuild = params.0.rebuild;
         let vault = self.core.vault_path.clone();
-        let profile = self.core.profile.clone();
         let settings = self.core.index_settings;
         let result = self
             .core
             .with_core(move |g| {
                 crate::indexer::run_index_shared(
-                    &vault,
-                    &config,
-                    settings,
-                    g.store,
-                    g.embedder,
-                    rebuild,
-                    profile.as_ref().as_ref(),
+                    &vault, &config, settings, g.store, g.embedder, rebuild,
                 )
             })
             .await
@@ -874,16 +867,9 @@ pub async fn run_serve(
 
     let core = Core::open(data_dir, config, read_only)?;
 
-    // The watcher's exclude list: config excludes plus the archive folder.
-    let mut exclude = core.config.exclude.clone();
-    if let Some(ref prof) = *core.profile
-        && let Some(ref archive) = prof.structure.folders.archive
-    {
-        let pattern = format!("{}/", archive);
-        if !exclude.contains(&pattern) {
-            exclude.push(pattern);
-        }
-    }
+    // The watcher's exclude list is the config's. The archive folder is
+    // indexed, and reads leave it out (#151).
+    let exclude = core.config.exclude.clone();
     let (watcher_handle, watcher_shutdown) = crate::watcher::start_watcher(core.clone(), exclude)?;
 
     if read_only {

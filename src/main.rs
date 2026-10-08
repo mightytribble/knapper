@@ -103,11 +103,12 @@ fn open_vault(data_dir: &Path) -> Result<(store::Store, PathBuf, Option<VaultPro
         eprintln!("No index found. Run 'knapper index <path>' first.");
         std::process::exit(1);
     }
-    let store = store::Store::open(&config::db_path(data_dir))?;
+    let profile = config::Config::load_vault_profile().ok().flatten();
+    let store = store::Store::open(&config::db_path(data_dir))?
+        .with_archive_folder(knapper::profile::archive_folder(profile.as_ref()));
     let vault_path = store.get_meta("vault_path")?.ok_or_else(|| {
         anyhow::anyhow!("No vault path in index. Run 'knapper index <path>' first.")
     })?;
-    let profile = config::Config::load_vault_profile().ok().flatten();
     Ok((store, PathBuf::from(&vault_path), profile))
 }
 
@@ -308,7 +309,9 @@ async fn main() -> Result<()> {
                 eprintln!("No index found. Run 'knapper index <path>' first.");
                 std::process::exit(1);
             }
-            let store = store::Store::open(&config::db_path(&data_dir))?;
+            let profile = config::Config::load_vault_profile().ok().flatten();
+            let store = store::Store::open(&config::db_path(&data_dir))?
+                .with_archive_folder(knapper::profile::archive_folder(profile.as_ref()));
             let report = knapper::matching::run(&store, &args)?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&report)?);

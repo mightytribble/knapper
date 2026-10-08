@@ -939,7 +939,6 @@ async fn handle_index(
         config.respect_gitignore = false;
     }
     let vault = state.core.vault_path.clone();
-    let profile = state.core.profile.clone();
     let settings = state.core.index_settings;
     let result = state
         .core
@@ -951,7 +950,6 @@ async fn handle_index(
                 g.store,
                 g.embedder,
                 body.rebuild,
-                profile.as_ref().as_ref(),
             )
         })
         .await?;
