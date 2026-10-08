@@ -75,7 +75,7 @@ pub struct SearchOutput {
 /// result under a scope is explained by the second number more often than by
 /// anything the lanes report.
 pub struct ScopeTrace {
-    /// `all=type/undead none=status/draft`, folded, empty fields omitted.
+    /// `all=type/undead none=status/draft`, folded, empty fields omitted, and `archive excluded` when the archive was left out.
     pub filter: String,
     /// How many notes the filter resolved to.
     pub notes: usize,
@@ -311,13 +311,16 @@ pub fn search_with_intelligence(
 
     // The scope resolves before anything is embedded, so a filter that admits
     // no note costs no model call, and a filter naming no tag fails with the
-    // repair rather than with an empty result (#60).
-    let scope_ids: Option<Vec<i64>> = match config.scope.is_empty() {
+    // repair rather than with an empty result (#60). The archive is left out
+    // unless the scope asks for it. That makes it a scope only when a note is
+    // there, so a vault with nothing archived keeps the unscoped path (#151).
+    let excludes_archive = config.store.excludes_archive(&config.scope)?;
+    let scope_ids: Option<Vec<i64>> = match config.scope.is_empty() && !excludes_archive {
         true => None,
         false => Some(config.store.files_in_scope(&config.scope)?),
     };
     let scope_trace = scope_ids.as_ref().map(|ids| ScopeTrace {
-        filter: config.scope.describe(),
+        filter: trace_filter(&config.scope, excludes_archive),
         notes: ids.len(),
     });
     if scope_ids.as_ref().is_some_and(|ids| ids.is_empty()) {
@@ -1636,11 +1639,25 @@ fn merge_seeds(semantic: &[RankedResult], fts: &[RankedResult]) -> Vec<RankedRes
 /// error its own way: the HTTP route answers 400, the CLI exits 1.
 pub fn parse_scope(req: &crate::params::Search) -> Result<crate::tags::Scope> {
     let all_terms = crate::tags::merge_scope_alias(req.scope.clone(), req.all.clone());
-    crate::tags::Scope::parse(&all_terms, &req.any, &req.none)?.with_filters(
-        req.property.as_deref(),
-        req.links_to.as_deref(),
-        req.linked_from.as_deref(),
-    )
+    Ok(crate::tags::Scope::parse(&all_terms, &req.any, &req.none)?
+        .with_filters(
+            req.property.as_deref(),
+            req.links_to.as_deref(),
+            req.linked_from.as_deref(),
+        )?
+        .including_archive(req.include_archive))
+}
+
+/// The scope as `--explain` prints it, with the archive named when the
+/// query left it out, so a note missing for that reason has a stated cause
+/// (#151).
+fn trace_filter(scope: &crate::tags::Scope, excludes_archive: bool) -> String {
+    let filter = scope.describe();
+    match (excludes_archive, filter.is_empty()) {
+        (false, _) => filter,
+        (true, true) => "archive excluded".to_string(),
+        (true, false) => format!("{filter} archive excluded"),
+    }
 }
 
 /// The one search body the three surfaces share (#62).
@@ -3143,6 +3160,139 @@ A warding effect that ends an ongoing spell.              It reaches an effect a
             err.to_string(),
             "no such tag 'type/undeed'; nearest: 'type/undead'"
         );
+    }
+
+    /// A live note and `archived` notes under `04-Archive`, all on one
+    /// subject, in a store that knows the folder.
+    fn vault_with_an_archive(archived: usize) -> (tempfile::TempDir, Store, llm::MockLlm) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("wight.md"),
+            "# Wight\n\nA warding effect that pins an undead creature in place.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("wolf.md"),
+            "# Wolf\n\nA warding effect that pins a beast in place.\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("04-Archive")).unwrap();
+        for i in 0..archived {
+            std::fs::write(
+                root.join(format!("04-Archive/old-{i}.md")),
+                format!("# Old {i}\n\nA warding effect that pins an undead creature in place.\n"),
+            )
+            .unwrap();
+        }
+        let store = Store::open_memory()
+            .unwrap()
+            .with_archive_folder("04-Archive");
+        let mut embedder = llm::MockLlm::new(256);
+        let config = crate::config::Config::default();
+        crate::indexer::run_index_shared(
+            root,
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut embedder,
+            false,
+        )
+        .unwrap();
+        (tmp, store, embedder)
+    }
+
+    fn answered(out: &SearchOutput) -> Vec<String> {
+        out.results.iter().map(|r| r.file_path.clone()).collect()
+    }
+
+    /// The archive is set aside, and `--explain` says so, so a note missing
+    /// for that reason has a stated cause (#151).
+    #[test]
+    fn an_unscoped_search_leaves_an_archived_note_out_and_says_so() {
+        let (_tmp, store, mut embedder) = vault_with_an_archive(1);
+        let out = search_scoped(
+            "warding",
+            crate::tags::Scope::default(),
+            &store,
+            &mut embedder,
+        )
+        .unwrap();
+        assert!(!out.results.is_empty());
+        assert!(
+            answered(&out).iter().all(|p| !p.starts_with("04-Archive/")),
+            "{:?}",
+            answered(&out)
+        );
+        let trace = out.retrieval.scope.expect("the exclusion is a scope");
+        assert_eq!(trace.filter, "archive excluded");
+        assert_eq!(trace.notes, 2);
+
+        let tagged = crate::tags::Scope::parse(&["/wight.md".to_string()], &[], &[]).unwrap();
+        let out = search_scoped("warding", tagged, &store, &mut embedder).unwrap();
+        assert_eq!(
+            out.retrieval.scope.unwrap().filter,
+            "all=/wight.md archive excluded"
+        );
+    }
+
+    #[test]
+    fn include_archive_or_naming_the_archive_brings_it_back() {
+        let (_tmp, store, mut embedder) = vault_with_an_archive(1);
+
+        let out = search_scoped(
+            "warding",
+            crate::tags::Scope::default().including_archive(true),
+            &store,
+            &mut embedder,
+        )
+        .unwrap();
+        assert!(answered(&out).contains(&"04-Archive/old-0.md".to_string()));
+        assert!(
+            out.retrieval.scope.is_none(),
+            "admitting everything is the unscoped path"
+        );
+
+        let archive = crate::tags::Scope::parse(&["/04-Archive/".to_string()], &[], &[]).unwrap();
+        let out = search_scoped("warding", archive, &store, &mut embedder).unwrap();
+        assert_eq!(answered(&out), ["04-Archive/old-0.md"]);
+    }
+
+    /// The exclusion costs nothing where there is nothing to exclude (#151).
+    #[test]
+    fn a_vault_with_nothing_archived_keeps_the_unscoped_path() {
+        let (_tmp, store, mut embedder) = vault_with_an_archive(0);
+        let out = search_scoped(
+            "warding",
+            crate::tags::Scope::default(),
+            &store,
+            &mut embedder,
+        )
+        .unwrap();
+        assert!(out.retrieval.scope.is_none());
+    }
+
+    /// The exclusion is a pre-filter on the lanes, so archived chunks cannot
+    /// fill a lane's width and push the live notes out of it (#60, #151).
+    #[test]
+    fn archived_chunks_do_not_take_the_vector_lanes_width() {
+        let (_tmp, store, mut embedder) = vault_with_an_archive(12);
+        let mut ranking = crate::config::Config::default().ranking;
+        ranking.retrieval_width = 2;
+        let mut config = SearchConfig {
+            ranking,
+            calibrated: crate::config::CalibratedConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..SearchConfig::new(&store, &crate::config::Config::default())
+        };
+        let out = search_with_intelligence("warding", 20, &mut embedder, &mut config).unwrap();
+        assert_eq!(
+            out.retrieval.semantic_hits, 2,
+            "both live notes, nothing else"
+        );
+        assert!(answered(&out).iter().all(|p| !p.starts_with("04-Archive/")));
     }
 
     /// A dated note outside the scope, linking to a note inside it, so the

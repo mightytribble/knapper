@@ -1244,6 +1244,7 @@ mod tests {
             property: None,
             links_to: None,
             linked_from: None,
+            include_archive: false,
             budget_tokens: None,
             full: false,
             summaries: false,

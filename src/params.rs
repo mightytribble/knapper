@@ -94,6 +94,12 @@ pub struct Search {
     #[arg(long)]
     #[serde(default)]
     pub linked_from: Option<String>,
+    /// Include notes under the archive folder, which a search leaves out by
+    /// default. Naming the archive folder, a folder inside it or a note
+    /// inside it in `scope`, `all` or `any` includes them too.
+    #[arg(long)]
+    #[serde(default)]
+    pub include_archive: bool,
     /// Token budget for the returned text. Fill is greedy in rank order; the
     /// first result is always included. Omit for the configured default (#35).
     #[arg(long = "tokens")]
