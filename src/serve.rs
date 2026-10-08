@@ -1119,20 +1119,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unarchive_of_a_note_with_no_archived_from_is_invalid_params() {
+    async fn an_archive_onto_a_path_the_archive_holds_is_invalid_request() {
         let (_tmp, server) = indexed_server(crate::config::GroupBy::Chunk);
         let vault = server.core.vault_path.as_ref().clone();
-        std::fs::create_dir_all(vault.join("04-Archive")).unwrap();
-        std::fs::write(vault.join("04-Archive/orphan.md"), "# Orphan\n").unwrap();
+        std::fs::create_dir_all(vault.join("04-Archive/rules")).unwrap();
+        std::fs::write(
+            vault.join("04-Archive/rules/evocation-spells.md"),
+            "# Old\n",
+        )
+        .unwrap();
         let err = server
             .archive(super::Parameters(crate::params::Archive {
-                file: "04-Archive/orphan.md".into(),
-                undo: true,
+                file: "rules/evocation-spells.md".into(),
+                undo: false,
             }))
             .await
             .unwrap_err();
-        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
-        assert_eq!(err.data.as_ref().unwrap()["kind"], "invalid_input");
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_REQUEST, "{err:?}");
+        assert_eq!(err.data.as_ref().unwrap()["kind"], "conflict");
     }
 
     #[tokio::test]

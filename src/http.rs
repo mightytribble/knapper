@@ -2453,19 +2453,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unarchive_of_a_note_with_no_archived_from_is_a_bad_request() {
+    async fn an_archive_onto_a_path_the_archive_holds_is_a_conflict() {
         let (_tmp, state) = indexed_state();
         let vault = state.core.vault_path.as_ref().clone();
-        std::fs::create_dir_all(vault.join("04-Archive")).unwrap();
-        std::fs::write(vault.join("04-Archive/orphan.md"), "# Orphan\n").unwrap();
+        std::fs::create_dir_all(vault.join("04-Archive/rules")).unwrap();
+        std::fs::write(
+            vault.join("04-Archive/rules/evocation-spells.md"),
+            "# Old\n",
+        )
+        .unwrap();
         let (status, body) = post_json(
             state,
             "/api/archive",
-            r#"{"file":"04-Archive/orphan.md","undo":true}"#,
+            r#"{"file":"rules/evocation-spells.md"}"#,
         )
         .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-        assert_eq!(body["kind"], "invalid_input");
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["kind"], "conflict");
     }
 
     /// A read-only server refuses `index` the way MCP's `index` refuses it:
