@@ -1529,14 +1529,17 @@ pub fn archive_note(
     if let Some(parent) = new_full_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    // The file moves before the store changes, so a failed rename leaves the
-    // note indexed where it is.
+    // The file moves before the store changes. A failed rename leaves the
+    // note where it is. A failed store change renames the file back.
     std::fs::rename(&old_path, &new_full_path)?;
     let docid = generate_docid(&new_rel_path);
-    store.transaction(|store| {
+    if let Err(e) = store.transaction(|store| {
         store.update_file_path(&file_record.path, &new_rel_path, &docid)?;
         store.update_file_mtime(&new_rel_path, file_mtime(&new_full_path)?)
-    })?;
+    }) {
+        let _ = std::fs::rename(&new_full_path, &old_path);
+        return Err(e);
+    }
     crate::indexer::reconcile_links(store, vault_path, &linking)?;
 
     Ok(WriteResult {
@@ -1780,12 +1783,17 @@ pub fn unarchive_note(
         if let Some(parent) = restore_full_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        // A failed rename leaves the note where it is. A failed store change
+        // renames the file back.
         std::fs::rename(&archive_path, &restore_full_path)?;
         let docid = generate_docid(&original_path);
-        store.transaction(|store| {
+        if let Err(e) = store.transaction(|store| {
             store.update_file_path(&archived, &original_path, &docid)?;
             store.update_file_mtime(&original_path, file_mtime(&restore_full_path)?)
-        })?;
+        }) {
+            let _ = std::fs::rename(&restore_full_path, &archive_path);
+            return Err(e);
+        }
         crate::indexer::reconcile_links(store, vault_path, &linking)?;
         return Ok(WriteResult {
             path: original_path,
@@ -5740,6 +5748,55 @@ mod tests {
             "# Old\n"
         );
         assert!(store.get_file("lore/n.md").unwrap().is_some());
+    }
+
+    /// A stale row at the destination makes the store refuse the move after
+    /// the file has gone. The file goes back (#151).
+    #[test]
+    fn an_archive_the_store_refuses_puts_the_file_back() {
+        let (_tmp, store, vault, _embedder) = vault_with("lore/n.md", "# N\n");
+        store
+            .insert_file("04-Archive/lore/n.md", "h", 0, "abcdef", None, None)
+            .unwrap();
+
+        let err = archive_note("lore/n.md", &store, &vault, None).unwrap_err();
+
+        assert_eq!(
+            crate::fault::Fault::of(&err).map(|f| f.kind()),
+            Some("conflict")
+        );
+        assert!(vault.join("lore/n.md").exists());
+        assert!(!vault.join("04-Archive/lore/n.md").exists());
+        assert!(store.get_file("lore/n.md").unwrap().is_some());
+    }
+
+    /// The same failure on the way back: the file returns to the archive
+    /// (#151).
+    #[test]
+    fn an_unarchive_the_store_refuses_puts_the_file_back() {
+        let (_tmp, store, vault, mut embedder) = vault_with("04-Archive/lore/n.md", "# N\n");
+        store
+            .insert_file("lore/n.md", "h", 0, "abcdef", None, None)
+            .unwrap();
+
+        let err = unarchive_note(
+            "04-Archive/lore/n.md",
+            &store,
+            &mut embedder,
+            EmbedComposition::default(),
+            test_chunk_opts(),
+            &vault,
+            None,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            crate::fault::Fault::of(&err).map(|f| f.kind()),
+            Some("conflict")
+        );
+        assert!(vault.join("04-Archive/lore/n.md").exists());
+        assert!(!vault.join("lore/n.md").exists());
+        assert!(store.get_file("04-Archive/lore/n.md").unwrap().is_some());
     }
 
     #[test]

@@ -1903,11 +1903,6 @@ mod tests {
         responses
     }
 
-    /// A client on the 2026-07-28 protocol may probe with `server/discover`
-    /// and then fall back to the `initialize` handshake. The session that
-    /// follows is a handshake session, so `tools/list` with no `_meta`
-    /// answers the tools rather than refusing for missing per-request
-    /// metadata, as rmcp 3.2 did once a discover had been answered.
     #[tokio::test]
     async fn the_vault_map_tool_takes_include_archive() {
         let (_tmp, core) = crate::core::testing::indexed_core(
@@ -1936,6 +1931,11 @@ mod tests {
         assert_eq!(total(true).await, 2);
     }
 
+    /// A client on the 2026-07-28 protocol may probe with `server/discover`
+    /// and then fall back to the `initialize` handshake. The session that
+    /// follows is a handshake session, so `tools/list` with no `_meta`
+    /// answers the tools rather than refusing for missing per-request
+    /// metadata, as rmcp 3.2 did once a discover had been answered.
     #[tokio::test]
     async fn initialize_after_discover_serves_tools_without_request_meta() {
         let responses = exchange_over_stdio(&[

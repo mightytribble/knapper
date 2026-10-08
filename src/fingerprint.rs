@@ -132,7 +132,8 @@ pub const CHUNK_RECORD_VERSION: u32 = 2;
 ///
 /// Version 6 is issue #151: a link resolves to a note outside the archive
 /// folder before one under it, then to the shortest path. The rebuild this
-/// bump declares re-derives every edge from the vault with no model.
+/// bump declares re-derives every edge from the vault with no model. `serve`
+/// refuses the index until `knapper index` has run it.
 pub const LINK_RESOLVER_VERSION: u32 = 6;
 
 /// Bump when the *text* of a [`crate::llm::PromptFormat`] template changes
