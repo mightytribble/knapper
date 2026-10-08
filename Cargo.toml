@@ -2,7 +2,7 @@
 name = "knapper"
 version = "0.9.13"
 edition = "2024"
-description = "Local hybrid search and MCP retrieval for Obsidian-format vaults"
+description = "A local MCP and REST server that lets AI agents search, read and edit Obsidian vaults section by section"
 license = "MIT"
 repository = "https://github.com/mightytribble/knapper"
 homepage = "https://github.com/mightytribble/knapper"

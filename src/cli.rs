@@ -20,7 +20,7 @@ use std::path::PathBuf;
 #[command(
     name = "knapper",
     version,
-    about = "Local hybrid search and MCP retrieval for Obsidian-format vaults"
+    about = "A local MCP and REST server that lets AI agents search, read and edit Obsidian vaults section by section"
 )]
 pub struct Cli {
     /// Output results as JSON.

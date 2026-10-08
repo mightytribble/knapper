@@ -1,11 +1,11 @@
 # knapper
 
-**Local hybrid search, retrieval and editing MCP for Obsidian-format vaults.**
+**A local MCP and REST server that lets AI agents search, read and edit Obsidian vaults section by section.**
 knapper indexes a markdown vault into section-level chunks and serves them to
 AI agents — either over [MCP](https://modelcontextprotocol.io) or via 
 a REST API. Semantic embeddings, full-text search, wikilink graph
 traversal and an optional cross-encoder run in one local binary. No API keys,
-no cloud.
+no cloud, by default.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 

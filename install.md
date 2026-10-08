@@ -402,5 +402,6 @@ there before Claude Code ever sees it.
 Everything knapper stores — the SQLite index, downloaded GGUF models, vault
 profile, and config — lives in one data directory: `~/.knapper` for a native
 install, or the `/data` mount (backed by the `knapper-data` volume) for a
-container. No API keys, no cloud calls — search, indexing, and inference all
-run against local files and local models.
+container. By default there are no API keys and no cloud calls — search,
+indexing, and inference all run against local files and local models. The
+optional Gemini embedder is the exception.

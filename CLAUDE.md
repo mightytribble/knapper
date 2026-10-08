@@ -1,6 +1,6 @@
 # knapper
 
-Local hybrid search and MCP retrieval for Obsidian-format vaults. Rust CLI + MCP server. llama.cpp inference with Metal GPU. MIT licensed.
+A local MCP and REST server that lets AI agents search, read and edit Obsidian vaults section by section. Rust CLI + MCP server. llama.cpp inference with Metal GPU. MIT licensed.
 
 ## Architecture
 

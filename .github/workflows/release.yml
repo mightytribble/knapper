@@ -87,7 +87,7 @@ jobs:
 
           cat > Formula/knapper.rb << 'FORMULA'
           class Knapper < Formula
-            desc "Local hybrid search and MCP retrieval for Obsidian-format vaults"
+            desc "Local MCP and REST server for AI agents to search and edit Obsidian vaults"
             homepage "https://github.com/mightytribble/knapper"
             license "MIT"
             version "@@VERSION@@"
