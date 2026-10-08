@@ -563,15 +563,8 @@ async fn handle_list(
     ApiQuery(params): ApiQuery<crate::params::List>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, false)?;
-    let all_terms = crate::tags::merge_scope_alias(params.scope, params.all);
-    let filter = crate::tags::Scope::parse(&all_terms, &params.any, &params.none)
-        .and_then(|s| {
-            s.with_filters(
-                params.property.as_deref(),
-                params.links_to.as_deref(),
-                params.linked_from.as_deref(),
-            )
-        })
+    let filter = params
+        .scope()
         .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
     let vault = state.core.vault_path.clone();
     let profile = state.core.profile.clone();
@@ -2109,6 +2102,27 @@ mod tests {
             crate::core::testing::test_config(),
         );
         (tmp, api_state_from(core))
+    }
+
+    /// A server over a live note and an archived one.
+    fn archive_state() -> (tempfile::TempDir, ApiState) {
+        let (tmp, core) = crate::core::testing::indexed_core(
+            &[
+                ("lore/live.md", "# Live\n\nThe coast road.\n"),
+                ("04-Archive/lore/old.md", "# Old\n\nThe coast road.\n"),
+            ],
+            crate::core::testing::test_config(),
+        );
+        (tmp, api_state_from(core))
+    }
+
+    #[tokio::test]
+    async fn the_list_route_takes_include_archive() {
+        let (_tmp, state) = archive_state();
+        let listed = paths(&json_body(get(state.clone(), "/api/list").await).await);
+        assert_eq!(listed, vec!["lore/live.md"]);
+        let listed = paths(&json_body(get(state, "/api/list?include_archive=true").await).await);
+        assert_eq!(listed, vec!["04-Archive/lore/old.md", "lore/live.md"]);
     }
 
     /// How many sections of the one file that holds three matching ones came

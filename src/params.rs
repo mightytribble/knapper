@@ -274,6 +274,12 @@ pub struct List {
     #[arg(long)]
     #[serde(default)]
     pub detailed: bool,
+    /// Include notes under the archive folder, which a listing leaves out by
+    /// default. Naming the archive folder, a folder inside it or a note
+    /// inside it in `scope`, `all` or `any` includes them too.
+    #[arg(long)]
+    #[serde(default)]
+    pub include_archive: bool,
 }
 
 /// The order a listing comes back in (#121). An enum and not a string, so a
@@ -289,6 +295,22 @@ pub enum Sort {
     Path,
     LinksIn,
     LinksInAsc,
+}
+
+impl List {
+    /// The notes to list: `scope` folded into `all`, the property and link
+    /// filters, and whether the archive is admitted. One builder, so the
+    /// three surfaces cannot read a listing two ways.
+    pub fn scope(&self) -> anyhow::Result<crate::tags::Scope> {
+        let all = crate::tags::merge_scope_alias(self.scope.clone(), self.all.clone());
+        Ok(crate::tags::Scope::parse(&all, &self.any, &self.none)?
+            .with_filters(
+                self.property.as_deref(),
+                self.links_to.as_deref(),
+                self.linked_from.as_deref(),
+            )?
+            .including_archive(self.include_archive))
+    }
 }
 
 impl From<Sort> for crate::store::ListOrder {
@@ -361,6 +383,13 @@ pub struct Match {
     #[arg(long)]
     #[serde(default)]
     pub limit: Option<usize>,
+    /// Include notes under the archive folder, which `match` leaves out by
+    /// default, so `notes: 0` speaks for the working vault. Naming the
+    /// archive folder, a folder inside it or a note inside it in `scope`,
+    /// `all` or `any` includes them too.
+    #[arg(long)]
+    #[serde(default)]
+    pub include_archive: bool,
 }
 
 /// Which half of a note `match` reads (#137). An enum and not a pair of
@@ -385,7 +414,8 @@ impl Match {
     /// The notes to look in, with `scope` folded into `all`.
     pub fn scope(&self) -> anyhow::Result<crate::tags::Scope> {
         let all = crate::tags::merge_scope_alias(self.scope.clone(), self.all.clone());
-        crate::tags::Scope::parse(&all, &self.any, &self.none)
+        Ok(crate::tags::Scope::parse(&all, &self.any, &self.none)?
+            .including_archive(self.include_archive))
     }
 }
 

@@ -4354,6 +4354,7 @@ mod tests {
             none: Vec::new(),
             scan: crate::params::Scan::All,
             limit: None,
+            include_archive: false,
         };
         let report = crate::matching::run(&store, &params).unwrap();
 

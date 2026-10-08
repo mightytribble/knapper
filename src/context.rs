@@ -2035,4 +2035,98 @@ mod tests {
         assert_eq!(read("n"), "lore/deeper/still/n.md");
         assert_eq!(read("only"), "04-Archive/only.md");
     }
+
+    /// A live note and an archived one, each with a tag and a property only
+    /// it carries, indexed into a store that knows the archive. The archived
+    /// note links to the live one.
+    fn archive_vault() -> (TempDir, Store, std::path::PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        for (rel, text) in [
+            (
+                "lore/live.md",
+                "---\ntags: [type/live]\nstatus: current\n---\n# Live\n\nThe coast road runs north.\n",
+            ),
+            (
+                "04-Archive/lore/old.md",
+                "---\ntags: [type/old]\nera: past\n---\n# Old\n\nThe coast road ran south. See [[live]].\n",
+            ),
+        ] {
+            std::fs::create_dir_all(root.join(rel).parent().unwrap()).unwrap();
+            std::fs::write(root.join(rel), text).unwrap();
+        }
+        let store = Store::open_memory()
+            .unwrap()
+            .with_archive_folder("04-Archive");
+        let config = crate::config::Config::default();
+        crate::indexer::run_index_shared(
+            &root,
+            &config,
+            crate::indexer::IndexSettings::from_config(&config),
+            &store,
+            &mut crate::llm::MockLlm::new(256),
+            false,
+        )
+        .unwrap();
+        (tmp, store, root)
+    }
+
+    #[test]
+    fn list_leaves_the_archive_out_unless_asked() {
+        let (_tmp, store, root) = archive_vault();
+        let ctx = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+        let list = |json: serde_json::Value| -> Vec<String> {
+            let params: crate::params::List = serde_json::from_value(json).unwrap();
+            context_list(
+                &ctx,
+                &params.scope().unwrap(),
+                None,
+                None,
+                None,
+                crate::store::ListOrder::Path,
+                false,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|item| item.path)
+            .collect()
+        };
+        assert_eq!(list(serde_json::json!({})), ["lore/live.md"]);
+        assert_eq!(
+            list(serde_json::json!({"include_archive": true})),
+            ["04-Archive/lore/old.md", "lore/live.md"]
+        );
+        assert_eq!(
+            list(serde_json::json!({"all": ["/04-Archive/"]})),
+            ["04-Archive/lore/old.md"]
+        );
+    }
+
+    #[test]
+    fn match_leaves_the_archive_out_unless_asked() {
+        let (_tmp, store, _root) = archive_vault();
+        let notes = |json: serde_json::Value| {
+            crate::matching::run(&store, &serde_json::from_value(json).unwrap())
+                .unwrap()
+                .notes
+        };
+        assert_eq!(notes(serde_json::json!({"pattern": "coast road"})), 1);
+        assert_eq!(
+            notes(serde_json::json!({"pattern": "coast road", "include_archive": true})),
+            2
+        );
+        assert_eq!(
+            notes(serde_json::json!({"pattern": "coast road", "all": ["/04-Archive/"]})),
+            1
+        );
+        assert_eq!(
+            notes(serde_json::json!({"pattern": "ran south"})),
+            0,
+            "absent from what a default read sees"
+        );
+    }
 }

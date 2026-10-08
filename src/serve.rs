@@ -151,16 +151,7 @@ impl KnapperServer {
         params: Parameters<crate::params::List>,
     ) -> Result<CallToolResult, McpError> {
         let p = params.0;
-        let all_terms = crate::tags::merge_scope_alias(p.scope, p.all);
-        let tags = crate::tags::Scope::parse(&all_terms, &p.any, &p.none)
-            .and_then(|s| {
-                s.with_filters(
-                    p.property.as_deref(),
-                    p.links_to.as_deref(),
-                    p.linked_from.as_deref(),
-                )
-            })
-            .map_err(|e| invalid_params(format!("{e:#}")))?;
+        let tags = p.scope().map_err(|e| invalid_params(format!("{e:#}")))?;
         let vault = self.core.vault_path.clone();
         let profile = self.core.profile.clone();
         let items = self
@@ -1344,6 +1335,7 @@ mod tests {
             none: vec![],
             scan: crate::params::Scan::default(),
             limit: None,
+            include_archive: false,
         };
         let err = server.r#match(super::Parameters(params)).await.unwrap_err();
         assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
@@ -1502,6 +1494,7 @@ mod tests {
             none: vec![],
             scan: crate::params::Scan::default(),
             limit: None,
+            include_archive: false,
         };
         let err = server.r#match(super::Parameters(params)).await.unwrap_err();
         assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");

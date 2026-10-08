@@ -437,13 +437,7 @@ async fn main() -> Result<()> {
                 vault_path: &vault_path,
                 profile: profile.as_ref(),
             };
-            let all_terms = knapper::tags::merge_scope_alias(args.scope, args.all);
-            let filter = knapper::tags::Scope::parse(&all_terms, &args.any, &args.none)?
-                .with_filters(
-                    args.property.as_deref(),
-                    args.links_to.as_deref(),
-                    args.linked_from.as_deref(),
-                )?;
+            let filter = args.scope()?;
             let items = knapper::context::context_list(
                 &params,
                 &filter,
